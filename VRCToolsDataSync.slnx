@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj">
+      <Platform Project="x86" />
+    </Project>
+    <Project Path="src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj" />
+    <Project Path="src/VRCToolsDataSync.Core/VRCToolsDataSync.Core.csproj" />
+  </Folder>
+</Solution>

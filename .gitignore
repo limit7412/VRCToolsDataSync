@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+out/
+
+# .NET / Visual Studio
+*.user
+*.suo
+*.userprefs
+.vs/
+TestResults/
+*.pdb
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# Publish profiles can contain secrets
+**/Properties/PublishProfiles/*.pubxml.user
+
+# Claude Code per-user state (local permissions, history)
+.claude/
