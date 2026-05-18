@@ -85,6 +85,22 @@ dotnet run --project src\VRCToolsDataSync.App
 
 設定カードで OneDrive フォルダを選択 → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
 
+## リリースビルド
+
+ローカルで self-contained な実行ファイルを作る場合:
+
+```powershell
+# x64 (既定)
+powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
+
+# arm64 など他アーキ
+powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Arch arm64
+```
+
+出力先は `artifacts/win-<arch>/{app,cli}/` と `artifacts/VRCToolsDataSync-win-<arch>.zip`。`app/VRCToolsDataSync.App.exe` が GUI、`cli/VRCToolsDataSync.Cli.exe` が CLI。
+
+GitHub Actions では `v*` タグの push で自動的に x64 / arm64 をビルドし、Draft の GitHub Release に zip を添付する（`.github/workflows/release.yml`）。手動で動かしたい場合は Actions タブから `release` ワークフローの **Run workflow** で実行できる。
+
 ## ライセンス
 
 [LICENSE](./LICENSE) を参照。

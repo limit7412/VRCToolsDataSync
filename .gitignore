@@ -2,6 +2,7 @@
 bin/
 obj/
 out/
+artifacts/
 
 # .NET / Visual Studio
 *.user
