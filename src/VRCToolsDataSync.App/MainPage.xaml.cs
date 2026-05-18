@@ -14,6 +14,14 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
         ViewModel.ConflictRequested += OnConflictRequested;
+
+        if (App.Coordinator is not null)
+        {
+            ViewModel.AttachCoordinator(App.Coordinator, action =>
+            {
+                App.DispatcherQueue.TryEnqueue(() => action());
+            });
+        }
     }
 
     private async void OnBrowseCloudFolder(object sender, RoutedEventArgs e)

@@ -5,6 +5,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Watch;
 
 namespace VRCToolsDataSync_App.ViewModels;
 
@@ -12,6 +13,8 @@ public partial class MainPageViewModel : ObservableObject
 {
     private readonly SyncRunner _runner;
     private SyncSettings _settings;
+    private AutoSyncCoordinator? _coordinator;
+    private Action<Action>? _uiDispatch;
 
     public MainPageViewModel() : this(new SyncRunner()) { }
 
@@ -23,7 +26,49 @@ public partial class MainPageViewModel : ObservableObject
         CloudFolderPath = _settings.CloudFolderPath;
         SyncVrcx = _settings.SyncVrcx;
         SyncFriendConnect = _settings.SyncFriendConnect;
+        AutoSyncEnabled = _settings.AutoSyncEnabled;
         RefreshStatusSummaries();
+    }
+
+    public void AttachCoordinator(AutoSyncCoordinator coordinator, Action<Action> uiDispatch)
+    {
+        _coordinator = coordinator;
+        _uiDispatch = uiDispatch;
+        coordinator.AutoPushTriggered += e => OnUi(() => AppendLog($"[auto] {e.DisplayName} 終了検知 → Push 開始"));
+        coordinator.AutoPushCompleted += e => OnUi(() =>
+        {
+            if (e.Result is null) return;
+            switch (e.Result.Outcome)
+            {
+                case SyncOutcome.Success:
+                    AppendLog($"[auto] {e.DisplayName} Push 完了 v{e.Result.RemoteVersion}");
+                    break;
+                case SyncOutcome.ConflictDetected:
+                    AppendLog($"[auto] {e.DisplayName} Push 競合 v{e.Result.RemoteVersion}");
+                    break;
+                case SyncOutcome.Aborted:
+                    AppendLog($"[auto] {e.DisplayName} Push 中止: {e.Result.Message}");
+                    break;
+                default:
+                    AppendLog($"[auto] {e.DisplayName} Push: {e.Result.Outcome} {e.Result.Message}");
+                    break;
+            }
+            RefreshStatusSummaries();
+        });
+        coordinator.AutoPushConflict += e => OnUi(() =>
+        {
+            AppendLog($"[auto] {e.DisplayName} Push 競合 remote=v{e.RemoteVersion} (要操作)");
+        });
+        coordinator.RemoteUpdateAvailable += e => OnUi(() =>
+        {
+            AppendLog($"[auto] {e.DisplayName} リモート更新 v{e.RemoteVersion} (by {e.MachineName})");
+        });
+    }
+
+    private void OnUi(Action action)
+    {
+        if (_uiDispatch is null) action();
+        else _uiDispatch(action);
     }
 
     [ObservableProperty]
@@ -37,6 +82,9 @@ public partial class MainPageViewModel : ObservableObject
 
     [ObservableProperty]
     public partial bool SyncFriendConnect { get; set; }
+
+    [ObservableProperty]
+    public partial bool AutoSyncEnabled { get; set; }
 
     [ObservableProperty]
     public partial string VrcxStatus { get; set; } = string.Empty;
@@ -58,8 +106,10 @@ public partial class MainPageViewModel : ObservableObject
         _settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         _settings.SyncVrcx = SyncVrcx;
         _settings.SyncFriendConnect = SyncFriendConnect;
+        _settings.AutoSyncEnabled = AutoSyncEnabled;
         _runner.SaveSettings(_settings);
-        AppendLog("設定を保存しました");
+        _coordinator?.UpdateSettings(_settings);
+        AppendLog($"設定を保存しました (auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
     }
 
     [RelayCommand]
