@@ -19,24 +19,52 @@ var noBackupOption = new Option<bool>(
     description: "Pull 前のローカルバックアップを省略する");
 
 var pushCommand = new Command("push", "ローカルデータをクラウドへアップロード");
+
 var pushVrcxCommand = new Command("vrcx", "VRCX のデータを Push");
 pushVrcxCommand.AddOption(cloudOption);
 pushVrcxCommand.AddOption(forceOption);
 pushVrcxCommand.SetHandler((string? cloud, bool force) =>
 {
-    Environment.ExitCode = PushVrcx(cloud, force);
+    Environment.ExitCode = RunPush(cloud, force, "VRCX",
+        (lf, _, _) => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
+        VrcxSyncService.Key);
 }, cloudOption, forceOption);
 pushCommand.AddCommand(pushVrcxCommand);
 
+var pushFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Push");
+pushFriendConnectCommand.AddOption(cloudOption);
+pushFriendConnectCommand.AddOption(forceOption);
+pushFriendConnectCommand.SetHandler((string? cloud, bool force) =>
+{
+    Environment.ExitCode = RunPush(cloud, force, "VRC Friend Connect",
+        (lf, _, _) => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
+        FriendConnectSyncService.Key);
+}, cloudOption, forceOption);
+pushCommand.AddCommand(pushFriendConnectCommand);
+
 var pullCommand = new Command("pull", "クラウドからローカルへデータを取得");
+
 var pullVrcxCommand = new Command("vrcx", "VRCX のデータを Pull");
 pullVrcxCommand.AddOption(cloudOption);
 pullVrcxCommand.AddOption(noBackupOption);
 pullVrcxCommand.SetHandler((string? cloud, bool noBackup) =>
 {
-    Environment.ExitCode = PullVrcx(cloud, noBackup);
+    Environment.ExitCode = RunPull(cloud, noBackup, "VRCX",
+        (lf, _, _) => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
+        VrcxSyncService.Key);
 }, cloudOption, noBackupOption);
 pullCommand.AddCommand(pullVrcxCommand);
+
+var pullFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Pull");
+pullFriendConnectCommand.AddOption(cloudOption);
+pullFriendConnectCommand.AddOption(noBackupOption);
+pullFriendConnectCommand.SetHandler((string? cloud, bool noBackup) =>
+{
+    Environment.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
+        (lf, _, _) => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
+        FriendConnectSyncService.Key);
+}, cloudOption, noBackupOption);
+pullCommand.AddCommand(pullFriendConnectCommand);
 
 var statusCommand = new Command("status", "現在の同期設定と最後の同期情報を表示");
 statusCommand.SetHandler(() =>
@@ -76,7 +104,12 @@ static (SettingsStore store, SyncSettings settings, string cloud, ILoggerFactory
     return (store, settings, cloud, loggerFactory);
 }
 
-static int PushVrcx(string? cloudOverride, bool force)
+static int RunPush(
+    string? cloudOverride,
+    bool force,
+    string toolDisplayName,
+    Func<ILoggerFactory, SyncSettings, string, ISyncService> serviceFactory,
+    string toolKey)
 {
     var ctx = LoadContext(cloudOverride);
     if (ctx is null) return 2;
@@ -84,8 +117,8 @@ static int PushVrcx(string? cloudOverride, bool force)
 
     try
     {
-        var service = new VrcxSyncService(logger: loggerFactory.CreateLogger<VrcxSyncService>());
-        var state = settings.ToolState.GetValueOrDefault(VrcxSyncService.Key) ?? new ToolSyncState();
+        var service = serviceFactory(loggerFactory, settings, cloud);
+        var state = settings.ToolState.GetValueOrDefault(toolKey) ?? new ToolSyncState();
 
         var result = service.Push(new PushOptions
         {
@@ -98,17 +131,17 @@ static int PushVrcx(string? cloudOverride, bool force)
         switch (result.Outcome)
         {
             case SyncOutcome.Success:
-                Console.WriteLine($"VRCX Push 完了 version={result.RemoteVersion}");
+                Console.WriteLine($"{toolDisplayName} Push 完了 version={result.RemoteVersion}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
                 state.LastPushedVersion = result.RemoteVersion ?? state.LastPushedVersion;
                 state.LastPushedAt = DateTimeOffset.Now;
                 state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
-                settings.ToolState[VrcxSyncService.Key] = state;
+                settings.ToolState[toolKey] = state;
                 store.Save(settings);
                 return 0;
             case SyncOutcome.ConflictDetected:
                 Console.Error.WriteLine($"コンフリクト: リモート version={result.RemoteVersion}, ローカル lastPulled={result.LastPulledVersion}");
-                Console.Error.WriteLine("先に `pull vrcx` を実行するか、`--force` で強制 Push してください。");
+                Console.Error.WriteLine($"先に `pull {toolKey}` を実行するか、`--force` で強制 Push してください。");
                 return 3;
             case SyncOutcome.SourceMissing:
                 Console.Error.WriteLine(result.Message);
@@ -121,7 +154,7 @@ static int PushVrcx(string? cloudOverride, bool force)
     catch (RunningProcessException ex)
     {
         Console.Error.WriteLine(ex.Message);
-        Console.Error.WriteLine("VRCX を終了してから再実行してください。");
+        Console.Error.WriteLine($"{toolDisplayName} を終了してから再実行してください。");
         return 5;
     }
     catch (Exception ex)
@@ -131,7 +164,12 @@ static int PushVrcx(string? cloudOverride, bool force)
     }
 }
 
-static int PullVrcx(string? cloudOverride, bool noBackup)
+static int RunPull(
+    string? cloudOverride,
+    bool noBackup,
+    string toolDisplayName,
+    Func<ILoggerFactory, SyncSettings, string, ISyncService> serviceFactory,
+    string toolKey)
 {
     var ctx = LoadContext(cloudOverride);
     if (ctx is null) return 2;
@@ -139,7 +177,7 @@ static int PullVrcx(string? cloudOverride, bool noBackup)
 
     try
     {
-        var service = new VrcxSyncService(logger: loggerFactory.CreateLogger<VrcxSyncService>());
+        var service = serviceFactory(loggerFactory, settings, cloud);
         var result = service.Pull(new PullOptions
         {
             CloudFolderPath = cloud,
@@ -149,13 +187,13 @@ static int PullVrcx(string? cloudOverride, bool noBackup)
         switch (result.Outcome)
         {
             case SyncOutcome.Success:
-                Console.WriteLine($"VRCX Pull 完了 version={result.RemoteVersion}");
+                Console.WriteLine($"{toolDisplayName} Pull 完了 version={result.RemoteVersion}");
                 if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
-                var state = settings.ToolState.GetValueOrDefault(VrcxSyncService.Key) ?? new ToolSyncState();
+                var state = settings.ToolState.GetValueOrDefault(toolKey) ?? new ToolSyncState();
                 state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
                 state.LastPulledAt = DateTimeOffset.Now;
-                settings.ToolState[VrcxSyncService.Key] = state;
+                settings.ToolState[toolKey] = state;
                 store.Save(settings);
                 return 0;
             case SyncOutcome.NothingToDo:
@@ -170,7 +208,7 @@ static int PullVrcx(string? cloudOverride, bool noBackup)
     catch (RunningProcessException ex)
     {
         Console.Error.WriteLine(ex.Message);
-        Console.Error.WriteLine("VRCX を終了してから再実行してください。");
+        Console.Error.WriteLine($"{toolDisplayName} を終了してから再実行してください。");
         return 5;
     }
     catch (Exception ex)
