@@ -1,5 +1,8 @@
+using System;
+using System.IO;
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppNotifications;
+using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
@@ -25,25 +28,78 @@ public partial class App : Application
     public App()
     {
         InitializeComponent();
+
+        UnhandledException += (_, e) =>
+        {
+            LogStartupFailure("UnhandledException", e.Exception);
+            e.Handled = true;
+        };
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            LogStartupFailure("AppDomain.UnhandledException", e.ExceptionObject as Exception);
+        };
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            LogStartupFailure("UnobservedTaskException", e.Exception);
+            e.SetObserved();
+        };
     }
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
-        DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+        try
+        {
+            DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
 
-        AppNotificationManager.Default.Register();
+            // unpackaged 起動では AppNotificationManager の登録に COM 設定が要り、
+            // 失敗するとプロセスごと落ちるため、起動継続を優先して握り潰す。
+            try { AppNotificationManager.Default.Register(); }
+            catch (Exception ex) { LogStartupFailure("AppNotificationManager.Register", ex); }
 
-        Tray.Initialize();
-        Tray.ShowWindowRequested += ShowMainWindow;
-        Tray.ExitRequested += ExitApplication;
+            try
+            {
+                Tray.Initialize();
+                Tray.ShowWindowRequested += ShowMainWindow;
+                Tray.ExitRequested += ExitApplication;
+            }
+            catch (Exception ex) { LogStartupFailure("Tray.Initialize", ex); }
 
-        var settings = Runner.LoadSettings();
-        Coordinator = new AutoSyncCoordinator(Runner, settings, Runner.CreateLogger<AutoSyncCoordinator>());
-        Coordinator.Start();
+            try
+            {
+                var settings = Runner.LoadSettings();
+                Coordinator = new AutoSyncCoordinator(Runner, settings, Runner.CreateLogger<AutoSyncCoordinator>());
+                Coordinator.Start();
+            }
+            catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
 
-        Window = new MainWindow();
-        Window.Closed += OnWindowClosed;
-        Window.Activate();
+            Window = new MainWindow();
+            Window.Closed += OnWindowClosed;
+            Window.Activate();
+        }
+        catch (Exception ex)
+        {
+            LogStartupFailure("OnLaunched", ex);
+            throw;
+        }
+    }
+
+    private static void LogStartupFailure(string source, Exception? ex)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(FileLoggerProvider.DefaultLogPath());
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            var path = FileLoggerProvider.DefaultLogPath();
+            var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [STARTUP-FAIL] {source}: {ex}";
+            File.AppendAllText(path, line + Environment.NewLine);
+        }
+        catch
+        {
+            // ロガー自体が落ちる環境では諦める
+        }
     }
 
     public static void ShowMainWindow()
