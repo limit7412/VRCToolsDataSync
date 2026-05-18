@@ -178,7 +178,11 @@ public sealed class VrcxSyncService : ISyncService
         }
         else if (File.Exists(_paths.SettingsJsonFile))
         {
-            try { File.Delete(_paths.SettingsJsonFile); } catch { /* best-effort */ }
+            // リモートに latest.json がなくなったときはローカルも削除して状態を
+            // 揃える。握りつぶすと Push 側で削除済み判定との対称性が崩れて、
+            // 古い VRCX.json が次の Push で manifest に再登録されてしまうため、
+            // 失敗は呼び出し側に伝播させる。
+            File.Delete(_paths.SettingsJsonFile);
         }
 
         _logger.LogInformation("VRCX Pull 完了 version={Version} backup={Backup}", entry.Version, backupPath ?? "(none)");
@@ -196,7 +200,10 @@ public sealed class VrcxSyncService : ISyncService
         var path = Path.Combine(dir, fileName);
         if (File.Exists(path))
         {
-            try { File.Delete(path); } catch { /* best-effort */ }
+            // WAL/SHM 削除失敗を握りつぶすと、直後にリモート DB で本体ファイルを
+            // 上書きしても古い WAL が新しい本体に対して再生されて Pull 内容が
+            // 破損する。失敗は呼び出し側 (Pull) に例外で伝え、Aborted にする。
+            File.Delete(path);
         }
     }
 

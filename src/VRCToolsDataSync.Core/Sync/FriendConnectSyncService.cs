@@ -196,7 +196,10 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (File.Exists(_paths.DbV11File))
         {
-            try { File.Delete(_paths.DbV11File); } catch { /* best-effort */ }
+            // リモートにない任意ファイルはローカルも削除して状態を揃える。
+            // 削除失敗を握りつぶすと、次の Push で古いファイルが manifest に
+            // 再登録されてしまうため、失敗は呼び出し側に伝播させる。
+            File.Delete(_paths.DbV11File);
         }
 
         var remoteConfig = Path.Combine(toolFolder, ConfigFileName);
@@ -207,7 +210,7 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (File.Exists(_paths.ConfigJsonFile))
         {
-            try { File.Delete(_paths.ConfigJsonFile); } catch { /* best-effort */ }
+            File.Delete(_paths.ConfigJsonFile);
         }
 
         var remoteNotes = Path.Combine(toolFolder, NotesFolderName);
@@ -221,7 +224,7 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (Directory.Exists(_paths.NotesDirectory))
         {
-            try { Directory.Delete(_paths.NotesDirectory, recursive: true); } catch { /* best-effort */ }
+            Directory.Delete(_paths.NotesDirectory, recursive: true);
         }
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
@@ -266,8 +269,11 @@ public sealed class FriendConnectSyncService : ISyncService
     {
         if (Directory.Exists(destination))
         {
-            try { Directory.Delete(destination, recursive: true); }
-            catch { /* best-effort */ }
+            // 削除失敗を握りつぶすと、source から消えた古い note ファイルが
+            // destination に残ったまま CopyDirectory が進み、Push 側では
+            // 残存ファイルも manifest に登録されて他 PC に古い note が
+            // 復元されてしまう。失敗は呼び出し側に伝播させて同期を中止する。
+            Directory.Delete(destination, recursive: true);
         }
         AtomicFile.CopyDirectory(source, destination, overwrite: true);
     }
@@ -277,7 +283,10 @@ public sealed class FriendConnectSyncService : ISyncService
         var path = Path.Combine(dir, fileName);
         if (File.Exists(path))
         {
-            try { File.Delete(path); } catch { /* best-effort */ }
+            // VRCX 側と同様: WAL/SHM 削除失敗を握りつぶすと、リモート DB を
+            // 上書きしても古い WAL が新しい本体 DB に再生される事故が起きるため、
+            // 失敗は呼び出し側 (Pull) に伝播させて Aborted にする。
+            File.Delete(path);
         }
     }
 
