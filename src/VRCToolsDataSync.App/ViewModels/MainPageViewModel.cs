@@ -48,6 +48,10 @@ public partial class MainPageViewModel : ObservableObject
             {
                 case SyncOutcome.Success:
                     AppendLog($"[auto] {e.DisplayName} Push 完了 v{e.Result.RemoteVersion}");
+                    // Coordinator 側の SyncRunner.Push が settings を保存しているが、
+                    // VM 側の _settings は別インスタンスのため、再読み込みしないと
+                    // 古い LastPulledVersion で次回手動 Push が無駄なコンフリクトを起こす。
+                    _settings = _runner.LoadSettings();
                     break;
                 case SyncOutcome.ConflictDetected:
                     AppendLog($"[auto] {e.DisplayName} Push 競合 v{e.Result.RemoteVersion}");

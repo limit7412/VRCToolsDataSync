@@ -39,8 +39,7 @@ $cliProject = Join-Path $repoRoot 'src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli
 $stagingRoot = Join-Path $OutputDir $rid
 $appStagingDir = Join-Path $stagingRoot 'app'
 $cliStagingDir = Join-Path $stagingRoot 'cli'
-$shortcutPath   = Join-Path $stagingRoot 'VRCToolsDataSync.lnk'
-$shortcutTarget = Join-Path $appStagingDir 'VRCToolsDataSync.App.exe'
+$launcherPath = Join-Path $stagingRoot 'VRCToolsDataSync.cmd'
 
 Write-Host "[1/6] Cleaning staging directory: $stagingRoot"
 if (Test-Path $stagingRoot) {
@@ -49,26 +48,17 @@ if (Test-Path $stagingRoot) {
 New-Item -ItemType Directory -Force -Path $appStagingDir | Out-Null
 New-Item -ItemType Directory -Force -Path $cliStagingDir | Out-Null
 
-# NOTE: 後段で & dotnet publish を経た直後の PowerShell では
-# Join-Path / 文字列補間 / WScript.Shell の組み合わせが安定せず、
-# 変数値が空文字に解決されたり Save() が無音失敗する事象を観測した。
-# このため .lnk は dotnet publish 前にこの位置で生成しておく。
-# ターゲットの exe はまだ存在しないが、ショートカットの解決は
-# 起動時にリンク追跡で行われるため事前生成で問題ない。
-Write-Host "[2/6] Creating launcher shortcut: $shortcutPath"
-$wshShell = New-Object -ComObject WScript.Shell
-$shortcut = $wshShell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $shortcutTarget
-$shortcut.WorkingDirectory = $appStagingDir
-$shortcut.IconLocation = "$shortcutTarget,0"
-$shortcut.Description = 'VRCToolsDataSync'
-$shortcut.Save()
-[System.Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) | Out-Null
-[System.Runtime.InteropServices.Marshal]::ReleaseComObject($wshShell) | Out-Null
-[GC]::Collect()
-[GC]::WaitForPendingFinalizers()
-if (-not [System.IO.File]::Exists($shortcutPath)) {
-    throw "Shortcut was not produced at: $shortcutPath"
+# ZIP 解凍先での絶対パス依存を避けるため、.lnk ではなく .cmd で
+# 自分のあるディレクトリ (%~dp0) からの相対参照で起動する。
+# start "" /B で外側のコマンドプロンプトをすぐに閉じる。
+Write-Host "[2/6] Writing launcher: $launcherPath"
+$launcherBody = @'
+@echo off
+start "" /B "%~dp0app\VRCToolsDataSync.App.exe" %*
+'@
+[System.IO.File]::WriteAllText($launcherPath, $launcherBody, [System.Text.Encoding]::ASCII)
+if (-not [System.IO.File]::Exists($launcherPath)) {
+    throw "Launcher was not produced at: $launcherPath"
 }
 
 Write-Host "[3/6] Publishing App ($rid)"
@@ -95,12 +85,13 @@ Write-Host "[4/6] Publishing Cli ($rid)"
     -o $cliStagingDir
 if ($LASTEXITCODE -ne 0) { throw "Cli publish failed (exit $LASTEXITCODE)" }
 
-Write-Host "[5/6] Verifying launcher shortcut and exe presence"
-if (-not [System.IO.File]::Exists($shortcutTarget)) {
-    throw "Shortcut target not found after publish: $shortcutTarget"
+Write-Host "[5/6] Verifying launcher and exe presence"
+$appExePath = Join-Path $appStagingDir 'VRCToolsDataSync.App.exe'
+if (-not [System.IO.File]::Exists($appExePath)) {
+    throw "App exe not found after publish: $appExePath"
 }
-if (-not [System.IO.File]::Exists($shortcutPath)) {
-    throw "Shortcut missing after publish: $shortcutPath"
+if (-not [System.IO.File]::Exists($launcherPath)) {
+    throw "Launcher missing after publish: $launcherPath"
 }
 
 Write-Host "[6/6] Creating zip archive"
