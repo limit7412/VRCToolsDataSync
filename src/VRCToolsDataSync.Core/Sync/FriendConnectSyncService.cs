@@ -1,0 +1,260 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using VRCToolsDataSync.Core.Paths;
+
+namespace VRCToolsDataSync.Core.Sync;
+
+public sealed class FriendConnectSyncService : ISyncService
+{
+    public const string Key = "friend-connect";
+
+    private const string SubFolder = "friend-connect";
+    private const string DbFileName = "db.sqlite";
+    private const string DbV11FileName = "db_1.1.sqlite";
+    private const string ConfigFileName = "config.json";
+    private const string NotesFolderName = "notes";
+
+    private readonly FriendConnectPaths _paths;
+    private readonly LocalBackup _backup;
+    private readonly ILogger<FriendConnectSyncService> _logger;
+
+    public string ToolKey => Key;
+
+    public FriendConnectSyncService(
+        FriendConnectPaths? paths = null,
+        LocalBackup? backup = null,
+        ILogger<FriendConnectSyncService>? logger = null)
+    {
+        _paths = paths ?? FriendConnectPaths.Default();
+        _backup = backup ?? new LocalBackup();
+        _logger = logger ?? NullLogger<FriendConnectSyncService>.Instance;
+    }
+
+    public SyncResult Push(PushOptions options)
+    {
+        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+
+        if (!_paths.Exists() || !File.Exists(_paths.DbFile))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"VRC Friend Connect のデータが見つかりません: {_paths.DbFile}",
+            };
+        }
+
+        var manifestStore = new ManifestStore(options.CloudFolderPath);
+        var manifest = manifestStore.Load();
+
+        if (!options.ForceOverwriteOnConflict
+            && manifest.Tools.TryGetValue(Key, out var existing)
+            && options.LastPulledVersion.HasValue
+            && existing.Version > options.LastPulledVersion.Value)
+        {
+            _logger.LogInformation(
+                "Friend Connect Push 中止: リモートの方が新しい (remote={Remote}, lastPulled={LastPulled})",
+                existing.Version, options.LastPulledVersion);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.ConflictDetected,
+                RemoteVersion = existing.Version,
+                LastPulledVersion = options.LastPulledVersion,
+                Message = "リモートにより新しい Friend Connect データがあります",
+            };
+        }
+
+        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
+        Directory.CreateDirectory(toolFolder);
+
+        var affected = new List<string>();
+
+        SnapshotSqliteTo(Path.Combine(toolFolder, DbFileName), _paths.DbFile, affected);
+        if (File.Exists(_paths.DbV11File))
+        {
+            SnapshotSqliteTo(Path.Combine(toolFolder, DbV11FileName), _paths.DbV11File, affected);
+        }
+
+        if (File.Exists(_paths.ConfigJsonFile))
+        {
+            var destConfig = Path.Combine(toolFolder, ConfigFileName);
+            AtomicFile.Copy(_paths.ConfigJsonFile, destConfig, overwrite: true);
+            affected.Add(destConfig);
+        }
+
+        if (Directory.Exists(_paths.NotesDirectory))
+        {
+            var destNotes = Path.Combine(toolFolder, NotesFolderName);
+            ReplaceDirectory(_paths.NotesDirectory, destNotes);
+            foreach (var file in Directory.EnumerateFiles(destNotes, "*", SearchOption.AllDirectories))
+            {
+                affected.Add(file);
+            }
+        }
+
+        var nextVersion = (manifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
+        manifest.Tools[Key] = new ToolManifestEntry
+        {
+            Version = nextVersion,
+            MachineName = options.MachineName,
+            UpdatedAt = DateTimeOffset.Now,
+            Files = BuildManifestFiles(affected, options.CloudFolderPath),
+        };
+        manifestStore.Save(manifest);
+
+        _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, affected.Count);
+        return new SyncResult
+        {
+            Outcome = SyncOutcome.Success,
+            RemoteVersion = nextVersion,
+            AffectedFiles = affected,
+        };
+    }
+
+    public SyncResult Pull(PullOptions options)
+    {
+        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+
+        var manifestStore = new ManifestStore(options.CloudFolderPath);
+        var manifest = manifestStore.Load();
+        if (!manifest.Tools.TryGetValue(Key, out var entry))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.NothingToDo,
+                Message = "クラウド側に Friend Connect のデータがありません",
+            };
+        }
+
+        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
+        var remoteDb = Path.Combine(toolFolder, DbFileName);
+        if (!File.Exists(remoteDb))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にスナップショットがありません: {remoteDb}",
+            };
+        }
+
+        Directory.CreateDirectory(_paths.RootDirectory);
+
+        string? backupPath = null;
+        if (!options.SkipBackup)
+        {
+            var filesToBackup = new List<string>();
+            if (File.Exists(_paths.DbFile)) filesToBackup.Add(_paths.DbFile);
+            if (File.Exists(_paths.DbV11File)) filesToBackup.Add(_paths.DbV11File);
+            if (File.Exists(_paths.ConfigJsonFile)) filesToBackup.Add(_paths.ConfigJsonFile);
+
+            var dirsToBackup = new List<string>();
+            if (Directory.Exists(_paths.NotesDirectory)) dirsToBackup.Add(_paths.NotesDirectory);
+
+            backupPath = _backup.CreateSnapshot(Key, filesToBackup, dirsToBackup);
+
+            DeleteIfExists(_paths.RootDirectory, "db.sqlite-shm");
+            DeleteIfExists(_paths.RootDirectory, "db.sqlite-wal");
+            DeleteIfExists(_paths.RootDirectory, "db_1.1.sqlite-shm");
+            DeleteIfExists(_paths.RootDirectory, "db_1.1.sqlite-wal");
+        }
+
+        var affected = new List<string>();
+
+        AtomicFile.Copy(remoteDb, _paths.DbFile, overwrite: true);
+        affected.Add(_paths.DbFile);
+
+        var remoteDbV11 = Path.Combine(toolFolder, DbV11FileName);
+        if (File.Exists(remoteDbV11))
+        {
+            AtomicFile.Copy(remoteDbV11, _paths.DbV11File, overwrite: true);
+            affected.Add(_paths.DbV11File);
+        }
+
+        var remoteConfig = Path.Combine(toolFolder, ConfigFileName);
+        if (File.Exists(remoteConfig))
+        {
+            AtomicFile.Copy(remoteConfig, _paths.ConfigJsonFile, overwrite: true);
+            affected.Add(_paths.ConfigJsonFile);
+        }
+
+        var remoteNotes = Path.Combine(toolFolder, NotesFolderName);
+        if (Directory.Exists(remoteNotes))
+        {
+            ReplaceDirectory(remoteNotes, _paths.NotesDirectory);
+            foreach (var file in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
+            {
+                affected.Add(file);
+            }
+        }
+
+        _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
+            entry.Version, backupPath ?? "(none)");
+        return new SyncResult
+        {
+            Outcome = SyncOutcome.Success,
+            RemoteVersion = entry.Version,
+            BackupPath = backupPath,
+            AffectedFiles = affected,
+        };
+    }
+
+    private static void SnapshotSqliteTo(string destination, string sourceDb, List<string> affected)
+    {
+        var tmp = destination + ".building";
+        SqliteSnapshot.Create(sourceDb, tmp);
+        try
+        {
+            if (File.Exists(destination))
+            {
+                File.Replace(tmp, destination, destinationBackupFileName: null);
+            }
+            else
+            {
+                File.Move(tmp, destination);
+            }
+        }
+        catch
+        {
+            if (File.Exists(tmp))
+            {
+                try { File.Delete(tmp); } catch { /* best-effort */ }
+            }
+            throw;
+        }
+        affected.Add(destination);
+    }
+
+    private static void ReplaceDirectory(string source, string destination)
+    {
+        if (Directory.Exists(destination))
+        {
+            try { Directory.Delete(destination, recursive: true); }
+            catch { /* best-effort */ }
+        }
+        AtomicFile.CopyDirectory(source, destination, overwrite: true);
+    }
+
+    private static void DeleteIfExists(string dir, string fileName)
+    {
+        var path = Path.Combine(dir, fileName);
+        if (File.Exists(path))
+        {
+            try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    private static List<ManifestFile> BuildManifestFiles(IEnumerable<string> paths, string cloudFolder)
+    {
+        var list = new List<ManifestFile>();
+        foreach (var p in paths)
+        {
+            var info = new FileInfo(p);
+            list.Add(new ManifestFile
+            {
+                RelativePath = Path.GetRelativePath(cloudFolder, p).Replace('\\', '/'),
+                Size = info.Length,
+                Sha256 = FileHasher.Sha256(p),
+            });
+        }
+        return list;
+    }
+}
