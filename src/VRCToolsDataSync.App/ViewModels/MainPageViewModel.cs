@@ -1,5 +1,6 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -16,6 +17,9 @@ public partial class MainPageViewModel : ObservableObject
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
     private Action<Action>? _uiDispatch;
+    // ContentDialog は WinUI 上で同時に複数表示できないため、自動通知の
+    // ダイアログ呼び出しはここでシリアライズして待ち合わせる。
+    private readonly SemaphoreSlim _dialogGate = new(1, 1);
 
     public MainPageViewModel() : this(new SyncRunner()) { }
 
@@ -316,17 +320,21 @@ public partial class MainPageViewModel : ObservableObject
         ShowWindowRequested?.Invoke();
 
         if (ConflictRequested is null) return;
-        var choice = await ConflictRequested.Invoke(new ConflictPrompt
-        {
-            ToolDisplayName = e.DisplayName,
-            RemoteVersion = e.RemoteVersion,
-            LastPulledVersion = e.LastPulledVersion,
-        });
 
-        if (!TryGetCloud(out var cloud)) return;
-
+        // ContentDialog は WinUI 上で同時に複数表示できないため、
+        // 自動通知のダイアログは _dialogGate で1件ずつ処理する。
+        await _dialogGate.WaitAsync();
         try
         {
+            var choice = await ConflictRequested.Invoke(new ConflictPrompt
+            {
+                ToolDisplayName = e.DisplayName,
+                RemoteVersion = e.RemoteVersion,
+                LastPulledVersion = e.LastPulledVersion,
+            });
+
+            if (!TryGetCloud(out var cloud)) return;
+
             switch (choice)
             {
                 case ConflictChoice.ForceOverwrite:
@@ -351,6 +359,7 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
+            _dialogGate.Release();
         }
     }
 
@@ -363,19 +372,23 @@ public partial class MainPageViewModel : ObservableObject
         ShowWindowRequested?.Invoke();
 
         if (RemoteUpdateRequested is null) return;
-        var choice = await RemoteUpdateRequested.Invoke(new RemoteUpdatePrompt
-        {
-            ToolDisplayName = e.DisplayName,
-            RemoteVersion = e.RemoteVersion,
-            LocalVersion = e.LocalVersion,
-            MachineName = e.MachineName,
-        });
 
-        if (choice != RemoteUpdateChoice.PullNow) return;
-        if (!TryGetCloud(out var cloud)) return;
-
+        // ContentDialog の同時表示は不可。AutoPushConflict と共通の
+        // _dialogGate で1件ずつ処理する。
+        await _dialogGate.WaitAsync();
         try
         {
+            var choice = await RemoteUpdateRequested.Invoke(new RemoteUpdatePrompt
+            {
+                ToolDisplayName = e.DisplayName,
+                RemoteVersion = e.RemoteVersion,
+                LocalVersion = e.LocalVersion,
+                MachineName = e.MachineName,
+            });
+
+            if (choice != RemoteUpdateChoice.PullNow) return;
+            if (!TryGetCloud(out var cloud)) return;
+
             AppendLog($"[auto] {e.DisplayName} Pull 実行");
             var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, cloud, skipBackup: false));
             ReportPullResult(e.DisplayName, pullResult);
@@ -387,6 +400,7 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
+            _dialogGate.Release();
         }
     }
 

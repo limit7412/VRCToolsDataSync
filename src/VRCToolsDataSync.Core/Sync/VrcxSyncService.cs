@@ -61,7 +61,8 @@ public sealed class VrcxSyncService : ISyncService
         Directory.CreateDirectory(toolFolder);
 
         var snapshotDest = Path.Combine(toolFolder, SnapshotFileName);
-        var snapshotTmp = snapshotDest + ".building";
+        // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
+        var snapshotTmp = snapshotDest + ".building-" + Guid.NewGuid().ToString("N");
         SqliteSnapshot.Create(_paths.SqliteFile, snapshotTmp);
 
         try

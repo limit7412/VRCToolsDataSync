@@ -234,7 +234,8 @@ public sealed class FriendConnectSyncService : ISyncService
 
     private static void SnapshotSqliteTo(string destination, string sourceDb, List<string> affected)
     {
-        var tmp = destination + ".building";
+        // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
+        var tmp = destination + ".building-" + Guid.NewGuid().ToString("N");
         SqliteSnapshot.Create(sourceDb, tmp);
         try
         {
