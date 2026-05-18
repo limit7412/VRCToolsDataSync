@@ -95,7 +95,11 @@ public sealed class VrcxSyncService : ISyncService
         }
         else if (File.Exists(settingsDest))
         {
-            try { File.Delete(settingsDest); } catch { /* best-effort */ }
+            // ローカルから消えた任意ファイルはクラウドからも削除する。
+            // ここで握りつぶすと Pull 側はリモートの実ファイル存在を見るため、
+            // 古い latest.json が他 PC へ復元され、削除した設定が復活する。
+            // 失敗した場合は Push 全体を失敗扱いにして上位に伝える。
+            File.Delete(settingsDest);
         }
 
         // 保存直前に manifest を再読込し、他 tool のエントリを失わないようにマージする。

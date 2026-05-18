@@ -430,11 +430,15 @@ public partial class MainPageViewModel : ObservableObject
             AppendLog($"指定フォルダが存在しません: {cloud}");
             return false;
         }
-        // 設定が未保存だった場合のために、同期実行時にも保存を反映しておく
+        // 設定が未保存だった場合のために、同期実行時にも保存を反映しておく。
+        // CloudFolderPath が変わった場合は常駐 Coordinator の CloudWatcher も
+        // 旧パスを監視したままになってしまうので、UpdateSettings で再起動して
+        // 新パスに張り替える (Watcher 再構築を伴う)。
         if (_settings.CloudFolderPath != cloud)
         {
             _settings.CloudFolderPath = cloud;
             _runner.SaveSettings(_settings);
+            _coordinator?.UpdateSettings(_settings);
         }
         return true;
     }

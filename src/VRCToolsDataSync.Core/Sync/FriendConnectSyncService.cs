@@ -78,7 +78,10 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (File.Exists(destDbV11))
         {
-            try { File.Delete(destDbV11); } catch { /* best-effort */ }
+            // 削除失敗を握りつぶすと Pull 側でリモートの古いファイルが
+            // 復元されて削除済みデータが復活するため、失敗時は Push を
+            // 失敗扱いにする。
+            File.Delete(destDbV11);
         }
 
         var destConfig = Path.Combine(toolFolder, ConfigFileName);
@@ -89,7 +92,7 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (File.Exists(destConfig))
         {
-            try { File.Delete(destConfig); } catch { /* best-effort */ }
+            File.Delete(destConfig);
         }
 
         var destNotes = Path.Combine(toolFolder, NotesFolderName);
@@ -103,7 +106,7 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else if (Directory.Exists(destNotes))
         {
-            try { Directory.Delete(destNotes, recursive: true); } catch { /* best-effort */ }
+            Directory.Delete(destNotes, recursive: true);
         }
 
         // 保存直前に manifest を再読込し、他 tool のエントリを失わないようにマージする。

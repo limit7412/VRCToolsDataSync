@@ -19,6 +19,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
+    // Start/Stop の世代を表す CancellationTokenSource。
+    // Stop / UpdateSettings で Cancel し、Start で再生成する。
+    // ProcessExited から切り離された HandleProcessExited タスクは、
+    // この token を見て grace sleep / Push 直前で打ち切る。
+    private CancellationTokenSource _generationCts = new();
 
     public event Action<AutoPushEvent>? AutoPushTriggered;
     public event Action<AutoPushEvent>? AutoPushCompleted;
@@ -40,6 +45,13 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _logger.LogInformation("AutoSync 起動スキップ: クラウドフォルダ未設定");
             return;
+        }
+
+        // 直前の Stop でキャンセル済みの可能性があるので、新しい世代用に張り直す。
+        if (_generationCts.IsCancellationRequested)
+        {
+            _generationCts.Dispose();
+            _generationCts = new CancellationTokenSource();
         }
 
         if (_settings.SyncVrcx)
@@ -76,6 +88,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     public void Stop()
     {
         if (!_started) return;
+
+        // 切り離された HandleProcessExited タスクを中断するため、
+        // Watcher 破棄より先に Cancel する。
+        try { _generationCts.Cancel(); } catch { /* best-effort */ }
+
         foreach (var binding in _bindings)
         {
             binding.Watcher.Dispose();
@@ -116,14 +133,32 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         var watcher = new ProcessWatcher(processNames);
         var binding = new ToolBinding(toolKey, displayName, watcher, serviceFactory);
-        watcher.ProcessExited += _ => Task.Run(() => HandleProcessExited(binding));
+        // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
+        // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
+        var token = _generationCts.Token;
+        watcher.ProcessExited += _ => Task.Run(() => HandleProcessExited(binding, token));
         return binding;
     }
 
-    private void HandleProcessExited(ToolBinding binding)
+    private void HandleProcessExited(ToolBinding binding, CancellationToken token)
     {
-        // プロセス終了直後はファイル解放待ちで数秒置く
-        Thread.Sleep(TimeSpan.FromSeconds(3));
+        // プロセス終了直後はファイル解放待ちで数秒置く (キャンセル対応)。
+        try
+        {
+            Task.Delay(TimeSpan.FromSeconds(3), token).GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("AutoPush キャンセル (grace中) tool={Tool}", binding.ToolKey);
+            return;
+        }
+
+        // grace 中に Stop / UpdateSettings で世代が切れていたら中断。
+        if (token.IsCancellationRequested)
+        {
+            _logger.LogInformation("AutoPush キャンセル tool={Tool}", binding.ToolKey);
+            return;
+        }
 
         var pushEvent = new AutoPushEvent(binding.ToolKey, binding.DisplayName);
         AutoPushTriggered?.Invoke(pushEvent);
@@ -138,6 +173,12 @@ public sealed class AutoSyncCoordinator : IDisposable
             SyncResult result;
             lock (_autoPushLock)
             {
+                // ロック取得後にも世代失効を確認 (長時間待ち後の二重Push防止)。
+                if (token.IsCancellationRequested)
+                {
+                    _logger.LogInformation("AutoPush キャンセル (lock後) tool={Tool}", binding.ToolKey);
+                    return;
+                }
                 result = _runner.Push(service, _settings, _settings.CloudFolderPath, force: false);
             }
             switch (result.Outcome)
@@ -202,7 +243,11 @@ public sealed class AutoSyncCoordinator : IDisposable
         }
     }
 
-    public void Dispose() => Stop();
+    public void Dispose()
+    {
+        Stop();
+        try { _generationCts.Dispose(); } catch { /* best-effort */ }
+    }
 
     private sealed record ToolBinding(
         string ToolKey,

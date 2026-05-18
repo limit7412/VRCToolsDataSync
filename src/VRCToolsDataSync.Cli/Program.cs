@@ -20,26 +20,35 @@ var noBackupOption = new Option<bool>(
 
 var pushCommand = new Command("push", "ローカルデータをクラウドへアップロード");
 
+// NOTE: System.CommandLine 2.0.0-beta4 では、ハンドラ内で Environment.ExitCode を
+// 設定しても InvokeAsync は常に 0 を返してしまい、シェルから見た終了コードが
+// 0 に上書きされる。各コマンドの InvocationContext.ExitCode に書き戻すことで
+// 確実に InvokeAsync の戻り値に反映させる。
+
 var pushVrcxCommand = new Command("vrcx", "VRCX のデータを Push");
 pushVrcxCommand.AddOption(cloudOption);
 pushVrcxCommand.AddOption(forceOption);
-pushVrcxCommand.SetHandler((string? cloud, bool force) =>
+pushVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
-    Environment.ExitCode = RunPush(cloud, force, "VRCX",
+    var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
+    var force = ctx.ParseResult.GetValueForOption(forceOption);
+    ctx.ExitCode = RunPush(cloud, force, "VRCX",
         (lf, _, _) => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
         VrcxSyncService.Key);
-}, cloudOption, forceOption);
+});
 pushCommand.AddCommand(pushVrcxCommand);
 
 var pushFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Push");
 pushFriendConnectCommand.AddOption(cloudOption);
 pushFriendConnectCommand.AddOption(forceOption);
-pushFriendConnectCommand.SetHandler((string? cloud, bool force) =>
+pushFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
-    Environment.ExitCode = RunPush(cloud, force, "VRC Friend Connect",
+    var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
+    var force = ctx.ParseResult.GetValueForOption(forceOption);
+    ctx.ExitCode = RunPush(cloud, force, "VRC Friend Connect",
         (lf, _, _) => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
         FriendConnectSyncService.Key);
-}, cloudOption, forceOption);
+});
 pushCommand.AddCommand(pushFriendConnectCommand);
 
 var pullCommand = new Command("pull", "クラウドからローカルへデータを取得");
@@ -47,29 +56,33 @@ var pullCommand = new Command("pull", "クラウドからローカルへデー�
 var pullVrcxCommand = new Command("vrcx", "VRCX のデータを Pull");
 pullVrcxCommand.AddOption(cloudOption);
 pullVrcxCommand.AddOption(noBackupOption);
-pullVrcxCommand.SetHandler((string? cloud, bool noBackup) =>
+pullVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
-    Environment.ExitCode = RunPull(cloud, noBackup, "VRCX",
+    var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
+    var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, "VRCX",
         (lf, _, _) => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
         VrcxSyncService.Key);
-}, cloudOption, noBackupOption);
+});
 pullCommand.AddCommand(pullVrcxCommand);
 
 var pullFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Pull");
 pullFriendConnectCommand.AddOption(cloudOption);
 pullFriendConnectCommand.AddOption(noBackupOption);
-pullFriendConnectCommand.SetHandler((string? cloud, bool noBackup) =>
+pullFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
-    Environment.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
+    var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
+    var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
         (lf, _, _) => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
         FriendConnectSyncService.Key);
-}, cloudOption, noBackupOption);
+});
 pullCommand.AddCommand(pullFriendConnectCommand);
 
 var statusCommand = new Command("status", "現在の同期設定と最後の同期情報を表示");
-statusCommand.SetHandler(() =>
+statusCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
-    Environment.ExitCode = ShowStatus();
+    ctx.ExitCode = ShowStatus();
 });
 
 rootCommand.AddCommand(pushCommand);
