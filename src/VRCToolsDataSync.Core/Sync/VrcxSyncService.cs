@@ -43,8 +43,7 @@ public sealed class VrcxSyncService : ISyncService
 
         if (!options.ForceOverwriteOnConflict
             && manifest.Tools.TryGetValue(Key, out var existing)
-            && options.LastPulledVersion.HasValue
-            && existing.Version > options.LastPulledVersion.Value)
+            && existing.Version > (options.LastPulledVersion ?? 0))
         {
             _logger.LogInformation(
                 "VRCX Push 中止: リモートの方が新しい (remote={Remote}, lastPulled={LastPulled})",
