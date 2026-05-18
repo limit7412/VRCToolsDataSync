@@ -25,6 +25,10 @@ public partial class App : Application
 
     public static TrayIconManager Tray { get; } = new();
 
+    // タスクトレイから「終了」を選んだとき、Window.Closed で
+    // タスクトレイ最小化に切り替えないために立てるフラグ。
+    private static bool _isExiting;
+
     public App()
     {
         InitializeComponent();
@@ -117,7 +121,12 @@ public partial class App : Application
 
     private static void OnWindowClosed(object sender, WindowEventArgs args)
     {
-        // 閉じるボタンはタスクトレイへの最小化として扱う
+        if (_isExiting)
+        {
+            // トレイメニューからの「終了」要求はそのまま閉じさせる。
+            return;
+        }
+        // それ以外（× ボタン押下）はタスクトレイへの最小化として扱う。
         args.Handled = true;
         if (Window.AppWindow is not null)
         {
@@ -127,14 +136,35 @@ public partial class App : Application
 
     private static void ExitApplication()
     {
+        // 既に終了処理中なら再入を防ぐ。
+        if (_isExiting) return;
+        _isExiting = true;
+
         DispatcherQueue.TryEnqueue(() =>
         {
-            Coordinator?.Dispose();
+            // 順序が重要:
+            // 1. プロセス監視 / FileSystemWatcher を止める (Coordinator)
+            // 2. トースト通知の登録解除 (AppNotificationManager)
+            // 3. メインウィンドウを実際に閉じる (Window.Close → OnWindowClosed が
+            //    _isExiting=true を見てそのまま閉じる)
+            // 4. タスクトレイアイコンを破棄 (TaskbarIcon)
+            // 5. プロセス自体を Environment.Exit で確実に終了させる。
+            //    Application.Current.Exit() だけでは TaskbarIcon 内部の COM
+            //    オブジェクトが解放されきらずプロセスが残るケースがある。
+            try { Coordinator?.Dispose(); } catch { /* best-effort */ }
             Coordinator = null;
-            Tray.Dispose();
             try { AppNotificationManager.Default.Unregister(); } catch { /* best-effort */ }
-            Window?.Close();
-            Microsoft.UI.Xaml.Application.Current.Exit();
+            try { Window?.Close(); } catch { /* best-effort */ }
+            try { Tray.Dispose(); } catch { /* best-effort */ }
+            try { Microsoft.UI.Xaml.Application.Current.Exit(); } catch { /* best-effort */ }
+
+            // 上記でメッセージループが抜けないケースに備えて最終手段。
+            // 1秒待ってもまだ生きていたら Environment.Exit でプロセスを殺す。
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                System.Threading.Thread.Sleep(1000);
+                Environment.Exit(0);
+            });
         });
     }
 }
