@@ -9,6 +9,7 @@ public sealed class FriendConnectSyncService : ISyncService
     public const string Key = "friend-connect";
 
     private const string SubFolder = "friend-connect";
+    private const string DbSubFolder = "db";
     private const string DbFileName = "db.sqlite";
     private const string DbV11FileName = "db_1.1.sqlite";
     private const string ConfigFileName = "config.json";
@@ -63,13 +64,14 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        Directory.CreateDirectory(toolFolder);
+        var toolDbFolder = Path.Combine(toolFolder, DbSubFolder);
+        Directory.CreateDirectory(toolDbFolder);
 
         var affected = new List<string>();
 
-        SnapshotSqliteTo(Path.Combine(toolFolder, DbFileName), _paths.DbFile, affected);
+        SnapshotSqliteTo(Path.Combine(toolDbFolder, DbFileName), _paths.DbFile, affected);
 
-        var destDbV11 = Path.Combine(toolFolder, DbV11FileName);
+        var destDbV11 = Path.Combine(toolDbFolder, DbV11FileName);
         if (File.Exists(_paths.DbV11File))
         {
             SnapshotSqliteTo(destDbV11, _paths.DbV11File, affected);
@@ -139,7 +141,8 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        var remoteDb = Path.Combine(toolFolder, DbFileName);
+        var toolDbFolder = Path.Combine(toolFolder, DbSubFolder);
+        var remoteDb = Path.Combine(toolDbFolder, DbFileName);
         if (!File.Exists(remoteDb))
         {
             return new SyncResult
@@ -150,6 +153,7 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         Directory.CreateDirectory(_paths.RootDirectory);
+        Directory.CreateDirectory(_paths.DbDirectory);
 
         string? backupPath = null;
         if (!options.SkipBackup)
@@ -164,10 +168,10 @@ public sealed class FriendConnectSyncService : ISyncService
 
             backupPath = _backup.CreateSnapshot(Key, filesToBackup, dirsToBackup);
 
-            DeleteIfExists(_paths.RootDirectory, "db.sqlite-shm");
-            DeleteIfExists(_paths.RootDirectory, "db.sqlite-wal");
-            DeleteIfExists(_paths.RootDirectory, "db_1.1.sqlite-shm");
-            DeleteIfExists(_paths.RootDirectory, "db_1.1.sqlite-wal");
+            DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
+            DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
+            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
+            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
         }
 
         var affected = new List<string>();
@@ -175,7 +179,7 @@ public sealed class FriendConnectSyncService : ISyncService
         AtomicFile.Copy(remoteDb, _paths.DbFile, overwrite: true);
         affected.Add(_paths.DbFile);
 
-        var remoteDbV11 = Path.Combine(toolFolder, DbV11FileName);
+        var remoteDbV11 = Path.Combine(toolDbFolder, DbV11FileName);
         if (File.Exists(remoteDbV11))
         {
             AtomicFile.Copy(remoteDbV11, _paths.DbV11File, overwrite: true);

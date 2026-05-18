@@ -25,8 +25,9 @@ public sealed class VrcxPaths
 public sealed class FriendConnectPaths
 {
     public string RootDirectory { get; }
-    public string DbFile => Path.Combine(RootDirectory, "db.sqlite");
-    public string DbV11File => Path.Combine(RootDirectory, "db_1.1.sqlite");
+    public string DbDirectory => Path.Combine(RootDirectory, "db");
+    public string DbFile => Path.Combine(DbDirectory, "db.sqlite");
+    public string DbV11File => Path.Combine(DbDirectory, "db_1.1.sqlite");
     public string NotesDirectory => Path.Combine(RootDirectory, "notes");
     public string ConfigJsonFile => Path.Combine(RootDirectory, "config.json");
 
