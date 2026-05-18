@@ -36,18 +36,42 @@ $rid = "win-$Arch"
 $appProject = Join-Path $repoRoot 'src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj'
 $cliProject = Join-Path $repoRoot 'src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj'
 
-$archStagingDir = Join-Path $OutputDir $rid
-$appStagingDir = Join-Path $archStagingDir 'app'
-$cliStagingDir = Join-Path $archStagingDir 'cli'
+$stagingRoot = Join-Path $OutputDir $rid
+$appStagingDir = Join-Path $stagingRoot 'app'
+$cliStagingDir = Join-Path $stagingRoot 'cli'
+$shortcutPath   = Join-Path $stagingRoot 'VRCToolsDataSync.lnk'
+$shortcutTarget = Join-Path $appStagingDir 'VRCToolsDataSync.App.exe'
 
-Write-Host "[1/4] Cleaning staging directory: $archStagingDir"
-if (Test-Path $archStagingDir) {
-    Remove-Item $archStagingDir -Recurse -Force
+Write-Host "[1/6] Cleaning staging directory: $stagingRoot"
+if (Test-Path $stagingRoot) {
+    Remove-Item $stagingRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $appStagingDir | Out-Null
 New-Item -ItemType Directory -Force -Path $cliStagingDir | Out-Null
 
-Write-Host "[2/4] Publishing App ($rid)"
+# NOTE: 後段で & dotnet publish を経た直後の PowerShell では
+# Join-Path / 文字列補間 / WScript.Shell の組み合わせが安定せず、
+# 変数値が空文字に解決されたり Save() が無音失敗する事象を観測した。
+# このため .lnk は dotnet publish 前にこの位置で生成しておく。
+# ターゲットの exe はまだ存在しないが、ショートカットの解決は
+# 起動時にリンク追跡で行われるため事前生成で問題ない。
+Write-Host "[2/6] Creating launcher shortcut: $shortcutPath"
+$wshShell = New-Object -ComObject WScript.Shell
+$shortcut = $wshShell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $shortcutTarget
+$shortcut.WorkingDirectory = $appStagingDir
+$shortcut.IconLocation = "$shortcutTarget,0"
+$shortcut.Description = 'VRCToolsDataSync'
+$shortcut.Save()
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($wshShell) | Out-Null
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
+if (-not [System.IO.File]::Exists($shortcutPath)) {
+    throw "Shortcut was not produced at: $shortcutPath"
+}
+
+Write-Host "[3/6] Publishing App ($rid)"
 & dotnet publish $appProject `
     -c $Configuration `
     -r $rid `
@@ -60,7 +84,7 @@ Write-Host "[2/4] Publishing App ($rid)"
     -o $appStagingDir
 if ($LASTEXITCODE -ne 0) { throw "App publish failed (exit $LASTEXITCODE)" }
 
-Write-Host "[3/4] Publishing Cli ($rid)"
+Write-Host "[4/6] Publishing Cli ($rid)"
 & dotnet publish $cliProject `
     -c $Configuration `
     -r $rid `
@@ -71,7 +95,15 @@ Write-Host "[3/4] Publishing Cli ($rid)"
     -o $cliStagingDir
 if ($LASTEXITCODE -ne 0) { throw "Cli publish failed (exit $LASTEXITCODE)" }
 
-Write-Host "[4/4] Creating zip archive"
+Write-Host "[5/6] Verifying launcher shortcut and exe presence"
+if (-not [System.IO.File]::Exists($shortcutTarget)) {
+    throw "Shortcut target not found after publish: $shortcutTarget"
+}
+if (-not [System.IO.File]::Exists($shortcutPath)) {
+    throw "Shortcut missing after publish: $shortcutPath"
+}
+
+Write-Host "[6/6] Creating zip archive"
 $zipPath = Join-Path $OutputDir "VRCToolsDataSync-$rid.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 # Compress-Archive は PowerShell 5.1 で大きいフォルダに対して
@@ -81,7 +113,7 @@ if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory(
-    $archStagingDir,
+    $stagingRoot,
     $zipPath,
     [System.IO.Compression.CompressionLevel]::Optimal,
     $false)
