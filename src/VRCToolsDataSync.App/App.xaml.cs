@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using H.NotifyIcon;
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppNotifications;
 using VRCToolsDataSync.Core.Logging;
@@ -108,13 +109,23 @@ public partial class App : Application
 
     public static void ShowMainWindow()
     {
+        // トレイメニュー等の WinUI 外のコンテキストから呼ばれる可能性があるので、
+        // 必ず UI スレッドへディスパッチする。
         DispatcherQueue.TryEnqueue(() =>
         {
             if (Window is null) return;
-            Window.Activate();
-            if (Window.AppWindow is not null)
+            // AppWindow.Show だけでは Z オーダーやフォアグラウンドが復帰しない
+            // ケースがあるため、H.NotifyIcon の WindowExtensions.Show を使う。
+            // 内部で AppWindow.Show + フォアグラウンド復帰 + Activate をまとめて行う。
+            try
             {
-                Window.AppWindow.Show();
+                WindowExtensions.Show(Window);
+            }
+            catch
+            {
+                // フォールバック: 標準 API でできる範囲のことだけやる。
+                try { Window.AppWindow?.Show(); } catch { /* best-effort */ }
+                try { Window.Activate(); } catch { /* best-effort */ }
             }
         });
     }
@@ -128,9 +139,15 @@ public partial class App : Application
         }
         // それ以外（× ボタン押下）はタスクトレイへの最小化として扱う。
         args.Handled = true;
-        if (Window.AppWindow is not null)
+        try
         {
-            Window.AppWindow.Hide();
+            // H.NotifyIcon の WindowExtensions.Hide はタスクバーからも
+            // 確実に消し、後続の Show 呼び出しで復帰できる状態にする。
+            WindowExtensions.Hide(Window);
+        }
+        catch
+        {
+            try { Window.AppWindow?.Hide(); } catch { /* best-effort */ }
         }
     }
 
@@ -140,31 +157,15 @@ public partial class App : Application
         if (_isExiting) return;
         _isExiting = true;
 
-        DispatcherQueue.TryEnqueue(() =>
-        {
-            // 順序が重要:
-            // 1. プロセス監視 / FileSystemWatcher を止める (Coordinator)
-            // 2. トースト通知の登録解除 (AppNotificationManager)
-            // 3. メインウィンドウを実際に閉じる (Window.Close → OnWindowClosed が
-            //    _isExiting=true を見てそのまま閉じる)
-            // 4. タスクトレイアイコンを破棄 (TaskbarIcon)
-            // 5. プロセス自体を Environment.Exit で確実に終了させる。
-            //    Application.Current.Exit() だけでは TaskbarIcon 内部の COM
-            //    オブジェクトが解放されきらずプロセスが残るケースがある。
-            try { Coordinator?.Dispose(); } catch { /* best-effort */ }
-            Coordinator = null;
-            try { AppNotificationManager.Default.Unregister(); } catch { /* best-effort */ }
-            try { Window?.Close(); } catch { /* best-effort */ }
-            try { Tray.Dispose(); } catch { /* best-effort */ }
-            try { Microsoft.UI.Xaml.Application.Current.Exit(); } catch { /* best-effort */ }
+        // WinUI 3 + H.NotifyIcon の組み合わせでは Application.Current.Exit() が
+        // 期待通りに動かず、TaskbarIcon が残ったままプロセスが停止しないことが
+        // 多いため、後始末を best-effort で実行してから Environment.Exit(0) で
+        // 確実に殺す。
+        try { Coordinator?.Dispose(); } catch { /* best-effort */ }
+        Coordinator = null;
+        try { AppNotificationManager.Default.Unregister(); } catch { /* best-effort */ }
+        try { Tray.Dispose(); } catch { /* best-effort */ }
 
-            // 上記でメッセージループが抜けないケースに備えて最終手段。
-            // 1秒待ってもまだ生きていたら Environment.Exit でプロセスを殺す。
-            System.Threading.Tasks.Task.Run(() =>
-            {
-                System.Threading.Thread.Sleep(1000);
-                Environment.Exit(0);
-            });
-        });
+        Environment.Exit(0);
     }
 }
