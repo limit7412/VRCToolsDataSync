@@ -151,10 +151,13 @@ public sealed class VrcxSyncService : ISyncService
             var filesToBackup = new List<string> { _paths.SqliteFile };
             if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
-
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
         }
+
+        // WAL/SHM の掃除はバックアップ有無に関わらず必ず実行する。
+        // 残しておくと新しい本体 DB に対して古い WAL が適用されて
+        // データが破損するため、--no-backup でも飛ばさない。
+        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
+        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
 
         var affected = new List<string>();
         AtomicFile.Copy(remoteSnapshot, _paths.SqliteFile, overwrite: true);

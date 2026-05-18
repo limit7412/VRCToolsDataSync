@@ -167,12 +167,15 @@ public sealed class FriendConnectSyncService : ISyncService
             if (Directory.Exists(_paths.NotesDirectory)) dirsToBackup.Add(_paths.NotesDirectory);
 
             backupPath = _backup.CreateSnapshot(Key, filesToBackup, dirsToBackup);
-
-            DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
-            DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
-            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
-            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
         }
+
+        // WAL/SHM の掃除はバックアップ有無に関わらず必ず実行する。
+        // 残しておくと新しい本体 DB に対して古い WAL が適用されて
+        // データが破損するため、--no-backup でも飛ばさない。
+        DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
+        DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
+        DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
+        DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
 
         var affected = new List<string>();
 
