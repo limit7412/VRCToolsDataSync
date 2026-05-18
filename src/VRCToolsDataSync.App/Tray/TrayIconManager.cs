@@ -5,8 +5,6 @@ using H.NotifyIcon;
 using H.NotifyIcon.Core;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.Windows.AppNotifications;
-using Microsoft.Windows.AppNotifications.Builder;
 
 namespace VRCToolsDataSync_App.Tray;
 
@@ -81,18 +79,14 @@ public sealed class TrayIconManager : IDisposable
 
     public void ShowToast(string title, string body)
     {
-        try
-        {
-            var payload = new AppNotificationBuilder()
-                .AddText(title)
-                .AddText(body)
-                .BuildNotification();
-            AppNotificationManager.Default.Show(payload);
-        }
-        catch
-        {
-            // 通知未許可など。トレイのまま落とさない
-        }
+        // NOTE: AppNotificationManager は packaged アプリ用の API で、
+        // unpackaged + self-contained 配布では確実に COMException (0x8007007E)
+        // を投げる。本アプリは GUI ログと ContentDialog で通知を代替している
+        // ため、ここでは no-op として扱う。将来 MSIX 配布に切り替える際は
+        // この呼び出しを Microsoft.Windows.AppNotifications.Builder で
+        // 復活させればよい。
+        _ = title;
+        _ = body;
     }
 
     public void Dispose()

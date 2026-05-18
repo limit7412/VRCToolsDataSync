@@ -2,7 +2,6 @@ using System;
 using System.IO;
 using H.NotifyIcon;
 using Microsoft.UI.Xaml;
-using Microsoft.Windows.AppNotifications;
 using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Sync;
@@ -56,10 +55,13 @@ public partial class App : Application
         {
             DispatcherQueue = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
 
-            // unpackaged 起動では AppNotificationManager の登録に COM 設定が要り、
-            // 失敗するとプロセスごと落ちるため、起動継続を優先して握り潰す。
-            try { AppNotificationManager.Default.Register(); }
-            catch (Exception ex) { LogStartupFailure("AppNotificationManager.Register", ex); }
+            // NOTE: AppNotificationManager.Default.Register() は packaged アプリ
+            // 用の API で、unpackaged + self-contained 配布では
+            // Microsoft.WindowsAppRuntime.Insights.Resource.dll が見つからずに
+            // 必ず COMException (0x8007007E) を出す。GUI 自体は問題なく動く
+            // ものの、毎回起動ログが汚れて分かりづらいため、最初から呼ばない。
+            // 通知 UI はトースト経由ではなく、GUI 上のログ表示や ContentDialog
+            // で十分代替できている。
 
             try
             {
@@ -163,7 +165,7 @@ public partial class App : Application
         // 確実に殺す。
         try { Coordinator?.Dispose(); } catch { /* best-effort */ }
         Coordinator = null;
-        try { AppNotificationManager.Default.Unregister(); } catch { /* best-effort */ }
+        // AppNotificationManager.Register を呼んでいないため Unregister も不要。
         try { Tray.Dispose(); } catch { /* best-effort */ }
 
         Environment.Exit(0);
