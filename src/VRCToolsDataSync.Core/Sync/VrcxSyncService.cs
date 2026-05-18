@@ -165,6 +165,10 @@ public sealed class VrcxSyncService : ISyncService
             AtomicFile.Copy(remoteSettings, _paths.SettingsJsonFile, overwrite: true);
             affected.Add(_paths.SettingsJsonFile);
         }
+        else if (File.Exists(_paths.SettingsJsonFile))
+        {
+            try { File.Delete(_paths.SettingsJsonFile); } catch { /* best-effort */ }
+        }
 
         _logger.LogInformation("VRCX Pull 完了 version={Version} backup={Backup}", entry.Version, backupPath ?? "(none)");
         return new SyncResult

@@ -185,12 +185,20 @@ public sealed class FriendConnectSyncService : ISyncService
             AtomicFile.Copy(remoteDbV11, _paths.DbV11File, overwrite: true);
             affected.Add(_paths.DbV11File);
         }
+        else if (File.Exists(_paths.DbV11File))
+        {
+            try { File.Delete(_paths.DbV11File); } catch { /* best-effort */ }
+        }
 
         var remoteConfig = Path.Combine(toolFolder, ConfigFileName);
         if (File.Exists(remoteConfig))
         {
             AtomicFile.Copy(remoteConfig, _paths.ConfigJsonFile, overwrite: true);
             affected.Add(_paths.ConfigJsonFile);
+        }
+        else if (File.Exists(_paths.ConfigJsonFile))
+        {
+            try { File.Delete(_paths.ConfigJsonFile); } catch { /* best-effort */ }
         }
 
         var remoteNotes = Path.Combine(toolFolder, NotesFolderName);
@@ -201,6 +209,10 @@ public sealed class FriendConnectSyncService : ISyncService
             {
                 affected.Add(file);
             }
+        }
+        else if (Directory.Exists(_paths.NotesDirectory))
+        {
+            try { Directory.Delete(_paths.NotesDirectory, recursive: true); } catch { /* best-effort */ }
         }
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
