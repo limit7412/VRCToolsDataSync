@@ -98,6 +98,16 @@ public sealed class AutoSyncCoordinator : IDisposable
         Start();
     }
 
+    /// <summary>
+    /// Watcher 構成を変えずに、Coordinator が保持する settings 参照
+    /// だけを差し替える。手動同期で ToolState が更新された後に呼んで、
+    /// 続く自動 Push が古い LastPulledVersion を使わないようにする。
+    /// </summary>
+    public void RefreshSettings(SyncSettings settings)
+    {
+        _settings = settings;
+    }
+
     private ToolBinding CreateBinding(
         string toolKey,
         string displayName,

@@ -52,6 +52,9 @@ public partial class MainPageViewModel : ObservableObject
                     // VM 側の _settings は別インスタンスのため、再読み込みしないと
                     // 古い LastPulledVersion で次回手動 Push が無駄なコンフリクトを起こす。
                     _settings = _runner.LoadSettings();
+                    // VM と Coordinator で同じインスタンスを共有させて、これ以降は
+                    // どちらの経路で更新しても両者が即座に最新を見るようにする。
+                    coordinator.RefreshSettings(_settings);
                     break;
                 case SyncOutcome.ConflictDetected:
                     AppendLog($"[auto] {e.DisplayName} Push 競合 v{e.Result.RemoteVersion}");
@@ -285,6 +288,10 @@ public partial class MainPageViewModel : ObservableObject
         {
             case SyncOutcome.Success:
                 AppendLog($"{displayName} Push 完了 version={result.RemoteVersion} files={result.AffectedFiles.Count}");
+                // 常駐側 Coordinator が保持する settings の LastPulledVersion を
+                // 同期させ、続く自動 Push が古いバージョンで不要な競合通知を
+                // 起こさないようにする。
+                _coordinator?.RefreshSettings(_settings);
                 break;
             case SyncOutcome.SourceMissing:
                 AppendLog($"{displayName} Push 中止: {result.Message}");
@@ -304,6 +311,8 @@ public partial class MainPageViewModel : ObservableObject
         {
             case SyncOutcome.Success:
                 AppendLog($"{displayName} Pull 完了 version={result.RemoteVersion} backup={result.BackupPath ?? "(none)"}");
+                // 常駐側 Coordinator にも反映 (ReportPushResult と同様の理由)。
+                _coordinator?.RefreshSettings(_settings);
                 break;
             case SyncOutcome.NothingToDo:
             case SyncOutcome.SourceMissing:
