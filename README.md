@@ -101,6 +101,14 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Arch arm64
 
 GitHub Actions では `v*` タグの push で自動的に x64 / arm64 をビルドし、Draft の GitHub Release に zip を添付する（`.github/workflows/release.yml`）。手動で動かしたい場合は Actions タブから `release` ワークフローの **Run workflow** で実行できる。
 
+## 第三者プロダクトに関する免責
+
+本ツールは [VRCX](https://github.com/vrcx-team/VRCX)（vrcx-team, MIT License）および VRC Friend Connect（たぴおかシステムズ, クローズドソース）の作者・開発元と一切の提携・支援関係はありません。
+
+- 本ツールは VRCX および VRC Friend Connect の本体コードやバイナリを再配布しません。ユーザーのローカル PC 上に存在する各アプリのデータファイル（SQLite / JSON / メモ）をコピー・スナップショット化し、OneDrive のローカル同期フォルダ経由で別 PC に反映するのみです。
+- 本ツールは VRC Friend Connect のスキーマ解析・改変・リバースエンジニアリングを行いません。`VACUUM INTO` を含む SQLite 操作はファイル単位の取り扱いに留まります。
+- VRCX および VRC Friend Connect 各々の利用規約遵守はユーザー自身の責任です。
+
 ## ライセンス
 
 [LICENSE](./LICENSE) を参照。
