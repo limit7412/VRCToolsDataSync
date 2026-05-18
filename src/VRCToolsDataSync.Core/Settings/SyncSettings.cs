@@ -7,6 +7,8 @@ public sealed class SyncSettings
     public bool SyncVrcx { get; set; } = true;
     public bool SyncFriendConnect { get; set; } = true;
 
+    public bool AutoSyncEnabled { get; set; } = false;
+
     public Dictionary<string, ToolSyncState> ToolState { get; set; } = new();
 }
 
