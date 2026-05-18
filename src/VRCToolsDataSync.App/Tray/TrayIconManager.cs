@@ -3,14 +3,13 @@ using System.Drawing;
 using System.IO;
 using H.NotifyIcon;
 using H.NotifyIcon.Core;
-using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
 
 namespace VRCToolsDataSync_App.Tray;
 
 public sealed class TrayIconManager : IDisposable
 {
     private TaskbarIcon? _taskbarIcon;
+    private PopupMenu? _popupMenu;
     private Icon? _icon;
 
     public event Action? ShowWindowRequested;
@@ -20,22 +19,27 @@ public sealed class TrayIconManager : IDisposable
     {
         if (_taskbarIcon is not null) return;
 
-        var showItem = new MenuFlyoutItem { Text = "ウィンドウを表示" };
-        showItem.Click += (_, _) => ShowWindowRequested?.Invoke();
-
-        var exitItem = new MenuFlyoutItem { Text = "終了" };
-        exitItem.Click += (_, _) => ExitRequested?.Invoke();
-
-        var menu = new MenuFlyout();
-        menu.Items.Add(showItem);
-        menu.Items.Add(new MenuFlyoutSeparator());
-        menu.Items.Add(exitItem);
+        // NOTE: WinUI 3 の MenuFlyout / MenuFlyoutItem は、ホストする
+        // メインウィンドウが Hide されていると Click イベントが発火しない
+        // 既知問題がある。タスクトレイは「ウィンドウが隠れている時こそ
+        // 使うもの」なので致命的。
+        // 代わりに H.NotifyIcon.Core.PopupMenu (Win32 ネイティブメニュー)
+        // を自前で構築し、TaskbarIcon の RightClick / LeftClick から表示する。
+        _popupMenu = new PopupMenu();
+        _popupMenu.Items.Add(new PopupMenuItem("ウィンドウを表示", (_, _) => ShowWindowRequested?.Invoke()));
+        _popupMenu.Items.Add(new PopupMenuSeparator());
+        _popupMenu.Items.Add(new PopupMenuItem("終了", (_, _) => ExitRequested?.Invoke()));
 
         _taskbarIcon = new TaskbarIcon
         {
             ToolTipText = "VRCToolsDataSync",
-            ContextFlyout = menu,
+            // 左クリックでウィンドウ復帰
             LeftClickCommand = new RelayCommand(() => ShowWindowRequested?.Invoke()),
+            // 右クリックで PopupMenu を表示
+            RightClickCommand = new RelayCommand(ShowPopupMenu),
+            // ContextMenuMode は WinUI MenuFlyout 経路を使わない
+            // (ContextFlyout を未設定なら不要だが、念のため Active 系を避ける)
+            ContextMenuMode = ContextMenuMode.PopupMenu,
         };
 
         _icon = TryLoadIcon();
@@ -45,6 +49,21 @@ public sealed class TrayIconManager : IDisposable
         }
 
         _taskbarIcon.ForceCreate();
+    }
+
+    private void ShowPopupMenu()
+    {
+        if (_popupMenu is null) return;
+        try
+        {
+            // カーソル位置に表示。座標は GetCursorPos で取得。
+            CursorPos.GetCursorPos(out var pt);
+            _popupMenu.Show(IntPtr.Zero, pt.X, pt.Y);
+        }
+        catch
+        {
+            // ポップアップ表示が失敗してもアプリ全体を落とさない。
+        }
     }
 
     private static Icon? TryLoadIcon()
@@ -93,8 +112,23 @@ public sealed class TrayIconManager : IDisposable
     {
         _taskbarIcon?.Dispose();
         _taskbarIcon = null;
+        _popupMenu = null;
         _icon?.Dispose();
         _icon = null;
+    }
+
+    private static class CursorPos
+    {
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        public static extern bool GetCursorPos(out POINT lpPoint);
     }
 
     private sealed class RelayCommand : System.Windows.Input.ICommand
