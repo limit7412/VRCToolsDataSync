@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 
@@ -28,6 +29,7 @@ public partial class MainPageViewModel : ObservableObject
         SyncFriendConnect = _settings.SyncFriendConnect;
         AutoSyncEnabled = _settings.AutoSyncEnabled;
         RefreshStatusSummaries();
+        RefreshStartupState();
     }
 
     public void AttachCoordinator(AutoSyncCoordinator coordinator, Action<Action> uiDispatch)
@@ -95,6 +97,12 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial bool IsBusy { get; set; }
 
+    [ObservableProperty]
+    public partial bool StartupRegistered { get; set; }
+
+    [ObservableProperty]
+    public partial string StartupStatus { get; set; } = string.Empty;
+
     public ObservableCollection<string> LogEntries { get; } = new();
 
     public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
@@ -110,6 +118,66 @@ public partial class MainPageViewModel : ObservableObject
         _runner.SaveSettings(_settings);
         _coordinator?.UpdateSettings(_settings);
         AppendLog($"設定を保存しました (auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
+    }
+
+    [RelayCommand]
+    private void RegisterStartup()
+    {
+        var path = ResolveExecutablePath();
+        if (path is null)
+        {
+            AppendLog("起動ファイルパスを特定できませんでした (Environment.ProcessPath が null)");
+            return;
+        }
+        try
+        {
+            StartupRegistration.Register(path);
+            AppendLog($"スタートアップに登録しました: {path}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"スタートアップ登録に失敗: {ex.Message}");
+        }
+        RefreshStartupState();
+    }
+
+    [RelayCommand]
+    private void UnregisterStartup()
+    {
+        try
+        {
+            StartupRegistration.Unregister();
+            AppendLog("スタートアップから解除しました");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"スタートアップ解除に失敗: {ex.Message}");
+        }
+        RefreshStartupState();
+    }
+
+    private static string? ResolveExecutablePath()
+    {
+        var path = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        // dotnet run の場合は dotnet.exe が返るため、その場合は登録に不向きであることを許容して
+        // そのまま返す（実機配布の exe では VRCToolsDataSync.App.exe が返る）
+        return path;
+    }
+
+    private void RefreshStartupState()
+    {
+        var registered = StartupRegistration.IsRegistered();
+        StartupRegistered = registered;
+        if (registered)
+        {
+            var cmd = StartupRegistration.GetRegisteredCommand();
+            StartupStatus = $"登録済み: {cmd}";
+        }
+        else
+        {
+            StartupStatus = "未登録";
+        }
     }
 
     [RelayCommand]

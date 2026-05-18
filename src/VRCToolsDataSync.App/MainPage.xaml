@@ -42,6 +42,20 @@
                     </StackPanel>
 
                     <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="登録"
+                                    Command="{x:Bind ViewModel.RegisterStartupCommand}"
+                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                            <Button Content="解除"
+                                    Command="{x:Bind ViewModel.UnregisterStartupCommand}"
+                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
+                        </StackPanel>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
