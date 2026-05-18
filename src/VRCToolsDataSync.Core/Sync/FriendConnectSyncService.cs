@@ -68,26 +68,40 @@ public sealed class FriendConnectSyncService : ISyncService
         var affected = new List<string>();
 
         SnapshotSqliteTo(Path.Combine(toolFolder, DbFileName), _paths.DbFile, affected);
+
+        var destDbV11 = Path.Combine(toolFolder, DbV11FileName);
         if (File.Exists(_paths.DbV11File))
         {
-            SnapshotSqliteTo(Path.Combine(toolFolder, DbV11FileName), _paths.DbV11File, affected);
+            SnapshotSqliteTo(destDbV11, _paths.DbV11File, affected);
+        }
+        else if (File.Exists(destDbV11))
+        {
+            try { File.Delete(destDbV11); } catch { /* best-effort */ }
         }
 
+        var destConfig = Path.Combine(toolFolder, ConfigFileName);
         if (File.Exists(_paths.ConfigJsonFile))
         {
-            var destConfig = Path.Combine(toolFolder, ConfigFileName);
             AtomicFile.Copy(_paths.ConfigJsonFile, destConfig, overwrite: true);
             affected.Add(destConfig);
         }
+        else if (File.Exists(destConfig))
+        {
+            try { File.Delete(destConfig); } catch { /* best-effort */ }
+        }
 
+        var destNotes = Path.Combine(toolFolder, NotesFolderName);
         if (Directory.Exists(_paths.NotesDirectory))
         {
-            var destNotes = Path.Combine(toolFolder, NotesFolderName);
             ReplaceDirectory(_paths.NotesDirectory, destNotes);
             foreach (var file in Directory.EnumerateFiles(destNotes, "*", SearchOption.AllDirectories))
             {
                 affected.Add(file);
             }
+        }
+        else if (Directory.Exists(destNotes))
+        {
+            try { Directory.Delete(destNotes, recursive: true); } catch { /* best-effort */ }
         }
 
         var nextVersion = (manifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;

@@ -86,11 +86,15 @@ public sealed class VrcxSyncService : ISyncService
 
         var affected = new List<string> { snapshotDest };
 
+        var settingsDest = Path.Combine(toolFolder, SettingsFileName);
         if (File.Exists(_paths.SettingsJsonFile))
         {
-            var settingsDest = Path.Combine(toolFolder, SettingsFileName);
             AtomicFile.Copy(_paths.SettingsJsonFile, settingsDest, overwrite: true);
             affected.Add(settingsDest);
+        }
+        else if (File.Exists(settingsDest))
+        {
+            try { File.Delete(settingsDest); } catch { /* best-effort */ }
         }
 
         var nextVersion = (manifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
