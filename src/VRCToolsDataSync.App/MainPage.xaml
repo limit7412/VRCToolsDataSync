@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="VRCToolsDataSync_App.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:VRCToolsDataSync_App"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer Padding="24">
+        <StackPanel Spacing="20" MaxWidth="900" HorizontalAlignment="Stretch">
+
+            <TextBlock Text="VRCToolsDataSync" Style="{StaticResource TitleTextBlockStyle}" />
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="設定" Style="{StaticResource SubtitleTextBlockStyle}" />
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="マシン名" />
+                        <TextBox Text="{x:Bind ViewModel.MachineName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="OneDrive 同期フォルダパス" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     Text="{x:Bind ViewModel.CloudFolderPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Grid.Column="1" Content="参照..." Click="OnBrowseCloudFolder" />
+                        </Grid>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="16">
+                        <ToggleSwitch Header="VRCX 同期" IsOn="{x:Bind ViewModel.SyncVrcx, Mode=TwoWay}" />
+                        <ToggleSwitch Header="VRC Friend Connect 同期" IsOn="{x:Bind ViewModel.SyncFriendConnect, Mode=TwoWay}" />
+                        <ToggleSwitch Header="常駐＋自動同期" IsOn="{x:Bind ViewModel.AutoSyncEnabled, Mode=TwoWay}" />
+                    </StackPanel>
+
+                    <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="登録"
+                                    Command="{x:Bind ViewModel.RegisterStartupCommand}"
+                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                            <Button Content="解除"
+                                    Command="{x:Bind ViewModel.UnregisterStartupCommand}"
+                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
+                        </StackPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="VRCX" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.VrcxStatus, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Push"
+                                Command="{x:Bind ViewModel.PushVrcxCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <Button Content="Pull"
+                                Command="{x:Bind ViewModel.PullVrcxCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="VRC Friend Connect" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.FriendConnectStatus, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Push"
+                                Command="{x:Bind ViewModel.PushFriendConnectCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <Button Content="Pull"
+                                Command="{x:Bind ViewModel.PullFriendConnectCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="ログ" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <ListView ItemsSource="{x:Bind ViewModel.LogEntries}"
+                              MaxHeight="240"
+                              SelectionMode="None"
+                              IsItemClickEnabled="False">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Padding" Value="0,2" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <TextBlock Text="{x:Bind}" FontFamily="Consolas" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</Page>

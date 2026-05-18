@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "VRCToolsDataSync.App (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "VRCToolsDataSync.App (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
