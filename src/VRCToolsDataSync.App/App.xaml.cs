@@ -46,7 +46,7 @@ public partial class App : Application
         Window.Activate();
     }
 
-    private static void ShowMainWindow()
+    public static void ShowMainWindow()
     {
         DispatcherQueue.TryEnqueue(() =>
         {

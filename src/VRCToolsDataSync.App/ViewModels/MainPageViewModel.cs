@@ -57,14 +57,8 @@ public partial class MainPageViewModel : ObservableObject
             }
             RefreshStatusSummaries();
         });
-        coordinator.AutoPushConflict += e => OnUi(() =>
-        {
-            AppendLog($"[auto] {e.DisplayName} Push 競合 remote=v{e.RemoteVersion} (要操作)");
-        });
-        coordinator.RemoteUpdateAvailable += e => OnUi(() =>
-        {
-            AppendLog($"[auto] {e.DisplayName} リモート更新 v{e.RemoteVersion} (by {e.MachineName})");
-        });
+        coordinator.AutoPushConflict += e => OnUi(() => _ = HandleAutoPushConflictAsync(e));
+        coordinator.RemoteUpdateAvailable += e => OnUi(() => _ = HandleRemoteUpdateAsync(e));
     }
 
     private void OnUi(Action action)
@@ -106,6 +100,12 @@ public partial class MainPageViewModel : ObservableObject
     public ObservableCollection<string> LogEntries { get; } = new();
 
     public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
+
+    public event Func<RemoteUpdatePrompt, Task<RemoteUpdateChoice>>? RemoteUpdateRequested;
+
+    public event Action? ShowWindowRequested;
+
+    public event Action<string, string>? ToastRequested;
 
     [RelayCommand]
     private void SaveSettings()
@@ -307,6 +307,89 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    private async Task HandleAutoPushConflictAsync(AutoPushConflictEvent e)
+    {
+        AppendLog($"[auto] {e.DisplayName} Push 競合 remote=v{e.RemoteVersion} (要操作)");
+        ToastRequested?.Invoke(
+            $"{e.DisplayName}: 自動 Push が競合しました",
+            $"リモート v{e.RemoteVersion} と未同期です。ウィンドウで操作を選択してください。");
+        ShowWindowRequested?.Invoke();
+
+        if (ConflictRequested is null) return;
+        var choice = await ConflictRequested.Invoke(new ConflictPrompt
+        {
+            ToolDisplayName = e.DisplayName,
+            RemoteVersion = e.RemoteVersion,
+            LastPulledVersion = e.LastPulledVersion,
+        });
+
+        if (!TryGetCloud(out var cloud)) return;
+
+        try
+        {
+            switch (choice)
+            {
+                case ConflictChoice.ForceOverwrite:
+                    AppendLog($"[auto] {e.DisplayName} 強制 Push 実行");
+                    var pushResult = await Task.Run(() => _runner.Push(e.ServiceFactory(), _settings, cloud, force: true));
+                    ReportPushResult(e.DisplayName, pushResult);
+                    break;
+                case ConflictChoice.PullFirst:
+                    AppendLog($"[auto] {e.DisplayName} 先に Pull を実行");
+                    var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, cloud, skipBackup: false));
+                    ReportPullResult(e.DisplayName, pullResult);
+                    break;
+                default:
+                    AppendLog($"[auto] {e.DisplayName} Push をキャンセル");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[auto] {e.DisplayName} 競合処理エラー: {ex.Message}");
+        }
+        finally
+        {
+            RefreshStatusSummaries();
+        }
+    }
+
+    private async Task HandleRemoteUpdateAsync(RemoteUpdateEvent e)
+    {
+        AppendLog($"[auto] {e.DisplayName} リモート更新 v{e.RemoteVersion} (by {e.MachineName})");
+        ToastRequested?.Invoke(
+            $"{e.DisplayName}: リモートに更新があります",
+            $"{e.MachineName} が v{e.RemoteVersion} を Push しました。Pull しますか？");
+        ShowWindowRequested?.Invoke();
+
+        if (RemoteUpdateRequested is null) return;
+        var choice = await RemoteUpdateRequested.Invoke(new RemoteUpdatePrompt
+        {
+            ToolDisplayName = e.DisplayName,
+            RemoteVersion = e.RemoteVersion,
+            LocalVersion = e.LocalVersion,
+            MachineName = e.MachineName,
+        });
+
+        if (choice != RemoteUpdateChoice.PullNow) return;
+        if (!TryGetCloud(out var cloud)) return;
+
+        try
+        {
+            AppendLog($"[auto] {e.DisplayName} Pull 実行");
+            var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, cloud, skipBackup: false));
+            ReportPullResult(e.DisplayName, pullResult);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[auto] {e.DisplayName} Pull エラー: {ex.Message}");
+        }
+        finally
+        {
+            RefreshStatusSummaries();
+        }
+    }
+
     private bool TryGetCloud(out string cloud)
     {
         cloud = CloudFolderPath?.Trim() ?? string.Empty;
@@ -364,4 +447,18 @@ public enum ConflictChoice
     Cancel,
     PullFirst,
     ForceOverwrite,
+}
+
+public sealed class RemoteUpdatePrompt
+{
+    public required string ToolDisplayName { get; init; }
+    public required long RemoteVersion { get; init; }
+    public required long LocalVersion { get; init; }
+    public required string MachineName { get; init; }
+}
+
+public enum RemoteUpdateChoice
+{
+    Later,
+    PullNow,
 }

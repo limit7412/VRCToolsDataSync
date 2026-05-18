@@ -14,6 +14,9 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
         ViewModel.ConflictRequested += OnConflictRequested;
+        ViewModel.RemoteUpdateRequested += OnRemoteUpdateRequested;
+        ViewModel.ShowWindowRequested += () => App.ShowMainWindow();
+        ViewModel.ToastRequested += (title, body) => App.Tray.ShowToast(title, body);
 
         if (App.Coordinator is not null)
         {
@@ -59,5 +62,20 @@ public sealed partial class MainPage : Page
             ContentDialogResult.Secondary => ConflictChoice.ForceOverwrite,
             _ => ConflictChoice.Cancel,
         };
+    }
+
+    private async Task<RemoteUpdateChoice> OnRemoteUpdateRequested(RemoteUpdatePrompt prompt)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = $"{prompt.ToolDisplayName}: リモート更新",
+            Content = $"{prompt.MachineName} がクラウドに v{prompt.RemoteVersion} を Push しました。\n手元の最終 Pull は v{prompt.LocalVersion} です。\n\n今 Pull しますか？",
+            PrimaryButtonText = "Pull する",
+            CloseButtonText = "あとで",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = this.XamlRoot,
+        };
+        var result = await dialog.ShowAsync();
+        return result == ContentDialogResult.Primary ? RemoteUpdateChoice.PullNow : RemoteUpdateChoice.Later;
     }
 }
