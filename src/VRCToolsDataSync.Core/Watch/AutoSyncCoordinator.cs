@@ -15,6 +15,7 @@ public sealed class AutoSyncCoordinator : IDisposable
     private readonly SyncRunner _runner;
     private readonly ILogger<AutoSyncCoordinator> _logger;
     private readonly List<ToolBinding> _bindings = new();
+    private readonly object _autoPushLock = new();
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
@@ -121,7 +122,14 @@ public sealed class AutoSyncCoordinator : IDisposable
         try
         {
             var service = binding.ServiceFactory();
-            var result = _runner.Push(service, _settings, _settings.CloudFolderPath, force: false);
+            // 自動 Push は VRCX と Friend Connect が近いタイミングで
+            // 並行発火する可能性があるため、同一プロセス内では直列化して
+            // manifest.json の read-modify-write 競合を回避する。
+            SyncResult result;
+            lock (_autoPushLock)
+            {
+                result = _runner.Push(service, _settings, _settings.CloudFolderPath, force: false);
+            }
             switch (result.Outcome)
             {
                 case SyncOutcome.Success:

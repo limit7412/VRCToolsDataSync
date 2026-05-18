@@ -97,15 +97,18 @@ public sealed class VrcxSyncService : ISyncService
             try { File.Delete(settingsDest); } catch { /* best-effort */ }
         }
 
-        var nextVersion = (manifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
-        manifest.Tools[Key] = new ToolManifestEntry
+        // 保存直前に manifest を再読込し、他 tool のエントリを失わないようにマージする。
+        // (別プロセス / 別 SyncService が同時に Push したケースを救済)
+        var finalManifest = manifestStore.Load();
+        var nextVersion = (finalManifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
+        finalManifest.Tools[Key] = new ToolManifestEntry
         {
             Version = nextVersion,
             MachineName = options.MachineName,
             UpdatedAt = DateTimeOffset.Now,
             Files = BuildManifestFiles(affected, options.CloudFolderPath),
         };
-        manifestStore.Save(manifest);
+        manifestStore.Save(finalManifest);
 
         _logger.LogInformation("VRCX Push 完了 version={Version} files={Count}", nextVersion, affected.Count);
         return new SyncResult

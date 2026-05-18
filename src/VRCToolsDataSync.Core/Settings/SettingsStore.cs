@@ -10,6 +10,8 @@ public sealed class SettingsStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     };
 
+    private readonly object _saveLock = new();
+
     public string FilePath { get; }
 
     public SettingsStore(string? filePath = null)
@@ -42,18 +44,35 @@ public sealed class SettingsStore
         {
             Directory.CreateDirectory(dir);
         }
-        var tmp = FilePath + ".tmp";
-        using (var stream = File.Create(tmp))
+
+        // 同一インスタンスからの並行 Save を直列化し、
+        // 一時ファイル名にも GUID を付けて他プロセス/別 SyncRunner からの
+        // 同時書き込みでも tmp 衝突しないようにする。
+        lock (_saveLock)
         {
-            JsonSerializer.Serialize(stream, settings, JsonOptions);
-        }
-        if (File.Exists(FilePath))
-        {
-            File.Replace(tmp, FilePath, destinationBackupFileName: null);
-        }
-        else
-        {
-            File.Move(tmp, FilePath);
+            var tmp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                using (var stream = File.Create(tmp))
+                {
+                    JsonSerializer.Serialize(stream, settings, JsonOptions);
+                }
+                if (File.Exists(FilePath))
+                {
+                    File.Replace(tmp, FilePath, destinationBackupFileName: null);
+                }
+                else
+                {
+                    File.Move(tmp, FilePath);
+                }
+            }
+            finally
+            {
+                if (File.Exists(tmp))
+                {
+                    try { File.Delete(tmp); } catch { /* best-effort */ }
+                }
+            }
         }
     }
 }
