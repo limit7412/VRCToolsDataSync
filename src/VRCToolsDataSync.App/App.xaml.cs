@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using H.NotifyIcon;
 using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Logging;
@@ -111,29 +112,59 @@ public partial class App : Application
 
     public static void ShowMainWindow()
     {
+        LogLifecycle("ShowMainWindow.entered");
         // トレイメニュー等の WinUI 外のコンテキストから呼ばれる可能性があるので、
         // 必ず UI スレッドへディスパッチする。
         DispatcherQueue.TryEnqueue(() =>
         {
-            if (Window is null) return;
-            // AppWindow.Show だけでは Z オーダーやフォアグラウンドが復帰しない
-            // ケースがあるため、H.NotifyIcon の WindowExtensions.Show を使う。
-            // 内部で AppWindow.Show + フォアグラウンド復帰 + Activate をまとめて行う。
+            if (Window is null)
+            {
+                LogLifecycle("ShowMainWindow.skip: Window is null");
+                return;
+            }
+
+            // 1) H.NotifyIcon の Show でタスクバー再表示 + Efficiency Mode 解除。
             try
             {
-                WindowExtensions.Show(Window);
+                WindowExtensions.Show(Window, disableEfficiencyMode: true);
+                LogLifecycle("ShowMainWindow.WindowExtensions.Show ok");
             }
-            catch
+            catch (Exception ex)
             {
-                // フォールバック: 標準 API でできる範囲のことだけやる。
+                LogLifecycle("ShowMainWindow.WindowExtensions.Show fail: " + ex.Message);
                 try { Window.AppWindow?.Show(); } catch { /* best-effort */ }
-                try { Window.Activate(); } catch { /* best-effort */ }
             }
+
+            // 2) Win32 で確実にウィンドウ復元 + フォアグラウンド化。
+            //    WinUI 3 の Activate / AppWindow.Show 単体では、Hide 経由で
+            //    隠したウィンドウが Z オーダー最下層に残るケースがあるため。
+            try
+            {
+                var hwnd = WindowHandle;
+                if (hwnd != IntPtr.Zero)
+                {
+                    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                    else ShowWindow(hwnd, SW_SHOW);
+                    SetForegroundWindow(hwnd);
+                    LogLifecycle("ShowMainWindow.Win32 ok hwnd=0x" + hwnd.ToString("X"));
+                }
+                else
+                {
+                    LogLifecycle("ShowMainWindow.skip: hwnd is zero");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogLifecycle("ShowMainWindow.Win32 fail: " + ex.Message);
+            }
+
+            try { Window.Activate(); } catch { /* best-effort */ }
         });
     }
 
     private static void OnWindowClosed(object sender, WindowEventArgs args)
     {
+        LogLifecycle("OnWindowClosed.entered isExiting=" + _isExiting);
         if (_isExiting)
         {
             // トレイメニューからの「終了」要求はそのまま閉じさせる。
@@ -143,31 +174,60 @@ public partial class App : Application
         args.Handled = true;
         try
         {
-            // H.NotifyIcon の WindowExtensions.Hide はタスクバーからも
-            // 確実に消し、後続の Show 呼び出しで復帰できる状態にする。
-            WindowExtensions.Hide(Window);
+            WindowExtensions.Hide(Window, enableEfficiencyMode: false);
+            LogLifecycle("OnWindowClosed.WindowExtensions.Hide ok");
         }
-        catch
+        catch (Exception ex)
         {
+            LogLifecycle("OnWindowClosed.WindowExtensions.Hide fail: " + ex.Message);
             try { Window.AppWindow?.Hide(); } catch { /* best-effort */ }
         }
     }
 
     private static void ExitApplication()
     {
+        LogLifecycle("ExitApplication.entered isExiting=" + _isExiting);
         // 既に終了処理中なら再入を防ぐ。
         if (_isExiting) return;
         _isExiting = true;
 
-        // WinUI 3 + H.NotifyIcon の組み合わせでは Application.Current.Exit() が
-        // 期待通りに動かず、TaskbarIcon が残ったままプロセスが停止しないことが
-        // 多いため、後始末を best-effort で実行してから Environment.Exit(0) で
-        // 確実に殺す。
-        try { Coordinator?.Dispose(); } catch { /* best-effort */ }
+        // 後始末を best-effort で実行してから Environment.Exit(0) で確実に殺す。
+        try { Coordinator?.Dispose(); LogLifecycle("ExitApplication.Coordinator.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Dispose fail: " + ex.Message); }
         Coordinator = null;
-        // AppNotificationManager.Register を呼んでいないため Unregister も不要。
-        try { Tray.Dispose(); } catch { /* best-effort */ }
+        try { Tray.Dispose(); LogLifecycle("ExitApplication.Tray.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Tray.Dispose fail: " + ex.Message); }
 
+        LogLifecycle("ExitApplication.Environment.Exit(0)");
         Environment.Exit(0);
     }
+
+    private static void LogLifecycle(string message)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(FileLoggerProvider.DefaultLogPath());
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            var path = FileLoggerProvider.DefaultLogPath();
+            var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [LIFECYCLE] {message}";
+            File.AppendAllText(path, line + Environment.NewLine);
+        }
+        catch { /* best-effort */ }
+    }
+
+    private const int SW_SHOW = 5;
+    private const int SW_RESTORE = 9;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(IntPtr hWnd);
 }
