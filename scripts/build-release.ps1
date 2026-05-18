@@ -74,7 +74,17 @@ if ($LASTEXITCODE -ne 0) { throw "Cli publish failed (exit $LASTEXITCODE)" }
 Write-Host "[4/4] Creating zip archive"
 $zipPath = Join-Path $OutputDir "VRCToolsDataSync-$rid.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-Compress-Archive -Path "$archStagingDir/*" -DestinationPath $zipPath -CompressionLevel Optimal
+# Compress-Archive は PowerShell 5.1 で大きいフォルダに対して
+# IndexOutOfRangeException を出すバグがあるため、.NET の ZipFile を直接使う。
+# 5.1 と 7+ の両方で動かすには System.IO.Compression 本体も含めて
+# Add-Type で明示的にロードする必要がある (CompressionLevel 型の解決のため)。
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $archStagingDir,
+    $zipPath,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $false)
 
 Write-Host ""
 Write-Host "Done."
