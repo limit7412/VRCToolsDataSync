@@ -1,14 +1,18 @@
 using System;
 using System.Drawing;
 using System.IO;
+using System.Reflection;
 using H.NotifyIcon;
-using Microsoft.UI.Xaml.Controls;
+using H.NotifyIcon.Core;
 
 namespace VRCToolsDataSync_App.Tray;
 
 public sealed class TrayIconManager : IDisposable
 {
     private TaskbarIcon? _taskbarIcon;
+    private PopupMenu? _popupMenu;
+    private MessageWindow? _messageWindow;
+    private EventHandler<MessageWindow.MouseEventReceivedEventArgs>? _mouseHandler;
     private Icon? _icon;
 
     public event Action? ShowWindowRequested;
@@ -18,28 +22,27 @@ public sealed class TrayIconManager : IDisposable
     {
         if (_taskbarIcon is not null) return;
 
-        // ContextFlyout に WinUI MenuFlyout を設定し、TaskbarIcon を
-        // ContextMenuMode.PopupMenu で動かすと、H.NotifyIcon が
-        // メニューを Win32 ネイティブメニューとして表示する。
-        // クリックの選択結果のみが MenuFlyoutItem.Click に転送されるため、
-        // メインウィンドウが Hide 状態でも Click が確実に届く。
-        var showItem = new MenuFlyoutItem { Text = "ウィンドウを表示" };
-        showItem.Click += (_, _) => ShowWindowRequested?.Invoke();
-
-        var exitItem = new MenuFlyoutItem { Text = "終了" };
-        exitItem.Click += (_, _) => ExitRequested?.Invoke();
-
-        var menu = new MenuFlyout();
-        menu.Items.Add(showItem);
-        menu.Items.Add(new MenuFlyoutSeparator());
-        menu.Items.Add(exitItem);
+        // H.NotifyIcon.Core.PopupMenu を Win32 ネイティブメニューとして
+        // 構築。WinUI MenuFlyout はメインウィンドウが Hide のとき click が
+        // 配送されないので使わない。
+        _popupMenu = new PopupMenu();
+        _popupMenu.Items.Add(new PopupMenuItem("ウィンドウを表示", (_, _) =>
+        {
+            LifecycleLog("Tray.PopupMenu Show clicked");
+            ShowWindowRequested?.Invoke();
+        }));
+        _popupMenu.Items.Add(new PopupMenuSeparator());
+        _popupMenu.Items.Add(new PopupMenuItem("終了", (_, _) =>
+        {
+            LifecycleLog("Tray.PopupMenu Exit clicked");
+            ExitRequested?.Invoke();
+        }));
 
         _taskbarIcon = new TaskbarIcon
         {
             ToolTipText = "VRCToolsDataSync",
-            ContextFlyout = menu,
-            ContextMenuMode = ContextMenuMode.PopupMenu,
-            LeftClickCommand = new RelayCommand(() => ShowWindowRequested?.Invoke()),
+            // ContextFlyout / ContextMenuMode は使わない (実機で動かなかった)。
+            // 左クリックはコマンド経由で OK。
         };
 
         _icon = TryLoadIcon();
@@ -49,11 +52,104 @@ public sealed class TrayIconManager : IDisposable
         }
 
         _taskbarIcon.ForceCreate();
+
+        // ForceCreate の後に TrayIcon → MessageWindow を取り出してマウス
+        // イベントを直接購読する。WinUI 上の Routed Event / Command 経路は
+        // メインウィンドウが Hide のとき不安定なため、Win32 メッセージレベル
+        // で拾う方が確実。
+        TryHookRawMouseEvents();
+    }
+
+    private void TryHookRawMouseEvents()
+    {
+        if (_taskbarIcon is null) return;
+        try
+        {
+            // TaskbarIcon.TrayIcon (H.NotifyIcon.Core.TrayIcon) を取得
+            var trayIcon = _taskbarIcon.TrayIcon;
+            if (trayIcon is null)
+            {
+                LifecycleLog("Tray.Hook fail: TaskbarIcon.TrayIcon is null");
+                return;
+            }
+
+            // Core.TrayIcon は MessageWindow プロパティを公開していないので
+            // リフレクションで取得する。
+            var messageWindowField = typeof(TrayIcon).GetField(
+                "messageWindow",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            var messageWindowProp = typeof(TrayIcon).GetProperty(
+                "MessageWindow",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+            object? mw = messageWindowField?.GetValue(trayIcon)
+                         ?? messageWindowProp?.GetValue(trayIcon);
+            if (mw is not MessageWindow messageWindow)
+            {
+                LifecycleLog("Tray.Hook fail: MessageWindow not found via reflection");
+                return;
+            }
+
+            _messageWindow = messageWindow;
+            _mouseHandler = OnRawMouseEvent;
+            _messageWindow.MouseEventReceived += _mouseHandler;
+            LifecycleLog("Tray.Hook ok");
+        }
+        catch (Exception ex)
+        {
+            LifecycleLog("Tray.Hook fail: " + ex.Message);
+        }
+    }
+
+    private void OnRawMouseEvent(object? sender, MessageWindow.MouseEventReceivedEventArgs e)
+    {
+        try
+        {
+            LifecycleLog("Tray.MouseEvent " + e.MouseEvent);
+            switch (e.MouseEvent)
+            {
+                case MouseEvent.IconLeftMouseUp:
+                    ShowWindowRequested?.Invoke();
+                    break;
+                case MouseEvent.IconRightMouseUp:
+                case MouseEvent.IconRightMouseDown:
+                    ShowPopupMenu();
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            LifecycleLog("Tray.MouseEvent fail: " + ex.Message);
+        }
+    }
+
+    private void ShowPopupMenu()
+    {
+        if (_popupMenu is null || _messageWindow is null) return;
+        try
+        {
+            // PopupMenu はオーナー HWND を必要とする。MessageWindow の Handle
+            // (タスクトレイ用の非表示ウィンドウ) を使えば、メインウィンドウが
+            // Hide でも問題なくメニューが表示される。
+            var hwndField = typeof(MessageWindow).GetProperty("Handle",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var hwnd = (IntPtr?)hwndField?.GetValue(_messageWindow) ?? IntPtr.Zero;
+
+            CursorPos.GetCursorPos(out var pt);
+            // Show の前にフォアグラウンド化しないと、メニュー外クリックで
+            // 閉じない / 項目クリックが届かないなどの問題がある (Win32 仕様)
+            if (hwnd != IntPtr.Zero) SetForegroundWindow(hwnd);
+            _popupMenu.Show(hwnd, pt.X, pt.Y);
+            LifecycleLog("Tray.ShowPopupMenu shown hwnd=0x" + hwnd.ToString("X"));
+        }
+        catch (Exception ex)
+        {
+            LifecycleLog("Tray.ShowPopupMenu fail: " + ex.Message);
+        }
     }
 
     private static Icon? TryLoadIcon()
     {
-        // 1) アプリ exe に埋め込まれたアイコンを抽出 (ApplicationIcon 経由)
         var exePath = Environment.ProcessPath;
         if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
         {
@@ -62,11 +158,9 @@ public sealed class TrayIconManager : IDisposable
                 var fromExe = Icon.ExtractAssociatedIcon(exePath);
                 if (fromExe is not null) return fromExe;
             }
-            catch { /* fallback to next strategy */ }
+            catch { /* fallback */ }
         }
 
-        // 2) フォールバック: Assets\AppIcon.ico を直接読む
-        //    (dotnet run など、exe 抽出が失敗する環境向け)
         try
         {
             var baseDir = AppContext.BaseDirectory;
@@ -83,30 +177,57 @@ public sealed class TrayIconManager : IDisposable
 
     public void ShowToast(string title, string body)
     {
-        // NOTE: AppNotificationManager は packaged アプリ用の API で、
-        // unpackaged + self-contained 配布では確実に COMException (0x8007007E)
-        // を投げる。本アプリは GUI ログと ContentDialog で通知を代替している
-        // ため、ここでは no-op として扱う。
+        // unpackaged では AppNotificationManager が必ず失敗するため no-op。
         _ = title;
         _ = body;
     }
 
     public void Dispose()
     {
+        if (_messageWindow is not null && _mouseHandler is not null)
+        {
+            try { _messageWindow.MouseEventReceived -= _mouseHandler; } catch { /* best-effort */ }
+        }
+        _messageWindow = null;
+        _mouseHandler = null;
+
         _taskbarIcon?.Dispose();
         _taskbarIcon = null;
+        _popupMenu = null;
         _icon?.Dispose();
         _icon = null;
     }
 
-    private sealed class RelayCommand : System.Windows.Input.ICommand
+    private static void LifecycleLog(string message)
     {
-        private readonly Action _execute;
-        public RelayCommand(Action execute) { _execute = execute; }
-#pragma warning disable CS0067 // ICommand 規約上必要だが、実コマンドの可否は変わらない
-        public event EventHandler? CanExecuteChanged;
-#pragma warning restore CS0067
-        public bool CanExecute(object? parameter) => true;
-        public void Execute(object? parameter) => _execute();
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "VRCToolsDataSync", "logs");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"sync-{DateTime.Now:yyyyMMdd}.log");
+            File.AppendAllText(path,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [LIFECYCLE] {message}{Environment.NewLine}");
+        }
+        catch { /* best-effort */ }
     }
+
+    private static class CursorPos
+    {
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        public static extern bool GetCursorPos(out POINT lpPoint);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 }
