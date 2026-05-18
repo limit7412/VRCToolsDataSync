@@ -103,6 +103,10 @@ public sealed class TrayIconManager : IDisposable
 
     private void OnRawMouseEvent(object? sender, MessageWindow.MouseEventReceivedEventArgs e)
     {
+        // MouseMove はトレイアイコン上にカーソルがある間連発されるので、
+        // ログにもアクションにも回さない (ノイズ抑制)。
+        if (e.MouseEvent == MouseEvent.MouseMove) return;
+
         try
         {
             LifecycleLog("Tray.MouseEvent " + e.MouseEvent);
@@ -111,8 +115,9 @@ public sealed class TrayIconManager : IDisposable
                 case MouseEvent.IconLeftMouseUp:
                     ShowWindowRequested?.Invoke();
                     break;
+                // 右クリックは Up のみで処理。Down/Up 両方で開くと
+                // 表示直後に閉じる挙動になる環境がある。
                 case MouseEvent.IconRightMouseUp:
-                case MouseEvent.IconRightMouseDown:
                     ShowPopupMenu();
                     break;
             }
