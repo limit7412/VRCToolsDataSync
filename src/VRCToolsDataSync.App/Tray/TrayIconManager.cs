@@ -1,4 +1,6 @@
 using System;
+using System.Drawing;
+using System.IO;
 using H.NotifyIcon;
 using H.NotifyIcon.Core;
 using Microsoft.UI.Xaml;
@@ -11,6 +13,7 @@ namespace VRCToolsDataSync_App.Tray;
 public sealed class TrayIconManager : IDisposable
 {
     private TaskbarIcon? _taskbarIcon;
+    private Icon? _icon;
 
     public event Action? ShowWindowRequested;
     public event Action? ExitRequested;
@@ -36,7 +39,44 @@ public sealed class TrayIconManager : IDisposable
             ContextFlyout = menu,
             LeftClickCommand = new RelayCommand(() => ShowWindowRequested?.Invoke()),
         };
+
+        _icon = TryLoadIcon();
+        if (_icon is not null)
+        {
+            _taskbarIcon.Icon = _icon;
+        }
+
         _taskbarIcon.ForceCreate();
+    }
+
+    private static Icon? TryLoadIcon()
+    {
+        // 1) アプリ exe に埋め込まれたアイコンを抽出 (ApplicationIcon 経由)
+        var exePath = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
+        {
+            try
+            {
+                var fromExe = Icon.ExtractAssociatedIcon(exePath);
+                if (fromExe is not null) return fromExe;
+            }
+            catch { /* fallback to next strategy */ }
+        }
+
+        // 2) フォールバック: Assets\AppIcon.ico を直接読む
+        //    (dotnet run など、exe 抽出が失敗する環境向け)
+        try
+        {
+            var baseDir = AppContext.BaseDirectory;
+            var icoPath = Path.Combine(baseDir, "Assets", "AppIcon.ico");
+            if (File.Exists(icoPath))
+            {
+                return new Icon(icoPath);
+            }
+        }
+        catch { /* give up */ }
+
+        return null;
     }
 
     public void ShowToast(string title, string body)
@@ -59,6 +99,8 @@ public sealed class TrayIconManager : IDisposable
     {
         _taskbarIcon?.Dispose();
         _taskbarIcon = null;
+        _icon?.Dispose();
+        _icon = null;
     }
 
     private sealed class RelayCommand : System.Windows.Input.ICommand
