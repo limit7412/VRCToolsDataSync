@@ -8,23 +8,96 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="16">
-        <TextBlock
-            Text="{x:Bind ViewModel.Greeting, Mode=OneWay}"
-            Style="{StaticResource TitleTextBlockStyle}" />
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="8">
-            <Button Command="{x:Bind ViewModel.IncrementCommand}">
-                <FontIcon Glyph="&#xE710;" FontSize="14" />
-            </Button>
-            <TextBlock
-                Text="{x:Bind ViewModel.Counter, Mode=OneWay}"
-                VerticalAlignment="Center"
-                MinWidth="40"
-                TextAlignment="Center"
-                Style="{StaticResource BodyStrongTextBlockStyle}" />
-            <Button Command="{x:Bind ViewModel.DecrementCommand}">
-                <FontIcon Glyph="&#xE738;" FontSize="14" />
-            </Button>
+    <ScrollViewer Padding="24">
+        <StackPanel Spacing="20" MaxWidth="900" HorizontalAlignment="Stretch">
+
+            <TextBlock Text="VRCToolsDataSync" Style="{StaticResource TitleTextBlockStyle}" />
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="設定" Style="{StaticResource SubtitleTextBlockStyle}" />
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="マシン名" />
+                        <TextBox Text="{x:Bind ViewModel.MachineName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="OneDrive 同期フォルダパス" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     Text="{x:Bind ViewModel.CloudFolderPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Grid.Column="1" Content="参照..." Click="OnBrowseCloudFolder" />
+                        </Grid>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="16">
+                        <ToggleSwitch Header="VRCX 同期" IsOn="{x:Bind ViewModel.SyncVrcx, Mode=TwoWay}" />
+                        <ToggleSwitch Header="VRC Friend Connect 同期" IsOn="{x:Bind ViewModel.SyncFriendConnect, Mode=TwoWay}" />
+                    </StackPanel>
+
+                    <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="VRCX" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.VrcxStatus, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Push"
+                                Command="{x:Bind ViewModel.PushVrcxCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <Button Content="Pull"
+                                Command="{x:Bind ViewModel.PullVrcxCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="VRC Friend Connect" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.FriendConnectStatus, Mode=OneWay}"
+                               Style="{StaticResource BodyTextBlockStyle}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Push"
+                                Command="{x:Bind ViewModel.PushFriendConnectCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <Button Content="Pull"
+                                Command="{x:Bind ViewModel.PullFriendConnectCommand}"
+                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="ログ" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <ListView ItemsSource="{x:Bind ViewModel.LogEntries}"
+                              MaxHeight="240"
+                              SelectionMode="None"
+                              IsItemClickEnabled="False">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem">
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="Padding" Value="0,2" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <TextBlock Text="{x:Bind}" FontFamily="Consolas" />
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </StackPanel>
+            </Border>
+
         </StackPanel>
-    </StackPanel>
+    </ScrollViewer>
 </Page>
