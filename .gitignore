@@ -11,6 +11,7 @@ artifacts/
 .vs/
 TestResults/
 *.pdb
+*.lscache
 
 # Rider / VS Code
 .idea/
