@@ -45,7 +45,7 @@ public sealed partial class MainWindow : Window
 
             _subclassProc = SubclassProc;
             // dwRefData は使わない。識別子は適当な定数 (1)。
-            SetWindowSubclass(hwnd, _subclassProc, uIdSubclass: 1, dwRefData: 0);
+            SetWindowSubclass(hwnd, _subclassProc, uIdSubclass: (nuint)1, dwRefData: (nuint)0);
         }
         catch
         {
@@ -54,7 +54,10 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private IntPtr SubclassProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam, IntPtr uIdSubclass, IntPtr dwRefData)
+    // SUBCLASSPROC の uIdSubclass / dwRefData は Win32 では UINT_PTR / DWORD_PTR
+    // (ポインタサイズ整数) として定義されているため、64bit プロセスで
+    // 32bit に切り詰めないよう nuint を使う。
+    private IntPtr SubclassProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam, nuint uIdSubclass, nuint dwRefData)
     {
         if (uMsg == App.ShowMainWindowMessageId && App.ShowMainWindowMessageId != 0)
         {
@@ -67,11 +70,11 @@ public sealed partial class MainWindow : Window
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate IntPtr SUBCLASSPROC(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam, IntPtr uIdSubclass, IntPtr dwRefData);
+    private delegate IntPtr SUBCLASSPROC(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam, nuint uIdSubclass, nuint dwRefData);
 
     [DllImport("comctl32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetWindowSubclass(IntPtr hWnd, SUBCLASSPROC pfnSubclass, uint uIdSubclass, uint dwRefData);
+    private static extern bool SetWindowSubclass(IntPtr hWnd, SUBCLASSPROC pfnSubclass, nuint uIdSubclass, nuint dwRefData);
 
     [DllImport("comctl32.dll")]
     private static extern IntPtr DefSubclassProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
