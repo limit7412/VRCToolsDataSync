@@ -32,9 +32,23 @@ public static class ProcessGuard
         var hits = new List<string>();
         foreach (var name in processNames)
         {
-            if (Process.GetProcessesByName(name).Length > 0)
+            // Process.GetProcessesByName が返す配列の各要素はネイティブハンドルを
+            // 持っているため、ヒット有無を確認したら必ず Dispose する。FindRunning は
+            // ポーリング経路で多用されるため、ここでリークすると蓄積する。
+            var processes = Process.GetProcessesByName(name);
+            try
             {
-                hits.Add(name);
+                if (processes.Length > 0)
+                {
+                    hits.Add(name);
+                }
+            }
+            finally
+            {
+                foreach (var p in processes)
+                {
+                    try { p.Dispose(); } catch { /* best-effort */ }
+                }
             }
         }
         return hits;

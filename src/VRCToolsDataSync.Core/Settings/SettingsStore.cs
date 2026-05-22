@@ -89,10 +89,11 @@ public sealed class SettingsStore
                 }
 
                 // 呼び出し元のインスタンスにも反映しておく。これがないと、
-                // 呼び出し元 settings の ToolState が古いままで、続けて
+                // 呼び出し元 settings の ToolState / Launch が古いままで、続けて
                 // 別の経路 (例: GUI ボタンの Push) が走った時に旧情報を
                 // 書き戻してしまう。
                 settings.ToolState = merged.ToolState;
+                settings.Launch = merged.Launch;
             }
             finally
             {
@@ -149,18 +150,33 @@ public sealed class SettingsStore
             SyncFriendConnect = topLevelSource.SyncFriendConnect,
             AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
             ToolState = new Dictionary<string, ToolSyncState>(),
+            Launch = new Dictionary<string, ToolLaunchConfig>(),
         };
 
         // 両方に存在する tool キーは新しい方を採用、片方だけにあるものはそのまま追加。
-        var allKeys = new HashSet<string>(disk.ToolState.Keys, StringComparer.Ordinal);
-        foreach (var k in incoming.ToolState.Keys) allKeys.Add(k);
+        // JSON デシリアライズで明示的に null が入る可能性があるため、null セーフに扱う。
+        var diskToolState = disk.ToolState ?? new Dictionary<string, ToolSyncState>();
+        var incomingToolState = incoming.ToolState ?? new Dictionary<string, ToolSyncState>();
+        var allKeys = new HashSet<string>(diskToolState.Keys, StringComparer.Ordinal);
+        foreach (var k in incomingToolState.Keys) allKeys.Add(k);
         foreach (var key in allKeys)
         {
-            var inc = incoming.ToolState.GetValueOrDefault(key);
-            var dsk = disk.ToolState.GetValueOrDefault(key);
+            var inc = incomingToolState.GetValueOrDefault(key);
+            var dsk = diskToolState.GetValueOrDefault(key);
             if (inc is null) { result.ToolState[key] = dsk!; continue; }
             if (dsk is null) { result.ToolState[key] = inc; continue; }
             result.ToolState[key] = PickNewer(inc, dsk);
+        }
+
+        // Launch は Top-level と同じ採用元から取る。理由:
+        // - 通常 Save (= GUI で設定変更) は incoming を採用したい
+        // - SaveToolStateOnly (= Push/Pull) は Launch を触らないので disk を残したい
+        // Launch には ToolSyncState のようなタイムスタンプが無いため、PickNewer は不要。
+        var launchSource = (mergeTopLevelFromDisk && diskAvailable) ? disk : incoming;
+        var launchDict = launchSource.Launch ?? new Dictionary<string, ToolLaunchConfig>();
+        foreach (var kv in launchDict)
+        {
+            result.Launch[kv.Key] = kv.Value;
         }
 
         return result;
