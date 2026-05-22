@@ -27,6 +27,13 @@ public sealed class AutoSyncCoordinator : IDisposable
     // 二重 Push しないために使う。
     private readonly object _inFlightLock = new();
     private readonly List<InFlightPush> _inFlightPushes = new();
+    // 既に完了している AutoPush の ToolKey を保持する。
+    // _inFlightPushes は完了 → ContinueWith で即削除されるため、
+    // 「WaitForInFlightPushAsync を呼ぶ直前に完了した AutoPush」が snapshot から
+    // 漏れて二重 Push の原因になっていた (issue: 直近完了 AutoPush のキー保持)。
+    // 完了時はこの集合に ToolKey を追加し、Start 時に明示クリアする
+    // (= 同一 Coordinator 世代の中だけ覚えていれば十分)。
+    private readonly HashSet<string> _recentlyCompletedAutoPushes = new(StringComparer.Ordinal);
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
@@ -68,6 +75,15 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _generationCts.Dispose();
             _generationCts = new CancellationTokenSource();
+        }
+
+        // 新しい監視世代に入るので、前回までの「完了済み AutoPush」の記録は捨てる。
+        // (前回 Coordinator が動いていた間に Push したものを今回の Shutdown でスキップ
+        //  対象にすると、その後ユーザがツールを再起動して再編集していた場合に
+        //  Push したい変更まで取りこぼす可能性があるため。)
+        lock (_inFlightLock)
+        {
+            _recentlyCompletedAutoPushes.Clear();
         }
 
         if (_settings.SyncVrcx)
@@ -175,7 +191,15 @@ public sealed class AutoSyncCoordinator : IDisposable
             lock (_inFlightLock) { _inFlightPushes.Add(entry); }
             entry.Task.ContinueWith(_ =>
             {
-                lock (_inFlightLock) { _inFlightPushes.Remove(entry); }
+                lock (_inFlightLock)
+                {
+                    _inFlightPushes.Remove(entry);
+                    // Push まで成功したものは「直近完了」集合にも残す。
+                    // _inFlightPushes から消えた後でも WaitForInFlightPushAsync が
+                    // 拾えるようにする (= 終了処理直前に完了した AutoPush の
+                    // 二重 Push を Shutdown 側でスキップさせる)。
+                    if (entry.Pushed) _recentlyCompletedAutoPushes.Add(entry.ToolKey);
+                }
             }, TaskScheduler.Default);
         };
         return binding;
@@ -185,7 +209,8 @@ public sealed class AutoSyncCoordinator : IDisposable
     /// Stop の Cancel 直後に呼んで、進行中の AutoPush タスクが終わるまで待つ。
     /// 終了シーケンス (ShutdownSyncOrchestrator) との二重 Push を防ぐ。
     /// 戻り値: Completed=true なら全 AutoPush 完了、false ならタイムアウト。
-    /// PushedToolKeys には、待機中に「実際に Push まで成功したツール」の ToolKey が入る。
+    /// PushedToolKeys には、現在の Coordinator 世代で「実際に Push まで成功したツール」の
+    /// ToolKey が入る (進行中タスクの完了 + これより前に完了済みの AutoPush の両方を含む)。
     /// 呼び出し元はこの集合に含まれるツールについて Shutdown Push をスキップすることで、
     /// AutoPush と Shutdown Push の二重 Push (= 無駄な version インクリメント) を回避できる。
     /// </summary>
@@ -193,29 +218,37 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         InFlightPush[] snapshot;
         lock (_inFlightLock) { snapshot = _inFlightPushes.ToArray(); }
-        if (snapshot.Length == 0) return new WaitForInFlightPushResult(true, Array.Empty<string>());
-        _logger.LogInformation("AutoPush in-flight: waiting count={Count}", snapshot.Length);
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(timeout);
-        var allDone = Task.WhenAll(snapshot.Select(e => e.Task));
-        var delay = Task.Delay(Timeout.Infinite, cts.Token);
-        Task completed;
-        try
+        bool completedOk = true;
+        if (snapshot.Length > 0)
         {
-            completed = await Task.WhenAny(allDone, delay).ConfigureAwait(false);
+            _logger.LogInformation("AutoPush in-flight: waiting count={Count}", snapshot.Length);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var allDone = Task.WhenAll(snapshot.Select(e => e.Task));
+            var delay = Task.Delay(Timeout.Infinite, cts.Token);
+            Task completed;
+            try
+            {
+                completed = await Task.WhenAny(allDone, delay).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // 通常 Task.WhenAny は例外を投げないが、念のため。タイムアウト扱い。
+                completed = delay;
+            }
+            // allDone が先に完了 = 全 AutoPush 完了。delay が先に完了 = タイムアウト。
+            completedOk = completed == allDone;
         }
-        catch (OperationCanceledException)
+        // 「直近完了 AutoPush」集合を取り出して合流させる。snapshot に入っていた
+        // タスクは ContinueWith でこの集合に追加されているはずで、加えて
+        // WaitForInFlightPushAsync が呼ばれる前に既に完了して _inFlightPushes
+        // から消えていた AutoPush もここから拾える。
+        string[] pushedKeys;
+        lock (_inFlightLock)
         {
-            // 通常 Task.WhenAny は例外を投げないが、念のため。
-            return new WaitForInFlightPushResult(false, Array.Empty<string>());
+            pushedKeys = _recentlyCompletedAutoPushes.ToArray();
         }
-        // allDone が先に完了 = 全 AutoPush 完了。delay が先に完了 = タイムアウト。
-        var pushedKeys = snapshot
-            .Where(e => e.Pushed)
-            .Select(e => e.ToolKey)
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
-        return new WaitForInFlightPushResult(completed == allDone, pushedKeys);
+        return new WaitForInFlightPushResult(completedOk, pushedKeys);
     }
 
     private sealed class InFlightPush
