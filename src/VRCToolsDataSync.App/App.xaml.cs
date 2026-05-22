@@ -47,6 +47,11 @@ public partial class App : Application
 
     public static AutoSyncCoordinator? Coordinator { get; private set; }
 
+    // Issue #6: 起動時の Pull → Launch のステップログ。MainPage / UI 側で
+    // 起動直後のサマリをログに出すのに使う (GUI 構築前に走るため、ここに溜める)。
+    public static System.Collections.Generic.IReadOnlyList<StartupSyncStep> StartupSyncSteps { get; private set; } =
+        System.Array.Empty<StartupSyncStep>();
+
     public static TrayIconManager Tray { get; } = new();
 
     // タスクトレイから「終了」を選んだとき、Window.Closed で
@@ -146,6 +151,21 @@ public partial class App : Application
             {
                 var settings = Runner.LoadSettings();
                 Coordinator = new AutoSyncCoordinator(Runner, settings, Runner.CreateLogger<AutoSyncCoordinator>());
+
+                // Issue #6: 起動時の同期 + 自動起動を Coordinator.Start より前に走らせる。
+                // Start 後だと Pull 直後にツールを起動するまでの隙間で自動 Push が
+                // 暴発する可能性がある。Coordinator.Start は最後にまとめて呼ぶ。
+                try
+                {
+                    var orchestrator = new StartupSyncOrchestrator(
+                        Runner,
+                        logger: Runner.CreateLogger<StartupSyncOrchestrator>());
+                    var steps = orchestrator.Run(settings);
+                    StartupSyncSteps = steps;
+                    LogLifecycle($"StartupSync.steps={steps.Count}");
+                }
+                catch (Exception ex) { LogStartupFailure("StartupSyncOrchestrator", ex); }
+
                 Coordinator.Start();
             }
             catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }

@@ -72,6 +72,26 @@
                                 Command="{x:Bind ViewModel.PullVrcxCommand}"
                                 IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
                     </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="VRCX 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     Text="{x:Bind ViewModel.VrcxExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Grid.Column="1" Content="自動検出"
+                                    Command="{x:Bind ViewModel.DetectVrcxExecutableCommand}" />
+                            <Button Grid.Column="2" Content="参照..." Click="OnBrowseVrcxExecutable" />
+                        </Grid>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="16">
+                        <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.VrcxLaunchOnAppStart, Mode=TwoWay}" />
+                        <ToggleSwitch Header="終了時にこのツールも閉じる" IsOn="{x:Bind ViewModel.VrcxStopOnAppExit, Mode=TwoWay}" />
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
@@ -87,6 +107,26 @@
                         <Button Content="Pull"
                                 Command="{x:Bind ViewModel.PullFriendConnectCommand}"
                                 IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="VRC Friend Connect 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     Text="{x:Bind ViewModel.FriendConnectExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Grid.Column="1" Content="自動検出"
+                                    Command="{x:Bind ViewModel.DetectFriendConnectExecutableCommand}" />
+                            <Button Grid.Column="2" Content="参照..." Click="OnBrowseFriendConnectExecutable" />
+                        </Grid>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="16">
+                        <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.FriendConnectLaunchOnAppStart, Mode=TwoWay}" />
+                        <ToggleSwitch Header="終了時にこのツールも閉じる" IsOn="{x:Bind ViewModel.FriendConnectStopOnAppExit, Mode=TwoWay}" />
                     </StackPanel>
                 </StackPanel>
             </Border>

@@ -25,6 +25,14 @@ public sealed partial class MainPage : Page
                 App.DispatcherQueue.TryEnqueue(() => action());
             });
         }
+
+        // Issue #6: App.OnLaunched で走った起動同期 (Pull → Launch) のステップを
+        // GUI のログに取り込む。Window 構築前に実行されているため、ここで初めて
+        // ユーザに見える形で履歴が出る。
+        if (App.StartupSyncSteps.Count > 0)
+        {
+            ViewModel.IngestStartupSteps(App.StartupSyncSteps);
+        }
     }
 
     private async void OnBrowseCloudFolder(object sender, RoutedEventArgs e)
@@ -41,6 +49,30 @@ public sealed partial class MainPage : Page
         {
             ViewModel.CloudFolderPath = folder.Path;
         }
+    }
+
+    private async void OnBrowseVrcxExecutable(object sender, RoutedEventArgs e)
+    {
+        var path = await PickExecutableAsync();
+        if (!string.IsNullOrEmpty(path)) ViewModel.VrcxExecutablePath = path;
+    }
+
+    private async void OnBrowseFriendConnectExecutable(object sender, RoutedEventArgs e)
+    {
+        var path = await PickExecutableAsync();
+        if (!string.IsNullOrEmpty(path)) ViewModel.FriendConnectExecutablePath = path;
+    }
+
+    private static async Task<string?> PickExecutableAsync()
+    {
+        var picker = new FileOpenPicker
+        {
+            SuggestedStartLocation = PickerLocationId.ComputerFolder,
+        };
+        picker.FileTypeFilter.Add(".exe");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
+        var file = await picker.PickSingleFileAsync();
+        return file?.Path;
     }
 
     private async Task<ConflictChoice> OnConflictRequested(ConflictPrompt prompt)

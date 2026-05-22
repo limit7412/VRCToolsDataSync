@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Sync;
@@ -35,8 +37,56 @@ public partial class MainPageViewModel : ObservableObject
         SyncVrcx = _settings.SyncVrcx;
         SyncFriendConnect = _settings.SyncFriendConnect;
         AutoSyncEnabled = _settings.AutoSyncEnabled;
+        LoadLaunchConfigToProperties();
         RefreshStatusSummaries();
         RefreshStartupState();
+    }
+
+    /// <summary>
+    /// 起動時の SyncRunner.Run のログを GUI に流す。MainPage が VM を取得した
+    /// 直後に呼び出される想定 (Window 構築前に走った StartupSyncOrchestrator
+    /// のステップを GUI 上のログに反映するため)。
+    /// </summary>
+    public void IngestStartupSteps(IReadOnlyList<StartupSyncStep> steps)
+    {
+        foreach (var step in steps)
+        {
+            switch (step.Kind)
+            {
+                case StartupSyncStepKind.PullStarted:
+                    AppendLog($"[startup] {step.DisplayName} Pull 開始...");
+                    break;
+                case StartupSyncStepKind.PullSucceeded:
+                    AppendLog($"[startup] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
+                    break;
+                case StartupSyncStepKind.PullFailed:
+                    AppendLog($"[startup] {step.DisplayName} Pull 失敗: {step.Message}");
+                    break;
+                case StartupSyncStepKind.PullSkipped:
+                    AppendLog($"[startup] {step.DisplayName} Pull スキップ: {step.Message}");
+                    break;
+                case StartupSyncStepKind.LaunchAttempted:
+                    var outcome = step.LaunchResult?.Outcome;
+                    var msg = outcome switch
+                    {
+                        ToolLaunchOutcome.Launched => "起動しました",
+                        ToolLaunchOutcome.AlreadyRunning => "既に起動中",
+                        ToolLaunchOutcome.ExecutableNotFound => $"実行ファイル未検出: {step.Message}",
+                        ToolLaunchOutcome.LaunchFailed => $"起動失敗: {step.Message}",
+                        _ => outcome?.ToString() ?? "不明",
+                    };
+                    AppendLog($"[startup] {step.DisplayName} {msg}");
+                    break;
+                case StartupSyncStepKind.LaunchSkipped:
+                    // 自動起動 OFF 時のログはノイズなので出さない。
+                    break;
+            }
+        }
+        // 起動時 Pull で ToolState が更新されている可能性があるので、Coordinator
+        // に最新の settings をリロードして渡す。VM 側の _settings も差し替える。
+        _settings = _runner.LoadSettings();
+        _coordinator?.RefreshSettings(_settings);
+        RefreshStatusSummaries();
     }
 
     public void AttachCoordinator(AutoSyncCoordinator coordinator, Action<Action> uiDispatch)
@@ -111,6 +161,26 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial string StartupStatus { get; set; } = string.Empty;
 
+    // VRCX Launch 設定
+    [ObservableProperty]
+    public partial string VrcxExecutablePath { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial bool VrcxLaunchOnAppStart { get; set; }
+
+    [ObservableProperty]
+    public partial bool VrcxStopOnAppExit { get; set; }
+
+    // VRC Friend Connect Launch 設定
+    [ObservableProperty]
+    public partial string FriendConnectExecutablePath { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial bool FriendConnectLaunchOnAppStart { get; set; }
+
+    [ObservableProperty]
+    public partial bool FriendConnectStopOnAppExit { get; set; }
+
     public ObservableCollection<string> LogEntries { get; } = new();
 
     public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
@@ -129,9 +199,69 @@ public partial class MainPageViewModel : ObservableObject
         _settings.SyncVrcx = SyncVrcx;
         _settings.SyncFriendConnect = SyncFriendConnect;
         _settings.AutoSyncEnabled = AutoSyncEnabled;
+        ApplyLaunchPropertiesToSettings();
         _runner.SaveSettings(_settings);
         _coordinator?.UpdateSettings(_settings);
         AppendLog($"設定を保存しました (auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
+    }
+
+    private void LoadLaunchConfigToProperties()
+    {
+        var vrcx = _settings.Launch.GetValueOrDefault(VrcxSyncService.Key) ?? new ToolLaunchConfig();
+        VrcxExecutablePath = vrcx.ExecutablePath ?? string.Empty;
+        VrcxLaunchOnAppStart = vrcx.LaunchOnAppStart;
+        VrcxStopOnAppExit = vrcx.StopOnAppExit;
+
+        var fc = _settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key) ?? new ToolLaunchConfig();
+        FriendConnectExecutablePath = fc.ExecutablePath ?? string.Empty;
+        FriendConnectLaunchOnAppStart = fc.LaunchOnAppStart;
+        FriendConnectStopOnAppExit = fc.StopOnAppExit;
+    }
+
+    private void ApplyLaunchPropertiesToSettings()
+    {
+        _settings.Launch[VrcxSyncService.Key] = new ToolLaunchConfig
+        {
+            ExecutablePath = string.IsNullOrWhiteSpace(VrcxExecutablePath) ? null : VrcxExecutablePath.Trim(),
+            LaunchOnAppStart = VrcxLaunchOnAppStart,
+            StopOnAppExit = VrcxStopOnAppExit,
+        };
+        _settings.Launch[FriendConnectSyncService.Key] = new ToolLaunchConfig
+        {
+            ExecutablePath = string.IsNullOrWhiteSpace(FriendConnectExecutablePath) ? null : FriendConnectExecutablePath.Trim(),
+            LaunchOnAppStart = FriendConnectLaunchOnAppStart,
+            StopOnAppExit = FriendConnectStopOnAppExit,
+        };
+    }
+
+    /// <summary>
+    /// 「自動検出」ボタン用。実行ファイルパスを TryFindExecutable から埋める。
+    /// 見つからなければ何もしない (ユーザに「参照…」ボタンを使わせる)。
+    /// </summary>
+    [RelayCommand]
+    private void DetectVrcxExecutable()
+    {
+        var path = VrcxPaths.TryFindExecutable();
+        if (path is null)
+        {
+            AppendLog("VRCX 実行ファイルを自動検出できませんでした。参照ボタンで指定してください。");
+            return;
+        }
+        VrcxExecutablePath = path;
+        AppendLog($"VRCX 実行ファイルを検出: {path}");
+    }
+
+    [RelayCommand]
+    private void DetectFriendConnectExecutable()
+    {
+        var path = FriendConnectPaths.TryFindExecutable();
+        if (path is null)
+        {
+            AppendLog("VRC Friend Connect 実行ファイルを自動検出できませんでした。参照ボタンで指定してください。");
+            return;
+        }
+        FriendConnectExecutablePath = path;
+        AppendLog($"VRC Friend Connect 実行ファイルを検出: {path}");
     }
 
     [RelayCommand]
