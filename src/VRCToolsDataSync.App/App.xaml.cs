@@ -328,14 +328,41 @@ public partial class App : Application
         }
     }
 
-    private static void ExitApplication()
+    // Tray の ExitRequested は同期メソッド型なので、async ロジックを内部関数に
+    // 切り出してファイア&フォーゲットで走らせる。多重呼び出しは _isExiting で防止。
+    private static void ExitApplication() => _ = ExitApplicationAsync(forceStopAllSyncedTools: true);
+
+    /// <summary>
+    /// 終了シーケンス。Coordinator を停止 → 設定に従ってツールを停止 → Push を済ませてから Environment.Exit。
+    /// <paramref name="forceStopAllSyncedTools"/> = true でユーザが明示的に「終了」を選んだ場合は、
+    /// 各ツールの StopOnAppExit 設定を上書きして全ツールを停止する。
+    /// </summary>
+    internal static async System.Threading.Tasks.Task ExitApplicationAsync(bool forceStopAllSyncedTools)
     {
         LogLifecycle("ExitApplication.entered isExiting=" + _isExiting);
         // 既に終了処理中なら再入を防ぐ。
         if (_isExiting) return;
         _isExiting = true;
 
-        // 後始末を best-effort で実行してから Environment.Exit(0) で確実に殺す。
+        // (0) Coordinator を停止 (Dispose ではなく Stop)。これ以降の Push は手動で呼ぶ。
+        try { Coordinator?.Stop(); LogLifecycle("ExitApplication.Coordinator.Stop ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Stop fail: " + ex.Message); }
+
+        // (1) ツール停止 + Push。Orchestrator が判断する。
+        try
+        {
+            var settings = Runner.LoadSettings();
+            var orchestrator = new ShutdownSyncOrchestrator(
+                Runner,
+                logger: Runner.CreateLogger<ShutdownSyncOrchestrator>());
+            var steps = await orchestrator.RunAsync(settings, new ShutdownSyncOptions
+            {
+                ForceStopAllSyncedTools = forceStopAllSyncedTools,
+            });
+            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count}");
+        }
+        catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
+
+        // (2) Coordinator を完全に Dispose してから Tray もきれいに片付ける。
         try { Coordinator?.Dispose(); LogLifecycle("ExitApplication.Coordinator.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Dispose fail: " + ex.Message); }
         Coordinator = null;
         try { Tray.Dispose(); LogLifecycle("ExitApplication.Tray.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Tray.Dispose fail: " + ex.Message); }
