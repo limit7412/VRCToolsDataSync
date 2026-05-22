@@ -345,7 +345,19 @@ public partial class App : Application
         _isExiting = true;
 
         // (0) Coordinator を停止 (Dispose ではなく Stop)。これ以降の Push は手動で呼ぶ。
+        //     Stop は監視解除 + 世代 Cancel しかしないため、HandleProcessExited で
+        //     既に走り始めた AutoPush は止まらない。Stop 後に WaitForInFlightPushAsync
+        //     で完了を待たないと、終了時 Push と並走して manifest 競合する。
         try { Coordinator?.Stop(); LogLifecycle("ExitApplication.Coordinator.Stop ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Stop fail: " + ex.Message); }
+        try
+        {
+            if (Coordinator is not null)
+            {
+                await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                LogLifecycle("ExitApplication.WaitForInFlightPush ok");
+            }
+        }
+        catch (Exception ex) { LogLifecycle("ExitApplication.WaitForInFlightPush fail: " + ex.Message); }
 
         // (1) ツール停止 + Push。Orchestrator が判断する。
         try

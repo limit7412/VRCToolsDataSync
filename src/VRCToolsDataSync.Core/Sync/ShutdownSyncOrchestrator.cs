@@ -67,7 +67,7 @@ public sealed class ShutdownSyncOrchestrator
         var cloudAvailable = !string.IsNullOrEmpty(cloud) && Directory.Exists(cloud);
 
         // (1) 全ツールの停止を並列で依頼。停止待ちの間は他ツールも止まるので並列が妥当。
-        var toolDefs = EnumerateTools(settings).ToArray();
+        var toolDefs = EnumerateTools(settings, _runner).ToArray();
         var stopTasks = new List<Task<(ToolDefinition def, ToolStopResult? result, bool skipped)>>();
         foreach (var def in toolDefs)
         {
@@ -205,14 +205,14 @@ public sealed class ShutdownSyncOrchestrator
         return (def, result, false);
     }
 
-    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings)
+    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings, SyncRunner runner)
     {
         yield return new ToolDefinition
         {
             Key = VrcxSyncService.Key,
             DisplayName = "VRCX",
             SyncEnabled = settings.SyncVrcx,
-            ServiceFactory = () => new VrcxSyncService(),
+            ServiceFactory = () => new VrcxSyncService(logger: runner.CreateLogger<VrcxSyncService>()),
             ProcessNames = ProcessGuard.VrcxProcessNames,
         };
         yield return new ToolDefinition
@@ -220,7 +220,7 @@ public sealed class ShutdownSyncOrchestrator
             Key = FriendConnectSyncService.Key,
             DisplayName = "VRC Friend Connect",
             SyncEnabled = settings.SyncFriendConnect,
-            ServiceFactory = () => new FriendConnectSyncService(),
+            ServiceFactory = () => new FriendConnectSyncService(logger: runner.CreateLogger<FriendConnectSyncService>()),
             ProcessNames = ProcessGuard.FriendConnectProcessNames,
         };
     }

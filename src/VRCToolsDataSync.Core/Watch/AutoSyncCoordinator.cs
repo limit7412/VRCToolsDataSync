@@ -21,6 +21,10 @@ public sealed class AutoSyncCoordinator : IDisposable
     // なったため、起動直後にユーザが「設定を保存」(UpdateSettings → Stop+Start)
     // するとレースして _bindings が二重に並ぶ可能性がある。
     private readonly object _lifecycleLock = new();
+    // 進行中の HandleProcessExited タスクをここに記録し、Stop / 終了時に
+    // join できるようにする。完了済みは適宜パージ。
+    private readonly object _inFlightLock = new();
+    private readonly List<Task> _inFlightPushes = new();
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
@@ -156,8 +160,39 @@ public sealed class AutoSyncCoordinator : IDisposable
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
-        watcher.ProcessExited += _ => Task.Run(() => HandleProcessExited(binding, token));
+        watcher.ProcessExited += _processName =>
+        {
+            var task = Task.Run(() => HandleProcessExited(binding, token));
+            // Stop / 終了シーケンスから待ち合わせできるよう、進行中タスクを記録。
+            // 完了したらリストから外す (リーク防止)。
+            lock (_inFlightLock) { _inFlightPushes.Add(task); }
+            task.ContinueWith(t =>
+            {
+                lock (_inFlightLock) { _inFlightPushes.Remove(t); }
+            }, TaskScheduler.Default);
+        };
         return binding;
+    }
+
+    /// <summary>
+    /// Stop の Cancel 直後に呼んで、進行中の AutoPush タスクが終わるまで待つ。
+    /// 終了シーケンス (ShutdownSyncOrchestrator) との二重 Push を防ぐ。
+    /// タイムアウト時はそれ以上は待たない (best-effort)。
+    /// </summary>
+    public async Task WaitForInFlightPushAsync(TimeSpan timeout, CancellationToken ct = default)
+    {
+        Task[] snapshot;
+        lock (_inFlightLock) { snapshot = _inFlightPushes.ToArray(); }
+        if (snapshot.Length == 0) return;
+        _logger.LogInformation("AutoPush in-flight: waiting count={Count}", snapshot.Length);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+        var allDone = Task.WhenAll(snapshot);
+        try
+        {
+            await Task.WhenAny(allDone, Task.Delay(Timeout.Infinite, cts.Token)).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { /* timeout */ }
     }
 
     private void HandleProcessExited(ToolBinding binding, CancellationToken token)
