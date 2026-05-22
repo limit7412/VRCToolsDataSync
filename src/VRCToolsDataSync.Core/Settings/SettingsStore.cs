@@ -149,6 +149,7 @@ public sealed class SettingsStore
             SyncFriendConnect = topLevelSource.SyncFriendConnect,
             AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
             ToolState = new Dictionary<string, ToolSyncState>(),
+            Launch = new Dictionary<string, ToolLaunchConfig>(),
         };
 
         // 両方に存在する tool キーは新しい方を採用、片方だけにあるものはそのまま追加。
@@ -161,6 +162,16 @@ public sealed class SettingsStore
             if (inc is null) { result.ToolState[key] = dsk!; continue; }
             if (dsk is null) { result.ToolState[key] = inc; continue; }
             result.ToolState[key] = PickNewer(inc, dsk);
+        }
+
+        // Launch は Top-level と同じ採用元から取る。理由:
+        // - 通常 Save (= GUI で設定変更) は incoming を採用したい
+        // - SaveToolStateOnly (= Push/Pull) は Launch を触らないので disk を残したい
+        // Launch には ToolSyncState のようなタイムスタンプが無いため、PickNewer は不要。
+        var launchSource = (mergeTopLevelFromDisk && diskAvailable) ? disk : incoming;
+        foreach (var kv in launchSource.Launch)
+        {
+            result.Launch[kv.Key] = kv.Value;
         }
 
         return result;
