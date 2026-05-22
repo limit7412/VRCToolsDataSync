@@ -354,13 +354,16 @@ public partial class App : Application
         //     で完了を待たないと、終了時 Push と並走して manifest 競合する。
         try { Coordinator?.Stop(); LogLifecycle("ExitApplication.Coordinator.Stop ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Stop fail: " + ex.Message); }
         var inFlightDone = true;
+        IReadOnlyList<string> autoPushedTools = System.Array.Empty<string>();
         try
         {
             if (Coordinator is not null)
             {
-                inFlightDone = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                var waitResult = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                inFlightDone = waitResult.Completed;
+                autoPushedTools = waitResult.PushedToolKeys;
                 LogLifecycle(inFlightDone
-                    ? "ExitApplication.WaitForInFlightPush ok"
+                    ? $"ExitApplication.WaitForInFlightPush ok autoPushed=[{string.Join(",", autoPushedTools)}]"
                     : "ExitApplication.WaitForInFlightPush TIMED OUT - AutoPush may still be running, will skip shutdown push to avoid manifest conflict");
             }
         }
@@ -370,6 +373,7 @@ public partial class App : Application
         //     SessionEnding 経路では waitForToolsToExit が指定されるので、その時間まで
         //     自然終了を待つ。Tray「終了」経路では null = 即時チェックして起動中なら Push スキップ。
         //     AutoPush 待機がタイムアウトしている場合は二重 Push を避けるため全件 Push スキップ。
+        //     直近 AutoPush で Push 済みのツール (autoPushedTools) は二重 Push を避けてスキップ。
         try
         {
             var settings = Runner.LoadSettings();
@@ -380,8 +384,9 @@ public partial class App : Application
             {
                 WaitForToolsToExit = waitForToolsToExit,
                 SkipPush = !inFlightDone,
+                SkipPushForTools = autoPushedTools,
             });
-            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone} waitForExit={waitForToolsToExit?.TotalSeconds.ToString("0.#") ?? "null"}");
+            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone} waitForExit={waitForToolsToExit?.TotalSeconds.ToString("0.#") ?? "null"} skipForTools=[{string.Join(",", autoPushedTools)}]");
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
 

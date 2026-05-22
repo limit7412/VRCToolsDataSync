@@ -44,6 +44,14 @@ public sealed class ShutdownSyncOptions
     /// 並走 Push による manifest 競合リスクが高い経路で使う。
     /// </summary>
     public bool SkipPush { get; init; }
+
+    /// <summary>
+    /// 直近 AutoPush で Push 完了済みのツール ToolKey 集合。
+    /// 呼び出し元は <see cref="AutoSyncCoordinator.WaitForInFlightPushAsync"/> から
+    /// 受け取った値をそのまま渡す。この集合のツールについては Shutdown Push を
+    /// スキップすることで二重 Push (= 無駄な version インクリメント) を回避する。
+    /// </summary>
+    public IReadOnlyCollection<string> SkipPushForTools { get; init; } = Array.Empty<string>();
 }
 
 /// <summary>
@@ -176,6 +184,22 @@ public sealed class ShutdownSyncOrchestrator
                     DisplayName = def.DisplayName,
                     Kind = ShutdownSyncStepKind.PushSkipped,
                     Message = "ツールが起動中のため Push できません",
+                });
+                continue;
+            }
+
+            // 直近の AutoPush で既に Push 済みのツールはスキップ。
+            // (ユーザがツールを閉じた → AutoPush が version=N で Push → 直後にトレイ「終了」
+            //  → Shutdown Push で同じ内容を version=N+1 で再 Push、という無駄な
+            //  version インクリメントを防ぐ。)
+            if (options.SkipPushForTools.Contains(def.Key))
+            {
+                steps.Add(new ShutdownSyncStep
+                {
+                    ToolKey = def.Key,
+                    DisplayName = def.DisplayName,
+                    Kind = ShutdownSyncStepKind.PushSkipped,
+                    Message = "直近の自動 Push で既に Push 済み",
                 });
                 continue;
             }
