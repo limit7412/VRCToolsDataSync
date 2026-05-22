@@ -349,21 +349,24 @@ public partial class App : Application
         //     既に走り始めた AutoPush は止まらない。Stop 後に WaitForInFlightPushAsync
         //     で完了を待たないと、終了時 Push と並走して manifest 競合する。
         try { Coordinator?.Stop(); LogLifecycle("ExitApplication.Coordinator.Stop ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Stop fail: " + ex.Message); }
+        var inFlightDone = true;
         try
         {
             if (Coordinator is not null)
             {
-                var inFlightDone = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
-                // タイムアウト時は AutoPush が並走しているまま終了 Push に入ることになるため
-                // 警告ログを残す。終了処理自体は止められないので進める他ない。
+                inFlightDone = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
                 LogLifecycle(inFlightDone
                     ? "ExitApplication.WaitForInFlightPush ok"
-                    : "ExitApplication.WaitForInFlightPush TIMED OUT - AutoPush may still be running, proceeding with shutdown push (manifest conflict risk)");
+                    : "ExitApplication.WaitForInFlightPush TIMED OUT - AutoPush may still be running, will skip shutdown push to avoid manifest conflict");
             }
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.WaitForInFlightPush fail: " + ex.Message); }
 
         // (1) ツール停止 + Push。Orchestrator が判断する。
+        // 待機がタイムアウトしている場合は AutoPush と並走するリスクが高いので、
+        // Push を全件 skip する (Stop だけは通常通り走る)。データロスの可能性は
+        // 残るが、manifest 競合で全 Push が失敗する方が後始末しづらいので
+        // 「次回起動時に手動 Push してもらう」を選択する。
         try
         {
             var settings = Runner.LoadSettings();
@@ -373,8 +376,9 @@ public partial class App : Application
             var steps = await orchestrator.RunAsync(settings, new ShutdownSyncOptions
             {
                 ForceStopAllSyncedTools = forceStopAllSyncedTools,
+                SkipPush = !inFlightDone,
             });
-            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count}");
+            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone}");
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
 

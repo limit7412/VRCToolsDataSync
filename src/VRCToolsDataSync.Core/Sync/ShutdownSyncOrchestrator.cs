@@ -35,6 +35,10 @@ public sealed class ShutdownSyncOptions
     public bool ForceStopAllSyncedTools { get; init; }
     // SessionEnding のように猶予が短い経路で呼ぶ場合、Push まで含めて
     // 早めに切り上げたい。CancellationToken でキャンセル可能。
+
+    // 終了直前の Push をすべてスキップする。AutoPush 待機がタイムアウトしたなど、
+    // 並走 Push による manifest 競合リスクが高い経路で使う。Stop だけは通常通り走る。
+    public bool SkipPush { get; init; }
 }
 
 /// <summary>
@@ -112,10 +116,13 @@ public sealed class ShutdownSyncOrchestrator
             });
         }
 
-        // (2) Push。CloudFolderPath が無ければスキップ。
-        if (!cloudAvailable)
+        // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたらスキップ。
+        if (!cloudAvailable || options.SkipPush)
         {
-            _logger.LogInformation("ShutdownSync push skipped: cloud folder not configured");
+            var reason = options.SkipPush
+                ? "呼び出し元の指示で Push をスキップ"
+                : "OneDrive フォルダ未設定";
+            _logger.LogInformation("ShutdownSync push skipped: {Reason}", reason);
             foreach (var def in toolDefs)
             {
                 steps.Add(new ShutdownSyncStep
@@ -123,7 +130,7 @@ public sealed class ShutdownSyncOrchestrator
                     ToolKey = def.Key,
                     DisplayName = def.DisplayName,
                     Kind = ShutdownSyncStepKind.PushSkipped,
-                    Message = "OneDrive フォルダ未設定",
+                    Message = reason,
                 });
             }
             return steps;
