@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
@@ -116,20 +117,29 @@ public sealed class ToolProcessController
             {
                 try
                 {
-                    if (!p.HasExited && p.MainWindowHandle != IntPtr.Zero)
+                    if (p.HasExited) continue;
+                    // Process.CloseMainWindow / p.MainWindowHandle は
+                    // 「タスクトレイ常駐でメインウィンドウが Hide 状態」のツール
+                    // (VRCX / VRC Friend Connect など) では IntPtr.Zero になり
+                    // WM_CLOSE が一切送られないため、15 秒タイムアウトで停止失敗 →
+                    // 終了時 Push 全件スキップ、という挙動になる。
+                    // 代わりに EnumWindows でプロセス所有の全トップレベル HWND を
+                    // 列挙し、それぞれに PostMessage(WM_CLOSE) を送る。非表示
+                    // ウィンドウにも届くので、Electron / WinForms 系のトレイ
+                    // 常駐ツールでもクリーン終了できる。
+                    var posted = PostWmCloseToAllProcessWindows((uint)p.Id);
+                    if (posted == 0)
                     {
-                        p.CloseMainWindow();
+                        _logger.LogDebug("Process {Pid} has no top-level window; WM_CLOSE skipped", p.Id);
                     }
-                    else if (!p.HasExited)
+                    else
                     {
-                        // メインウィンドウが無い (バックグラウンド) 場合は CloseMainWindow が
-                        // 効かないので何もしない。WM_CLOSE 送信失敗時は呼び出し側で Kill 判断。
-                        _logger.LogDebug("Process {Pid} has no MainWindow; CloseMainWindow skipped", p.Id);
+                        _logger.LogDebug("Posted WM_CLOSE to {Count} window(s) of pid={Pid}", posted, p.Id);
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "CloseMainWindow failed for pid={Pid}", p.Id);
+                    _logger.LogWarning(ex, "WM_CLOSE post failed for pid={Pid}", p.Id);
                 }
             }
 
@@ -206,6 +216,49 @@ public sealed class ToolProcessController
         try { return p.ProcessName; }
         catch { return null; }
     }
+
+    /// <summary>
+    /// 指定 PID が所有する全トップレベルウィンドウに WM_CLOSE を投げる。
+    /// 戻り値は送信に成功したウィンドウ数。Process.CloseMainWindow と違って、
+    /// 非表示 (タスクトレイ常駐) のメインウィンドウにも届くので、
+    /// VRCX や VRC Friend Connect のような常駐型ツールでも閉じられる。
+    /// </summary>
+    private static int PostWmCloseToAllProcessWindows(uint targetPid)
+    {
+        var posted = 0;
+        EnumWindows((hwnd, _) =>
+        {
+            try
+            {
+                GetWindowThreadProcessId(hwnd, out var pid);
+                if (pid == targetPid)
+                {
+                    if (PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero))
+                    {
+                        posted++;
+                    }
+                }
+            }
+            catch { /* best-effort: 1 ウィンドウの失敗で列挙全体を止めない */ }
+            return true; // continue enumeration
+        }, IntPtr.Zero);
+        return posted;
+    }
+
+    private const uint WM_CLOSE = 0x0010;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     /// <summary>
     /// <paramref name="processNames"/> がすべて終了するまで待機する。

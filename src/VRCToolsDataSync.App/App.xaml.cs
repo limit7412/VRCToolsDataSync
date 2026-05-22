@@ -328,14 +328,69 @@ public partial class App : Application
         }
     }
 
-    private static void ExitApplication()
+    // Tray の ExitRequested は同期メソッド型なので、async ロジックを内部関数に
+    // 切り出してファイア&フォーゲットで走らせる。多重呼び出しは _isExiting で防止。
+    // Tray「終了」では各ツールを能動停止せず、既に終了しているツールだけ Push する。
+    // (VRCX / VRC Friend Connect は WM_CLOSE では「トレイに最小化」だけでプロセスが
+    //  生き残るため、自前で停止することは諦めた)
+    private static void ExitApplication() => _ = ExitApplicationAsync(waitForToolsToExit: null);
+
+    /// <summary>
+    /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
+    /// 終了済みのツールだけ Push → Environment.Exit。
+    /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、
+    /// 値あり = タイムアウトまで自然終了を待つ (SessionEnding 経路)。
+    /// </summary>
+    internal static async System.Threading.Tasks.Task ExitApplicationAsync(TimeSpan? waitForToolsToExit)
     {
         LogLifecycle("ExitApplication.entered isExiting=" + _isExiting);
         // 既に終了処理中なら再入を防ぐ。
         if (_isExiting) return;
         _isExiting = true;
 
-        // 後始末を best-effort で実行してから Environment.Exit(0) で確実に殺す。
+        // (0) Coordinator を停止 (Dispose ではなく Stop)。これ以降の Push は手動で呼ぶ。
+        //     Stop は監視解除 + 世代 Cancel しかしないため、HandleProcessExited で
+        //     既に走り始めた AutoPush は止まらない。Stop 後に WaitForInFlightPushAsync
+        //     で完了を待たないと、終了時 Push と並走して manifest 競合する。
+        try { Coordinator?.Stop(); LogLifecycle("ExitApplication.Coordinator.Stop ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Stop fail: " + ex.Message); }
+        var inFlightDone = true;
+        IReadOnlyList<string> autoPushedTools = System.Array.Empty<string>();
+        try
+        {
+            if (Coordinator is not null)
+            {
+                var waitResult = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                inFlightDone = waitResult.Completed;
+                autoPushedTools = waitResult.PushedToolKeys;
+                LogLifecycle(inFlightDone
+                    ? $"ExitApplication.WaitForInFlightPush ok autoPushed=[{string.Join(",", autoPushedTools)}]"
+                    : "ExitApplication.WaitForInFlightPush TIMED OUT - AutoPush may still be running, will skip shutdown push to avoid manifest conflict");
+            }
+        }
+        catch (Exception ex) { LogLifecycle("ExitApplication.WaitForInFlightPush fail: " + ex.Message); }
+
+        // (1) 各ツールが終了済みかチェック → 終了済みのツールだけ Push。
+        //     SessionEnding 経路では waitForToolsToExit が指定されるので、その時間まで
+        //     自然終了を待つ。Tray「終了」経路では null = 即時チェックして起動中なら Push スキップ。
+        //     AutoPush 待機がタイムアウトしている場合は二重 Push を避けるため全件 Push スキップ。
+        //     直近 AutoPush で Push 済みのツール (autoPushedTools) は二重 Push を避けてスキップ。
+        try
+        {
+            var settings = Runner.LoadSettings();
+            var orchestrator = new ShutdownSyncOrchestrator(
+                Runner,
+                logger: Runner.CreateLogger<ShutdownSyncOrchestrator>());
+            var steps = await orchestrator.RunAsync(settings, new ShutdownSyncOptions
+            {
+                WaitForToolsToExit = waitForToolsToExit,
+                SkipPush = !inFlightDone,
+                SkipPushForTools = autoPushedTools,
+            });
+            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone} waitForExit={waitForToolsToExit?.TotalSeconds.ToString("0.#") ?? "null"} skipForTools=[{string.Join(",", autoPushedTools)}]");
+        }
+        catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
+
+        // (2) Coordinator を完全に Dispose してから Tray もきれいに片付ける。
         try { Coordinator?.Dispose(); LogLifecycle("ExitApplication.Coordinator.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Dispose fail: " + ex.Message); }
         Coordinator = null;
         try { Tray.Dispose(); LogLifecycle("ExitApplication.Tray.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Tray.Dispose fail: " + ex.Message); }
