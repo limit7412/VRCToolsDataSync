@@ -220,15 +220,23 @@ public partial class MainPageViewModel : ObservableObject
 
     private void ApplyLaunchPropertiesToSettings()
     {
+        // 既存の Arguments は GUI で編集できないが、JSON を手編集して
+        // 起動オプションを与えているユーザもいる。設定保存のたびに
+        // 新規 ToolLaunchConfig を作ると Arguments が消えるので、
+        // 既存 entry の値を引き継いでから上書きする。
+        var existingVrcx = _settings.Launch.GetValueOrDefault(VrcxSyncService.Key);
         _settings.Launch[VrcxSyncService.Key] = new ToolLaunchConfig
         {
             ExecutablePath = string.IsNullOrWhiteSpace(VrcxExecutablePath) ? null : VrcxExecutablePath.Trim(),
+            Arguments = existingVrcx?.Arguments,
             LaunchOnAppStart = VrcxLaunchOnAppStart,
             StopOnAppExit = VrcxStopOnAppExit,
         };
+        var existingFc = _settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key);
         _settings.Launch[FriendConnectSyncService.Key] = new ToolLaunchConfig
         {
             ExecutablePath = string.IsNullOrWhiteSpace(FriendConnectExecutablePath) ? null : FriendConnectExecutablePath.Trim(),
+            Arguments = existingFc?.Arguments,
             LaunchOnAppStart = FriendConnectLaunchOnAppStart,
             StopOnAppExit = FriendConnectStopOnAppExit,
         };
