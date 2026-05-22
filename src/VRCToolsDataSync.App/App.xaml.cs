@@ -49,14 +49,50 @@ public partial class App : Application
 
     // Issue #6: 起動時の Pull → Launch のステップログ。MainPage / UI 側で
     // 起動直後のサマリをログに出すのに使う (GUI 構築前に走るため、ここに溜める)。
-    public static System.Collections.Generic.IReadOnlyList<StartupSyncStep> StartupSyncSteps { get; private set; } =
-        System.Array.Empty<StartupSyncStep>();
+    // 直接読まずに必ず SubscribeStartupSyncSteps 経由で取り出すこと
+    // (取り込みと購読の競合を回避するため)。
+    private static readonly object _startupSyncStepsLock = new();
+    private static System.Collections.Generic.IReadOnlyList<StartupSyncStep>? _startupSyncSteps;
+    private static Action<System.Collections.Generic.IReadOnlyList<StartupSyncStep>>? _startupSyncStepsHandlers;
 
-    // バックグラウンドで Run が完了した時に発火。MainPage が VM 取得後に
-    // この通知を受け取って GUI ログに反映する。Window 表示後に Run が終わる
-    // 可能性もあるため、初期コンストラクタの IngestStartupSteps とは別経路で
-    // 取り込めるようイベントを公開しておく。
-    public static event Action<System.Collections.Generic.IReadOnlyList<StartupSyncStep>>? StartupSyncStepsAvailable;
+    /// <summary>
+    /// 起動同期 (Pull → Launch) のステップ取り込み口を購読する。
+    /// 「既に Run 完了済みなら直ちに <paramref name="handler"/> を呼ぶ」「未完了なら次の Run 完了時に呼ぶ」を
+    /// lock 下でアトミックに行うので、判定と購読の隙間でステップを取りこぼしたり
+    /// 二重取り込みしたりすることが無い。
+    /// </summary>
+    public static void SubscribeStartupSyncSteps(Action<System.Collections.Generic.IReadOnlyList<StartupSyncStep>> handler)
+    {
+        System.Collections.Generic.IReadOnlyList<StartupSyncStep>? alreadyAvailable;
+        lock (_startupSyncStepsLock)
+        {
+            alreadyAvailable = _startupSyncSteps;
+            _startupSyncStepsHandlers += handler;
+        }
+        if (alreadyAvailable is not null)
+        {
+            try { handler(alreadyAvailable); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// バックグラウンドの Orchestrator.Run 完了時に呼び、ステップを保存して
+    /// 既存購読者へも通知する。lock で <see cref="SubscribeStartupSyncSteps"/> と
+    /// 競合しないようにする。
+    /// </summary>
+    private static void PublishStartupSyncSteps(System.Collections.Generic.IReadOnlyList<StartupSyncStep> steps)
+    {
+        Action<System.Collections.Generic.IReadOnlyList<StartupSyncStep>>? handlers;
+        lock (_startupSyncStepsLock)
+        {
+            _startupSyncSteps = steps;
+            handlers = _startupSyncStepsHandlers;
+        }
+        if (handlers is not null)
+        {
+            try { handlers(steps); } catch { /* best-effort */ }
+        }
+    }
 
     public static TrayIconManager Tray { get; } = new();
 
@@ -172,12 +208,11 @@ public partial class App : Application
                             Runner,
                             logger: Runner.CreateLogger<StartupSyncOrchestrator>());
                         var steps = orchestrator.Run(settings);
-                        StartupSyncSteps = steps;
                         LogLifecycle($"StartupSync.steps={steps.Count}");
-                        // MainPage が後から VM を生成した時にも IngestStartupSteps で
-                        // ログに反映できるよう、ここでは Window 表示済みの場合のみ
-                        // 既存の VM へディスパッチして通知する。
-                        StartupSyncStepsAvailable?.Invoke(steps);
+                        // ステップ保存と既存購読者への通知を 1 つのロック内で
+                        // 行う。これで MainPage の SubscribeStartupSyncSteps と
+                        // 競合しても取りこぼし/二重取り込みが起こらない。
+                        PublishStartupSyncSteps(steps);
                     }
                     catch (Exception ex) { LogStartupFailure("StartupSyncOrchestrator", ex); }
                     finally

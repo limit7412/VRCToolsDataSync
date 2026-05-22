@@ -27,20 +27,17 @@ public sealed partial class MainPage : Page
         }
 
         // Issue #6: App.OnLaunched でバックグラウンドで走った起動同期 (Pull → Launch)
-        // のステップを GUI のログに取り込む。
-        // - Run が既に完了済み: App.StartupSyncSteps に溜まっているので即時取り込み
-        // - 未完了: App.StartupSyncStepsAvailable イベントを購読し、完了時に取り込む
-        if (App.StartupSyncSteps.Count > 0)
-        {
-            ViewModel.IngestStartupSteps(App.StartupSyncSteps);
-        }
-        App.StartupSyncStepsAvailable += steps =>
+        // のステップを GUI のログに取り込む。SubscribeStartupSyncSteps が
+        // 「既に Run 完了済みなら即時呼び出し」「未完了なら次の完了で呼び出し」を
+        // lock 下でアトミックに行うため、判定と購読の隙間でステップを取りこぼしたり
+        // 二重取り込みしたりすることが無い。
+        App.SubscribeStartupSyncSteps(steps =>
         {
             App.DispatcherQueue.TryEnqueue(() =>
             {
                 try { ViewModel.IngestStartupSteps(steps); } catch { /* best-effort */ }
             });
-        };
+        });
     }
 
     private async void OnBrowseCloudFolder(object sender, RoutedEventArgs e)
