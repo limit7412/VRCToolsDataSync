@@ -39,7 +39,11 @@ public sealed class SyncRunner
             state.LastPushedAt = DateTimeOffset.Now;
             state.LastPulledVersion = result.RemoteVersion.Value;
             settings.ToolState[service.ToolKey] = state;
-            _store.Save(settings);
+            // Push 経由の Save は ToolState の更新だけが目的。Top-level 設定は
+            // disk 値を優先しないと、古いインスタンスを持った別経路 (CLI / 別
+            // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
+            // 等を巻き戻してしまう。
+            _store.SaveToolStateOnly(settings);
         }
         return result;
     }
@@ -62,7 +66,8 @@ public sealed class SyncRunner
             state.LastPulledVersion = result.RemoteVersion.Value;
             state.LastPulledAt = DateTimeOffset.Now;
             settings.ToolState[service.ToolKey] = state;
-            _store.Save(settings);
+            // Push と同じ理由で SaveToolStateOnly を使う。
+            _store.SaveToolStateOnly(settings);
         }
         return result;
     }

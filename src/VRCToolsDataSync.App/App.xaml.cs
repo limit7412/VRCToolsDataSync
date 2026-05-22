@@ -1,7 +1,9 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using H.NotifyIcon;
+using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
@@ -13,6 +15,18 @@ namespace VRCToolsDataSync_App;
 
 public partial class App : Application
 {
+    // 多重起動防止用の Named Mutex。
+    // 自動起動 + ユーザのショートカット二重起動などで 2 つの App プロセスが
+    // 並走すると、AutoSyncCoordinator が二重 Push を行って manifest.json の
+    // 競合検知が暴発するため、プロセス内 _autoPushLock では守れない領域として
+    // ここでガードする。Global\ プリフィクスは付けずユーザセッション内のみ排他にする。
+    private const string SingleInstanceMutexName = "VRCToolsDataSync.App.SingleInstance";
+    // 既存インスタンスへの「メインウィンドウ復帰」要求に使う Win32 メッセージ。
+    // RegisterWindowMessage はユーザセッション内で同名 → 同一 ID が返るため、
+    // 別プロセス間でも安全に同期できる。
+    private const string ShowWindowMessageName = "VRCToolsDataSync.App.ShowMainWindow";
+    private static Mutex? _singleInstanceMutex;
+    internal static uint ShowMainWindowMessageId { get; private set; }
     public static Window Window { get; private set; } = null!;
 
     public static Microsoft.UI.Dispatching.DispatcherQueue DispatcherQueue { get; private set; } = null!;
@@ -20,7 +34,16 @@ public partial class App : Application
     public static nint WindowHandle =>
         WinRT.Interop.WindowNative.GetWindowHandle(Window);
 
-    public static SyncRunner Runner { get; } = new();
+    // AutoSync 系の挙動を %AppData%\VRCToolsDataSync\logs\sync-YYYYMMDD.log に
+    // 残すため、GUI でも CLI と同じ FileLoggerProvider を共有する。
+    // SyncRunner / AutoSyncCoordinator / 各 SyncService がここから ILogger を取得する。
+    public static ILoggerFactory LoggerFactory { get; } = Microsoft.Extensions.Logging.LoggerFactory.Create(builder =>
+    {
+        builder.SetMinimumLevel(LogLevel.Information);
+        builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
+    });
+
+    public static SyncRunner Runner { get; } = new(loggerFactory: LoggerFactory);
 
     public static AutoSyncCoordinator? Coordinator { get; private set; }
 
@@ -48,6 +71,53 @@ public partial class App : Application
             LogStartupFailure("UnobservedTaskException", e.Exception);
             e.SetObserved();
         };
+    }
+
+    /// <summary>
+    /// 多重起動を検出した場合に true を返す。既存インスタンスに対しては
+    /// HWND_BROADCAST で復帰要求メッセージを送ってから自身は終了する想定。
+    /// </summary>
+    internal static bool TryAcquireSingleInstance()
+    {
+        try
+        {
+            ShowMainWindowMessageId = RegisterWindowMessage(ShowWindowMessageName);
+            _singleInstanceMutex = new Mutex(initiallyOwned: true, name: SingleInstanceMutexName, out var createdNew);
+            if (createdNew)
+            {
+                LogLifecycle("SingleInstance.acquired");
+                return true;
+            }
+            LogLifecycle("SingleInstance.already-running -> notify existing");
+            // 既存インスタンスに対して「ウィンドウを出して」とブロードキャスト。
+            // 受け側 (MainWindow の WndProc) がこのメッセージを拾って ShowMainWindow する。
+            if (ShowMainWindowMessageId != 0)
+            {
+                PostMessage(HWND_BROADCAST, ShowMainWindowMessageId, IntPtr.Zero, IntPtr.Zero);
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // ガードに失敗した場合は安全側に倒して起動を許可する。
+            LogStartupFailure("TryAcquireSingleInstance", ex);
+            return true;
+        }
+    }
+
+    internal static void ReleaseSingleInstance()
+    {
+        try
+        {
+            _singleInstanceMutex?.ReleaseMutex();
+        }
+        catch { /* best-effort */ }
+        try
+        {
+            _singleInstanceMutex?.Dispose();
+        }
+        catch { /* best-effort */ }
+        _singleInstanceMutex = null;
     }
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
@@ -218,6 +288,7 @@ public partial class App : Application
 
     private const int SW_SHOW = 5;
     private const int SW_RESTORE = 9;
+    private static readonly IntPtr HWND_BROADCAST = new(0xFFFF);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -230,4 +301,11 @@ public partial class App : Application
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint RegisterWindowMessage(string lpString);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 }

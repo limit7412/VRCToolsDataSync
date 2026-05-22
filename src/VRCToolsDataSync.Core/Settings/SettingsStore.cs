@@ -37,7 +37,23 @@ public sealed class SettingsStore
         return JsonSerializer.Deserialize<SyncSettings>(stream, JsonOptions) ?? new SyncSettings();
     }
 
-    public void Save(SyncSettings settings)
+    public void Save(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: false);
+
+    /// <summary>
+    /// ToolState の更新だけが目的の Save。Top-level の設定
+    /// (CloudFolderPath / MachineName / SyncVrcx / SyncFriendConnect /
+    /// AutoSyncEnabled) はディスク側の現行値を採用し、incoming は ToolState
+    /// のみを差し込む形でマージする。
+    ///
+    /// 通常の Save (= GUI の「設定を保存」ボタン) と違い、Push/Pull のような
+    /// 「Top-level 設定をユーザが触っていない経路」から呼ばれることを想定。
+    /// これがないと、GUI で AutoSyncEnabled=ON にした直後に CLI 等の別プロセス
+    /// が古い settings (AutoSyncEnabled=false) で Push して store.Save を呼ぶと、
+    /// その古い値で上書きされて ON 設定が消えてしまう。
+    /// </summary>
+    public void SaveToolStateOnly(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: true);
+
+    private void SaveInternal(SyncSettings settings, bool mergeTopLevelFromDisk)
     {
         var dir = Path.GetDirectoryName(FilePath);
         if (!string.IsNullOrEmpty(dir))
@@ -54,7 +70,7 @@ public sealed class SettingsStore
             // tool キー単位でマージする。これにより、別プロセス/別 SyncRunner
             // が同じ settings.json に対して別 tool の状態更新を入れた直後でも、
             // 自分の Save がそれを消し飛ばさない。
-            var merged = MergeForSave(settings);
+            var merged = MergeForSave(settings, mergeTopLevelFromDisk);
 
             var tmp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
             try
@@ -90,30 +106,48 @@ public sealed class SettingsStore
 
     /// <summary>
     /// 呼び出し元の <paramref name="incoming"/> とディスクの現行 settings を
-    /// マージした結果を返す。Top-level の設定 (CloudFolderPath, MachineName,
-    /// SyncVrcx, SyncFriendConnect, AutoSyncEnabled) は incoming を優先する。
+    /// マージした結果を返す。
+    /// <para>
+    /// <paramref name="mergeTopLevelFromDisk"/> が false (通常の Save) の場合、
+    /// Top-level 設定 (CloudFolderPath, MachineName, SyncVrcx, SyncFriendConnect,
+    /// AutoSyncEnabled) は incoming を優先する。
+    /// </para>
+    /// <para>
+    /// true (SaveToolStateOnly) の場合、Top-level 設定はディスク側を採用する。
+    /// Push/Pull の付随 Save がユーザの Top-level 設定変更を巻き戻すのを防ぐ。
+    /// ディスクに settings.json が無い場合 (初回) は incoming を採用する。
+    /// </para>
     /// ToolState は tool キーごとに、より新しいタイムスタンプを持つ側を採用する。
     /// </summary>
-    private SyncSettings MergeForSave(SyncSettings incoming)
+    private SyncSettings MergeForSave(SyncSettings incoming, bool mergeTopLevelFromDisk)
     {
         SyncSettings disk;
+        bool diskAvailable;
         try
         {
+            diskAvailable = File.Exists(FilePath);
             disk = Load();
         }
         catch
         {
             // 読み込めない場合 (初回 / ファイル破損) はマージ不要、incoming をそのまま使う。
             disk = new SyncSettings();
+            diskAvailable = false;
         }
 
+        // Top-level の採用元を決める。
+        // - 通常 Save: incoming (ユーザが触った最新値)
+        // - ToolState 専用 Save: ディスク (Push/Pull は Top-level を変えない)
+        //   ただしディスクに既存ファイルが無い場合は incoming にフォールバック
+        //   しないと、初回 Push でユーザ設定がデフォルト値に潰れる。
+        var topLevelSource = (mergeTopLevelFromDisk && diskAvailable) ? disk : incoming;
         var result = new SyncSettings
         {
-            CloudFolderPath = incoming.CloudFolderPath,
-            MachineName = incoming.MachineName,
-            SyncVrcx = incoming.SyncVrcx,
-            SyncFriendConnect = incoming.SyncFriendConnect,
-            AutoSyncEnabled = incoming.AutoSyncEnabled,
+            CloudFolderPath = topLevelSource.CloudFolderPath,
+            MachineName = topLevelSource.MachineName,
+            SyncVrcx = topLevelSource.SyncVrcx,
+            SyncFriendConnect = topLevelSource.SyncFriendConnect,
+            AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
             ToolState = new Dictionary<string, ToolSyncState>(),
         };
 

@@ -21,7 +21,10 @@ public partial class MainPageViewModel : ObservableObject
     // ダイアログ呼び出しはここでシリアライズして待ち合わせる。
     private readonly SemaphoreSlim _dialogGate = new(1, 1);
 
-    public MainPageViewModel() : this(new SyncRunner()) { }
+    // x:Bind 用の引数なしコンストラクタ。GUI ホストでは必ず App.Runner を共有して、
+    // App 側で構成された FileLoggerProvider 経由でログが出るようにする。
+    // (テスト等から MainPageViewModel 単体で生成したい場合は引数付きを使う)
+    public MainPageViewModel() : this(App.Runner) { }
 
     public MainPageViewModel(SyncRunner runner)
     {
