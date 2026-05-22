@@ -47,23 +47,23 @@ public partial class MainPageViewModel : ObservableObject
     /// 直後に呼び出される想定 (Window 構築前に走った StartupSyncOrchestrator
     /// のステップを GUI 上のログに反映するため)。
     /// </summary>
-    public void IngestStartupSteps(IReadOnlyList<StartupSyncStep> steps)
+    public void IngestStartupSteps(IReadOnlyList<StartupSyncStep> steps, string logPrefix = "startup")
     {
         foreach (var step in steps)
         {
             switch (step.Kind)
             {
                 case StartupSyncStepKind.PullStarted:
-                    AppendLog($"[startup] {step.DisplayName} Pull 開始...");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 開始...");
                     break;
                 case StartupSyncStepKind.PullSucceeded:
-                    AppendLog($"[startup] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
                     break;
                 case StartupSyncStepKind.PullFailed:
-                    AppendLog($"[startup] {step.DisplayName} Pull 失敗: {step.Message}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 失敗: {step.Message}");
                     break;
                 case StartupSyncStepKind.PullSkipped:
-                    AppendLog($"[startup] {step.DisplayName} Pull スキップ: {step.Message}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull スキップ: {step.Message}");
                     break;
                 case StartupSyncStepKind.LaunchAttempted:
                     var outcome = step.LaunchResult?.Outcome;
@@ -75,15 +75,23 @@ public partial class MainPageViewModel : ObservableObject
                         ToolLaunchOutcome.LaunchFailed => $"起動失敗: {step.Message}",
                         _ => outcome?.ToString() ?? "不明",
                     };
-                    AppendLog($"[startup] {step.DisplayName} {msg}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} {msg}");
                     break;
                 case StartupSyncStepKind.LaunchSkipped:
                     // 自動起動 OFF 時のログはノイズなので出さない。
                     break;
             }
         }
-        // 起動時 Pull で ToolState が更新されている可能性があるので、Coordinator
-        // に最新の settings をリロードして渡す。VM 側の _settings も差し替える。
+        RefreshSettingsAndStatus();
+    }
+
+    /// <summary>
+    /// 起動同期 / 終了同期 / 再起動同期 のいずれかが Push/Pull を行った後に呼び、
+    /// VM が保持する settings をディスクから読み直して Coordinator にも反映する。
+    /// 古い ToolState で続く処理が動かないようにするための共通後処理。
+    /// </summary>
+    private void RefreshSettingsAndStatus()
+    {
         _settings = _runner.LoadSettings();
         _coordinator?.RefreshSettings(_settings);
         RefreshStatusSummaries();
@@ -282,14 +290,14 @@ public partial class MainPageViewModel : ObservableObject
             {
                 WaitForToolsToExit = null,
             });
-            IngestShutdownSteps(shutdownSteps);
+            IngestShutdownSteps(shutdownSteps, logPrefix: "restart");
 
             // (2) Pull → Launch を回す
             var startup = new StartupSyncOrchestrator(
                 _runner,
                 logger: _runner.CreateLogger<StartupSyncOrchestrator>());
             var startupSteps = await Task.Run(() => startup.Run(_settings));
-            IngestStartupSteps(startupSteps);
+            IngestStartupSteps(startupSteps, logPrefix: "restart");
         }
         catch (Exception ex)
         {
@@ -301,28 +309,29 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
-    private void IngestShutdownSteps(IReadOnlyList<ShutdownSyncStep> steps)
+    /// <summary>
+    /// ShutdownSyncOrchestrator のステップを GUI ログに流し、最後に
+    /// settings / Coordinator を最新化する。<paramref name="logPrefix"/> は
+    /// 呼び出し元 (再起動 / 終了など) を区別するためのログ接頭辞。
+    /// </summary>
+    public void IngestShutdownSteps(IReadOnlyList<ShutdownSyncStep> steps, string logPrefix = "shutdown")
     {
         foreach (var step in steps)
         {
             var line = step.Kind switch
             {
-                ShutdownSyncStepKind.StopStarted => $"[restart] {step.DisplayName} 停止要求",
-                ShutdownSyncStepKind.StopSucceeded => $"[restart] {step.DisplayName} 停止完了",
-                ShutdownSyncStepKind.StopTimedOut => $"[restart] {step.DisplayName} 停止タイムアウト",
-                ShutdownSyncStepKind.PushStarted => $"[restart] {step.DisplayName} Push 開始",
-                ShutdownSyncStepKind.PushSucceeded => $"[restart] {step.DisplayName} Push 完了 v{step.PushResult?.RemoteVersion}",
-                ShutdownSyncStepKind.PushFailed => $"[restart] {step.DisplayName} Push 失敗: {step.Message}",
-                ShutdownSyncStepKind.PushSkipped => $"[restart] {step.DisplayName} Push スキップ: {step.Message}",
+                ShutdownSyncStepKind.StopStarted => $"[{logPrefix}] {step.DisplayName} 停止要求",
+                ShutdownSyncStepKind.StopSucceeded => $"[{logPrefix}] {step.DisplayName} 停止完了",
+                ShutdownSyncStepKind.StopTimedOut => $"[{logPrefix}] {step.DisplayName} 停止タイムアウト",
+                ShutdownSyncStepKind.PushStarted => $"[{logPrefix}] {step.DisplayName} Push 開始",
+                ShutdownSyncStepKind.PushSucceeded => $"[{logPrefix}] {step.DisplayName} Push 完了 v{step.PushResult?.RemoteVersion}",
+                ShutdownSyncStepKind.PushFailed => $"[{logPrefix}] {step.DisplayName} Push 失敗: {step.Message}",
+                ShutdownSyncStepKind.PushSkipped => $"[{logPrefix}] {step.DisplayName} Push スキップ: {step.Message}",
                 _ => null,
             };
             if (line is not null) AppendLog(line);
         }
-        // ShutdownSyncOrchestrator が Push を打って ToolState が更新されている
-        // ので、起動シーケンスに入る前に最新を読み直す。
-        _settings = _runner.LoadSettings();
-        _coordinator?.RefreshSettings(_settings);
-        RefreshStatusSummaries();
+        RefreshSettingsAndStatus();
     }
 
     /// <summary>

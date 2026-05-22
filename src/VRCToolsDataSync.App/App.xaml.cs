@@ -380,12 +380,13 @@ public partial class App : Application
     public static MainPage? Page { get; set; }
 
     /// <summary>
-    /// トレイ「同期して起動」ハンドラ。MainPage が初期化済みであれば VM の
-    /// コマンドを叩く。未初期化なら MainWindow を表示してから VM 側に委ねる。
+    /// トレイ「同期して起動」ハンドラ。MainWindow を表示してから VM の
+    /// コマンドを叩く。Window を先に出すのは、進捗ログをユーザに見せたいから。
     /// </summary>
     private static void OnTraySyncAndLaunch()
     {
         LogLifecycle("Tray.SyncAndLaunch entered");
+        ShowMainWindow();
         DispatcherQueue.TryEnqueue(() =>
         {
             var vm = Page?.ViewModel;
