@@ -156,7 +156,11 @@ public sealed class ToolProcessController
                 }
             }
 
-            // initial の各 HasExited で最終判定する。生きていれば名前を返す。
+            // 最終判定。initial で掴んだ Process が全て HasExited でも、
+            // 待機中に同名で再起動されたケース (ユーザが立ち上げ直した、ツールの
+            // 自己リスタート機能など) があるので、processNames で再スキャンする。
+            // ここで生き残りを取りこぼすと、Stop が StoppedGracefully を返した直後の
+            // Push が実行中プロセスにぶつかって失敗する。
             var stillRunning = new List<string>();
             foreach (var p in initial)
             {
@@ -165,6 +169,10 @@ public sealed class ToolProcessController
                     var name = SafeProcessName(p);
                     if (name is not null && !stillRunning.Contains(name)) stillRunning.Add(name);
                 }
+            }
+            foreach (var name in _launcher.FindRunning(processNames))
+            {
+                if (!stillRunning.Contains(name)) stillRunning.Add(name);
             }
             return new ToolStopResult
             {
@@ -230,7 +238,9 @@ public sealed class ToolProcessController
             {
                 if (!p.HasExited) return false;
             }
-            return true;
+            // initial が全て終了済みでも、待機中に同名で再起動された可能性が
+            // あるため、processNames で再スキャンして生き残りが無いことを確認する。
+            return _launcher.FindRunning(processNames).Count == 0;
         }
         finally
         {
