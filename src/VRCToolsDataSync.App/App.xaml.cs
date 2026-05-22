@@ -387,29 +387,38 @@ public partial class App : Application
         LogLifecycle("OnSessionEnding entered reason=" + e.Reason);
         // SessionEnding はバックグラウンドスレッドで呼ばれる。Window へ
         // 直接アクセスすると COMException になるので、必ずキャッシュ HWND を使う。
+        // ShutdownBlockReasonCreate / Destroy は「対象 hWnd を作成したスレッド」から
+        // 呼ぶ必要があるため (Win32 仕様)、DispatcherQueue で UI スレッドへ転送する。
+        // バックグラウンドスレッドから直接呼ぶと ERROR_ACCESS_DENIED で失敗する。
 
         // シャットダウンを最大 SessionEndPushTimeout 秒だけ延長する。
         var hwnd = _cachedWindowHandle;
-        try
+        InvokeOnUiThread(() =>
         {
-            if (hwnd != IntPtr.Zero)
+            try
             {
-                ShutdownBlockReasonCreate(hwnd, "同期処理を完了するまでお待ちください...");
+                if (hwnd != IntPtr.Zero)
+                {
+                    ShutdownBlockReasonCreate(hwnd, "同期処理を完了するまでお待ちください...");
+                }
             }
-        }
-        catch (Exception ex) { LogLifecycle("ShutdownBlockReasonCreate fail: " + ex.Message); }
+            catch (Exception ex) { LogLifecycle("ShutdownBlockReasonCreate fail: " + ex.Message); }
+        });
 
         // SessionEnding が複数回呼ばれる可能性があるので、CTS はその都度
         // 新規に作って入れ替える。Cancel 済みの CTS のトークンは復活できないため、
         // 前回タイムアウトでキャンセル済みのものを使い回すと、次回の Push が
         // 最初からキャンセル状態で始まってしまう。
+        //
+        // 旧版で「入れ替え時に古い CTS を即 Dispose」していたが、再入したケースで
+        // 先行ハンドラ側の cts.Cancel() が ObjectDisposedException で失敗していた。
+        // CancellationTokenSource はネイティブハンドルを持たない managed リソース
+        // なので、ここで明示 Dispose せず GC に任せる方が安全。
         CancellationTokenSource cts;
         lock (_sessionEndCtsLock)
         {
-            var old = _sessionEndCts;
             _sessionEndCts = new CancellationTokenSource();
             cts = _sessionEndCts;
-            try { old.Dispose(); } catch { /* best-effort */ }
         }
         try
         {
@@ -429,12 +438,39 @@ public partial class App : Application
         catch (Exception ex) { LogLifecycle("OnSessionEnding ExitApplicationAsync fail: " + ex.Message); }
         finally
         {
-            try
+            InvokeOnUiThread(() =>
             {
-                if (hwnd != IntPtr.Zero) ShutdownBlockReasonDestroy(hwnd);
-            }
-            catch { /* best-effort */ }
+                try
+                {
+                    if (hwnd != IntPtr.Zero) ShutdownBlockReasonDestroy(hwnd);
+                }
+                catch { /* best-effort */ }
+            });
         }
+    }
+
+    /// <summary>
+    /// 指定アクションを UI スレッドで同期的に実行する。
+    /// SessionEnding ハンドラなどのバックグラウンドスレッドから、HWND を作成した
+    /// UI スレッド経由でしか呼べない Win32 API (ShutdownBlockReasonCreate 等) を
+    /// 呼ぶときに使う。UI スレッド上から呼ばれた場合はそのまま実行する。
+    /// </summary>
+    private static void InvokeOnUiThread(Action action)
+    {
+        if (DispatcherQueue is null || DispatcherQueue.HasThreadAccess)
+        {
+            action();
+            return;
+        }
+        using var done = new ManualResetEventSlim(false);
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            try { action(); }
+            finally { done.Set(); }
+        });
+        // ShutdownBlockReasonCreate/Destroy は数 ms で終わる軽い呼び出しなので、
+        // UI スレッドの完了を 2 秒だけ待つ (UI スレッドが応答不能なら諦める)。
+        done.Wait(TimeSpan.FromSeconds(2));
     }
 
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
