@@ -227,6 +227,16 @@ public partial class App : Application
             Window = new MainWindow();
             Window.Closed += OnWindowClosed;
             Window.Activate();
+
+            // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
+            // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
+            // 最大 15 秒だけシャットダウンを延長して Push を完了させる。
+            try
+            {
+                Microsoft.Win32.SystemEvents.SessionEnding += OnSessionEnding;
+                LogLifecycle("SessionEnding handler registered");
+            }
+            catch (Exception ex) { LogStartupFailure("SessionEnding.register", ex); }
         }
         catch (Exception ex)
         {
@@ -335,6 +345,57 @@ public partial class App : Application
     //  生き残るため、自前で停止することは諦めた)
     private static void ExitApplication() => _ = ExitApplicationAsync(waitForToolsToExit: null);
 
+    /// Windows ログオフ / シャットダウンのハンドラ。SystemEvents から呼ばれる。
+    /// 既定の Windows のシャットダウン猶予 (約 5 秒) では Push が間に合わないため、
+    /// <c>ShutdownBlockReasonCreate</c> で「同期中…」と表示して最大 <c>SessionEndPushTimeout</c>
+    /// 秒だけシャットダウンを延長する。
+    /// この経路では各ツール (VRCX / VRC Friend Connect) も同時にシャットダウン
+    /// シーケンスで終了していくため、waitForToolsToExit にタイムアウトを渡して
+    /// 自然終了を待ち、終了済みになったツールについて Push する。
+    /// </summary>
+    private static readonly TimeSpan SessionEndPushTimeout = TimeSpan.FromSeconds(15);
+
+    private static void OnSessionEnding(object sender, Microsoft.Win32.SessionEndingEventArgs e)
+    {
+        LogLifecycle("OnSessionEnding entered reason=" + e.Reason);
+        if (_isExiting)
+        {
+            LogLifecycle("OnSessionEnding skip: already exiting");
+            return;
+        }
+
+        // シャットダウンを最大 SessionEndPushTimeout 秒だけ延長する。
+        try
+        {
+            var hwnd = Window is null ? IntPtr.Zero : WindowHandle;
+            if (hwnd != IntPtr.Zero)
+            {
+                ShutdownBlockReasonCreate(hwnd, "同期処理を完了するまでお待ちください...");
+            }
+        }
+        catch (Exception ex) { LogLifecycle("ShutdownBlockReasonCreate fail: " + ex.Message); }
+
+        try
+        {
+            // SystemEvents のスレッドではダイアログを出せないので、同期的に完了を待つ。
+            // 15 秒の壁を越えると Windows 側に殺される可能性があるため、ツール終了待ちと
+            // 全体ウェイトを 15 秒に揃えて諦める。SessionEnding 経路では各ツールも
+            // 同時にシャットダウンで終了していくはずなので、自然終了を待ってから Push する。
+            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout);
+            task.Wait(SessionEndPushTimeout);
+        }
+        catch (Exception ex) { LogLifecycle("OnSessionEnding ExitApplicationAsync fail: " + ex.Message); }
+        finally
+        {
+            try
+            {
+                var hwnd = Window is null ? IntPtr.Zero : WindowHandle;
+                if (hwnd != IntPtr.Zero) ShutdownBlockReasonDestroy(hwnd);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
     /// <summary>
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
     /// 終了済みのツールだけ Push → Environment.Exit。
@@ -437,4 +498,14 @@ public partial class App : Application
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    // SessionEnding 中にシャットダウンを一時的にブロックして、Push を完了させる時間を稼ぐ。
+    // 表示文字列はユーザに「待ち時間が発生する理由」を伝える。
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string pwszReason);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
 }
