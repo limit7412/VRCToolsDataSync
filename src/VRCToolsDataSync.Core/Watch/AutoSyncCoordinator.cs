@@ -16,6 +16,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     private readonly ILogger<AutoSyncCoordinator> _logger;
     private readonly List<ToolBinding> _bindings = new();
     private readonly object _autoPushLock = new();
+    // Start / Stop / UpdateSettings のライフサイクル系操作を直列化する。
+    // App.OnLaunched 内で Coordinator.Start が Task.Run で非同期に走るように
+    // なったため、起動直後にユーザが「設定を保存」(UpdateSettings → Stop+Start)
+    // するとレースして _bindings が二重に並ぶ可能性がある。
+    private readonly object _lifecycleLock = new();
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
@@ -38,6 +43,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     }
 
     public void Start()
+    {
+        lock (_lifecycleLock) { StartCore(); }
+    }
+
+    private void StartCore()
     {
         if (_started) return;
         if (!_settings.AutoSyncEnabled) return;
@@ -87,6 +97,11 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Stop()
     {
+        lock (_lifecycleLock) { StopCore(); }
+    }
+
+    private void StopCore()
+    {
         if (!_started) return;
 
         // 切り離された HandleProcessExited タスクを中断するため、
@@ -110,9 +125,14 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void UpdateSettings(SyncSettings settings)
     {
-        _settings = settings;
-        Stop();
-        Start();
+        // Start / Stop と同じ lock を取って、未完了の Start と並走しないようにする。
+        // 内部で StopCore / StartCore を呼ぶことで再入を避ける (同じ lock を二重取得しない)。
+        lock (_lifecycleLock)
+        {
+            _settings = settings;
+            StopCore();
+            StartCore();
+        }
     }
 
     /// <summary>

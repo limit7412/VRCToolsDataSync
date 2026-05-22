@@ -25,6 +25,19 @@ public sealed partial class MainPage : Page
                 App.DispatcherQueue.TryEnqueue(() => action());
             });
         }
+
+        // Issue #6: App.OnLaunched でバックグラウンドで走った起動同期 (Pull → Launch)
+        // のステップを GUI のログに取り込む。SubscribeStartupSyncSteps が
+        // 「既に Run 完了済みなら即時呼び出し」「未完了なら次の完了で呼び出し」を
+        // lock 下でアトミックに行うため、判定と購読の隙間でステップを取りこぼしたり
+        // 二重取り込みしたりすることが無い。
+        App.SubscribeStartupSyncSteps(steps =>
+        {
+            App.DispatcherQueue.TryEnqueue(() =>
+            {
+                try { ViewModel.IngestStartupSteps(steps); } catch { /* best-effort */ }
+            });
+        });
     }
 
     private async void OnBrowseCloudFolder(object sender, RoutedEventArgs e)
@@ -41,6 +54,30 @@ public sealed partial class MainPage : Page
         {
             ViewModel.CloudFolderPath = folder.Path;
         }
+    }
+
+    private async void OnBrowseVrcxExecutable(object sender, RoutedEventArgs e)
+    {
+        var path = await PickExecutableAsync();
+        if (!string.IsNullOrEmpty(path)) ViewModel.VrcxExecutablePath = path;
+    }
+
+    private async void OnBrowseFriendConnectExecutable(object sender, RoutedEventArgs e)
+    {
+        var path = await PickExecutableAsync();
+        if (!string.IsNullOrEmpty(path)) ViewModel.FriendConnectExecutablePath = path;
+    }
+
+    private static async Task<string?> PickExecutableAsync()
+    {
+        var picker = new FileOpenPicker
+        {
+            SuggestedStartLocation = PickerLocationId.ComputerFolder,
+        };
+        picker.FileTypeFilter.Add(".exe");
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
+        var file = await picker.PickSingleFileAsync();
+        return file?.Path;
     }
 
     private async Task<ConflictChoice> OnConflictRequested(ConflictPrompt prompt)
