@@ -27,21 +27,15 @@ public sealed class VrcxPaths
     // 危険があるため、見つからなければ null を返す。
     public static string? TryFindExecutable()
     {
-        var candidates = new[]
+        // 標準的な VRCX インストール先は %LocalAppData%\Programs\VRCX。
+        // Roaming から相対遡行する経路はフォルダリダイレクト環境で誤動作の
+        // 可能性があるため採用しない。
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Programs", "VRCX", "VRCX.exe");
+        if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Programs", "VRCX", "VRCX.exe"),
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "..", "Local", "Programs", "VRCX", "VRCX.exe"),
-        };
-        foreach (var path in candidates)
-        {
-            if (!string.IsNullOrEmpty(path) && File.Exists(path))
-            {
-                return Path.GetFullPath(path);
-            }
+            return Path.GetFullPath(path);
         }
         return null;
     }

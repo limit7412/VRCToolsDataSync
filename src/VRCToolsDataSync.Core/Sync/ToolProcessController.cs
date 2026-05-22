@@ -110,45 +110,93 @@ public sealed class ToolProcessController
             return new ToolStopResult { Outcome = ToolStopOutcome.NotRunning };
         }
 
-        foreach (var p in initial)
+        try
         {
-            try
+            foreach (var p in initial)
             {
-                if (!p.HasExited && p.MainWindowHandle != IntPtr.Zero)
+                try
                 {
-                    p.CloseMainWindow();
+                    if (!p.HasExited && p.MainWindowHandle != IntPtr.Zero)
+                    {
+                        p.CloseMainWindow();
+                    }
+                    else if (!p.HasExited)
+                    {
+                        // メインウィンドウが無い (バックグラウンド) 場合は CloseMainWindow が
+                        // 効かないので何もしない。WM_CLOSE 送信失敗時は呼び出し側で Kill 判断。
+                        _logger.LogDebug("Process {Pid} has no MainWindow; CloseMainWindow skipped", p.Id);
+                    }
                 }
-                else if (!p.HasExited)
+                catch (Exception ex)
                 {
-                    // メインウィンドウが無い (バックグラウンド) 場合は CloseMainWindow が
-                    // 効かないので何もしない。WM_CLOSE 送信失敗時は呼び出し側で Kill 判断。
-                    _logger.LogDebug("Process {Pid} has no MainWindow; CloseMainWindow skipped", p.Id);
+                    _logger.LogWarning(ex, "CloseMainWindow failed for pid={Pid}", p.Id);
                 }
             }
-            catch (Exception ex)
+
+            // initial で掴んだ Process ハンドルそのものに対して WaitForExitAsync を回す。
+            // ProcessGuard.FindRunning のポーリングだとループのたびに Process を取得し
+            // ハンドルリークが起こる + 200ms 粒度になる。WaitForExitAsync は完了通知ベース。
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var waitTasks = new List<Task>(initial.Count);
+            foreach (var p in initial)
             {
-                _logger.LogWarning(ex, "CloseMainWindow failed for pid={Pid}", p.Id);
+                if (p.HasExited) continue;
+                waitTasks.Add(WaitForExitSafeAsync(p, cts.Token));
+            }
+            if (waitTasks.Count > 0)
+            {
+                try
+                {
+                    await Task.WhenAll(waitTasks).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // CancelAfter によるタイムアウト。下で TimedOut として返す。
+                }
+            }
+
+            // initial の各 HasExited で最終判定する。生きていれば名前を返す。
+            var stillRunning = new List<string>();
+            foreach (var p in initial)
+            {
+                if (!p.HasExited)
+                {
+                    var name = SafeProcessName(p);
+                    if (name is not null && !stillRunning.Contains(name)) stillRunning.Add(name);
+                }
+            }
+            return new ToolStopResult
+            {
+                Outcome = stillRunning.Count == 0 ? ToolStopOutcome.StoppedGracefully : ToolStopOutcome.TimedOut,
+                StillRunningProcessNames = stillRunning,
+            };
+        }
+        finally
+        {
+            foreach (var p in initial)
+            {
+                try { p.Dispose(); } catch { /* best-effort */ }
             }
         }
+    }
 
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+    private static async Task WaitForExitSafeAsync(Process p, CancellationToken ct)
+    {
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var running = _launcher.FindRunning(processNames);
-            if (running.Count == 0)
-            {
-                return new ToolStopResult { Outcome = ToolStopOutcome.StoppedGracefully };
-            }
-            await Task.Delay(200, ct).ConfigureAwait(false);
+            await p.WaitForExitAsync(ct).ConfigureAwait(false);
         }
-
-        var stillRunning = _launcher.FindRunning(processNames);
-        return new ToolStopResult
+        catch (InvalidOperationException)
         {
-            Outcome = stillRunning.Count == 0 ? ToolStopOutcome.StoppedGracefully : ToolStopOutcome.TimedOut,
-            StillRunningProcessNames = stillRunning,
-        };
+            // 既に終了済み等の状態異常は無視。
+        }
+    }
+
+    private static string? SafeProcessName(Process p)
+    {
+        try { return p.ProcessName; }
+        catch { return null; }
     }
 
     /// <summary>
@@ -160,17 +208,37 @@ public sealed class ToolProcessController
         TimeSpan timeout,
         CancellationToken ct = default)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+        var initial = _launcher.GetProcesses(processNames);
+        if (initial.Count == 0) return true;
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            if (_launcher.FindRunning(processNames).Count == 0)
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var waitTasks = new List<Task>(initial.Count);
+            foreach (var p in initial)
             {
-                return true;
+                if (p.HasExited) continue;
+                waitTasks.Add(WaitForExitSafeAsync(p, cts.Token));
             }
-            await Task.Delay(200, ct).ConfigureAwait(false);
+            try
+            {
+                await Task.WhenAll(waitTasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* timeout */ }
+
+            foreach (var p in initial)
+            {
+                if (!p.HasExited) return false;
+            }
+            return true;
         }
-        return _launcher.FindRunning(processNames).Count == 0;
+        finally
+        {
+            foreach (var p in initial)
+            {
+                try { p.Dispose(); } catch { /* best-effort */ }
+            }
+        }
     }
 }
 
