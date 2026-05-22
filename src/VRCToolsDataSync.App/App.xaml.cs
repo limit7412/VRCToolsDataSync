@@ -52,6 +52,12 @@ public partial class App : Application
     public static System.Collections.Generic.IReadOnlyList<StartupSyncStep> StartupSyncSteps { get; private set; } =
         System.Array.Empty<StartupSyncStep>();
 
+    // バックグラウンドで Run が完了した時に発火。MainPage が VM 取得後に
+    // この通知を受け取って GUI ログに反映する。Window 表示後に Run が終わる
+    // 可能性もあるため、初期コンストラクタの IngestStartupSteps とは別経路で
+    // 取り込めるようイベントを公開しておく。
+    public static event Action<System.Collections.Generic.IReadOnlyList<StartupSyncStep>>? StartupSyncStepsAvailable;
+
     public static TrayIconManager Tray { get; } = new();
 
     // タスクトレイから「終了」を選んだとき、Window.Closed で
@@ -152,21 +158,34 @@ public partial class App : Application
                 var settings = Runner.LoadSettings();
                 Coordinator = new AutoSyncCoordinator(Runner, settings, Runner.CreateLogger<AutoSyncCoordinator>());
 
-                // Issue #6: 起動時の同期 + 自動起動を Coordinator.Start より前に走らせる。
-                // Start 後だと Pull 直後にツールを起動するまでの隙間で自動 Push が
-                // 暴発する可能性がある。Coordinator.Start は最後にまとめて呼ぶ。
-                try
+                // Issue #6: 起動時の同期 + 自動起動 (Pull → Launch) は OneDrive 経由の
+                // ネットワーク I/O を伴うため、UI スレッドで同期実行するとアプリ
+                // ウィンドウが表示されるまでフリーズに見える。Window を先に表示し、
+                // バックグラウンドで Run → 完了通知を出してから Coordinator.Start を呼ぶ。
+                // Coordinator.Start を後回しにするのは、Start 直後に走る監視より
+                // 先に Pull を済ませて自動 Push 暴発を避けるため。
+                _ = System.Threading.Tasks.Task.Run(() =>
                 {
-                    var orchestrator = new StartupSyncOrchestrator(
-                        Runner,
-                        logger: Runner.CreateLogger<StartupSyncOrchestrator>());
-                    var steps = orchestrator.Run(settings);
-                    StartupSyncSteps = steps;
-                    LogLifecycle($"StartupSync.steps={steps.Count}");
-                }
-                catch (Exception ex) { LogStartupFailure("StartupSyncOrchestrator", ex); }
-
-                Coordinator.Start();
+                    try
+                    {
+                        var orchestrator = new StartupSyncOrchestrator(
+                            Runner,
+                            logger: Runner.CreateLogger<StartupSyncOrchestrator>());
+                        var steps = orchestrator.Run(settings);
+                        StartupSyncSteps = steps;
+                        LogLifecycle($"StartupSync.steps={steps.Count}");
+                        // MainPage が後から VM を生成した時にも IngestStartupSteps で
+                        // ログに反映できるよう、ここでは Window 表示済みの場合のみ
+                        // 既存の VM へディスパッチして通知する。
+                        StartupSyncStepsAvailable?.Invoke(steps);
+                    }
+                    catch (Exception ex) { LogStartupFailure("StartupSyncOrchestrator", ex); }
+                    finally
+                    {
+                        try { Coordinator?.Start(); LogLifecycle("Coordinator.Start ok (post-startup-sync)"); }
+                        catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+                    }
+                });
             }
             catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
 

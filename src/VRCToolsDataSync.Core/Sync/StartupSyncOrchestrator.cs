@@ -58,15 +58,15 @@ public sealed class StartupSyncOrchestrator
             return steps;
         }
 
-        foreach (var def in EnumerateTools(settings))
+        foreach (var def in EnumerateTools(settings, _runner))
         {
             // (1) Pull
-            var pullResult = TryPull(def, settings, cloud, steps);
+            TryPull(def, settings, cloud, steps);
 
             // (2) Launch
             // Pull 失敗時もユーザの設定通りに Launch を試みる。Pull が失敗していても
             // ツール起動自体は止めない (ローカルにデータが残っている可能性があるため)。
-            TryLaunch(def, settings, steps, pullResult);
+            TryLaunch(def, settings, steps);
         }
 
         return steps;
@@ -96,11 +96,21 @@ public sealed class StartupSyncOrchestrator
         try
         {
             var result = _runner.Pull(def.ServiceFactory(), settings, cloud, skipBackup: false);
+            // NothingToDo / SourceMissing は通常運用で起こり得る (クラウド未作成や
+            // 初回セットアップ直後) ため、失敗ではなく Skip 扱い。それ以外の非成功
+            // は予期しない異常なので PullFailed とする。
+            var kind = result.Outcome switch
+            {
+                SyncOutcome.Success => StartupSyncStepKind.PullSucceeded,
+                SyncOutcome.NothingToDo => StartupSyncStepKind.PullSkipped,
+                SyncOutcome.SourceMissing => StartupSyncStepKind.PullSkipped,
+                _ => StartupSyncStepKind.PullFailed,
+            };
             steps.Add(new StartupSyncStep
             {
                 ToolKey = def.Key,
                 DisplayName = def.DisplayName,
-                Kind = result.Outcome == SyncOutcome.Success ? StartupSyncStepKind.PullSucceeded : StartupSyncStepKind.PullFailed,
+                Kind = kind,
                 Message = result.Message,
                 PullResult = result,
             });
@@ -135,7 +145,7 @@ public sealed class StartupSyncOrchestrator
         }
     }
 
-    private void TryLaunch(ToolDefinition def, SyncSettings settings, List<StartupSyncStep> steps, SyncResult? pullResult)
+    private void TryLaunch(ToolDefinition def, SyncSettings settings, List<StartupSyncStep> steps)
     {
         var config = settings.Launch.GetValueOrDefault(def.Key);
         if (config is null || !config.LaunchOnAppStart)
@@ -166,14 +176,14 @@ public sealed class StartupSyncOrchestrator
         });
     }
 
-    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings)
+    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings, SyncRunner runner)
     {
         yield return new ToolDefinition
         {
             Key = VrcxSyncService.Key,
             DisplayName = "VRCX",
             SyncEnabled = settings.SyncVrcx,
-            ServiceFactory = () => new VrcxSyncService(),
+            ServiceFactory = () => new VrcxSyncService(logger: runner.CreateLogger<VrcxSyncService>()),
             ProcessNames = ProcessGuard.VrcxProcessNames,
             FindExecutable = VrcxPaths.TryFindExecutable,
         };
@@ -182,7 +192,7 @@ public sealed class StartupSyncOrchestrator
             Key = FriendConnectSyncService.Key,
             DisplayName = "VRC Friend Connect",
             SyncEnabled = settings.SyncFriendConnect,
-            ServiceFactory = () => new FriendConnectSyncService(),
+            ServiceFactory = () => new FriendConnectSyncService(logger: runner.CreateLogger<FriendConnectSyncService>()),
             ProcessNames = ProcessGuard.FriendConnectProcessNames,
             FindExecutable = FriendConnectPaths.TryFindExecutable,
         };

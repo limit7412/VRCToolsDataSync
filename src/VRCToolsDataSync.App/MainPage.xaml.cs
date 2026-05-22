@@ -26,13 +26,21 @@ public sealed partial class MainPage : Page
             });
         }
 
-        // Issue #6: App.OnLaunched で走った起動同期 (Pull → Launch) のステップを
-        // GUI のログに取り込む。Window 構築前に実行されているため、ここで初めて
-        // ユーザに見える形で履歴が出る。
+        // Issue #6: App.OnLaunched でバックグラウンドで走った起動同期 (Pull → Launch)
+        // のステップを GUI のログに取り込む。
+        // - Run が既に完了済み: App.StartupSyncSteps に溜まっているので即時取り込み
+        // - 未完了: App.StartupSyncStepsAvailable イベントを購読し、完了時に取り込む
         if (App.StartupSyncSteps.Count > 0)
         {
             ViewModel.IngestStartupSteps(App.StartupSyncSteps);
         }
+        App.StartupSyncStepsAvailable += steps =>
+        {
+            App.DispatcherQueue.TryEnqueue(() =>
+            {
+                try { ViewModel.IngestStartupSteps(steps); } catch { /* best-effort */ }
+            });
+        };
     }
 
     private async void OnBrowseCloudFolder(object sender, RoutedEventArgs e)
