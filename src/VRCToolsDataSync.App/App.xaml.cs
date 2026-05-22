@@ -254,7 +254,6 @@ public partial class App : Application
             }
             catch (Exception ex) { LogStartupFailure("CacheWindowHandle", ex); }
 
-
             // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
             // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
             // 最大 15 秒だけシャットダウンを延長して Push を完了させる。
@@ -450,7 +449,6 @@ public partial class App : Application
         }
     }
 
-    /// <summary>
     /// 指定アクションを UI スレッドで同期的に実行する。
     /// SessionEnding ハンドラなどのバックグラウンドスレッドから、HWND を作成した
     /// UI スレッド経由でしか呼べない Win32 API (ShutdownBlockReasonCreate 等) を
@@ -488,6 +486,7 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
     /// 終了済みのツールだけ Push → Environment.Exit。
     /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、
