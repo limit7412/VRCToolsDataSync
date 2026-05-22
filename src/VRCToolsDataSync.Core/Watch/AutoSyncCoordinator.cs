@@ -177,22 +177,32 @@ public sealed class AutoSyncCoordinator : IDisposable
     /// <summary>
     /// Stop の Cancel 直後に呼んで、進行中の AutoPush タスクが終わるまで待つ。
     /// 終了シーケンス (ShutdownSyncOrchestrator) との二重 Push を防ぐ。
-    /// タイムアウト時はそれ以上は待たない (best-effort)。
+    /// 全完了したら true、タイムアウトしたら false を返す。タイムアウト時は
+    /// AutoPush が並走している可能性があるため、呼び出し元が manifest 競合の
+    /// リスクを意識して終了 Push を進めるかどうか判断する。
     /// </summary>
-    public async Task WaitForInFlightPushAsync(TimeSpan timeout, CancellationToken ct = default)
+    public async Task<bool> WaitForInFlightPushAsync(TimeSpan timeout, CancellationToken ct = default)
     {
         Task[] snapshot;
         lock (_inFlightLock) { snapshot = _inFlightPushes.ToArray(); }
-        if (snapshot.Length == 0) return;
+        if (snapshot.Length == 0) return true;
         _logger.LogInformation("AutoPush in-flight: waiting count={Count}", snapshot.Length);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(timeout);
         var allDone = Task.WhenAll(snapshot);
+        var delay = Task.Delay(Timeout.Infinite, cts.Token);
+        Task completed;
         try
         {
-            await Task.WhenAny(allDone, Task.Delay(Timeout.Infinite, cts.Token)).ConfigureAwait(false);
+            completed = await Task.WhenAny(allDone, delay).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { /* timeout */ }
+        catch (OperationCanceledException)
+        {
+            // 通常 Task.WhenAny は例外を投げないが、念のため。
+            return false;
+        }
+        // allDone が先に完了 = 全 AutoPush 完了。delay が先に完了 = タイムアウト。
+        return completed == allDone;
     }
 
     private void HandleProcessExited(ToolBinding binding, CancellationToken token)

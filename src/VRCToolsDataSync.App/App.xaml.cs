@@ -353,8 +353,12 @@ public partial class App : Application
         {
             if (Coordinator is not null)
             {
-                await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
-                LogLifecycle("ExitApplication.WaitForInFlightPush ok");
+                var inFlightDone = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                // タイムアウト時は AutoPush が並走しているまま終了 Push に入ることになるため
+                // 警告ログを残す。終了処理自体は止められないので進める他ない。
+                LogLifecycle(inFlightDone
+                    ? "ExitApplication.WaitForInFlightPush ok"
+                    : "ExitApplication.WaitForInFlightPush TIMED OUT - AutoPush may still be running, proceeding with shutdown push (manifest conflict risk)");
             }
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.WaitForInFlightPush fail: " + ex.Message); }
