@@ -168,18 +168,12 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial bool VrcxLaunchOnAppStart { get; set; }
 
-    [ObservableProperty]
-    public partial bool VrcxStopOnAppExit { get; set; }
-
     // VRC Friend Connect Launch 設定
     [ObservableProperty]
     public partial string FriendConnectExecutablePath { get; set; } = string.Empty;
 
     [ObservableProperty]
     public partial bool FriendConnectLaunchOnAppStart { get; set; }
-
-    [ObservableProperty]
-    public partial bool FriendConnectStopOnAppExit { get; set; }
 
     public ObservableCollection<string> LogEntries { get; } = new();
 
@@ -210,12 +204,10 @@ public partial class MainPageViewModel : ObservableObject
         var vrcx = _settings.Launch.GetValueOrDefault(VrcxSyncService.Key) ?? new ToolLaunchConfig();
         VrcxExecutablePath = vrcx.ExecutablePath ?? string.Empty;
         VrcxLaunchOnAppStart = vrcx.LaunchOnAppStart;
-        VrcxStopOnAppExit = vrcx.StopOnAppExit;
 
         var fc = _settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key) ?? new ToolLaunchConfig();
         FriendConnectExecutablePath = fc.ExecutablePath ?? string.Empty;
         FriendConnectLaunchOnAppStart = fc.LaunchOnAppStart;
-        FriendConnectStopOnAppExit = fc.StopOnAppExit;
     }
 
     private void ApplyLaunchPropertiesToSettings()
@@ -230,7 +222,6 @@ public partial class MainPageViewModel : ObservableObject
             ExecutablePath = string.IsNullOrWhiteSpace(VrcxExecutablePath) ? null : VrcxExecutablePath.Trim(),
             Arguments = existingVrcx?.Arguments,
             LaunchOnAppStart = VrcxLaunchOnAppStart,
-            StopOnAppExit = VrcxStopOnAppExit,
         };
         var existingFc = _settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key);
         _settings.Launch[FriendConnectSyncService.Key] = new ToolLaunchConfig
@@ -238,7 +229,6 @@ public partial class MainPageViewModel : ObservableObject
             ExecutablePath = string.IsNullOrWhiteSpace(FriendConnectExecutablePath) ? null : FriendConnectExecutablePath.Trim(),
             Arguments = existingFc?.Arguments,
             LaunchOnAppStart = FriendConnectLaunchOnAppStart,
-            StopOnAppExit = FriendConnectStopOnAppExit,
         };
     }
 

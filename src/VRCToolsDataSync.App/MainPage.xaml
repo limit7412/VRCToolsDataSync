@@ -90,7 +90,6 @@
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Spacing="16">
                         <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.VrcxLaunchOnAppStart, Mode=TwoWay}" />
-                        <ToggleSwitch Header="終了時にこのツールも閉じる" IsOn="{x:Bind ViewModel.VrcxStopOnAppExit, Mode=TwoWay}" />
                     </StackPanel>
                 </StackPanel>
             </Border>
@@ -126,7 +125,6 @@
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Spacing="16">
                         <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.FriendConnectLaunchOnAppStart, Mode=TwoWay}" />
-                        <ToggleSwitch Header="終了時にこのツールも閉じる" IsOn="{x:Bind ViewModel.FriendConnectStopOnAppExit, Mode=TwoWay}" />
                     </StackPanel>
                 </StackPanel>
             </Border>

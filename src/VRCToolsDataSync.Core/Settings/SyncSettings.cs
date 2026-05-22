@@ -11,7 +11,7 @@ public sealed class SyncSettings
 
     public Dictionary<string, ToolSyncState> ToolState { get; set; } = new();
 
-    // Issue #6: ツールごとの自動起動・終了設定。キーは ISyncService.ToolKey と一致させる
+    // Issue #6: ツールごとの自動起動設定。キーは ISyncService.ToolKey と一致させる
     // ("vrcx", "friend-connect")。
     public Dictionary<string, ToolLaunchConfig> Launch { get; set; } = new();
 }
@@ -31,6 +31,4 @@ public sealed class ToolLaunchConfig
     public string? Arguments { get; set; }
     // VRCToolsDataSync 起動時の Pull 完了後に自動起動するかどうか。
     public bool LaunchOnAppStart { get; set; }
-    // VRCToolsDataSync 終了時にこのツールも閉じてから Push するかどうか。
-    public bool StopOnAppExit { get; set; }
 }
