@@ -110,8 +110,11 @@ public partial class App : Application
 
     // SessionEnding がタイムアウトして Push 中断したのに、後から
     // Environment.Exit(0) が走るのを防ぐためのキャンセル兼フラグ。
-    // タイムアウトで true、Push 完了で false のままにする。
-    private static readonly CancellationTokenSource _sessionEndCts = new();
+    // 一度 Cancel すると同じ CTS のトークンは復活できないため、
+    // OnSessionEnding 呼び出しごとに新しい CTS を作って差し替える。
+    // ガード用 lock。
+    private static readonly object _sessionEndCtsLock = new();
+    private static CancellationTokenSource _sessionEndCts = new();
 
     public App()
     {
@@ -396,19 +399,31 @@ public partial class App : Application
         }
         catch (Exception ex) { LogLifecycle("ShutdownBlockReasonCreate fail: " + ex.Message); }
 
+        // SessionEnding が複数回呼ばれる可能性があるので、CTS はその都度
+        // 新規に作って入れ替える。Cancel 済みの CTS のトークンは復活できないため、
+        // 前回タイムアウトでキャンセル済みのものを使い回すと、次回の Push が
+        // 最初からキャンセル状態で始まってしまう。
+        CancellationTokenSource cts;
+        lock (_sessionEndCtsLock)
+        {
+            var old = _sessionEndCts;
+            _sessionEndCts = new CancellationTokenSource();
+            cts = _sessionEndCts;
+            try { old.Dispose(); } catch { /* best-effort */ }
+        }
         try
         {
             // SystemEvents のスレッドではダイアログを出せないので、同期的に完了を待つ。
             // 15 秒の壁を越えると Windows 側に殺される可能性があるため、ツール終了待ちと
             // 全体ウェイトを 15 秒に揃えて諦める。SessionEnding 経路では各ツールも
             // 同時にシャットダウンで終了していくはずなので、自然終了を待ってから Push する。
-            // タイムアウト時は _sessionEndCts を Cancel し、ExitApplicationAsync の最後で
+            // タイムアウト時は cts.Cancel し、ExitApplicationAsync の最後で
             // Environment.Exit を抑止する (ユーザがシャットダウンをキャンセルした場合に備えて)。
-            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout, externalCt: _sessionEndCts.Token);
+            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout, externalCt: cts.Token);
             if (!task.Wait(SessionEndPushTimeout))
             {
                 LogLifecycle("OnSessionEnding timed out; cancelling exit");
-                try { _sessionEndCts.Cancel(); } catch { /* best-effort */ }
+                try { cts.Cancel(); } catch { /* best-effort */ }
             }
         }
         catch (Exception ex) { LogLifecycle("OnSessionEnding ExitApplicationAsync fail: " + ex.Message); }
@@ -486,6 +501,12 @@ public partial class App : Application
         if (externalCt.IsCancellationRequested)
         {
             LogLifecycle("ExitApplication.skip Environment.Exit (externalCt cancelled)");
+            // 既に Coordinator.Stop() を呼んでいるため、このままだとプロセスは
+            // 生き残るのに AutoSync 監視だけ止まった半死状態になる。Start() を
+            // 呼び戻して監視を復活させる (Start は AutoSyncEnabled=false や
+            // CloudFolderPath 未設定なら no-op なので、安全に再呼び出し可能)。
+            try { Coordinator?.Start(); LogLifecycle("ExitApplication.Coordinator.Start (resumed after externalCt cancel)"); }
+            catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Start fail (resume): " + ex.Message); }
             // 終了フラグをクリアして次の終了要求を受け付けられるようにする
             Interlocked.Exchange(ref _isExiting, 0);
             return;
