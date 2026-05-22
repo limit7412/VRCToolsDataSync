@@ -233,6 +233,99 @@ public partial class MainPageViewModel : ObservableObject
     }
 
     /// <summary>
+    /// トレイ「同期して起動」と MainPage の同名ボタンから呼ばれる。
+    /// 同期 ON のツールを Pull → Launch する。既に動いていれば Launch は no-op。
+    /// </summary>
+    [RelayCommand]
+    private async Task SyncAndLaunchAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            var orchestrator = new StartupSyncOrchestrator(
+                _runner,
+                logger: _runner.CreateLogger<StartupSyncOrchestrator>());
+            var steps = await Task.Run(() => orchestrator.Run(_settings));
+            IngestStartupSteps(steps);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"同期して起動 エラー: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// トレイ「同期して再起動」と MainPage の同名ボタンから呼ばれる。
+    /// VRCToolsDataSync 側からツールを能動停止することは諦めたので、この操作は
+    /// 「ユーザが既にツールを終了している前提で」: 終了済みツールだけ Push → Pull
+    /// → 設定通りに Launch、という流れになる。起動中のツールについては Push も
+    /// 行わずスキップする (Pull はツールが起動中だと RunningProcessException で失敗するため
+    /// StartupSyncOrchestrator が内部で扱う)。
+    /// </summary>
+    [RelayCommand]
+    private async Task SyncAndRestartAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            // (1) 終了済みツールだけ Push (起動中はスキップ)。
+            var shutdown = new ShutdownSyncOrchestrator(
+                _runner,
+                logger: _runner.CreateLogger<ShutdownSyncOrchestrator>());
+            var shutdownSteps = await shutdown.RunAsync(_settings, new ShutdownSyncOptions
+            {
+                WaitForToolsToExit = null,
+            });
+            IngestShutdownSteps(shutdownSteps);
+
+            // (2) Pull → Launch を回す
+            var startup = new StartupSyncOrchestrator(
+                _runner,
+                logger: _runner.CreateLogger<StartupSyncOrchestrator>());
+            var startupSteps = await Task.Run(() => startup.Run(_settings));
+            IngestStartupSteps(startupSteps);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"同期して再起動 エラー: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private void IngestShutdownSteps(IReadOnlyList<ShutdownSyncStep> steps)
+    {
+        foreach (var step in steps)
+        {
+            var line = step.Kind switch
+            {
+                ShutdownSyncStepKind.StopStarted => $"[restart] {step.DisplayName} 停止要求",
+                ShutdownSyncStepKind.StopSucceeded => $"[restart] {step.DisplayName} 停止完了",
+                ShutdownSyncStepKind.StopTimedOut => $"[restart] {step.DisplayName} 停止タイムアウト",
+                ShutdownSyncStepKind.PushStarted => $"[restart] {step.DisplayName} Push 開始",
+                ShutdownSyncStepKind.PushSucceeded => $"[restart] {step.DisplayName} Push 完了 v{step.PushResult?.RemoteVersion}",
+                ShutdownSyncStepKind.PushFailed => $"[restart] {step.DisplayName} Push 失敗: {step.Message}",
+                ShutdownSyncStepKind.PushSkipped => $"[restart] {step.DisplayName} Push スキップ: {step.Message}",
+                _ => null,
+            };
+            if (line is not null) AppendLog(line);
+        }
+        // ShutdownSyncOrchestrator が Push を打って ToolState が更新されている
+        // ので、起動シーケンスに入る前に最新を読み直す。
+        _settings = _runner.LoadSettings();
+        _coordinator?.RefreshSettings(_settings);
+        RefreshStatusSummaries();
+    }
+
+    /// <summary>
     /// 「自動検出」ボタン用。実行ファイルパスを TryFindExecutable から埋める。
     /// 見つからなければ何もしない (ユーザに「参照…」ボタンを使わせる)。
     /// </summary>

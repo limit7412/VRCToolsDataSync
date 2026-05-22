@@ -202,6 +202,8 @@ public partial class App : Application
                 Tray.Initialize();
                 Tray.ShowWindowRequested += ShowMainWindow;
                 Tray.ExitRequested += ExitApplication;
+                Tray.SyncAndLaunchRequested += OnTraySyncAndLaunch;
+                Tray.SyncAndRestartRequested += OnTraySyncAndRestart;
             }
             catch (Exception ex) { LogStartupFailure("Tray.Initialize", ex); }
 
@@ -372,6 +374,53 @@ public partial class App : Application
     //  生き残るため、自前で停止することは諦めた)
     private static void ExitApplication() => _ = ExitApplicationAsync(waitForToolsToExit: null);
 
+    // MainPage が VM を経由してウィンドウのコマンドを呼べるよう、MainPage 側で
+    // 自分のインスタンスをここに登録する。WinUI Page にはシングルトンが無いので、
+    // App と Page の間の橋渡しに使う。
+    public static MainPage? Page { get; set; }
+
+    /// <summary>
+    /// トレイ「同期して起動」ハンドラ。MainPage が初期化済みであれば VM の
+    /// コマンドを叩く。未初期化なら MainWindow を表示してから VM 側に委ねる。
+    /// </summary>
+    private static void OnTraySyncAndLaunch()
+    {
+        LogLifecycle("Tray.SyncAndLaunch entered");
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            var vm = Page?.ViewModel;
+            if (vm is null)
+            {
+                LogLifecycle("Tray.SyncAndLaunch skip: page is null");
+                return;
+            }
+            if (vm.SyncAndLaunchCommand.CanExecute(null))
+            {
+                vm.SyncAndLaunchCommand.Execute(null);
+            }
+        });
+    }
+
+    private static void OnTraySyncAndRestart()
+    {
+        LogLifecycle("Tray.SyncAndRestart entered");
+        ShowMainWindow();
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            var vm = Page?.ViewModel;
+            if (vm is null)
+            {
+                LogLifecycle("Tray.SyncAndRestart skip: page is null");
+                return;
+            }
+            if (vm.SyncAndRestartCommand.CanExecute(null))
+            {
+                vm.SyncAndRestartCommand.Execute(null);
+            }
+        });
+    }
+
+    /// <summary>
     /// Windows ログオフ / シャットダウンのハンドラ。SystemEvents から呼ばれる。
     /// 既定の Windows のシャットダウン猶予 (約 5 秒) では Push が間に合わないため、
     /// <c>ShutdownBlockReasonCreate</c> で「同期中…」と表示して最大 <c>SessionEndPushTimeout</c>
