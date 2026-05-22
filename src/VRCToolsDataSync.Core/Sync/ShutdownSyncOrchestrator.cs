@@ -6,10 +6,13 @@ namespace VRCToolsDataSync.Core.Sync;
 
 public enum ShutdownSyncStepKind
 {
-    StopStarted,
-    StopSucceeded,
-    StopTimedOut,
-    StopSkipped,
+    // 「ツールが終了しているか」のチェック関連。
+    // 「能動停止」の意味は持たない (VRCX/VRC Friend Connect は WM_CLOSE では
+    // トレイ常駐に最小化されるだけでプロセスが死なないため、対応を諦めた)。
+    StopStarted,        // 終了待機開始 (WaitForToolsToExit があるとき)
+    StopSucceeded,      // ツールが終了済み (Push 可能)
+    StopTimedOut,       // 終了待機がタイムアウト (起動中のまま)
+    StopSkipped,        // 待たない経路で起動中だった (Push 不可)
     PushStarted,
     PushSucceeded,
     PushFailed,
@@ -28,22 +31,33 @@ public sealed class ShutdownSyncStep
 
 public sealed class ShutdownSyncOptions
 {
-    // ツールごとの停止タイムアウト。WM_CLOSE 送信後ここまで待つ。
-    public TimeSpan StopTimeout { get; init; } = TimeSpan.FromSeconds(15);
-    // 「同期して終了」「同期して再起動」のようなユーザ明示操作では設定の
-    // StopOnAppExit を上書きしてすべてのツールを停止する。
-    public bool ForceStopAllSyncedTools { get; init; }
-    // SessionEnding のように猶予が短い経路で呼ぶ場合、Push まで含めて
-    // 早めに切り上げたい。CancellationToken でキャンセル可能。
+    /// <summary>
+    /// 起動中のツールが自然終了するのを待つタイムアウト。
+    /// null = 待たない (Tray「終了」経路。即時チェックして起動中なら Push スキップ)。
+    /// 値あり = 待つ (SessionEnding 経路。ログオフ/シャットダウン時にツールが順に
+    /// 終了していくのを待ち、終わったツールから Push する)。
+    /// </summary>
+    public TimeSpan? WaitForToolsToExit { get; init; }
 
-    // 終了直前の Push をすべてスキップする。AutoPush 待機がタイムアウトしたなど、
-    // 並走 Push による manifest 競合リスクが高い経路で使う。Stop だけは通常通り走る。
+    /// <summary>
+    /// 終了直前の Push をすべてスキップする。AutoPush 待機がタイムアウトしたなど、
+    /// 並走 Push による manifest 競合リスクが高い経路で使う。
+    /// </summary>
     public bool SkipPush { get; init; }
 }
 
 /// <summary>
-/// VRCToolsDataSync 終了時の「ツール停止 → Push」の流れを取りまとめる。
-/// 各ステップを <see cref="ShutdownSyncStep"/> として返す。
+/// VRCToolsDataSync 終了時の流れを取りまとめる。
+/// <para>
+/// 旧設計では WM_CLOSE でツールを能動停止していたが、VRCX / VRC Friend Connect は
+/// WM_CLOSE では「トレイに最小化」されるだけでプロセスが死なないため、自前で停止
+/// することは諦めた。現設計では:
+/// <list type="bullet">
+/// <item><description>Tray「終了」: 各ツールが既に終了済みかチェック。終了済みのツールだけ Push する。</description></item>
+/// <item><description>SessionEnding (Windows ログオフ/シャットダウン): タイムアウトまで自然終了を待ち、終わったツールから Push する。</description></item>
+/// </list>
+/// 各ステップは <see cref="ShutdownSyncStep"/> として返す。
+/// </para>
 /// </summary>
 public sealed class ShutdownSyncOrchestrator
 {
@@ -70,53 +84,52 @@ public sealed class ShutdownSyncOrchestrator
         var cloud = settings.CloudFolderPath?.Trim() ?? string.Empty;
         var cloudAvailable = !string.IsNullOrEmpty(cloud) && Directory.Exists(cloud);
 
-        // (1) 全ツールの停止を並列で依頼。停止待ちの間は他ツールも止まるので並列が妥当。
+        // (1) 各ツールについて「終了済みか」をチェックする。SessionEnding 経路
+        //     (WaitForToolsToExit が指定されている) なら、最大そのタイムアウトまで
+        //     自然終了を待つ。Tray「終了」経路 (null) なら即時判定。
         var toolDefs = EnumerateTools(settings, _runner).ToArray();
-        var stopTasks = new List<Task<(ToolDefinition def, ToolStopResult? result, bool skipped)>>();
+        var exitChecks = new List<Task<(ToolDefinition def, bool exited)>>();
         foreach (var def in toolDefs)
         {
-            var shouldStop = options.ForceStopAllSyncedTools
-                ? def.SyncEnabled
-                : (settings.Launch.GetValueOrDefault(def.Key)?.StopOnAppExit ?? false);
-            if (!shouldStop)
-            {
-                steps.Add(new ShutdownSyncStep
-                {
-                    ToolKey = def.Key,
-                    DisplayName = def.DisplayName,
-                    Kind = ShutdownSyncStepKind.StopSkipped,
-                    Message = "停止設定が無効",
-                });
-                stopTasks.Add(Task.FromResult<(ToolDefinition, ToolStopResult?, bool)>((def, null, true)));
-                continue;
-            }
-
             steps.Add(new ShutdownSyncStep
             {
                 ToolKey = def.Key,
                 DisplayName = def.DisplayName,
                 Kind = ShutdownSyncStepKind.StopStarted,
             });
-            stopTasks.Add(StopOneAsync(def, options.StopTimeout, ct));
+            exitChecks.Add(CheckExitedAsync(def, options.WaitForToolsToExit, ct));
         }
 
-        var stopResults = await Task.WhenAll(stopTasks).ConfigureAwait(false);
+        var exitResults = await Task.WhenAll(exitChecks).ConfigureAwait(false);
 
-        foreach (var (def, result, skipped) in stopResults)
+        foreach (var (def, exited) in exitResults)
         {
-            if (skipped || result is null) continue;
-            steps.Add(new ShutdownSyncStep
+            if (exited)
             {
-                ToolKey = def.Key,
-                DisplayName = def.DisplayName,
-                Kind = result.Outcome == ToolStopOutcome.TimedOut
-                    ? ShutdownSyncStepKind.StopTimedOut
-                    : ShutdownSyncStepKind.StopSucceeded,
-                StillRunningProcessNames = result.StillRunningProcessNames,
-            });
+                steps.Add(new ShutdownSyncStep
+                {
+                    ToolKey = def.Key,
+                    DisplayName = def.DisplayName,
+                    Kind = ShutdownSyncStepKind.StopSucceeded,
+                });
+            }
+            else
+            {
+                steps.Add(new ShutdownSyncStep
+                {
+                    ToolKey = def.Key,
+                    DisplayName = def.DisplayName,
+                    Kind = options.WaitForToolsToExit is null
+                        ? ShutdownSyncStepKind.StopSkipped
+                        : ShutdownSyncStepKind.StopTimedOut,
+                    Message = options.WaitForToolsToExit is null
+                        ? "ツールが起動中なので Push をスキップします"
+                        : "ツールの自然終了待ちがタイムアウト",
+                });
+            }
         }
 
-        // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたらスキップ。
+        // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
         if (!cloudAvailable || options.SkipPush)
         {
             var reason = options.SkipPush
@@ -136,7 +149,7 @@ public sealed class ShutdownSyncOrchestrator
             return steps;
         }
 
-        foreach (var (def, stopResult, skipped) in stopResults)
+        foreach (var (def, exited) in exitResults)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -153,17 +166,16 @@ public sealed class ShutdownSyncOrchestrator
                 continue;
             }
 
-            // 停止対象だったのにタイムアウトした → SQLite が解放されていない可能性が
-            // 高い。Push しても RunningProcessException で失敗するだけなので skip。
-            // ユーザは GUI で強制終了するか諦めるかを選んで再度同期する。
-            if (!skipped && stopResult?.Outcome == ToolStopOutcome.TimedOut)
+            // ツールが起動中なら Push は不可能。SQLite が握られているので
+            // RunningProcessException で失敗するだけ。スキップして次回起動時に手動 Push してもらう。
+            if (!exited)
             {
                 steps.Add(new ShutdownSyncStep
                 {
                     ToolKey = def.Key,
                     DisplayName = def.DisplayName,
                     Kind = ShutdownSyncStepKind.PushSkipped,
-                    Message = "ツールの停止待ちがタイムアウト",
+                    Message = "ツールが起動中のため Push できません",
                 });
                 continue;
             }
@@ -203,13 +215,26 @@ public sealed class ShutdownSyncOrchestrator
         return steps;
     }
 
-    private async Task<(ToolDefinition def, ToolStopResult? result, bool skipped)> StopOneAsync(
+    /// <summary>
+    /// ツールが終了しているかチェックする。
+    /// <paramref name="waitTimeout"/> が null なら即時、値ありなら最大そのタイムアウトまで自然終了を待つ。
+    /// </summary>
+    private async Task<(ToolDefinition def, bool exited)> CheckExitedAsync(
         ToolDefinition def,
-        TimeSpan timeout,
+        TimeSpan? waitTimeout,
         CancellationToken ct)
     {
-        var result = await _processController.RequestStopAsync(def.ProcessNames, timeout, ct).ConfigureAwait(false);
-        return (def, result, false);
+        if (waitTimeout is null)
+        {
+            // 即時判定: 起動中なら false。
+            var running = ProcessGuard.FindRunning(def.ProcessNames);
+            return (def, exited: running.Count == 0);
+        }
+
+        // 自然終了を待つ。WaitUntilExitedAsync は起動中ツールに対しては
+        // Process ハンドルを掴んで WaitForExitAsync で待つ実装。
+        var exited = await _processController.WaitUntilExitedAsync(def.ProcessNames, waitTimeout.Value, ct).ConfigureAwait(false);
+        return (def, exited);
     }
 
     private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings, SyncRunner runner)

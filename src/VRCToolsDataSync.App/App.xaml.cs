@@ -330,14 +330,18 @@ public partial class App : Application
 
     // Tray の ExitRequested は同期メソッド型なので、async ロジックを内部関数に
     // 切り出してファイア&フォーゲットで走らせる。多重呼び出しは _isExiting で防止。
-    private static void ExitApplication() => _ = ExitApplicationAsync(forceStopAllSyncedTools: true);
+    // Tray「終了」では各ツールを能動停止せず、既に終了しているツールだけ Push する。
+    // (VRCX / VRC Friend Connect は WM_CLOSE では「トレイに最小化」だけでプロセスが
+    //  生き残るため、自前で停止することは諦めた)
+    private static void ExitApplication() => _ = ExitApplicationAsync(waitForToolsToExit: null);
 
     /// <summary>
-    /// 終了シーケンス。Coordinator を停止 → 設定に従ってツールを停止 → Push を済ませてから Environment.Exit。
-    /// <paramref name="forceStopAllSyncedTools"/> = true でユーザが明示的に「終了」を選んだ場合は、
-    /// 各ツールの StopOnAppExit 設定を上書きして全ツールを停止する。
+    /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
+    /// 終了済みのツールだけ Push → Environment.Exit。
+    /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、
+    /// 値あり = タイムアウトまで自然終了を待つ (SessionEnding 経路)。
     /// </summary>
-    internal static async System.Threading.Tasks.Task ExitApplicationAsync(bool forceStopAllSyncedTools)
+    internal static async System.Threading.Tasks.Task ExitApplicationAsync(TimeSpan? waitForToolsToExit)
     {
         LogLifecycle("ExitApplication.entered isExiting=" + _isExiting);
         // 既に終了処理中なら再入を防ぐ。
@@ -362,11 +366,10 @@ public partial class App : Application
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.WaitForInFlightPush fail: " + ex.Message); }
 
-        // (1) ツール停止 + Push。Orchestrator が判断する。
-        // 待機がタイムアウトしている場合は AutoPush と並走するリスクが高いので、
-        // Push を全件 skip する (Stop だけは通常通り走る)。データロスの可能性は
-        // 残るが、manifest 競合で全 Push が失敗する方が後始末しづらいので
-        // 「次回起動時に手動 Push してもらう」を選択する。
+        // (1) 各ツールが終了済みかチェック → 終了済みのツールだけ Push。
+        //     SessionEnding 経路では waitForToolsToExit が指定されるので、その時間まで
+        //     自然終了を待つ。Tray「終了」経路では null = 即時チェックして起動中なら Push スキップ。
+        //     AutoPush 待機がタイムアウトしている場合は二重 Push を避けるため全件 Push スキップ。
         try
         {
             var settings = Runner.LoadSettings();
@@ -375,10 +378,10 @@ public partial class App : Application
                 logger: Runner.CreateLogger<ShutdownSyncOrchestrator>());
             var steps = await orchestrator.RunAsync(settings, new ShutdownSyncOptions
             {
-                ForceStopAllSyncedTools = forceStopAllSyncedTools,
+                WaitForToolsToExit = waitForToolsToExit,
                 SkipPush = !inFlightDone,
             });
-            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone}");
+            LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone} waitForExit={waitForToolsToExit?.TotalSeconds.ToString("0.#") ?? "null"}");
         }
         catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
 
