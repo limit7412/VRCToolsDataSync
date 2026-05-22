@@ -98,7 +98,20 @@ public partial class App : Application
 
     // タスクトレイから「終了」を選んだとき、Window.Closed で
     // タスクトレイ最小化に切り替えないために立てるフラグ。
-    private static bool _isExiting;
+    // Interlocked.CompareExchange でアトミックに立てるため int で持つ
+    // (トレイメニュー終了 と SessionEnding が同時に走ると二重実行する可能性がある)。
+    private static int _isExiting;
+
+    // SessionEnding ハンドラから安全に参照するための HWND キャッシュ。
+    // WinUI 3 の Window は UI スレッドからしかアクセスできない (COMException
+    // になる) ため、OnLaunched で Window 作成直後に値を取り、SessionEnding は
+    // これを使う。
+    private static IntPtr _cachedWindowHandle = IntPtr.Zero;
+
+    // SessionEnding がタイムアウトして Push 中断したのに、後から
+    // Environment.Exit(0) が走るのを防ぐためのキャンセル兼フラグ。
+    // タイムアウトで true、Push 完了で false のままにする。
+    private static readonly CancellationTokenSource _sessionEndCts = new();
 
     public App()
     {
@@ -228,6 +241,16 @@ public partial class App : Application
             Window.Closed += OnWindowClosed;
             Window.Activate();
 
+            // SessionEnding はバックグラウンドスレッドで動くため、UI スレッド
+            // 専用の Window から WindowHandle を取ろうとすると COMException が
+            // 出る。ここで一度だけ HWND を取り出してキャッシュしておく。
+            try
+            {
+                _cachedWindowHandle = WindowHandle;
+                LogLifecycle("CachedWindowHandle=" + _cachedWindowHandle.ToString("X"));
+            }
+            catch (Exception ex) { LogStartupFailure("CacheWindowHandle", ex); }
+
             // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
             // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
             // 最大 15 秒だけシャットダウンを延長して Push を完了させる。
@@ -318,8 +341,9 @@ public partial class App : Application
 
     private static void OnWindowClosed(object sender, WindowEventArgs args)
     {
-        LogLifecycle("OnWindowClosed.entered isExiting=" + _isExiting);
-        if (_isExiting)
+        var exiting = Interlocked.CompareExchange(ref _isExiting, 0, 0);
+        LogLifecycle("OnWindowClosed.entered isExiting=" + exiting);
+        if (exiting != 0)
         {
             // トレイメニューからの「終了」要求はそのまま閉じさせる。
             return;
@@ -358,16 +382,13 @@ public partial class App : Application
     private static void OnSessionEnding(object sender, Microsoft.Win32.SessionEndingEventArgs e)
     {
         LogLifecycle("OnSessionEnding entered reason=" + e.Reason);
-        if (_isExiting)
-        {
-            LogLifecycle("OnSessionEnding skip: already exiting");
-            return;
-        }
+        // SessionEnding はバックグラウンドスレッドで呼ばれる。Window へ
+        // 直接アクセスすると COMException になるので、必ずキャッシュ HWND を使う。
 
         // シャットダウンを最大 SessionEndPushTimeout 秒だけ延長する。
+        var hwnd = _cachedWindowHandle;
         try
         {
-            var hwnd = Window is null ? IntPtr.Zero : WindowHandle;
             if (hwnd != IntPtr.Zero)
             {
                 ShutdownBlockReasonCreate(hwnd, "同期処理を完了するまでお待ちください...");
@@ -381,33 +402,40 @@ public partial class App : Application
             // 15 秒の壁を越えると Windows 側に殺される可能性があるため、ツール終了待ちと
             // 全体ウェイトを 15 秒に揃えて諦める。SessionEnding 経路では各ツールも
             // 同時にシャットダウンで終了していくはずなので、自然終了を待ってから Push する。
-            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout);
-            task.Wait(SessionEndPushTimeout);
+            // タイムアウト時は _sessionEndCts を Cancel し、ExitApplicationAsync の最後で
+            // Environment.Exit を抑止する (ユーザがシャットダウンをキャンセルした場合に備えて)。
+            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout, externalCt: _sessionEndCts.Token);
+            if (!task.Wait(SessionEndPushTimeout))
+            {
+                LogLifecycle("OnSessionEnding timed out; cancelling exit");
+                try { _sessionEndCts.Cancel(); } catch { /* best-effort */ }
+            }
         }
         catch (Exception ex) { LogLifecycle("OnSessionEnding ExitApplicationAsync fail: " + ex.Message); }
         finally
         {
             try
             {
-                var hwnd = Window is null ? IntPtr.Zero : WindowHandle;
                 if (hwnd != IntPtr.Zero) ShutdownBlockReasonDestroy(hwnd);
             }
             catch { /* best-effort */ }
         }
     }
 
-    /// <summary>
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
     /// 終了済みのツールだけ Push → Environment.Exit。
     /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、
     /// 値あり = タイムアウトまで自然終了を待つ (SessionEnding 経路)。
+    /// <paramref name="externalCt"/> はキャンセル通知用 (SessionEnding のタイムアウトで使う)。
     /// </summary>
-    internal static async System.Threading.Tasks.Task ExitApplicationAsync(TimeSpan? waitForToolsToExit)
+    internal static async System.Threading.Tasks.Task ExitApplicationAsync(
+        TimeSpan? waitForToolsToExit,
+        CancellationToken externalCt = default)
     {
-        LogLifecycle("ExitApplication.entered isExiting=" + _isExiting);
-        // 既に終了処理中なら再入を防ぐ。
-        if (_isExiting) return;
-        _isExiting = true;
+        var prior = Interlocked.CompareExchange(ref _isExiting, 1, 0);
+        LogLifecycle("ExitApplication.entered isExiting=" + prior);
+        // 既に終了処理中なら再入を防ぐ (Tray と SessionEnding が並走しても安全)。
+        if (prior != 0) return;
 
         // (0) Coordinator を停止 (Dispose ではなく Stop)。これ以降の Push は手動で呼ぶ。
         //     Stop は監視解除 + 世代 Cancel しかしないため、HandleProcessExited で
@@ -420,7 +448,7 @@ public partial class App : Application
         {
             if (Coordinator is not null)
             {
-                var waitResult = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                var waitResult = await Coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20), externalCt);
                 inFlightDone = waitResult.Completed;
                 autoPushedTools = waitResult.PushedToolKeys;
                 LogLifecycle(inFlightDone
@@ -446,10 +474,22 @@ public partial class App : Application
                 WaitForToolsToExit = waitForToolsToExit,
                 SkipPush = !inFlightDone,
                 SkipPushForTools = autoPushedTools,
-            });
+            }, externalCt);
             LogLifecycle($"ExitApplication.ShutdownSync.steps={steps.Count} skipPush={!inFlightDone} waitForExit={waitForToolsToExit?.TotalSeconds.ToString("0.#") ?? "null"} skipForTools=[{string.Join(",", autoPushedTools)}]");
         }
+        catch (OperationCanceledException) { LogLifecycle("ExitApplication.ShutdownSync cancelled"); }
         catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
+
+        // SessionEnding がタイムアウトでキャンセルしていた場合は、Environment.Exit
+        // までは進めない。ユーザがシャットダウンを取り消した時にアプリが
+        // 中途半端な状態のまま残るのを避けるため、ここで早期 return する。
+        if (externalCt.IsCancellationRequested)
+        {
+            LogLifecycle("ExitApplication.skip Environment.Exit (externalCt cancelled)");
+            // 終了フラグをクリアして次の終了要求を受け付けられるようにする
+            Interlocked.Exchange(ref _isExiting, 0);
+            return;
+        }
 
         // (2) Coordinator を完全に Dispose してから Tray もきれいに片付ける。
         try { Coordinator?.Dispose(); LogLifecycle("ExitApplication.Coordinator.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Dispose fail: " + ex.Message); }
