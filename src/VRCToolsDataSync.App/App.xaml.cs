@@ -254,6 +254,7 @@ public partial class App : Application
             }
             catch (Exception ex) { LogStartupFailure("CacheWindowHandle", ex); }
 
+
             // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
             // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
             // 最大 15 秒だけシャットダウンを延長して Push を完了させる。
