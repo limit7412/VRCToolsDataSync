@@ -243,11 +243,15 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>
     /// トレイ「同期して起動」と MainPage の同名ボタンから呼ばれる。
     /// 同期 ON のツールを Pull → Launch する。既に動いていれば Launch は no-op。
+    /// 未保存の CloudFolderPath が UI にあれば実行前に反映する (TryGetCloud)。
     /// </summary>
     [RelayCommand]
     private async Task SyncAndLaunchAsync()
     {
         if (IsBusy) return;
+        // UI で編集中の CloudFolderPath を _settings へ反映してから走らせる。
+        // RunPushAsync/RunPullAsync が TryGetCloud で行っているのと同じ前処理。
+        if (!TryGetCloud(out _)) return;
         IsBusy = true;
         try
         {
@@ -274,20 +278,44 @@ public partial class MainPageViewModel : ObservableObject
     /// → 設定通りに Launch、という流れになる。起動中のツールについては Push も
     /// 行わずスキップする (Pull はツールが起動中だと RunningProcessException で失敗するため
     /// StartupSyncOrchestrator が内部で扱う)。
+    /// AutoSync 監視中は ShutdownSyncOrchestrator と並走する AutoPush を避けるため
+    /// Coordinator.Stop → WaitForInFlightPushAsync で AutoPush を吸い切ってから
+    /// 走らせ、最後に Coordinator.Start で監視を復帰する。
+    /// 未保存の CloudFolderPath が UI にあれば実行前に反映する。
     /// </summary>
     [RelayCommand]
     private async Task SyncAndRestartAsync()
     {
         if (IsBusy) return;
+        if (!TryGetCloud(out _)) return;
         IsBusy = true;
+        var coordinatorWasRunning = false;
         try
         {
+            // (0) AutoSync 監視を止め、進行中の HandleProcessExited による
+            //     自動 Push が ShutdownSyncOrchestrator と並走しないようにする。
+            //     再起動完了後に Start() で復帰させる。
+            IReadOnlyList<string> autoPushedTools = System.Array.Empty<string>();
+            if (_coordinator is not null)
+            {
+                coordinatorWasRunning = true;
+                _coordinator.Stop();
+                var waitResult = await _coordinator.WaitForInFlightPushAsync(TimeSpan.FromSeconds(20));
+                autoPushedTools = waitResult.PushedToolKeys;
+                if (!waitResult.Completed)
+                {
+                    AppendLog("[restart] 進行中の自動 Push 待機がタイムアウト (manifest 競合の可能性あり)");
+                }
+            }
+
             // (1) 終了済みツールだけ Push (起動中はスキップ)。
+            //     直近 AutoPush で Push 済みのツール (autoPushedTools) は二重 Push を避けてスキップ。
             var shutdown = new ShutdownSyncOrchestrator(
                 _runner,
                 logger: _runner.CreateLogger<ShutdownSyncOrchestrator>());
             var shutdownSteps = await shutdown.RunAsync(_settings, new ShutdownSyncOptions
             {
+                SkipPushForTools = autoPushedTools,
                 WaitForToolsToExit = null,
             });
             IngestShutdownSteps(shutdownSteps, logPrefix: "restart");
@@ -305,6 +333,13 @@ public partial class MainPageViewModel : ObservableObject
         }
         finally
         {
+            // (3) AutoSync を停止していたなら、Launch されたツールに対する
+            //     監視を復帰させる。Start は AutoSyncEnabled=false 等で no-op。
+            if (coordinatorWasRunning)
+            {
+                try { _coordinator?.Start(); }
+                catch (Exception ex) { AppendLog($"[restart] Coordinator.Start 復帰失敗: {ex.Message}"); }
+            }
             IsBusy = false;
         }
     }
