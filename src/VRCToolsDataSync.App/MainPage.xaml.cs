@@ -13,6 +13,10 @@ public sealed partial class MainPage : Page
     public MainPage()
     {
         InitializeComponent();
+        // Issue #6: トレイメニューから VM のコマンドを叩けるよう、App 側に
+        // シングルトン参照を持たせる。MainPage は MainWindow の content として
+        // 一度だけ生成される想定。
+        App.Page = this;
         ViewModel.ConflictRequested += OnConflictRequested;
         ViewModel.RemoteUpdateRequested += OnRemoteUpdateRequested;
         ViewModel.ShowWindowRequested += () => App.ShowMainWindow();

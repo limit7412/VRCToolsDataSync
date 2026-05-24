@@ -202,6 +202,7 @@ public partial class App : Application
                 Tray.Initialize();
                 Tray.ShowWindowRequested += ShowMainWindow;
                 Tray.ExitRequested += ExitApplication;
+                Tray.SyncAndLaunchRequested += OnTraySyncAndLaunch;
             }
             catch (Exception ex) { LogStartupFailure("Tray.Initialize", ex); }
 
@@ -372,6 +373,35 @@ public partial class App : Application
     //  生き残るため、自前で停止することは諦めた)
     private static void ExitApplication() => _ = ExitApplicationAsync(waitForToolsToExit: null);
 
+    // MainPage が VM を経由してウィンドウのコマンドを呼べるよう、MainPage 側で
+    // 自分のインスタンスをここに登録する。WinUI Page にはシングルトンが無いので、
+    // App と Page の間の橋渡しに使う。
+    public static MainPage? Page { get; set; }
+
+    /// <summary>
+    /// トレイ「同期して起動」ハンドラ。MainWindow を表示してから VM の
+    /// コマンドを叩く。Window を先に出すのは、進捗ログをユーザに見せたいから。
+    /// </summary>
+    private static void OnTraySyncAndLaunch()
+    {
+        LogLifecycle("Tray.SyncAndLaunch entered");
+        ShowMainWindow();
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            var vm = Page?.ViewModel;
+            if (vm is null)
+            {
+                LogLifecycle("Tray.SyncAndLaunch skip: page is null");
+                return;
+            }
+            if (vm.SyncAndLaunchCommand.CanExecute(null))
+            {
+                vm.SyncAndLaunchCommand.Execute(null);
+            }
+        });
+    }
+
+    /// <summary>
     /// Windows ログオフ / シャットダウンのハンドラ。SystemEvents から呼ばれる。
     /// 既定の Windows のシャットダウン猶予 (約 5 秒) では Push が間に合わないため、
     /// <c>ShutdownBlockReasonCreate</c> で「同期中…」と表示して最大 <c>SessionEndPushTimeout</c>
@@ -449,7 +479,6 @@ public partial class App : Application
         }
     }
 
-    /// <summary>
     /// 指定アクションを UI スレッドで同期的に実行する。
     /// SessionEnding ハンドラなどのバックグラウンドスレッドから、HWND を作成した
     /// UI スレッド経由でしか呼べない Win32 API (ShutdownBlockReasonCreate 等) を
@@ -487,6 +516,7 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
     /// 終了済みのツールだけ Push → Environment.Exit。
     /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、

@@ -47,23 +47,23 @@ public partial class MainPageViewModel : ObservableObject
     /// 直後に呼び出される想定 (Window 構築前に走った StartupSyncOrchestrator
     /// のステップを GUI 上のログに反映するため)。
     /// </summary>
-    public void IngestStartupSteps(IReadOnlyList<StartupSyncStep> steps)
+    public void IngestStartupSteps(IReadOnlyList<StartupSyncStep> steps, string logPrefix = "startup")
     {
         foreach (var step in steps)
         {
             switch (step.Kind)
             {
                 case StartupSyncStepKind.PullStarted:
-                    AppendLog($"[startup] {step.DisplayName} Pull 開始...");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 開始...");
                     break;
                 case StartupSyncStepKind.PullSucceeded:
-                    AppendLog($"[startup] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
                     break;
                 case StartupSyncStepKind.PullFailed:
-                    AppendLog($"[startup] {step.DisplayName} Pull 失敗: {step.Message}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull 失敗: {step.Message}");
                     break;
                 case StartupSyncStepKind.PullSkipped:
-                    AppendLog($"[startup] {step.DisplayName} Pull スキップ: {step.Message}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} Pull スキップ: {step.Message}");
                     break;
                 case StartupSyncStepKind.LaunchAttempted:
                     var outcome = step.LaunchResult?.Outcome;
@@ -75,15 +75,23 @@ public partial class MainPageViewModel : ObservableObject
                         ToolLaunchOutcome.LaunchFailed => $"起動失敗: {step.Message}",
                         _ => outcome?.ToString() ?? "不明",
                     };
-                    AppendLog($"[startup] {step.DisplayName} {msg}");
+                    AppendLog($"[{logPrefix}] {step.DisplayName} {msg}");
                     break;
                 case StartupSyncStepKind.LaunchSkipped:
                     // 自動起動 OFF 時のログはノイズなので出さない。
                     break;
             }
         }
-        // 起動時 Pull で ToolState が更新されている可能性があるので、Coordinator
-        // に最新の settings をリロードして渡す。VM 側の _settings も差し替える。
+        RefreshSettingsAndStatus();
+    }
+
+    /// <summary>
+    /// 起動同期 / 終了同期 / 再起動同期 のいずれかが Push/Pull を行った後に呼び、
+    /// VM が保持する settings をディスクから読み直して Coordinator にも反映する。
+    /// 古い ToolState で続く処理が動かないようにするための共通後処理。
+    /// </summary>
+    private void RefreshSettingsAndStatus()
+    {
         _settings = _runner.LoadSettings();
         _coordinator?.RefreshSettings(_settings);
         RefreshStatusSummaries();
@@ -230,6 +238,37 @@ public partial class MainPageViewModel : ObservableObject
             Arguments = existingFc?.Arguments,
             LaunchOnAppStart = FriendConnectLaunchOnAppStart,
         };
+    }
+
+    /// <summary>
+    /// トレイ「同期して起動」と MainPage の同名ボタンから呼ばれる。
+    /// 同期 ON のツールを Pull → Launch する。既に動いていれば Launch は no-op。
+    /// 未保存の CloudFolderPath が UI にあれば実行前に反映する (TryGetCloud)。
+    /// </summary>
+    [RelayCommand]
+    private async Task SyncAndLaunchAsync()
+    {
+        if (IsBusy) return;
+        // UI で編集中の CloudFolderPath を _settings へ反映してから走らせる。
+        // RunPushAsync/RunPullAsync が TryGetCloud で行っているのと同じ前処理。
+        if (!TryGetCloud(out _)) return;
+        IsBusy = true;
+        try
+        {
+            var orchestrator = new StartupSyncOrchestrator(
+                _runner,
+                logger: _runner.CreateLogger<StartupSyncOrchestrator>());
+            var steps = await Task.Run(() => orchestrator.Run(_settings));
+            IngestStartupSteps(steps);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"同期して起動 エラー: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
     }
 
     /// <summary>

@@ -17,6 +17,9 @@ public sealed class TrayIconManager : IDisposable
 
     public event Action? ShowWindowRequested;
     public event Action? ExitRequested;
+    // Issue #6: 「同期して起動」のトレイメニュー項目から発火。
+    // MainPage 側でツール起動を伴う Pull → Launch を呼ぶ。
+    public event Action? SyncAndLaunchRequested;
 
     public void Initialize()
     {
@@ -32,7 +35,13 @@ public sealed class TrayIconManager : IDisposable
             ShowWindowRequested?.Invoke();
         }));
         _popupMenu.Items.Add(new PopupMenuSeparator());
-        _popupMenu.Items.Add(new PopupMenuItem("終了", (_, _) =>
+        _popupMenu.Items.Add(new PopupMenuItem("同期して起動", (_, _) =>
+        {
+            LifecycleLog("Tray.PopupMenu SyncAndLaunch clicked");
+            SyncAndLaunchRequested?.Invoke();
+        }));
+        _popupMenu.Items.Add(new PopupMenuSeparator());
+        _popupMenu.Items.Add(new PopupMenuItem("同期して終了", (_, _) =>
         {
             LifecycleLog("Tray.PopupMenu Exit clicked");
             ExitRequested?.Invoke();

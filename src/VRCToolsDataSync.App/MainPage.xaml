@@ -44,6 +44,15 @@
                     <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
 
                     <StackPanel Spacing="4">
+                        <TextBlock Text="同期付きアクション" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="同期して起動"
+                                    Command="{x:Bind ViewModel.SyncAndLaunchCommand}"
+                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
                         <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}" />
