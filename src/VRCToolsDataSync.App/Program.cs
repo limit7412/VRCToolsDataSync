@@ -36,6 +36,11 @@ public static class Program
         finally
         {
             App.ReleaseSingleInstance();
+            // FileLoggerProvider 内のファイルハンドル等の解放と、未 flush ログの
+            // 書き出しを保証する。Tray「終了」経路の Environment.Exit(0) は
+            // この finally を通らないため ExitApplicationAsync 側でも Dispose
+            // しているが、それ以外の正常終了経路ではここが flush の機会になる。
+            try { App.LoggerFactory.Dispose(); } catch { /* best-effort */ }
         }
     }
 }

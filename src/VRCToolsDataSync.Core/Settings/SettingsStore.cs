@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading;
 
 namespace VRCToolsDataSync.Core.Settings;
 
@@ -11,6 +12,17 @@ public sealed class SettingsStore
     };
 
     private readonly object _saveLock = new();
+
+    // クロスプロセス排他用の Named Mutex 名。
+    // GUI (App) と CLI が同じ settings.json に対して並走で
+    // read-modify-write すると、プロセス内 _saveLock だけではアトミック性が
+    // 担保できず、片方の更新が他方に潰される。Global\ は付けずユーザセッション
+    // 内のみ排他にする (settings は %AppData% 配下なのでユーザ毎にしか共有されない)。
+    private const string CrossProcessMutexName = "VRCToolsDataSync.SettingsStore.Save";
+    // Mutex 取得のタイムアウト。普通の Save は数十 ms で終わるため、
+    // これだけ待っても取れない場合は別プロセスがハング相当なので、
+    // 取得を諦めてプロセス内ロックだけで救済し best-effort で書く。
+    private static readonly TimeSpan CrossProcessMutexTimeout = TimeSpan.FromSeconds(10);
 
     public string FilePath { get; }
 
@@ -61,46 +73,83 @@ public sealed class SettingsStore
             Directory.CreateDirectory(dir);
         }
 
-        // 同一インスタンスからの並行 Save を直列化し、
-        // 一時ファイル名にも GUID を付けて他プロセス/別 SyncRunner からの
-        // 同時書き込みでも tmp 衝突しないようにする。
-        lock (_saveLock)
+        // クロスプロセス排他: GUI と CLI が並走したケースで read-modify-write を
+        // アトミックに完結させる。プロセス内 _saveLock は同一インスタンス内の
+        // 並行 Save 直列化用で、別プロセスからの同時 Save は守れない。
+        // initiallyOwned=false でハンドルだけ作り、WaitOne でブロック取得する。
+        using var crossProcessMutex = new Mutex(initiallyOwned: false, name: CrossProcessMutexName);
+        bool mutexAcquired = false;
+        try
         {
-            // 保存直前にディスクの現行 settings を再読込し、ToolState を
-            // tool キー単位でマージする。これにより、別プロセス/別 SyncRunner
-            // が同じ settings.json に対して別 tool の状態更新を入れた直後でも、
-            // 自分の Save がそれを消し飛ばさない。
-            var merged = MergeForSave(settings, mergeTopLevelFromDisk);
-
-            var tmp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
             try
             {
-                using (var stream = File.Create(tmp))
-                {
-                    JsonSerializer.Serialize(stream, merged, JsonOptions);
-                }
-                if (File.Exists(FilePath))
-                {
-                    File.Replace(tmp, FilePath, destinationBackupFileName: null);
-                }
-                else
-                {
-                    File.Move(tmp, FilePath);
-                }
-
-                // 呼び出し元のインスタンスにも反映しておく。これがないと、
-                // 呼び出し元 settings の ToolState / Launch が古いままで、続けて
-                // 別の経路 (例: GUI ボタンの Push) が走った時に旧情報を
-                // 書き戻してしまう。
-                settings.ToolState = merged.ToolState;
-                settings.Launch = merged.Launch;
+                mutexAcquired = crossProcessMutex.WaitOne(CrossProcessMutexTimeout);
             }
-            finally
+            catch (AbandonedMutexException)
             {
-                if (File.Exists(tmp))
+                // 他プロセスが Mutex を保持したまま死んだ場合、所有権はこちらに
+                // 渡ってくる。Mutex 自体は取れているので続行する。
+                mutexAcquired = true;
+            }
+
+            // タイムアウトで取れなかった場合はプロセス内ロックだけで best-effort 保存。
+            // 取得を諦めるよりは書き込んだ方がマシ (待つほど呼び出し元が長時間ハングする)。
+
+            // 一時ファイル名にも GUID を付けて、Mutex 取得失敗時の best-effort 書き込みや
+            // 他プロセスからの同時書き込みでも tmp 衝突しないようにする。
+            lock (_saveLock)
+            {
+                // 保存直前にディスクの現行 settings を再読込し、ToolState を
+                // tool キー単位でマージする。これにより、別プロセス/別 SyncRunner
+                // が同じ settings.json に対して別 tool の状態更新を入れた直後でも、
+                // 自分の Save がそれを消し飛ばさない。
+                var merged = MergeForSave(settings, mergeTopLevelFromDisk);
+
+                var tmp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
+                try
                 {
-                    try { File.Delete(tmp); } catch { /* best-effort */ }
+                    using (var stream = File.Create(tmp))
+                    {
+                        JsonSerializer.Serialize(stream, merged, JsonOptions);
+                    }
+                    if (File.Exists(FilePath))
+                    {
+                        File.Replace(tmp, FilePath, destinationBackupFileName: null);
+                    }
+                    else
+                    {
+                        File.Move(tmp, FilePath);
+                    }
+
+                    // 呼び出し元のインスタンスにも反映しておく。これがないと、
+                    // 呼び出し元 settings の ToolState / Launch が古いままで、続けて
+                    // 別の経路 (例: GUI ボタンの Push) が走った時に旧情報を
+                    // 書き戻してしまう。
+                    // Top-level 設定も同期する: SaveToolStateOnly 後に同じ settings
+                    // インスタンスで通常 Save が走ると、ディスクから採用した最新の
+                    // top-level が in-memory の古い値で上書きされて消えるため。
+                    settings.CloudFolderPath = merged.CloudFolderPath;
+                    settings.MachineName = merged.MachineName;
+                    settings.SyncVrcx = merged.SyncVrcx;
+                    settings.SyncFriendConnect = merged.SyncFriendConnect;
+                    settings.AutoSyncEnabled = merged.AutoSyncEnabled;
+                    settings.ToolState = merged.ToolState;
+                    settings.Launch = merged.Launch;
                 }
+                finally
+                {
+                    if (File.Exists(tmp))
+                    {
+                        try { File.Delete(tmp); } catch { /* best-effort */ }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                try { crossProcessMutex.ReleaseMutex(); } catch { /* best-effort */ }
             }
         }
     }

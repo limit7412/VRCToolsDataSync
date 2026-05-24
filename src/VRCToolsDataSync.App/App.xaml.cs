@@ -43,6 +43,12 @@ public partial class App : Application
         builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
     });
 
+    // App.xaml.cs 内の起動/終了ライフサイクルログ用のカテゴリ付きロガー。
+    // 以前は LogLifecycle が File.AppendAllText で FileLoggerProvider と同じ
+    // ファイルに直接書き込んでいたが、シェアリング違反 (IOException) のリスクが
+    // あったため、共有 LoggerFactory 経由に統一した。
+    private static readonly ILogger _lifecycleLogger = LoggerFactory.CreateLogger("VRCToolsDataSync.App.Lifecycle");
+
     public static SyncRunner Runner { get; } = new(loggerFactory: LoggerFactory);
 
     public static AutoSyncCoordinator? Coordinator { get; private set; }
@@ -274,6 +280,16 @@ public partial class App : Application
 
     private static void LogStartupFailure(string source, Exception? ex)
     {
+        // まず共有 LoggerFactory 経由で書く。シェアリング違反を回避するため、
+        // 直接 File.AppendAllText を使うのは LoggerFactory 自体が機能していない
+        // 最悪ケースのフォールバックに限定する。
+        try
+        {
+            _lifecycleLogger.LogError(ex, "[STARTUP-FAIL] {Source}", source);
+            return;
+        }
+        catch { /* fall through to last-resort direct write */ }
+
         try
         {
             var dir = Path.GetDirectoryName(FileLoggerProvider.DefaultLogPath());
@@ -606,7 +622,14 @@ public partial class App : Application
         Coordinator = null;
         try { Tray.Dispose(); LogLifecycle("ExitApplication.Tray.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Tray.Dispose fail: " + ex.Message); }
 
+        // 多重起動防止 Mutex を解放してから LoggerFactory を Dispose する。
+        // LoggerFactory を Dispose すると FileLoggerProvider のファイルハンドル
+        // など内部リソースが解放され、未 flush のログが確実に書き出される。
+        // Environment.Exit(0) は finally を呼ばないため、ここで明示的に
+        // Dispose しないとログの末尾が欠ける可能性がある。
+        ReleaseSingleInstance();
         LogLifecycle("ExitApplication.Environment.Exit(0)");
+        try { LoggerFactory.Dispose(); } catch { /* best-effort */ }
         Environment.Exit(0);
     }
 
@@ -614,14 +637,9 @@ public partial class App : Application
     {
         try
         {
-            var dir = Path.GetDirectoryName(FileLoggerProvider.DefaultLogPath());
-            if (!string.IsNullOrEmpty(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-            var path = FileLoggerProvider.DefaultLogPath();
-            var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [LIFECYCLE] {message}";
-            File.AppendAllText(path, line + Environment.NewLine);
+            // ログ出力先は FileLoggerProvider と共通化されており、内部の lock
+            // でシリアライズされるため、シェアリング違反は起きない。
+            _lifecycleLogger.LogInformation("{Message}", message);
         }
         catch { /* best-effort */ }
     }
