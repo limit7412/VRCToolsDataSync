@@ -16,6 +16,24 @@ public sealed class AutoSyncCoordinator : IDisposable
     private readonly ILogger<AutoSyncCoordinator> _logger;
     private readonly List<ToolBinding> _bindings = new();
     private readonly object _autoPushLock = new();
+    // Start / Stop / UpdateSettings のライフサイクル系操作を直列化する。
+    // App.OnLaunched 内で Coordinator.Start が Task.Run で非同期に走るように
+    // なったため、起動直後にユーザが「設定を保存」(UpdateSettings → Stop+Start)
+    // するとレースして _bindings が二重に並ぶ可能性がある。
+    private readonly object _lifecycleLock = new();
+    // 進行中の HandleProcessExited タスクをここに記録し、Stop / 終了時に
+    // join + 「どのツールが Push 完了したか」を把握できるようにする。
+    // ShutdownSyncOrchestrator は AutoPush で既に Push 済みのツールを
+    // 二重 Push しないために使う。
+    private readonly object _inFlightLock = new();
+    private readonly List<InFlightPush> _inFlightPushes = new();
+    // 既に完了している AutoPush の ToolKey を保持する。
+    // _inFlightPushes は完了 → ContinueWith で即削除されるため、
+    // 「WaitForInFlightPushAsync を呼ぶ直前に完了した AutoPush」が snapshot から
+    // 漏れて二重 Push の原因になっていた (issue: 直近完了 AutoPush のキー保持)。
+    // 完了時はこの集合に ToolKey を追加し、Start 時に明示クリアする
+    // (= 同一 Coordinator 世代の中だけ覚えていれば十分)。
+    private readonly HashSet<string> _recentlyCompletedAutoPushes = new(StringComparer.Ordinal);
     private CloudWatcher? _cloudWatcher;
     private SyncSettings _settings;
     private bool _started;
@@ -39,6 +57,11 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Start()
     {
+        lock (_lifecycleLock) { StartCore(); }
+    }
+
+    private void StartCore()
+    {
         if (_started) return;
         if (!_settings.AutoSyncEnabled) return;
         if (string.IsNullOrWhiteSpace(_settings.CloudFolderPath) || !Directory.Exists(_settings.CloudFolderPath))
@@ -52,6 +75,15 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _generationCts.Dispose();
             _generationCts = new CancellationTokenSource();
+        }
+
+        // 新しい監視世代に入るので、前回までの「完了済み AutoPush」の記録は捨てる。
+        // (前回 Coordinator が動いていた間に Push したものを今回の Shutdown でスキップ
+        //  対象にすると、その後ユーザがツールを再起動して再編集していた場合に
+        //  Push したい変更まで取りこぼす可能性があるため。)
+        lock (_inFlightLock)
+        {
+            _recentlyCompletedAutoPushes.Clear();
         }
 
         if (_settings.SyncVrcx)
@@ -87,6 +119,11 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Stop()
     {
+        lock (_lifecycleLock) { StopCore(); }
+    }
+
+    private void StopCore()
+    {
         if (!_started) return;
 
         // 切り離された HandleProcessExited タスクを中断するため、
@@ -110,9 +147,14 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void UpdateSettings(SyncSettings settings)
     {
-        _settings = settings;
-        Stop();
-        Start();
+        // Start / Stop と同じ lock を取って、未完了の Start と並走しないようにする。
+        // 内部で StopCore / StartCore を呼ぶことで再入を避ける (同じ lock を二重取得しない)。
+        lock (_lifecycleLock)
+        {
+            _settings = settings;
+            StopCore();
+            StartCore();
+        }
     }
 
     /// <summary>
@@ -136,11 +178,94 @@ public sealed class AutoSyncCoordinator : IDisposable
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
-        watcher.ProcessExited += _ => Task.Run(() => HandleProcessExited(binding, token));
+        watcher.ProcessExited += _processName =>
+        {
+            // 進行中の AutoPush を ToolKey 付きで記録し、Stop / 終了シーケンスから
+            // 待ち合わせ + どのツールが Push 完了したかを把握できるようにする。
+            var entry = new InFlightPush(binding.ToolKey);
+            entry.Task = Task.Run(() =>
+            {
+                var pushed = HandleProcessExited(binding, token);
+                entry.Pushed = pushed;
+            });
+            lock (_inFlightLock) { _inFlightPushes.Add(entry); }
+            entry.Task.ContinueWith(_ =>
+            {
+                lock (_inFlightLock)
+                {
+                    _inFlightPushes.Remove(entry);
+                    // Push まで成功したものは「直近完了」集合にも残す。
+                    // _inFlightPushes から消えた後でも WaitForInFlightPushAsync が
+                    // 拾えるようにする (= 終了処理直前に完了した AutoPush の
+                    // 二重 Push を Shutdown 側でスキップさせる)。
+                    if (entry.Pushed) _recentlyCompletedAutoPushes.Add(entry.ToolKey);
+                }
+            }, TaskScheduler.Default);
+        };
         return binding;
     }
 
-    private void HandleProcessExited(ToolBinding binding, CancellationToken token)
+    /// <summary>
+    /// Stop の Cancel 直後に呼んで、進行中の AutoPush タスクが終わるまで待つ。
+    /// 終了シーケンス (ShutdownSyncOrchestrator) との二重 Push を防ぐ。
+    /// 戻り値: Completed=true なら全 AutoPush 完了、false ならタイムアウト。
+    /// PushedToolKeys には、現在の Coordinator 世代で「実際に Push まで成功したツール」の
+    /// ToolKey が入る (進行中タスクの完了 + これより前に完了済みの AutoPush の両方を含む)。
+    /// 呼び出し元はこの集合に含まれるツールについて Shutdown Push をスキップすることで、
+    /// AutoPush と Shutdown Push の二重 Push (= 無駄な version インクリメント) を回避できる。
+    /// </summary>
+    public async Task<WaitForInFlightPushResult> WaitForInFlightPushAsync(TimeSpan timeout, CancellationToken ct = default)
+    {
+        InFlightPush[] snapshot;
+        lock (_inFlightLock) { snapshot = _inFlightPushes.ToArray(); }
+        bool completedOk = true;
+        if (snapshot.Length > 0)
+        {
+            _logger.LogInformation("AutoPush in-flight: waiting count={Count}", snapshot.Length);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(timeout);
+            var allDone = Task.WhenAll(snapshot.Select(e => e.Task));
+            var delay = Task.Delay(Timeout.Infinite, cts.Token);
+            Task completed;
+            try
+            {
+                completed = await Task.WhenAny(allDone, delay).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // 通常 Task.WhenAny は例外を投げないが、念のため。タイムアウト扱い。
+                completed = delay;
+            }
+            // allDone が先に完了 = 全 AutoPush 完了。delay が先に完了 = タイムアウト。
+            completedOk = completed == allDone;
+        }
+        // 「直近完了 AutoPush」集合を取り出して合流させる。snapshot に入っていた
+        // タスクは ContinueWith でこの集合に追加されているはずで、加えて
+        // WaitForInFlightPushAsync が呼ばれる前に既に完了して _inFlightPushes
+        // から消えていた AutoPush もここから拾える。
+        string[] pushedKeys;
+        lock (_inFlightLock)
+        {
+            pushedKeys = _recentlyCompletedAutoPushes.ToArray();
+        }
+        return new WaitForInFlightPushResult(completedOk, pushedKeys);
+    }
+
+    private sealed class InFlightPush
+    {
+        public string ToolKey { get; }
+        public Task Task { get; set; } = Task.CompletedTask;
+        public bool Pushed { get; set; }
+        public InFlightPush(string toolKey) { ToolKey = toolKey; }
+    }
+
+    /// <summary>
+    /// プロセス終了検知後の AutoPush 本体。Push まで成功したら true を返す。
+    /// 戻り値は <see cref="InFlightPush"/> に記録され、<see cref="WaitForInFlightPushAsync"/>
+    /// を経由して呼び出し元 (Shutdown シーケンス) に「直近 AutoPush で Push 完了したツール」
+    /// として伝わる。これでShutdownSyncOrchestrator が同じツールを二重 Push しないようにする。
+    /// </summary>
+    private bool HandleProcessExited(ToolBinding binding, CancellationToken token)
     {
         // プロセス終了直後はファイル解放待ちで数秒置く (キャンセル対応)。
         try
@@ -150,14 +275,14 @@ public sealed class AutoSyncCoordinator : IDisposable
         catch (OperationCanceledException)
         {
             _logger.LogInformation("AutoPush キャンセル (grace中) tool={Tool}", binding.ToolKey);
-            return;
+            return false;
         }
 
         // grace 中に Stop / UpdateSettings で世代が切れていたら中断。
         if (token.IsCancellationRequested)
         {
             _logger.LogInformation("AutoPush キャンセル tool={Tool}", binding.ToolKey);
-            return;
+            return false;
         }
 
         var pushEvent = new AutoPushEvent(binding.ToolKey, binding.DisplayName);
@@ -177,7 +302,7 @@ public sealed class AutoSyncCoordinator : IDisposable
                 if (token.IsCancellationRequested)
                 {
                     _logger.LogInformation("AutoPush キャンセル (lock後) tool={Tool}", binding.ToolKey);
-                    return;
+                    return false;
                 }
                 result = _runner.Push(service, _settings, _settings.CloudFolderPath, force: false);
             }
@@ -186,7 +311,7 @@ public sealed class AutoSyncCoordinator : IDisposable
                 case SyncOutcome.Success:
                     _logger.LogInformation("AutoPush 完了 tool={Tool} version={Version}", binding.ToolKey, result.RemoteVersion);
                     AutoPushCompleted?.Invoke(pushEvent with { Result = result });
-                    break;
+                    return true;
                 case SyncOutcome.ConflictDetected:
                     _logger.LogInformation("AutoPush 競合 tool={Tool} remote={Remote}", binding.ToolKey, result.RemoteVersion);
                     AutoPushConflict?.Invoke(new AutoPushConflictEvent(
@@ -194,10 +319,10 @@ public sealed class AutoSyncCoordinator : IDisposable
                         result.RemoteVersion ?? 0,
                         result.LastPulledVersion ?? 0,
                         binding.ServiceFactory));
-                    break;
+                    return false;
                 default:
                     AutoPushCompleted?.Invoke(pushEvent with { Result = result });
-                    break;
+                    return false;
             }
         }
         catch (RunningProcessException ex)
@@ -209,6 +334,7 @@ public sealed class AutoSyncCoordinator : IDisposable
                 Outcome = SyncOutcome.Aborted,
                 Message = ex.Message,
             }});
+            return false;
         }
         catch (Exception ex)
         {
@@ -218,6 +344,7 @@ public sealed class AutoSyncCoordinator : IDisposable
                 Outcome = SyncOutcome.Aborted,
                 Message = ex.Message,
             }});
+            return false;
         }
     }
 
@@ -275,3 +402,12 @@ public sealed record RemoteUpdateEvent(
     long LocalVersion,
     string MachineName,
     Func<ISyncService> ServiceFactory);
+
+/// <summary>
+/// <see cref="AutoSyncCoordinator.WaitForInFlightPushAsync"/> の戻り値。
+/// </summary>
+/// <param name="Completed">true なら全 AutoPush が完了 / false ならタイムアウト。</param>
+/// <param name="PushedToolKeys">待機中に「実際に Push まで成功したツール」の ToolKey 集合。
+/// 呼び出し元 (Shutdown シーケンス) はこの集合のツールについて Shutdown Push を
+/// スキップすることで二重 Push を回避できる。</param>
+public sealed record WaitForInFlightPushResult(bool Completed, IReadOnlyList<string> PushedToolKeys);

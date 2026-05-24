@@ -150,7 +150,9 @@ static int RunPush(
                 state.LastPushedAt = DateTimeOffset.Now;
                 state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
                 settings.ToolState[toolKey] = state;
-                store.Save(settings);
+                // Push 経由の Save では Top-level 設定を書き戻さない
+                // (GUI 等で変更された AutoSyncEnabled 等を巻き戻さないため)。
+                store.SaveToolStateOnly(settings);
                 return 0;
             case SyncOutcome.ConflictDetected:
                 Console.Error.WriteLine($"コンフリクト: リモート version={result.RemoteVersion}, ローカル lastPulled={result.LastPulledVersion}");
@@ -207,7 +209,8 @@ static int RunPull(
                 state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
                 state.LastPulledAt = DateTimeOffset.Now;
                 settings.ToolState[toolKey] = state;
-                store.Save(settings);
+                // Pull 経由の Save では Top-level 設定を書き戻さない (Push と同様)。
+                store.SaveToolStateOnly(settings);
                 return 0;
             case SyncOutcome.NothingToDo:
             case SyncOutcome.SourceMissing:
