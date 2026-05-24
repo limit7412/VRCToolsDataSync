@@ -403,7 +403,7 @@ public partial class App : Application
                 }
             }
             catch (Exception ex) { LogLifecycle("ShutdownBlockReasonCreate fail: " + ex.Message); }
-        });
+        }, logTag: "ShutdownBlockReasonCreate");
 
         // SessionEnding が複数回呼ばれる可能性があるので、CTS はその都度
         // 新規に作って入れ替える。Cancel 済みの CTS のトークンは復活できないため、
@@ -428,7 +428,7 @@ public partial class App : Application
             // 同時にシャットダウンで終了していくはずなので、自然終了を待ってから Push する。
             // タイムアウト時は cts.Cancel し、ExitApplicationAsync の最後で
             // Environment.Exit を抑止する (ユーザがシャットダウンをキャンセルした場合に備えて)。
-            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout, externalCt: cts.Token);
+            var task = ExitApplicationAsync(waitForToolsToExit: SessionEndPushTimeout, externalCt: cts.Token, isSessionEnding: true);
             if (!task.Wait(SessionEndPushTimeout))
             {
                 LogLifecycle("OnSessionEnding timed out; cancelling exit");
@@ -445,7 +445,7 @@ public partial class App : Application
                     if (hwnd != IntPtr.Zero) ShutdownBlockReasonDestroy(hwnd);
                 }
                 catch { /* best-effort */ }
-            });
+            }, logTag: "ShutdownBlockReasonDestroy");
         }
     }
 
@@ -454,8 +454,10 @@ public partial class App : Application
     /// SessionEnding ハンドラなどのバックグラウンドスレッドから、HWND を作成した
     /// UI スレッド経由でしか呼べない Win32 API (ShutdownBlockReasonCreate 等) を
     /// 呼ぶときに使う。UI スレッド上から呼ばれた場合はそのまま実行する。
+    /// <paramref name="logTag"/> は失敗時のログに含めるラベル (どの呼び出しが失敗
+    /// したかを切り分けるため)。
     /// </summary>
-    private static void InvokeOnUiThread(Action action)
+    private static void InvokeOnUiThread(Action action, string logTag)
     {
         if (DispatcherQueue is null || DispatcherQueue.HasThreadAccess)
         {
@@ -463,14 +465,26 @@ public partial class App : Application
             return;
         }
         using var done = new ManualResetEventSlim(false);
-        DispatcherQueue.TryEnqueue(() =>
+        // TryEnqueue は DispatcherQueue がシャットダウン済み等で受け付けられない場合に
+        // false を返し、その場合 action は一度も実行されない。サイレントに見逃すと
+        // ShutdownBlockReasonCreate が呼ばれずシャットダウン猶予延長が効かない、
+        // などの問題に気付けないので、必ず戻り値を確認してログに残す。
+        var enqueued = DispatcherQueue.TryEnqueue(() =>
         {
             try { action(); }
             finally { done.Set(); }
         });
+        if (!enqueued)
+        {
+            LogLifecycle($"InvokeOnUiThread.TryEnqueue failed ({logTag}); UI dispatch is unavailable, skipped");
+            return;
+        }
         // ShutdownBlockReasonCreate/Destroy は数 ms で終わる軽い呼び出しなので、
         // UI スレッドの完了を 2 秒だけ待つ (UI スレッドが応答不能なら諦める)。
-        done.Wait(TimeSpan.FromSeconds(2));
+        if (!done.Wait(TimeSpan.FromSeconds(2)))
+        {
+            LogLifecycle($"InvokeOnUiThread.Wait timed out ({logTag}); UI thread is unresponsive");
+        }
     }
 
     /// 終了シーケンス。Coordinator を停止 → 各ツールが既に終了しているか確認 →
@@ -478,10 +492,15 @@ public partial class App : Application
     /// <paramref name="waitForToolsToExit"/> null = 待たない (Tray「終了」経路)、
     /// 値あり = タイムアウトまで自然終了を待つ (SessionEnding 経路)。
     /// <paramref name="externalCt"/> はキャンセル通知用 (SessionEnding のタイムアウトで使う)。
+    /// <paramref name="isSessionEnding"/> SessionEnding 経路から呼ばれた場合は true。
+    /// このときは Environment.Exit(0) を呼ばず、OS のシャットダウンに終了を委ねる。
+    /// ユーザがログオフ/シャットダウンを 15 秒以内に取り消したケースで
+    /// 「OS は継続しているのにアプリだけ落ちる」不整合を防ぐため。
     /// </summary>
     internal static async System.Threading.Tasks.Task ExitApplicationAsync(
         TimeSpan? waitForToolsToExit,
-        CancellationToken externalCt = default)
+        CancellationToken externalCt = default,
+        bool isSessionEnding = false)
     {
         var prior = Interlocked.CompareExchange(ref _isExiting, 1, 0);
         LogLifecycle("ExitApplication.entered isExiting=" + prior);
@@ -531,17 +550,21 @@ public partial class App : Application
         catch (OperationCanceledException) { LogLifecycle("ExitApplication.ShutdownSync cancelled"); }
         catch (Exception ex) { LogLifecycle("ExitApplication.ShutdownSync fail: " + ex.Message); }
 
-        // SessionEnding がタイムアウトでキャンセルしていた場合は、Environment.Exit
-        // までは進めない。ユーザがシャットダウンを取り消した時にアプリが
-        // 中途半端な状態のまま残るのを避けるため、ここで早期 return する。
-        if (externalCt.IsCancellationRequested)
+        // SessionEnding 経路は Environment.Exit を呼ばない。
+        // - シャットダウン/ログオフが本当に進めば、OS 側がプロセスを殺すので
+        //   こちらから明示的に終了する必要は無い。
+        // - ユーザがシャットダウンを (タイムアウト前であれ後であれ) 取り消した
+        //   ケースで「OS は継続しているのにアプリだけ落ちる」不整合を避けるため、
+        //   ここで早期 return して Coordinator.Start で監視を復活させる。
+        // externalCt がキャンセルされた経路 (= 15s タイムアウト) も同じ理由で早期 return。
+        if (isSessionEnding || externalCt.IsCancellationRequested)
         {
-            LogLifecycle("ExitApplication.skip Environment.Exit (externalCt cancelled)");
+            LogLifecycle($"ExitApplication.skip Environment.Exit (isSessionEnding={isSessionEnding} externalCtCancelled={externalCt.IsCancellationRequested})");
             // 既に Coordinator.Stop() を呼んでいるため、このままだとプロセスは
             // 生き残るのに AutoSync 監視だけ止まった半死状態になる。Start() を
             // 呼び戻して監視を復活させる (Start は AutoSyncEnabled=false や
             // CloudFolderPath 未設定なら no-op なので、安全に再呼び出し可能)。
-            try { Coordinator?.Start(); LogLifecycle("ExitApplication.Coordinator.Start (resumed after externalCt cancel)"); }
+            try { Coordinator?.Start(); LogLifecycle("ExitApplication.Coordinator.Start (resumed)"); }
             catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Start fail (resume): " + ex.Message); }
             // 終了フラグをクリアして次の終了要求を受け付けられるようにする
             Interlocked.Exchange(ref _isExiting, 0);
