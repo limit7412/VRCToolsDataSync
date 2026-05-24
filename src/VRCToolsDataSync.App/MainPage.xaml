@@ -49,9 +49,6 @@
                             <Button Content="同期して起動"
                                     Command="{x:Bind ViewModel.SyncAndLaunchCommand}"
                                     IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                            <Button Content="同期して再起動"
-                                    Command="{x:Bind ViewModel.SyncAndRestartCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
                         </StackPanel>
                     </StackPanel>
 

@@ -203,7 +203,6 @@ public partial class App : Application
                 Tray.ShowWindowRequested += ShowMainWindow;
                 Tray.ExitRequested += ExitApplication;
                 Tray.SyncAndLaunchRequested += OnTraySyncAndLaunch;
-                Tray.SyncAndRestartRequested += OnTraySyncAndRestart;
             }
             catch (Exception ex) { LogStartupFailure("Tray.Initialize", ex); }
 
@@ -398,25 +397,6 @@ public partial class App : Application
             if (vm.SyncAndLaunchCommand.CanExecute(null))
             {
                 vm.SyncAndLaunchCommand.Execute(null);
-            }
-        });
-    }
-
-    private static void OnTraySyncAndRestart()
-    {
-        LogLifecycle("Tray.SyncAndRestart entered");
-        ShowMainWindow();
-        DispatcherQueue.TryEnqueue(() =>
-        {
-            var vm = Page?.ViewModel;
-            if (vm is null)
-            {
-                LogLifecycle("Tray.SyncAndRestart skip: page is null");
-                return;
-            }
-            if (vm.SyncAndRestartCommand.CanExecute(null))
-            {
-                vm.SyncAndRestartCommand.Execute(null);
             }
         });
     }

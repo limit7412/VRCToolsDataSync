@@ -17,11 +17,9 @@ public sealed class TrayIconManager : IDisposable
 
     public event Action? ShowWindowRequested;
     public event Action? ExitRequested;
-    // Issue #6: 「同期して起動 / 再起動 / 終了」のトレイメニュー項目から発火。
-    // 起動・再起動は MainPage 側でツール起動を伴う Pull → Launch を、
-    // 終了は ExitApplicationAsync(forceStopAllSyncedTools=true) を呼ぶ想定。
+    // Issue #6: 「同期して起動」のトレイメニュー項目から発火。
+    // MainPage 側でツール起動を伴う Pull → Launch を呼ぶ。
     public event Action? SyncAndLaunchRequested;
-    public event Action? SyncAndRestartRequested;
 
     public void Initialize()
     {
@@ -41,11 +39,6 @@ public sealed class TrayIconManager : IDisposable
         {
             LifecycleLog("Tray.PopupMenu SyncAndLaunch clicked");
             SyncAndLaunchRequested?.Invoke();
-        }));
-        _popupMenu.Items.Add(new PopupMenuItem("同期して再起動", (_, _) =>
-        {
-            LifecycleLog("Tray.PopupMenu SyncAndRestart clicked");
-            SyncAndRestartRequested?.Invoke();
         }));
         _popupMenu.Items.Add(new PopupMenuSeparator());
         _popupMenu.Items.Add(new PopupMenuItem("同期して終了", (_, _) =>
