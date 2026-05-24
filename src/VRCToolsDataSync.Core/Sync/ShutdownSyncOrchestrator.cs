@@ -95,10 +95,22 @@ public sealed class ShutdownSyncOrchestrator
         // (1) 各ツールについて「終了済みか」をチェックする。SessionEnding 経路
         //     (WaitForToolsToExit が指定されている) なら、最大そのタイムアウトまで
         //     自然終了を待つ。Tray「終了」経路 (null) なら即時判定。
+        //
+        //     ただし SyncEnabled=false のツールは Push しないので終了を待つ意味が
+        //     無い。むしろ待ってしまうと SessionEnding 経路で同期 OFF のツール
+        //     (例: SyncFriendConnect=false のとき常駐中の Friend Connect) に
+        //     最大 WaitForToolsToExit (=15s) 引っ張られ、その間に外側の OnSessionEnding
+        //     全体タイムアウトに達して、同期 ON ツール (例: VRCX) の終了時 Push が
+        //     キャンセルで巻き添えになる。同期 OFF ツールは exitChecks に乗せず、
+        //     即時に PushSkipped("同期が無効化されています") として処理する。
         var toolDefs = EnumerateTools(settings, _runner).ToArray();
         var exitChecks = new List<Task<(ToolDefinition def, bool exited)>>();
         foreach (var def in toolDefs)
         {
+            if (!def.SyncEnabled)
+            {
+                continue;
+            }
             steps.Add(new ShutdownSyncStep
             {
                 ToolKey = def.Key,
@@ -138,6 +150,9 @@ public sealed class ShutdownSyncOrchestrator
         }
 
         // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
+        //     ここでは toolDefs ベース (= 同期 OFF も含む) で PushSkipped を出す。
+        //     UI/ログでは全ツールの結果が並ぶことになるが、同期 OFF ツールは Stop
+        //     フェーズには登場しない (上の (1) で exitChecks に投入していないため)。
         if (!cloudAvailable || options.SkipPush)
         {
             var reason = options.SkipPush
@@ -151,28 +166,30 @@ public sealed class ShutdownSyncOrchestrator
                     ToolKey = def.Key,
                     DisplayName = def.DisplayName,
                     Kind = ShutdownSyncStepKind.PushSkipped,
-                    Message = reason,
+                    Message = def.SyncEnabled ? reason : "同期が無効化されています",
                 });
             }
             return steps;
         }
 
+        // 同期 OFF のツールは exitResults に乗っていないので、ここで先に
+        // PushSkipped("同期が無効化されています") を出してから、同期 ON ツールの
+        // 通常 Push 処理に進む。
+        foreach (var def in toolDefs)
+        {
+            if (def.SyncEnabled) continue;
+            steps.Add(new ShutdownSyncStep
+            {
+                ToolKey = def.Key,
+                DisplayName = def.DisplayName,
+                Kind = ShutdownSyncStepKind.PushSkipped,
+                Message = "同期が無効化されています",
+            });
+        }
+
         foreach (var (def, exited) in exitResults)
         {
             ct.ThrowIfCancellationRequested();
-
-            // 同期 OFF のツールは Push しない。
-            if (!def.SyncEnabled)
-            {
-                steps.Add(new ShutdownSyncStep
-                {
-                    ToolKey = def.Key,
-                    DisplayName = def.DisplayName,
-                    Kind = ShutdownSyncStepKind.PushSkipped,
-                    Message = "同期が無効化されています",
-                });
-                continue;
-            }
 
             // ツールが起動中なら Push は不可能。SQLite が握られているので
             // RunningProcessException で失敗するだけ。スキップして次回起動時に手動 Push してもらう。
