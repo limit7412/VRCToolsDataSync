@@ -59,6 +59,9 @@ public sealed class SyncRunner
         // ローカルが既に最新と分かっているリモート (LastPulledVersion>=Version) の
         // Pull を抑止する。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
         // false を使い、従来通り上書き Pull を行う。
+        // JSON デシリアライズで ToolState が明示的に null になる可能性に備え、
+        // SettingsStore.MergeForSave と同様に null ガードを入れる。
+        settings.ToolState ??= new Dictionary<string, ToolSyncState>();
         var state = settings.ToolState.GetValueOrDefault(service.ToolKey);
         var result = service.Pull(new PullOptions
         {

@@ -147,9 +147,14 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         // Issue #19: 起動時自動 Pull の暴走防止。VRCX 側と同じ判定。
+        // ローカル必須ファイル (db.sqlite) が消えているケースでは skip せず
+        // 通常 Pull に進めて復元する (#20 レビュー指摘)。Push 側のガードと同じく
+        // _paths.Exists() (Root のみ) では不十分なので DbFile の存在もチェック。
         if (options.SkipIfNotNewer
             && options.LastPulledVersion is long lastPulled
-            && entry.Version <= lastPulled)
+            && entry.Version <= lastPulled
+            && _paths.Exists()
+            && File.Exists(_paths.DbFile))
         {
             _logger.LogInformation(
                 "Friend Connect Pull スキップ: ローカルが最新 (remote={Remote}, lastPulled={LastPulled})",
