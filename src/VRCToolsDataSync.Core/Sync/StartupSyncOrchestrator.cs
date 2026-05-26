@@ -95,7 +95,10 @@ public sealed class StartupSyncOrchestrator
 
         try
         {
-            var result = _runner.Pull(def.ServiceFactory(), settings, cloud, skipBackup: false);
+            // Issue #19: 起動時自動 Pull はローカルが既に最新なら何もしない。
+            // 手動 Pull や AutoPushConflict 経路の "先に Pull" は呼び出し側で
+            // デフォルト false のまま使い、従来通り上書き Pull させる。
+            var result = _runner.Pull(def.ServiceFactory(), settings, cloud, skipBackup: false, skipIfNotNewer: true);
             // NothingToDo / SourceMissing は通常運用で起こり得る (クラウド未作成や
             // 初回セットアップ直後) ため、失敗ではなく Skip 扱い。それ以外の非成功
             // は予期しない異常なので PullFailed とする。
