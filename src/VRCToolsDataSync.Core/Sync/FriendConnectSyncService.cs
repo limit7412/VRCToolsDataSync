@@ -146,6 +146,23 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
+        // Issue #19: 起動時自動 Pull の暴走防止。VRCX 側と同じ判定。
+        if (options.SkipIfNotNewer
+            && options.LastPulledVersion is long lastPulled
+            && entry.Version <= lastPulled)
+        {
+            _logger.LogInformation(
+                "Friend Connect Pull スキップ: ローカルが最新 (remote={Remote}, lastPulled={LastPulled})",
+                entry.Version, lastPulled);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.NothingToDo,
+                RemoteVersion = entry.Version,
+                LastPulledVersion = lastPulled,
+                Message = "ローカルが最新のため Pull スキップ",
+            };
+        }
+
         var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
         var toolDbFolder = Path.Combine(toolFolder, DbSubFolder);
         var remoteDb = Path.Combine(toolDbFolder, DbFileName);

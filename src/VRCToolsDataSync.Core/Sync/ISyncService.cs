@@ -20,6 +20,13 @@ public sealed class PullOptions
 {
     public required string CloudFolderPath { get; init; }
     public bool SkipBackup { get; init; }
+
+    // Issue #19: 起動時自動 Pull の暴走防止。
+    // SkipIfNotNewer=true かつ LastPulledVersion>=リモート Version の場合は Pull を行わず
+    // NothingToDo を返す。手動 Pull / コンフリクト解消 Pull は SkipIfNotNewer=false のままにして、
+    // 「ユーザが意図的に呼んだ Pull は従来通り上書きする」セマンティクスを維持する。
+    public long? LastPulledVersion { get; init; }
+    public bool SkipIfNotNewer { get; init; }
 }
 
 public sealed class SyncResult

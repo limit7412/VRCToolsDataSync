@@ -139,6 +139,26 @@ public sealed class VrcxSyncService : ISyncService
             };
         }
 
+        // Issue #19: 起動時自動 Pull の暴走防止。
+        // ローカルの LastPulledVersion がリモートの Version 以上なら、
+        // 「ローカルが新しいかリモートと同じ」なので Pull で上書きしない。
+        // SkipIfNotNewer は呼び出し側 (StartupSyncOrchestrator) で true にする想定。
+        if (options.SkipIfNotNewer
+            && options.LastPulledVersion is long lastPulled
+            && entry.Version <= lastPulled)
+        {
+            _logger.LogInformation(
+                "VRCX Pull スキップ: ローカルが最新 (remote={Remote}, lastPulled={LastPulled})",
+                entry.Version, lastPulled);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.NothingToDo,
+                RemoteVersion = entry.Version,
+                LastPulledVersion = lastPulled,
+                Message = "ローカルが最新のため Pull スキップ",
+            };
+        }
+
         var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
         var remoteSnapshot = Path.Combine(toolFolder, SnapshotFileName);
         var remoteSettings = Path.Combine(toolFolder, SettingsFileName);
