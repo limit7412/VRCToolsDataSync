@@ -21,4 +21,6 @@ TestResults/
 **/Properties/PublishProfiles/*.pubxml.user
 
 # Claude Code per-user state (local permissions, history)
-.claude/
+.claude/*
+# ただし共有するプロジェクトスキルは追跡する
+!.claude/skills/
