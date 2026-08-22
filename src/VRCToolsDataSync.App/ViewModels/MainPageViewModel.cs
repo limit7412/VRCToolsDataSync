@@ -8,6 +8,7 @@ using CommunityToolkit.Mvvm.Input;
 using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
+using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 
@@ -40,6 +41,7 @@ public partial class MainPageViewModel : ObservableObject
         LoadLaunchConfigToProperties();
         RefreshStatusSummaries();
         RefreshStartupState();
+        AppendLog($"保存先: {SyncStorageFactory.DescribeTarget(_settings)}");
     }
 
     /// <summary>
@@ -587,12 +589,29 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 同期を始める前に保存先が使える状態かを確かめる。
+    /// ローカルフォルダモードでは、UI で編集中のパスを設定へ反映してから確認する。
+    /// S3 互換モードでは CLI の `storage s3` で設定した内容の妥当性だけを見る
+    /// (この画面からは S3 の設定を編集できない)。
+    /// </summary>
     private bool TryGetCloud(out string cloud)
     {
         cloud = CloudFolderPath?.Trim() ?? string.Empty;
+
+        if (_settings.StorageMode == SyncStorageMode.S3)
+        {
+            if (!SyncStorageFactory.TryCreate(_settings, out _, out var error))
+            {
+                AppendLog(error ?? "S3 互換ストレージの設定が不正です");
+                return false;
+            }
+            return true;
+        }
+
         if (string.IsNullOrEmpty(cloud))
         {
-            AppendLog("OneDrive フォルダパスを指定して「設定を保存」してください");
+            AppendLog("同期フォルダのパスを指定して「設定を保存」してください");
             return false;
         }
         if (!System.IO.Directory.Exists(cloud))
@@ -601,8 +620,8 @@ public partial class MainPageViewModel : ObservableObject
             return false;
         }
         // 設定が未保存だった場合のために、同期実行時にも保存を反映しておく。
-        // CloudFolderPath が変わった場合は常駐 Coordinator の CloudWatcher も
-        // 旧パスを監視したままになってしまうので、UpdateSettings で再起動して
+        // CloudFolderPath が変わった場合は常駐 Coordinator の監視も
+        // 旧パスを見たままになってしまうので、UpdateSettings で再起動して
         // 新パスに張り替える (Watcher 再構築を伴う)。
         if (_settings.CloudFolderPath != cloud)
         {
@@ -615,9 +634,20 @@ public partial class MainPageViewModel : ObservableObject
 
     private void RefreshStatusSummaries()
     {
-        VrcxStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(VrcxSyncService.Key));
-        FriendConnectStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(FriendConnectSyncService.Key));
+        // ToolState のキーは保存先ごとに接頭辞が付く。表示中の保存先の分だけを拾う。
+        var prefix = ToolStateKeyPrefix();
+        VrcxStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(prefix + VrcxSyncService.Key));
+        FriendConnectStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(prefix + FriendConnectSyncService.Key));
     }
+
+    /// <summary>
+    /// 現在の保存先に対応する ToolState の接頭辞。保存先を組み立てられない
+    /// (未設定など) 段階でも状態表示は出したいので、その場合は接頭辞なしとして扱う。
+    /// </summary>
+    private string ToolStateKeyPrefix()
+        => SyncStorageFactory.TryCreate(_settings, out var storage, out _)
+            ? storage!.StateKeyPrefix
+            : string.Empty;
 
     private static string FormatStatus(ToolSyncState? state)
     {

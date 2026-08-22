@@ -23,7 +23,7 @@
                     </StackPanel>
 
                     <StackPanel Spacing="4">
-                        <TextBlock Text="OneDrive 同期フォルダパス" />
+                        <TextBlock Text="同期フォルダパス (S3 互換モードでは未使用)" />
                         <Grid ColumnSpacing="8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />

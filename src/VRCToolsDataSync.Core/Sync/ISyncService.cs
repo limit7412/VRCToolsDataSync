@@ -1,3 +1,5 @@
+using VRCToolsDataSync.Core.Storage;
+
 namespace VRCToolsDataSync.Core.Sync;
 
 public interface ISyncService
@@ -10,7 +12,9 @@ public interface ISyncService
 
 public sealed class PushOptions
 {
-    public required string CloudFolderPath { get; init; }
+    /// <summary>同期先。ローカル同期フォルダか S3 互換ストレージのどちらか。</summary>
+    public required ISyncStorage Storage { get; init; }
+
     public required string MachineName { get; init; }
     public bool ForceOverwriteOnConflict { get; init; }
     public long? LastPulledVersion { get; init; }
@@ -18,13 +22,15 @@ public sealed class PushOptions
 
 public sealed class PullOptions
 {
-    public required string CloudFolderPath { get; init; }
+    /// <summary>同期先。ローカル同期フォルダか S3 互換ストレージのどちらか。</summary>
+    public required ISyncStorage Storage { get; init; }
+
     public bool SkipBackup { get; init; }
 
     // Issue #19: 起動時自動 Pull の暴走防止。
     // SkipIfNotNewer=true かつ LastPulledVersion>=リモート Version の場合は Pull を行わず
-    // NothingToDo を返す。手動 Pull / コンフリクト解消 Pull は SkipIfNotNewer=false のままにして、
-    // 「ユーザが意図的に呼んだ Pull は従来通り上書きする」セマンティクスを維持する。
+    // NothingToDo を返す。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
+    // false のままにして、「ユーザが意図的に呼んだ Pull は従来通り上書きする」セマンティクスを維持する。
     public long? LastPulledVersion { get; init; }
     public bool SkipIfNotNewer { get; init; }
 }

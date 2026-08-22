@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
 
@@ -89,8 +90,19 @@ public sealed class ShutdownSyncOrchestrator
         CancellationToken ct = default)
     {
         var steps = new List<ShutdownSyncStep>();
-        var cloud = settings.CloudFolderPath?.Trim() ?? string.Empty;
-        var cloudAvailable = !string.IsNullOrEmpty(cloud) && Directory.Exists(cloud);
+
+        // 保存先を先に組み立てておく。作れない場合 (未設定 / S3 の設定不備) は
+        // Push できないので、後段で全件スキップの理由として使う。
+        ISyncStorage? storage = null;
+        string? storageError = null;
+        try
+        {
+            storage = _runner.CreateStorage(settings);
+        }
+        catch (SyncStorageException ex)
+        {
+            storageError = ex.Message;
+        }
 
         // (1) 各ツールについて「終了済みか」をチェックする。SessionEnding 経路
         //     (WaitForToolsToExit が指定されている) なら、最大そのタイムアウトまで
@@ -149,15 +161,15 @@ public sealed class ShutdownSyncOrchestrator
             }
         }
 
-        // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
+        // (2) Push。保存先を作れなければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
         //     ここでは toolDefs ベース (= 同期 OFF も含む) で PushSkipped を出す。
         //     UI/ログでは全ツールの結果が並ぶことになるが、同期 OFF ツールは Stop
         //     フェーズには登場しない (上の (1) で exitChecks に投入していないため)。
-        if (!cloudAvailable || options.SkipPush)
+        if (storage is null || options.SkipPush)
         {
             var reason = options.SkipPush
                 ? "呼び出し元の指示で Push をスキップ"
-                : "OneDrive フォルダ未設定";
+                : storageError ?? "保存先が未設定";
             _logger.LogInformation("ShutdownSync push skipped: {Reason}", reason);
             foreach (var def in toolDefs)
             {
@@ -171,6 +183,9 @@ public sealed class ShutdownSyncOrchestrator
             }
             return steps;
         }
+
+        // ラムダへ渡すので non-null の局所変数に移す。
+        var pushStorage = storage;
 
         // 同期 OFF のツールは exitResults に乗っていないので、ここで先に
         // PushSkipped("同期が無効化されています") を出してから、同期 ON ツールの
@@ -230,7 +245,7 @@ public sealed class ShutdownSyncOrchestrator
 
             try
             {
-                var pushResult = await Task.Run(() => _runner.Push(def.ServiceFactory(), settings, cloud, force: false), ct).ConfigureAwait(false);
+                var pushResult = await Task.Run(() => _runner.Push(def.ServiceFactory(), settings, pushStorage, force: false), ct).ConfigureAwait(false);
                 steps.Add(new ShutdownSyncStep
                 {
                     ToolKey = def.Key,

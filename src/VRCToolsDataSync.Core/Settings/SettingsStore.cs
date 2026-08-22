@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 
 namespace VRCToolsDataSync.Core.Settings;
@@ -9,6 +10,9 @@ public sealed class SettingsStore
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        // StorageMode を数値ではなく "localFolder" / "s3" として読み書きする。
+        // 数値表記の既存ファイルもこのコンバータで読める。
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
     private readonly object _saveLock = new();
@@ -54,7 +58,7 @@ public sealed class SettingsStore
     /// <summary>
     /// ToolState の更新だけが目的の Save。Top-level の設定
     /// (CloudFolderPath / MachineName / SyncVrcx / SyncFriendConnect /
-    /// AutoSyncEnabled) はディスク側の現行値を採用し、incoming は ToolState
+    /// AutoSyncEnabled / StorageMode / S3) はディスク側の現行値を採用し、incoming は ToolState
     /// のみを差し込む形でマージする。
     ///
     /// 通常の Save (= GUI の「設定を保存」ボタン) と違い、Push/Pull のような
@@ -133,6 +137,8 @@ public sealed class SettingsStore
                     settings.SyncVrcx = merged.SyncVrcx;
                     settings.SyncFriendConnect = merged.SyncFriendConnect;
                     settings.AutoSyncEnabled = merged.AutoSyncEnabled;
+                    settings.StorageMode = merged.StorageMode;
+                    settings.S3 = merged.S3;
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
                 }
@@ -160,7 +166,7 @@ public sealed class SettingsStore
     /// <para>
     /// <paramref name="mergeTopLevelFromDisk"/> が false (通常の Save) の場合、
     /// Top-level 設定 (CloudFolderPath, MachineName, SyncVrcx, SyncFriendConnect,
-    /// AutoSyncEnabled) は incoming を優先する。
+    /// AutoSyncEnabled, StorageMode, S3) は incoming を優先する。
     /// </para>
     /// <para>
     /// true (SaveToolStateOnly) の場合、Top-level 設定はディスク側を採用する。
@@ -198,6 +204,10 @@ public sealed class SettingsStore
             SyncVrcx = topLevelSource.SyncVrcx,
             SyncFriendConnect = topLevelSource.SyncFriendConnect,
             AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
+            // 保存先の種類と S3 接続設定も Top-level と同じ採用元から取る。
+            // Push/Pull 経由の Save がユーザの保存先変更を巻き戻さないようにする。
+            StorageMode = topLevelSource.StorageMode,
+            S3 = topLevelSource.S3?.Clone(),
             ToolState = new Dictionary<string, ToolSyncState>(),
             Launch = new Dictionary<string, ToolLaunchConfig>(),
         };

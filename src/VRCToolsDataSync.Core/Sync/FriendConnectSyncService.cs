@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Paths;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
 
@@ -8,12 +9,10 @@ public sealed class FriendConnectSyncService : ISyncService
 {
     public const string Key = "friend-connect";
 
-    private const string SubFolder = "friend-connect";
-    private const string DbSubFolder = "db";
-    private const string DbFileName = "db.sqlite";
-    private const string DbV11FileName = "db_1.1.sqlite";
-    private const string ConfigFileName = "config.json";
-    private const string NotesFolderName = "notes";
+    private const string DbKey = "friend-connect/db/db.sqlite";
+    private const string DbV11Key = "friend-connect/db/db_1.1.sqlite";
+    private const string ConfigKey = "friend-connect/config.json";
+    private const string NotesKeyPrefix = "friend-connect/notes/";
 
     private readonly FriendConnectPaths _paths;
     private readonly LocalBackup _backup;
@@ -44,11 +43,13 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        var manifestStore = new ManifestStore(options.CloudFolderPath);
+        var storage = options.Storage;
+        var manifestStore = new ManifestStore(storage);
         var manifest = manifestStore.Load();
+        manifest.Tools.TryGetValue(Key, out var existing);
 
         if (!options.ForceOverwriteOnConflict
-            && manifest.Tools.TryGetValue(Key, out var existing)
+            && existing is not null
             && existing.Version > (options.LastPulledVersion ?? 0))
         {
             _logger.LogInformation(
@@ -63,66 +64,68 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        var toolDbFolder = Path.Combine(toolFolder, DbSubFolder);
-        Directory.CreateDirectory(toolDbFolder);
-
+        var remoteFiles = existing?.Files ?? new List<ManifestFile>();
+        var files = new List<ManifestFile>();
         var affected = new List<string>();
 
-        SnapshotSqliteTo(Path.Combine(toolDbFolder, DbFileName), _paths.DbFile, affected);
+        files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected));
 
-        var destDbV11 = Path.Combine(toolDbFolder, DbV11FileName);
         if (File.Exists(_paths.DbV11File))
         {
-            SnapshotSqliteTo(destDbV11, _paths.DbV11File, affected);
+            files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected));
         }
-        else if (File.Exists(destDbV11))
+        else
         {
             // 削除失敗を握りつぶすと Pull 側でリモートの古いファイルが
             // 復元されて削除済みデータが復活するため、失敗時は Push を
             // 失敗扱いにする。
-            File.Delete(destDbV11);
+            storage.Delete(DbV11Key);
         }
 
-        var destConfig = Path.Combine(toolFolder, ConfigFileName);
         if (File.Exists(_paths.ConfigJsonFile))
         {
-            AtomicFile.Copy(_paths.ConfigJsonFile, destConfig, overwrite: true);
-            affected.Add(destConfig);
-        }
-        else if (File.Exists(destConfig))
-        {
-            File.Delete(destConfig);
-        }
-
-        var destNotes = Path.Combine(toolFolder, NotesFolderName);
-        if (Directory.Exists(_paths.NotesDirectory))
-        {
-            ReplaceDirectory(_paths.NotesDirectory, destNotes);
-            foreach (var file in Directory.EnumerateFiles(destNotes, "*", SearchOption.AllDirectories))
+            var config = SyncTransfer.Describe(_paths.ConfigJsonFile, ConfigKey);
+            if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, config))
             {
-                affected.Add(file);
+                _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
             }
+            else
+            {
+                storage.Upload(_paths.ConfigJsonFile, ConfigKey);
+                affected.Add(ConfigKey);
+            }
+            files.Add(config);
         }
-        else if (Directory.Exists(destNotes))
+        else
         {
-            Directory.Delete(destNotes, recursive: true);
+            storage.Delete(ConfigKey);
         }
 
-        // 保存直前に manifest を再読込し、他 tool のエントリを失わないようにマージする。
-        // (別プロセス / 別 SyncService が同時に Push したケースを救済)
-        var finalManifest = manifestStore.Load();
-        var nextVersion = (finalManifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
-        finalManifest.Tools[Key] = new ToolManifestEntry
+        files.AddRange(PushNotes(storage, remoteFiles, affected));
+
+        if (SyncTransfer.IsUnchangedSet(existing, files))
         {
-            Version = nextVersion,
+            // 送るものが何も無いなら manifest も触らない。version を進めると
+            // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
+            // ダウンロードを誘発してしまう。
+            _logger.LogInformation("Friend Connect Push: 変更なし version={Version}", existing!.Version);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Success,
+                RemoteVersion = existing.Version,
+                Message = "前回の Push から変更がないため、同期先はそのままです",
+            };
+        }
+
+        var nextVersion = manifestStore.UpdateToolEntry(Key, version => new ToolManifestEntry
+        {
+            Version = version,
             MachineName = options.MachineName,
             UpdatedAt = DateTimeOffset.Now,
-            Files = BuildManifestFiles(affected, options.CloudFolderPath),
-        };
-        manifestStore.Save(finalManifest);
+            Files = files,
+        });
 
-        _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, affected.Count);
+        _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
         {
             Outcome = SyncOutcome.Success,
@@ -135,8 +138,8 @@ public sealed class FriendConnectSyncService : ISyncService
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
 
-        var manifestStore = new ManifestStore(options.CloudFolderPath);
-        var manifest = manifestStore.Load();
+        var storage = options.Storage;
+        var manifest = new ManifestStore(storage).Load();
         if (!manifest.Tools.TryGetValue(Key, out var entry))
         {
             return new SyncResult
@@ -168,15 +171,13 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        var toolDbFolder = Path.Combine(toolFolder, DbSubFolder);
-        var remoteDb = Path.Combine(toolDbFolder, DbFileName);
-        if (!File.Exists(remoteDb))
+        var remoteFiles = entry.Files.ToDictionary(f => f.RelativePath, StringComparer.Ordinal);
+        if (!remoteFiles.TryGetValue(DbKey, out var remoteDb))
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {remoteDb}",
+                Message = $"クラウド側にスナップショットがありません: {DbKey}",
             };
         }
 
@@ -207,14 +208,18 @@ public sealed class FriendConnectSyncService : ISyncService
 
         var affected = new List<string>();
 
-        AtomicFile.Copy(remoteDb, _paths.DbFile, overwrite: true);
-        affected.Add(_paths.DbFile);
-
-        var remoteDbV11 = Path.Combine(toolDbFolder, DbV11FileName);
-        if (File.Exists(remoteDbV11))
+        if (!SyncTransfer.Restore(storage, remoteDb, _paths.DbFile, affected, _logger))
         {
-            AtomicFile.Copy(remoteDbV11, _paths.DbV11File, overwrite: true);
-            affected.Add(_paths.DbV11File);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にスナップショットがありません: {DbKey}",
+            };
+        }
+
+        if (remoteFiles.TryGetValue(DbV11Key, out var remoteDbV11))
+        {
+            SyncTransfer.Restore(storage, remoteDbV11, _paths.DbV11File, affected, _logger);
         }
         else if (File.Exists(_paths.DbV11File))
         {
@@ -224,30 +229,16 @@ public sealed class FriendConnectSyncService : ISyncService
             File.Delete(_paths.DbV11File);
         }
 
-        var remoteConfig = Path.Combine(toolFolder, ConfigFileName);
-        if (File.Exists(remoteConfig))
+        if (remoteFiles.TryGetValue(ConfigKey, out var remoteConfig))
         {
-            AtomicFile.Copy(remoteConfig, _paths.ConfigJsonFile, overwrite: true);
-            affected.Add(_paths.ConfigJsonFile);
+            SyncTransfer.Restore(storage, remoteConfig, _paths.ConfigJsonFile, affected, _logger);
         }
         else if (File.Exists(_paths.ConfigJsonFile))
         {
             File.Delete(_paths.ConfigJsonFile);
         }
 
-        var remoteNotes = Path.Combine(toolFolder, NotesFolderName);
-        if (Directory.Exists(remoteNotes))
-        {
-            ReplaceDirectory(remoteNotes, _paths.NotesDirectory);
-            foreach (var file in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
-            {
-                affected.Add(file);
-            }
-        }
-        else if (Directory.Exists(_paths.NotesDirectory))
-        {
-            Directory.Delete(_paths.NotesDirectory, recursive: true);
-        }
+        PullNotes(storage, entry.Files, affected);
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
             entry.Version, backupPath ?? "(none)");
@@ -260,44 +251,109 @@ public sealed class FriendConnectSyncService : ISyncService
         };
     }
 
-    private static void SnapshotSqliteTo(string destination, string sourceDb, List<string> affected)
+    /// <summary>SQLite を WAL 統合済みのスナップショットにして送る。</summary>
+    private ManifestFile PushSqlite(
+        ISyncStorage storage,
+        string sourceDb,
+        string key,
+        IReadOnlyList<ManifestFile> remoteFiles,
+        List<string> affected)
     {
-        // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
-        var tmp = destination + ".building-" + Guid.NewGuid().ToString("N");
-        SqliteSnapshot.Create(sourceDb, tmp);
-        try
+        using var staged = storage.BeginUpload(key);
+        SqliteSnapshot.Create(sourceDb, staged.LocalPath);
+        var described = SyncTransfer.Describe(staged.LocalPath, key);
+        if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, described))
         {
-            if (File.Exists(destination))
-            {
-                File.Replace(tmp, destination, destinationBackupFileName: null);
-            }
-            else
-            {
-                File.Move(tmp, destination);
-            }
+            _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
         }
-        catch
+        else
         {
-            if (File.Exists(tmp))
-            {
-                try { File.Delete(tmp); } catch { /* best-effort */ }
-            }
-            throw;
+            staged.Commit();
+            affected.Add(key);
         }
-        affected.Add(destination);
+        return described;
     }
 
-    private static void ReplaceDirectory(string source, string destination)
+    /// <summary>
+    /// notes フォルダを送る。ローカルに無くなったファイルは同期先からも消す。
+    /// 削除対象は同期先の列挙から求める。manifest だけを見ると、過去に中断した
+    /// Push が残した孤児オブジェクトを取りこぼす。
+    /// </summary>
+    private List<ManifestFile> PushNotes(
+        ISyncStorage storage,
+        IReadOnlyList<ManifestFile> remoteFiles,
+        List<string> affected)
     {
-        if (Directory.Exists(destination))
+        var files = new List<ManifestFile>();
+
+        if (Directory.Exists(_paths.NotesDirectory))
         {
-            // 削除失敗を握りつぶすと、source から消えた古い note ファイルが
-            // destination に残ったまま CopyDirectory が進み、Push 側では
-            // 残存ファイルも manifest に登録されて他 PC に古い note が
-            // 復元されてしまう。失敗は呼び出し側に伝播させて同期を中止する。
-            Directory.Delete(destination, recursive: true);
+            foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
+            {
+                var relative = StorageKey.FromRelativePath(
+                    Path.GetRelativePath(_paths.NotesDirectory, localPath));
+                var key = NotesKeyPrefix + relative;
+                var described = SyncTransfer.Describe(localPath, key);
+                if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, described))
+                {
+                    _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
+                }
+                else
+                {
+                    storage.Upload(localPath, key);
+                    affected.Add(key);
+                }
+                files.Add(described);
+            }
         }
-        AtomicFile.CopyDirectory(source, destination, overwrite: true);
+
+        var keep = new HashSet<string>(files.Select(f => f.RelativePath), StringComparer.Ordinal);
+        foreach (var remoteKey in storage.List(NotesKeyPrefix))
+        {
+            if (keep.Contains(remoteKey)) continue;
+            storage.Delete(remoteKey);
+            _logger.LogInformation("同期先から削除: {Key}", remoteKey);
+        }
+
+        return files;
+    }
+
+    /// <summary>notes フォルダを取り出す。リモートに無いファイルはローカルからも消す。</summary>
+    private void PullNotes(ISyncStorage storage, IReadOnlyList<ManifestFile> remoteFiles, List<string> affected)
+    {
+        var notes = remoteFiles
+            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
+            .ToList();
+
+        if (notes.Count == 0)
+        {
+            if (Directory.Exists(_paths.NotesDirectory))
+            {
+                Directory.Delete(_paths.NotesDirectory, recursive: true);
+            }
+            return;
+        }
+
+        Directory.CreateDirectory(_paths.NotesDirectory);
+
+        var restored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var note in notes)
+        {
+            // manifest は他 PC が書いたものなので、キーの形を検証してから
+            // ローカルパスに写す。notes フォルダの外へ書き出させない。
+            var localPath = StorageKey.ToLocalPath(
+                _paths.NotesDirectory, note.RelativePath[NotesKeyPrefix.Length..]);
+            SyncTransfer.Restore(storage, note, localPath, affected, _logger);
+            restored.Add(Path.GetFullPath(localPath));
+        }
+
+        // リモートから消えた note はローカルからも消して状態を揃える。
+        // 握りつぶすと次の Push で古い note が manifest に再登録されてしまう。
+        foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
+        {
+            if (restored.Contains(Path.GetFullPath(localPath))) continue;
+            File.Delete(localPath);
+        }
     }
 
     private static void DeleteIfExists(string dir, string fileName)
@@ -310,21 +366,5 @@ public sealed class FriendConnectSyncService : ISyncService
             // 失敗は呼び出し側 (Pull) に伝播させて Aborted にする。
             File.Delete(path);
         }
-    }
-
-    private static List<ManifestFile> BuildManifestFiles(IEnumerable<string> paths, string cloudFolder)
-    {
-        var list = new List<ManifestFile>();
-        foreach (var p in paths)
-        {
-            var info = new FileInfo(p);
-            list.Add(new ManifestFile
-            {
-                RelativePath = Path.GetRelativePath(cloudFolder, p).Replace('\\', '/'),
-                Size = info.Length,
-                Sha256 = FileHasher.Sha256(p),
-            });
-        }
-        return list;
     }
 }
