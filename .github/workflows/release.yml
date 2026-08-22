@@ -17,9 +17,11 @@ on:
 permissions:
   contents: write
 
-# タグの採番が競合しないよう、リリースは同時に 1 本だけ走らせる。
+# 自動採番する master への push だけを直列化する。番号が競合しうるのはこの経路だけで、
+# タグ push と手動実行とリリース作成は番号が決まっているため待機させる理由が無い。
+# 同じグループに入れると、待機中の実行が後続に置き換えられてリリースが作られなくなる。
 concurrency:
-  group: release
+  group: release-${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') && 'master' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -104,7 +106,8 @@ jobs:
               rest="${latest#*.}"
               minor="${rest%%.*}"
               patch="${rest#*.}"
-              name="$major.$minor.$((patch + 1))"
+              # タグは先頭ゼロを許すため、10 進数として解釈する (09 を 8 進数と見て失敗させない)。
+              name="$major.$minor.$((10#$patch + 1))"
             fi
             draft=false
           else
