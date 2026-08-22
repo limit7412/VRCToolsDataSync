@@ -59,12 +59,22 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
             throw new SyncStorageConfigurationException(
                 $"同期フォルダへ書き込めません: {_rootDirectory} ({ex.Message})");
         }
-        finally
+
+        // 削除の可否も確かめる。NTFS では「ファイルの作成」と「削除」が別の権限
+        // なので、作成だけ許して削除を拒むフォルダを作れる。Push はローカルから
+        // 消えた任意ファイルの削除と古い note の回収で削除を行うため、そこを
+        // 確認しないと設定を保存できても後の同期で失敗する。
+        //
+        // 失敗した場合、検査用ファイルは残る。設定が保存されない以上、利用者は
+        // 権限を直して再度試すことになるので、S3 側と同じ扱いにしている。
+        try
         {
-            if (File.Exists(probe))
-            {
-                try { File.Delete(probe); } catch { /* best-effort cleanup */ }
-            }
+            File.Delete(probe);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new SyncStorageConfigurationException(
+                $"同期フォルダのファイルを削除できません: {_rootDirectory} ({ex.Message})");
         }
     }
 

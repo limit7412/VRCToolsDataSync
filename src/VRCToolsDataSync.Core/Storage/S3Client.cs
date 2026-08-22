@@ -564,12 +564,15 @@ internal sealed class S3Client
     /// 呼び出し側は結果を使い回すこと。
     /// <para>
     /// ResponseHeadersRead で受けた応答ではバッファされていないネットワーク
-    /// ストリームを読むことになる。相手がヘッダだけ返して黙り込んだ場合に
-    /// 無期限に待たないよう、必ずトークンを渡す。
+    /// ストリームを読むことになる。トークンを <c>ReadAsStream</c> へ渡しても
+    /// 効くのはストリームを取り出すまでで、その後の同期読み取りには効かない。
+    /// 期限が来たら応答を破棄して、止まっている読み取りを失敗させる。
     /// </para>
     /// </summary>
     private static string ReadBody(HttpResponseMessage response, CancellationToken cancellationToken)
     {
+        using var registration = cancellationToken.Register(
+            static state => ((HttpResponseMessage)state!).Dispose(), response);
         try
         {
             using var stream = response.Content.ReadAsStream(cancellationToken);
@@ -578,8 +581,16 @@ internal sealed class S3Client
             var read = reader.ReadBlock(buffer, 0, buffer.Length);
             return read <= 0 ? string.Empty : new string(buffer, 0, read);
         }
+        catch when (cancellationToken.IsCancellationRequested)
+        {
+            // 期限切れを空の本文として返すと、IsMissingObject が
+            // 「エラーコードを読めなかった」= オブジェクトなしと誤読する。
+            // 読めなかった理由が期限切れであることは呼び出し元へ伝える。
+            throw new SyncStorageException("応答本文の読み取りがタイムアウトしました");
+        }
         catch
         {
+            // 本文が読めなくても、状態コードだけで失敗の内容は組み立てられる。
             return string.Empty;
         }
     }
