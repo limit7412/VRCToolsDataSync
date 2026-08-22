@@ -39,5 +39,8 @@ jobs:
         # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
         run: dotnet build src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj --configuration Release
 
+      # PublishTrimmed は Release 構成で既定 true になっており、self-contained
+      # でないビルドでは NETSDK1102 になる。トリミングはリリース時にだけ効けば
+      # よいので、build-release.ps1 と同じく無効にする。
       - name: Build App
-        run: dotnet build src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj --configuration Release --runtime win-x64 -p:Platform=x64
+        run: dotnet build src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj --configuration Release --runtime win-x64 -p:Platform=x64 -p:PublishTrimmed=false
