@@ -6,6 +6,13 @@
     <RootNamespace>VRCToolsDataSync_App</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Platforms>x86;x64;ARM64</Platforms>
+    <!--
+      RID は Platform に合わせる。ホストのプロセッサアーキテクチャから導くと、
+      solution 経由のビルド (Platform が solution 側から渡る) で PlatformTarget と
+      食い違い、NETSDK1032 で失敗する。Platform が無い単体ビルドのときだけ
+      ホストのアーキテクチャにフォールバックする。
+    -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and '$(Platform)' != '' and '$(Platform)' != 'AnyCPU'">win-$(Platform.ToLowerInvariant())</RuntimeIdentifier>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
     <PublishProfile Condition="Exists('Properties\PublishProfiles\win-$(Platform).pubxml')">win-$(Platform).pubxml</PublishProfile>
     <UseWinUI>true</UseWinUI>
