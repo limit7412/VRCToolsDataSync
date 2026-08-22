@@ -159,7 +159,7 @@ VRCToolsDataSync.Cli.exe storage local --path "D:\OneDrive\VRCToolsDataSync"
 dotnet run --project src\VRCToolsDataSync.App
 ```
 
-設定カードで保存先を選び (同期フォルダなら パスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
+設定カードで保存先を選び (同期フォルダならパスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
 
 ## CI
 
