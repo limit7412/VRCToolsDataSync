@@ -113,6 +113,10 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 
 ### 本ツールに設定する
 
+GUI の設定カードで「データの保存先」を「S3 互換ストレージ」に切り替えると、エンドポイント URL・バケット名・リージョン・キー接頭辞・アクセスキーを入力できる。「接続テスト」で到達性を確かめてから「設定を保存」する。
+
+CLI でも設定できる。
+
 ```powershell
 # Cloudflare R2
 VRCToolsDataSync.Cli.exe storage s3 `
@@ -145,10 +149,9 @@ VRCToolsDataSync.Cli.exe storage local --path "D:\OneDrive\VRCToolsDataSync"
 
 ### 注意点
 
-- シークレットアクセスキーは DPAPI で保護して保存する。復号できるのは保存した Windows ユーザだけなので、`settings.json` を別 PC へコピーしても S3 の設定は引き継げない。PC ごとに `storage s3` を実行すること。
-- 同期履歴 (`toolState`) は保存先ごとに別のキーで持つ。保存先を切り替えても、元の保存先の履歴はそのまま残る。
-- GUI の設定画面から S3 の接続情報は編集できない。設定は CLI で行い、Push / Pull は GUI からも実行できる。
-- 保存先を CLI で切り替えた場合は、GUI を起動し直すこと。起動中の GUI で「設定を保存」すると、GUI が起動時に読んだ古い保存先設定で上書きされる。
+- エンドポイントは `https` のみ受け付ける。ファイルの送信では本文のハッシュを署名に含めない代わりに、内容の完全性を TLS に委ねているため。
+- シークレットアクセスキーは DPAPI で保護して保存する。復号できるのは保存した Windows ユーザだけなので、`settings.json` を別 PC へコピーしても S3 の設定は引き継げない。PC ごとに設定し直すこと。
+- 同期履歴 (`toolState`) は保存先ごとに別のキーで持つ。保存先を切り替えても、元の保存先の履歴はそのまま残る。同期フォルダも、フォルダのパスごとに別の履歴になる。
 
 ## GUI
 
@@ -156,9 +159,7 @@ VRCToolsDataSync.Cli.exe storage local --path "D:\OneDrive\VRCToolsDataSync"
 dotnet run --project src\VRCToolsDataSync.App
 ```
 
-設定カードで同期フォルダを選択 → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
-
-S3 互換モードでは、接続情報の編集は CLI の `storage s3` で行う。設定済みであれば、Push/Pull やコンフリクト解決はローカルフォルダモードと同じ操作でできる。
+設定カードで保存先を選び (同期フォルダなら パスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
 
 ## リリースビルド
 

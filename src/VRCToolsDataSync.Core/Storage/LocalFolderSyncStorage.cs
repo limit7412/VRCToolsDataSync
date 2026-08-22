@@ -25,9 +25,13 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
 
     public string DisplayName => _rootDirectory;
 
-    // 既存の settings.json はツールキーをそのまま ToolState のキーに使っている。
-    // ローカルフォルダは接頭辞なしにして、更新後も同期履歴を引き継げるようにする。
-    public string StateKeyPrefix => string.Empty;
+    // フォルダごとに同期履歴を分ける。同じ接頭辞を共有すると、別のフォルダへ
+    // 切り替えたときに前のフォルダの LastPulledVersion がそのまま使われ、
+    // 起動時 Pull が「ローカルが最新」として省略されたり、Push が競合を
+    // 見逃して切り替え先を上書きしたりする。
+    // 更新前の settings.json が持つツールキーだけの履歴は、同じフォルダを
+    // 指している場合に限り SyncRunner が引き継ぐ。
+    public string StateKeyPrefix => $"folder|{_rootDirectory.ToLowerInvariant()}|";
 
     public ManifestSnapshot LoadManifest()
     {
@@ -42,11 +46,15 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     }
 
     /// <summary>
-    /// manifest を書き出す。ローカルフォルダには内容を比較して弾く手段が無いため
-    /// <paramref name="expectedTag"/> は使わず、常に成功を返す。
-    /// 同一 PC 内の並走は <see cref="ManifestStore.UpdateToolEntry"/> の
-    /// 「保存直前の読み直し」で、別 PC との衝突はフォルダ同期クライアントの
-    /// 競合検出でそれぞれ扱う。
+    /// manifest を書き出す。ローカルフォルダには保存時に内容を比較して弾く手段が
+    /// 無いため <paramref name="expectedTag"/> は使わず、常に成功を返す。
+    /// <para>
+    /// つまりこのモードでは compare-and-swap が効かない。読み直しと書き込みの間に
+    /// 別プロセスが更新した場合、その更新は失われる
+    /// (<see cref="ManifestStore.UpdateToolEntry"/> の version 検査で、同じ tool に
+    /// 対する競合は Push 側で検出できるが、書き込み自体は不可分ではない)。
+    /// 別 PC との衝突はフォルダ同期クライアントの競合検出に委ねる。
+    /// </para>
     /// </summary>
     public bool TrySaveManifest(SyncManifest manifest, string? expectedTag)
     {

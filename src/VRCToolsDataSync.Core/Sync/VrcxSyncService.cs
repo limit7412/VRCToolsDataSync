@@ -119,13 +119,34 @@ public sealed class VrcxSyncService : ISyncService
             };
         }
 
-        var nextVersion = manifestStore.UpdateToolEntry(Key, version => new ToolManifestEntry
+        long nextVersion;
+        try
         {
-            Version = version,
-            MachineName = options.MachineName,
-            UpdatedAt = DateTimeOffset.Now,
-            Files = files,
-        });
+            nextVersion = manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, version => new ToolManifestEntry
+            {
+                Version = version,
+                MachineName = options.MachineName,
+                UpdatedAt = DateTimeOffset.Now,
+                Files = files,
+            });
+        }
+        catch (ToolEntryChangedException ex)
+        {
+            // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が
+            // 同じ tool を Push した。ここで押し切ると、相手が上書きしたオブジェクトに
+            // 対して「内容が同じだから送らない」と判断した記録を残すことになり、
+            // manifest と実データがずれる。コンフリクトとして扱い、先に Pull させる。
+            _logger.LogInformation(
+                "VRCX Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
+                ex.ExpectedVersion, ex.ActualVersion);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.ConflictDetected,
+                RemoteVersion = ex.ActualVersion,
+                LastPulledVersion = options.LastPulledVersion,
+                Message = "Push の途中で他の PC が同期先を更新しました。先に Pull してください。",
+            };
+        }
 
         _logger.LogInformation("VRCX Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
@@ -192,10 +213,54 @@ public sealed class VrcxSyncService : ISyncService
 
         Directory.CreateDirectory(_paths.RootDirectory);
 
+        // (1) 同期先から取り出す。ここではローカルの既存ファイルに触れないので、
+        //     途中で失敗しても手元のデータは元のまま残る。
+        using var staging = new PullStaging(_logger);
+
+        if (!staging.Fetch(storage, remoteSnapshot, _paths.SqliteFile))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にスナップショットがありません: {SnapshotKey}",
+            };
+        }
+
+        remoteFiles.TryGetValue(SettingsKey, out var remoteSettings);
+        if (remoteSettings is not null && !staging.Fetch(storage, remoteSettings, _paths.SettingsJsonFile))
+        {
+            // manifest が要求するファイルが同期先に無い。ここで成功にしてしまうと
+            // LastPulledVersion だけ進み、以後の起動時 Pull はこの version を
+            // 最新とみなして省略するため、欠けたまま固定される。
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にファイルがありません: {SettingsKey}",
+            };
+        }
+
+        // (2) 取り出した内容が manifest の記録と合っているか確かめる。
+        if (staging.FindMismatchedKey() is { } mismatched)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}",
+            };
+        }
+
+        // (3) ここから先はローカルを書き換える。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
-            var filesToBackup = new List<string> { _paths.SqliteFile };
+            // WAL/SHM もバックアップに含める。この後で消すので、含めておかないと
+            // 本体へ未反映のローカル変更が復元できなくなる。
+            var filesToBackup = new List<string>
+            {
+                _paths.SqliteFile,
+                Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-wal"),
+                Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-shm"),
+            };
             if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
@@ -211,21 +276,9 @@ public sealed class VrcxSyncService : ISyncService
         DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
 
         var affected = new List<string>();
+        staging.Apply(affected);
 
-        if (!SyncTransfer.Restore(storage, remoteSnapshot, _paths.SqliteFile, affected, _logger))
-        {
-            return new SyncResult
-            {
-                Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {SnapshotKey}",
-            };
-        }
-
-        if (remoteFiles.TryGetValue(SettingsKey, out var remoteSettings))
-        {
-            SyncTransfer.Restore(storage, remoteSettings, _paths.SettingsJsonFile, affected, _logger);
-        }
-        else if (File.Exists(_paths.SettingsJsonFile))
+        if (remoteSettings is null && File.Exists(_paths.SettingsJsonFile))
         {
             // リモートに latest.json がなくなったときはローカルも削除して状態を
             // 揃える。握りつぶすと Push 側で削除済み判定との対称性が崩れて、

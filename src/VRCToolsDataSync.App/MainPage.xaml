@@ -23,7 +23,16 @@
                     </StackPanel>
 
                     <StackPanel Spacing="4">
-                        <TextBlock Text="同期フォルダパス (S3 互換モードでは未使用)" />
+                        <TextBlock Text="データの保存先" />
+                        <ComboBox SelectedIndex="{x:Bind ViewModel.StorageModeIndex, Mode=TwoWay}"
+                                  HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="同期フォルダ (OneDrive など)" />
+                            <ComboBoxItem Content="S3 互換ストレージ (Cloudflare R2 / Amazon S3 など)" />
+                        </ComboBox>
+                    </StackPanel>
+
+                    <StackPanel Spacing="4" Visibility="{x:Bind ViewModel.LocalFolderSettingsVisibility, Mode=OneWay}">
+                        <TextBlock Text="同期フォルダパス" />
                         <Grid ColumnSpacing="8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
@@ -33,6 +42,63 @@
                                      Text="{x:Bind ViewModel.CloudFolderPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                             <Button Grid.Column="1" Content="参照..." Click="OnBrowseCloudFolder" />
                         </Grid>
+                    </StackPanel>
+
+                    <StackPanel Spacing="8" Visibility="{x:Bind ViewModel.S3SettingsVisibility, Mode=OneWay}">
+                        <TextBlock Text="接続情報" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap"
+                                   Text="R2 は https://&lt;アカウントID&gt;.r2.cloudflarestorage.com とリージョン auto、S3 は https://s3.&lt;リージョン&gt;.amazonaws.com とバケットのリージョンを指定する。API キーは対象バケットだけに絞って発行すること。" />
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="エンドポイント URL" />
+                            <TextBox Text="{x:Bind ViewModel.S3ServiceUrl, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     PlaceholderText="https://&lt;アカウントID&gt;.r2.cloudflarestorage.com" />
+                        </StackPanel>
+
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Spacing="4">
+                                <TextBlock Text="バケット名" />
+                                <TextBox Text="{x:Bind ViewModel.S3BucketName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Spacing="4">
+                                <TextBlock Text="リージョン" />
+                                <TextBox Text="{x:Bind ViewModel.S3Region, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                         PlaceholderText="auto" />
+                            </StackPanel>
+                        </Grid>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="キー接頭辞 (省略可)" />
+                            <TextBox Text="{x:Bind ViewModel.S3KeyPrefix, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     PlaceholderText="バケット直下に置く場合は空欄" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="アクセスキー ID" />
+                            <TextBox Text="{x:Bind ViewModel.S3AccessKeyId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="シークレットアクセスキー" />
+                            <PasswordBox Password="{x:Bind ViewModel.S3SecretAccessKey, Mode=TwoWay}" />
+                            <TextBlock Text="{x:Bind ViewModel.S3SecretStatus, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Spacing="16">
+                            <ToggleSwitch Header="パス形式" IsOn="{x:Bind ViewModel.S3UsePathStyle, Mode=TwoWay}" />
+                            <ToggleSwitch Header="条件付き書き込み" IsOn="{x:Bind ViewModel.S3UseConditionalWrites, Mode=TwoWay}" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="接続テスト"
+                                    Command="{x:Bind ViewModel.TestStorageCommand}"
+                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        </StackPanel>
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Spacing="16">

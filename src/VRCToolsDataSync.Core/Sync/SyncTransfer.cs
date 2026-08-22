@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
@@ -42,34 +41,6 @@ internal static class SyncTransfer
                 && string.Equals(remote.Sha256, candidate.Sha256, StringComparison.OrdinalIgnoreCase);
         }
         return false;
-    }
-
-    /// <summary>
-    /// manifest のエントリをローカルへ反映する。手元のファイルが既に同じ内容なら
-    /// ダウンロードを省く。実際に書き込んだ場合だけ <paramref name="affected"/> に積む。
-    /// </summary>
-    /// <returns>ローカルが目的の内容になったなら true。同期先にキーが無ければ false。</returns>
-    public static bool Restore(
-        ISyncStorage storage,
-        ManifestFile remote,
-        string localPath,
-        List<string> affected,
-        ILogger logger)
-    {
-        if (!string.IsNullOrEmpty(remote.Sha256)
-            && File.Exists(localPath)
-            && string.Equals(FileHasher.Sha256(localPath), remote.Sha256, StringComparison.OrdinalIgnoreCase))
-        {
-            logger.LogInformation("取得を省略 (内容が同じ): {Key}", remote.RelativePath);
-            return true;
-        }
-
-        if (!storage.TryDownload(remote.RelativePath, localPath))
-        {
-            return false;
-        }
-        affected.Add(localPath);
-        return true;
     }
 
     /// <summary>

@@ -32,8 +32,7 @@ public sealed class SyncRunner
         ISyncStorage storage,
         bool force)
     {
-        var stateKey = ToolStateKey(storage, service.ToolKey);
-        var state = settings.ToolState.GetValueOrDefault(stateKey) ?? new ToolSyncState();
+        var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
         var result = service.Push(new PushOptions
         {
             Storage = storage,
@@ -68,11 +67,7 @@ public sealed class SyncRunner
         // ローカルが既に最新と分かっているリモート (LastPulledVersion>=Version) の
         // Pull を抑止する。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
         // false を使い、従来通り上書き Pull を行う。
-        // JSON デシリアライズで ToolState が明示的に null になる可能性に備え、
-        // SettingsStore.MergeForSave と同様に null ガードを入れる。
-        settings.ToolState ??= new Dictionary<string, ToolSyncState>();
-        var stateKey = ToolStateKey(storage, service.ToolKey);
-        var state = settings.ToolState.GetValueOrDefault(stateKey);
+        var state = ResolveState(settings, storage, service.ToolKey, out var stateKey);
         var result = service.Pull(new PullOptions
         {
             Storage = storage,
@@ -96,30 +91,61 @@ public sealed class SyncRunner
     }
 
     /// <summary>
-    /// 設定から同期先を組み立ててから Push する。同期先を使い回さない
-    /// 単発の呼び出し向け。
-    /// </summary>
-    public SyncResult Push(ISyncService service, SyncSettings settings, string? localFolderOverride, bool force)
-        => Push(service, settings, CreateStorage(settings, localFolderOverride), force);
-
-    /// <summary>
-    /// 設定から同期先を組み立ててから Pull する。同期先を使い回さない
-    /// 単発の呼び出し向け。
-    /// </summary>
-    public SyncResult Pull(
-        ISyncService service,
-        SyncSettings settings,
-        string? localFolderOverride,
-        bool skipBackup,
-        bool skipIfNotNewer = false)
-        => Pull(service, settings, CreateStorage(settings, localFolderOverride), skipBackup, skipIfNotNewer);
-
-    /// <summary>
     /// <see cref="SyncSettings.ToolState"/> のキー。同期先ごとに分けることで、
     /// 保存先を切り替えても互いの同期履歴を壊さない。
     /// </summary>
     public static string ToolStateKey(ISyncStorage storage, string toolKey)
         => storage.StateKeyPrefix + toolKey;
+
+    /// <summary>
+    /// 同期先とツールに対応する同期履歴を取り出す。
+    /// <para>
+    /// 保存先ごとにキーを分ける前の settings.json では、履歴がツールキーだけで
+    /// 入っていた。その履歴は「当時 settings に設定されていた同期フォルダ」に対する
+    /// ものなので、同じフォルダを指しているときに限って引き継ぐ。別のフォルダや
+    /// S3 互換ストレージへは持ち込まない。
+    /// </para>
+    /// </summary>
+    private static ToolSyncState? ResolveState(
+        SyncSettings settings,
+        ISyncStorage storage,
+        string toolKey,
+        out string stateKey)
+    {
+        // JSON デシリアライズで ToolState が明示的に null になる可能性に備え、
+        // SettingsStore.MergeForSave と同様に null ガードを入れる。
+        settings.ToolState ??= new Dictionary<string, ToolSyncState>();
+
+        stateKey = ToolStateKey(storage, toolKey);
+        var state = settings.ToolState.GetValueOrDefault(stateKey);
+        if (state is not null) return state;
+
+        if (storage is LocalFolderSyncStorage local
+            && IsConfiguredFolder(settings, local)
+            && settings.ToolState.TryGetValue(toolKey, out var legacy))
+        {
+            return legacy;
+        }
+        return null;
+    }
+
+    private static bool IsConfiguredFolder(SyncSettings settings, LocalFolderSyncStorage storage)
+    {
+        var configured = settings.CloudFolderPath?.Trim();
+        if (string.IsNullOrEmpty(configured)) return false;
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(configured),
+                storage.RootDirectory,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // 設定に壊れたパスが入っている場合は引き継がない。
+            return false;
+        }
+    }
 
     public ILogger<T> CreateLogger<T>() => _loggerFactory.CreateLogger<T>();
 }

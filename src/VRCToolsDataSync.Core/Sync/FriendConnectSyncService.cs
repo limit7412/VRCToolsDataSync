@@ -101,13 +101,16 @@ public sealed class FriendConnectSyncService : ISyncService
             storage.Delete(ConfigKey);
         }
 
-        files.AddRange(PushNotes(storage, remoteFiles, affected));
+        var noteFiles = PushNotes(storage, remoteFiles, affected);
+        files.AddRange(noteFiles);
 
         if (SyncTransfer.IsUnchangedSet(existing, files))
         {
             // 送るものが何も無いなら manifest も触らない。version を進めると
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
             // ダウンロードを誘発してしまう。
+            // (manifest は既に noteFiles と同じ集合を指しているので、孤児の掃除だけは行う)
+            RemoveStaleRemoteNotes(storage, noteFiles);
             _logger.LogInformation("Friend Connect Push: 変更なし version={Version}", existing!.Version);
             return new SyncResult
             {
@@ -117,13 +120,39 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        var nextVersion = manifestStore.UpdateToolEntry(Key, version => new ToolManifestEntry
+        long nextVersion;
+        try
         {
-            Version = version,
-            MachineName = options.MachineName,
-            UpdatedAt = DateTimeOffset.Now,
-            Files = files,
-        });
+            nextVersion = manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, version => new ToolManifestEntry
+            {
+                Version = version,
+                MachineName = options.MachineName,
+                UpdatedAt = DateTimeOffset.Now,
+                Files = files,
+            });
+        }
+        catch (ToolEntryChangedException ex)
+        {
+            // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が
+            // 同じ tool を Push した。ここで押し切ると、相手が上書きしたオブジェクトに
+            // 対して「内容が同じだから送らない」と判断した記録を残すことになり、
+            // manifest と実データがずれる。コンフリクトとして扱い、先に Pull させる。
+            _logger.LogInformation(
+                "Friend Connect Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
+                ex.ExpectedVersion, ex.ActualVersion);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.ConflictDetected,
+                RemoteVersion = ex.ActualVersion,
+                LastPulledVersion = options.LastPulledVersion,
+                Message = "Push の途中で他の PC が同期先を更新しました。先に Pull してください。",
+            };
+        }
+
+        // manifest が新しい集合を指してから、参照されなくなったオブジェクトを消す。
+        // 逆順にすると、manifest 更新が競合で失敗したときに
+        // 「manifest はまだ参照しているのに実体が無い」状態が残る。
+        RemoveStaleRemoteNotes(storage, noteFiles);
 
         _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
@@ -184,13 +213,66 @@ public sealed class FriendConnectSyncService : ISyncService
         Directory.CreateDirectory(_paths.RootDirectory);
         Directory.CreateDirectory(_paths.DbDirectory);
 
+        // (1) 同期先から取り出す。ここではローカルの既存ファイルに触れないので、
+        //     途中で失敗しても手元のデータは元のまま残る。
+        using var staging = new PullStaging(_logger);
+
+        if (!staging.Fetch(storage, remoteDb, _paths.DbFile))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にスナップショットがありません: {DbKey}",
+            };
+        }
+
+        remoteFiles.TryGetValue(DbV11Key, out var remoteDbV11);
+        remoteFiles.TryGetValue(ConfigKey, out var remoteConfig);
+        var remoteNotes = entry.Files
+            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
+            .ToList();
+
+        // manifest が要求するファイルはすべて揃わなければ Pull を成功にしない。
+        // 欠けたまま成功にすると LastPulledVersion だけ進み、以後の起動時 Pull は
+        // この version を最新とみなして省略するため、差異が固定される。
+        var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File)
+            ?? FetchOptional(staging, storage, remoteConfig, _paths.ConfigJsonFile)
+            ?? FetchNotes(staging, storage, remoteNotes);
+        if (missing is not null)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にファイルがありません: {missing}",
+            };
+        }
+
+        // (2) 取り出した内容が manifest の記録と合っているか確かめる。
+        if (staging.FindMismatchedKey() is { } mismatched)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}",
+            };
+        }
+
+        // (3) ここから先はローカルを書き換える。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
-            var filesToBackup = new List<string>();
-            if (File.Exists(_paths.DbFile)) filesToBackup.Add(_paths.DbFile);
-            if (File.Exists(_paths.DbV11File)) filesToBackup.Add(_paths.DbV11File);
-            if (File.Exists(_paths.ConfigJsonFile)) filesToBackup.Add(_paths.ConfigJsonFile);
+            // WAL/SHM もバックアップに含める。この後で消すので、含めておかないと
+            // 本体へ未反映のローカル変更が復元できなくなる。
+            var filesToBackup = new List<string>
+            {
+                _paths.DbFile,
+                _paths.DbV11File,
+                _paths.ConfigJsonFile,
+                Path.Combine(_paths.DbDirectory, "db.sqlite-wal"),
+                Path.Combine(_paths.DbDirectory, "db.sqlite-shm"),
+                Path.Combine(_paths.DbDirectory, "db_1.1.sqlite-wal"),
+                Path.Combine(_paths.DbDirectory, "db_1.1.sqlite-shm"),
+            };
 
             var dirsToBackup = new List<string>();
             if (Directory.Exists(_paths.NotesDirectory)) dirsToBackup.Add(_paths.NotesDirectory);
@@ -207,38 +289,20 @@ public sealed class FriendConnectSyncService : ISyncService
         DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
 
         var affected = new List<string>();
+        staging.Apply(affected);
 
-        if (!SyncTransfer.Restore(storage, remoteDb, _paths.DbFile, affected, _logger))
+        // リモートにない任意ファイルはローカルも削除して状態を揃える。
+        // 削除失敗を握りつぶすと、次の Push で古いファイルが manifest に
+        // 再登録されてしまうため、失敗は呼び出し側に伝播させる。
+        if (remoteDbV11 is null && File.Exists(_paths.DbV11File))
         {
-            return new SyncResult
-            {
-                Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {DbKey}",
-            };
-        }
-
-        if (remoteFiles.TryGetValue(DbV11Key, out var remoteDbV11))
-        {
-            SyncTransfer.Restore(storage, remoteDbV11, _paths.DbV11File, affected, _logger);
-        }
-        else if (File.Exists(_paths.DbV11File))
-        {
-            // リモートにない任意ファイルはローカルも削除して状態を揃える。
-            // 削除失敗を握りつぶすと、次の Push で古いファイルが manifest に
-            // 再登録されてしまうため、失敗は呼び出し側に伝播させる。
             File.Delete(_paths.DbV11File);
         }
-
-        if (remoteFiles.TryGetValue(ConfigKey, out var remoteConfig))
-        {
-            SyncTransfer.Restore(storage, remoteConfig, _paths.ConfigJsonFile, affected, _logger);
-        }
-        else if (File.Exists(_paths.ConfigJsonFile))
+        if (remoteConfig is null && File.Exists(_paths.ConfigJsonFile))
         {
             File.Delete(_paths.ConfigJsonFile);
         }
-
-        PullNotes(storage, entry.Files, affected);
+        RemoveStaleNotes(remoteNotes);
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
             entry.Version, backupPath ?? "(none)");
@@ -307,24 +371,59 @@ public sealed class FriendConnectSyncService : ISyncService
             }
         }
 
-        var keep = new HashSet<string>(files.Select(f => f.RelativePath), StringComparer.Ordinal);
+        return files;
+    }
+
+    /// <summary>
+    /// ローカルに無くなった note を同期先から取り除く。manifest の更新が
+    /// 成功してから呼ぶこと。先に消すと、manifest 更新が競合で失敗したときに
+    /// 「manifest はまだ参照しているのに実体が無い」状態が残る。
+    /// <para>
+    /// 削除対象は同期先の列挙から求める。manifest だけを見ると、過去に中断した
+    /// Push が残した孤児オブジェクトを取りこぼす。
+    /// </para>
+    /// </summary>
+    private void RemoveStaleRemoteNotes(ISyncStorage storage, IReadOnlyList<ManifestFile> keptNotes)
+    {
+        var keep = new HashSet<string>(keptNotes.Select(f => f.RelativePath), StringComparer.Ordinal);
         foreach (var remoteKey in storage.List(NotesKeyPrefix))
         {
             if (keep.Contains(remoteKey)) continue;
             storage.Delete(remoteKey);
             _logger.LogInformation("同期先から削除: {Key}", remoteKey);
         }
-
-        return files;
     }
 
-    /// <summary>notes フォルダを取り出す。リモートに無いファイルはローカルからも消す。</summary>
-    private void PullNotes(ISyncStorage storage, IReadOnlyList<ManifestFile> remoteFiles, List<string> affected)
+    /// <summary>
+    /// 任意ファイルを取り出す。manifest に載っていなければ何もしない。
+    /// 載っているのに同期先で見つからない場合は、そのキーを返して呼び出し側に伝える。
+    /// </summary>
+    private static string? FetchOptional(
+        PullStaging staging,
+        ISyncStorage storage,
+        ManifestFile? remote,
+        string targetPath)
     {
-        var notes = remoteFiles
-            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
-            .ToList();
+        if (remote is null) return null;
+        return staging.Fetch(storage, remote, targetPath) ? null : remote.RelativePath;
+    }
 
+    /// <summary>notes を取り出す。見つからないキーがあればその名前を返す。</summary>
+    private string? FetchNotes(PullStaging staging, ISyncStorage storage, IReadOnlyList<ManifestFile> notes)
+    {
+        if (notes.Count == 0) return null;
+
+        Directory.CreateDirectory(_paths.NotesDirectory);
+        foreach (var note in notes)
+        {
+            if (!staging.Fetch(storage, note, ToLocalNotePath(note))) return note.RelativePath;
+        }
+        return null;
+    }
+
+    /// <summary>リモートから消えた note をローカルからも取り除く。</summary>
+    private void RemoveStaleNotes(IReadOnlyList<ManifestFile> notes)
+    {
         if (notes.Count == 0)
         {
             if (Directory.Exists(_paths.NotesDirectory))
@@ -334,26 +433,12 @@ public sealed class FriendConnectSyncService : ISyncService
             return;
         }
 
-        Directory.CreateDirectory(_paths.NotesDirectory);
+        if (!Directory.Exists(_paths.NotesDirectory)) return;
 
-        var restored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var note in notes)
-        {
-            // manifest は他 PC が書いたものなので、キーの形を検証してから
-            // ローカルパスに写す。notes フォルダの外へ書き出させない。
-            var localPath = StorageKey.ToLocalPath(
-                _paths.NotesDirectory, note.RelativePath[NotesKeyPrefix.Length..]);
-            if (!SyncTransfer.Restore(storage, note, localPath, affected, _logger))
-            {
-                // manifest には載っているのに実体が無い。Push が途中で落ちた後などに
-                // 起こりうる。note は任意ファイルなので Pull 全体は止めず、記録に残す。
-                _logger.LogWarning("同期先に note が見つかりません: {Key}", note.RelativePath);
-                continue;
-            }
-            restored.Add(Path.GetFullPath(localPath));
-        }
+        var keep = new HashSet<string>(
+            notes.Select(n => Path.GetFullPath(ToLocalNotePath(n))),
+            StringComparer.OrdinalIgnoreCase);
 
-        // リモートから消えた note はローカルからも消して状態を揃える。
         // 握りつぶすと次の Push で古い note が manifest に再登録されてしまう。
         // 列挙しながら削除すると取りこぼしうるので、先に一覧を確定させる。
         var localNotes = Directory
@@ -361,10 +446,18 @@ public sealed class FriendConnectSyncService : ISyncService
             .ToList();
         foreach (var localPath in localNotes)
         {
-            if (restored.Contains(Path.GetFullPath(localPath))) continue;
+            if (keep.Contains(Path.GetFullPath(localPath))) continue;
             File.Delete(localPath);
         }
     }
+
+    /// <summary>
+    /// note のキーをローカルパスへ写す。manifest は他 PC が書いたものなので、
+    /// <see cref="StorageKey.ToLocalPath"/> がキーの形を検証し、
+    /// notes フォルダの外へ書き出させない。
+    /// </summary>
+    private string ToLocalNotePath(ManifestFile note)
+        => StorageKey.ToLocalPath(_paths.NotesDirectory, note.RelativePath[NotesKeyPrefix.Length..]);
 
     private static void DeleteIfExists(string dir, string fileName)
     {

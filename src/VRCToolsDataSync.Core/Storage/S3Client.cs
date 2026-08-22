@@ -73,7 +73,8 @@ internal sealed class S3Client
             AwsV4Signer.EmptyPayloadHash, headers: null,
             HttpCompletionOption.ResponseContentRead, cts.Token);
 
-        if (response.StatusCode == HttpStatusCode.NotFound)
+        if (response.StatusCode == HttpStatusCode.NotFound
+            && IsMissingObject(response, $"オブジェクトの取得 ({key})", cts.Token))
         {
             return null;
         }
@@ -97,11 +98,12 @@ internal sealed class S3Client
             AwsV4Signer.EmptyPayloadHash, headers: null,
             HttpCompletionOption.ResponseHeadersRead, cts.Token);
 
-        if (response.StatusCode == HttpStatusCode.NotFound)
+        if (response.StatusCode == HttpStatusCode.NotFound
+            && IsMissingObject(response, $"オブジェクトの取得 ({key})", cts.Token))
         {
             return false;
         }
-        EnsureSuccess(response, $"オブジェクトの取得 ({key})");
+        EnsureSuccess(response, $"オブジェクトの取得 ({key})", cts.Token);
 
         var directory = Path.GetDirectoryName(localPath);
         if (!string.IsNullOrEmpty(directory))
@@ -170,7 +172,7 @@ internal sealed class S3Client
         }
 
         // 応答本文は一度しか読めないので、ここで読み切ってから判定と例外に回す。
-        var errorBody = ReadBody(response);
+        var errorBody = ReadBody(response, cts.Token);
         if (conditionHeaders is { Count: > 0 }
             && IsConditionalWriteUnsupported(response.StatusCode, errorBody))
         {
@@ -372,7 +374,7 @@ internal sealed class S3Client
         EnsureSuccess(response, $"マルチパートアップロードの完了 ({key})");
 
         // 完了要求は HTTP 200 を返してから本文でエラーを伝えることがある。
-        var text = ReadBody(response);
+        var text = ReadBody(response, cts.Token);
         if (text.Contains("<Error", StringComparison.Ordinal))
         {
             var (code, message) = ParseError(text);
@@ -437,15 +439,39 @@ internal sealed class S3Client
                 response.Dispose();
                 response = null;
             }
-            catch (Exception ex) when (attempt < MaxAttempts && IsTransient(ex, cancellationToken))
+            catch (Exception ex) when (IsTransportFailure(ex))
             {
                 response?.Dispose();
+
+                // 名前解決の失敗、接続拒否、タイムアウトは呼び出し側にとって
+                // 「保存先へ到達できない」という一つの結果でしかない。HTTP 層の
+                // 例外をそのまま漏らすと、設定不備として扱う経路をすり抜けるため、
+                // 同期先の例外に包み直す。
+                if (attempt >= MaxAttempts || cancellationToken.IsCancellationRequested)
+                {
+                    throw new SyncStorageException(BuildTransportMessage(uri, ex, cancellationToken), ex);
+                }
             }
 
             // 相手側の一時的な不調とみて、待ち時間を倍にしながら再試行する。
             var delayMilliseconds = 500 * (int)Math.Pow(2, attempt - 1);
-            Thread.Sleep(TimeSpan.FromMilliseconds(delayMilliseconds));
+            cancellationToken.WaitHandle.WaitOne(TimeSpan.FromMilliseconds(delayMilliseconds));
+            cancellationToken.ThrowIfCancellationRequested();
         }
+    }
+
+    private static bool IsTransportFailure(Exception exception)
+        => exception is HttpRequestException or IOException or TaskCanceledException or OperationCanceledException;
+
+    private static string BuildTransportMessage(Uri uri, Exception exception, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested || exception is TaskCanceledException or OperationCanceledException)
+        {
+            return $"同期先への通信がタイムアウトしました ({uri.Host})";
+        }
+        // HttpRequestException は内部例外の方が原因を具体的に述べていることが多い。
+        var detail = exception.InnerException?.Message ?? exception.Message;
+        return $"同期先へ接続できませんでした ({uri.Host}): {detail}";
     }
 
     private (Uri Uri, string CanonicalPath) BuildUri(string key, string canonicalQuery)
@@ -485,29 +511,42 @@ internal sealed class S3Client
            || status == HttpStatusCode.RequestTimeout
            || status == HttpStatusCode.TooManyRequests;
 
-    private static bool IsTransient(Exception exception, CancellationToken cancellationToken)
-    {
-        // 呼び出し側のタイムアウト / キャンセルは再試行しない。
-        if (cancellationToken.IsCancellationRequested) return false;
-        return exception is HttpRequestException or IOException or TaskCanceledException;
-    }
-
     /// <summary>
     /// 条件付き書き込みに対応していない応答かを判定する。
     /// 未対応のプロバイダは 501 を返すか、本文のエラーコードで NotImplemented を伝える。
+    /// <para>
+    /// 汎用の InvalidRequest まで拾うと、無関係な 400 が一度出ただけで
+    /// 複数 PC 間の競合検出を黙って捨ててしまうため、明示的な非対応の signal に絞る。
+    /// </para>
     /// </summary>
     private static bool IsConditionalWriteUnsupported(HttpStatusCode status, string body)
     {
         if (status == HttpStatusCode.NotImplemented) return true;
-        if (status != HttpStatusCode.BadRequest) return false;
         var (code, _) = ParseError(body);
-        return code is "NotImplemented" or "InvalidRequest";
+        return string.Equals(code, "NotImplemented", StringComparison.Ordinal);
     }
 
-    private static void EnsureSuccess(HttpResponseMessage response, string operation)
+    /// <summary>
+    /// 404 が「オブジェクトが無い」ことを指しているかを判定する。
+    /// バケット名の間違いでも 404 が返るため、これを欠落と取り違えると、
+    /// 存在しないバケットを指したまま接続テストを通してしまう。
+    /// 欠落でなければ例外にする。
+    /// </summary>
+    private static bool IsMissingObject(HttpResponseMessage response, string operation, CancellationToken cancellationToken)
+    {
+        var body = ReadBody(response, cancellationToken);
+        var (code, _) = ParseError(body);
+        if (code.Length == 0 || string.Equals(code, "NoSuchKey", StringComparison.Ordinal))
+        {
+            return true;
+        }
+        throw BuildFailure(response.StatusCode, body, operation);
+    }
+
+    private static void EnsureSuccess(HttpResponseMessage response, string operation, CancellationToken cancellationToken = default)
     {
         if (response.IsSuccessStatusCode) return;
-        throw BuildFailure(response.StatusCode, ReadBody(response), operation);
+        throw BuildFailure(response.StatusCode, ReadBody(response, cancellationToken), operation);
     }
 
     private static SyncStorageException BuildFailure(HttpStatusCode status, string body, string operation)
@@ -520,12 +559,17 @@ internal sealed class S3Client
     /// <summary>
     /// 応答本文を読み出す。本文のストリームは一度しか読めないので、
     /// 呼び出し側は結果を使い回すこと。
+    /// <para>
+    /// ResponseHeadersRead で受けた応答ではバッファされていないネットワーク
+    /// ストリームを読むことになる。相手がヘッダだけ返して黙り込んだ場合に
+    /// 無期限に待たないよう、必ずトークンを渡す。
+    /// </para>
     /// </summary>
-    private static string ReadBody(HttpResponseMessage response)
+    private static string ReadBody(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         try
         {
-            using var stream = response.Content.ReadAsStream();
+            using var stream = response.Content.ReadAsStream(cancellationToken);
             using var reader = new StreamReader(stream, Encoding.UTF8);
             var buffer = new char[MaxErrorBodyChars];
             var read = reader.ReadBlock(buffer, 0, buffer.Length);

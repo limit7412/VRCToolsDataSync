@@ -14,11 +14,11 @@ namespace VRCToolsDataSync.Core.Storage;
 public sealed class PollingManifestWatcher : IManifestWatcher
 {
     private readonly ISyncStorage _storage;
-    private readonly TimeSpan _interval;
     private readonly System.Timers.Timer _timer;
     private readonly object _pollLock = new();
 
     private string? _lastSignature;
+    private bool _baselineTaken;
     private bool _started;
 
     public event Action<SyncManifest>? ManifestChanged;
@@ -26,7 +26,6 @@ public sealed class PollingManifestWatcher : IManifestWatcher
     public PollingManifestWatcher(ISyncStorage storage, TimeSpan interval)
     {
         _storage = storage;
-        _interval = interval;
         _timer = new System.Timers.Timer(interval.TotalMilliseconds)
         {
             // 前回の問い合わせが終わってから次を張り直す。通信が遅いときに
@@ -40,20 +39,9 @@ public sealed class PollingManifestWatcher : IManifestWatcher
     {
         if (_started) return;
         _started = true;
-
-        // 初回は現在の内容を基準として記録するだけにする。監視を始めた瞬間に
-        // 「更新あり」と誤って通知しないため。
-        lock (_pollLock)
-        {
-            try
-            {
-                _lastSignature = BuildSignature(_storage.LoadManifest());
-            }
-            catch
-            {
-                // 起動直後に到達できなくても監視は続ける。次の問い合わせで拾う。
-            }
-        }
+        // ここで manifest を読みに行かない。呼び出し元 (AutoSyncCoordinator.Start)
+        // はライフサイクルのロックを保持しており、通信が詰まると GUI の
+        // 「設定を保存」まで巻き込んで固まる。基準値は最初の問い合わせで取る。
         _timer.Start();
     }
 
@@ -65,7 +53,14 @@ public sealed class PollingManifestWatcher : IManifestWatcher
             {
                 var snapshot = _storage.LoadManifest();
                 var signature = BuildSignature(snapshot);
-                if (signature != _lastSignature)
+                if (!_baselineTaken)
+                {
+                    // 監視を始めた時点の内容を基準にする。ここで通知すると、
+                    // 起動のたびに「リモート更新あり」と誤って伝えてしまう。
+                    _baselineTaken = true;
+                    _lastSignature = signature;
+                }
+                else if (signature != _lastSignature)
                 {
                     _lastSignature = signature;
                     ManifestChanged?.Invoke(snapshot.Manifest);

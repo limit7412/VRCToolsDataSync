@@ -46,11 +46,18 @@ public sealed class S3StorageOptions
         {
             throw new SyncStorageConfigurationException("S3 互換ストレージのエンドポイント URL が未設定です");
         }
-        if (!Uri.TryCreate(ServiceUrl, UriKind.Absolute, out var uri)
-            || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp))
+        if (!Uri.TryCreate(ServiceUrl, UriKind.Absolute, out var uri))
         {
             throw new SyncStorageConfigurationException(
                 $"S3 互換ストレージのエンドポイント URL が不正です: {ServiceUrl}");
+        }
+        // ファイルの送信では本文のハッシュを署名に含めない (UNSIGNED-PAYLOAD) ため、
+        // 本文の完全性は TLS に委ねている。平文 HTTP を許すと、経路上で
+        // アップロード内容を署名を壊さずに書き換えられる。
+        if (uri.Scheme != Uri.UriSchemeHttps)
+        {
+            throw new SyncStorageConfigurationException(
+                $"エンドポイントは https である必要があります: {ServiceUrl}");
         }
         if (string.IsNullOrWhiteSpace(BucketName))
         {

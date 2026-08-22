@@ -62,8 +62,7 @@ pullVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx)
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
     ctx.ExitCode = RunPull(cloud, noBackup, "VRCX",
-        lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
-        VrcxSyncService.Key);
+        lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()));
 });
 pullCommand.AddCommand(pullVrcxCommand);
 
@@ -75,8 +74,7 @@ pullFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationCon
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
     ctx.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
-        lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
-        FriendConnectSyncService.Key);
+        lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()));
 });
 pullCommand.AddCommand(pullFriendConnectCommand);
 
@@ -172,7 +170,7 @@ return await rootCommand.InvokeAsync(args);
 
 // --- handlers ---
 
-static (SettingsStore store, SyncSettings settings, ISyncStorage storage, ILoggerFactory loggerFactory)?
+static (SyncRunner runner, SyncSettings settings, ISyncStorage storage, ILoggerFactory loggerFactory)?
     LoadContext(string? cloudOverride)
 {
     var store = new SettingsStore();
@@ -185,8 +183,10 @@ static (SettingsStore store, SyncSettings settings, ISyncStorage storage, ILogge
 
     try
     {
-        var storage = SyncStorageFactory.Create(settings, cloudOverride, loggerFactory);
-        return (store, settings, storage, loggerFactory);
+        var runner = new SyncRunner(store, loggerFactory);
+        // 同期履歴の読み書きは SyncRunner に任せる。保存先ごとのキーの扱いと、
+        // 更新前の settings.json からの引き継ぎを一箇所にまとめるため。
+        return (runner, settings, runner.CreateStorage(settings, cloudOverride), loggerFactory);
     }
     catch (SyncStorageException ex)
     {
@@ -205,21 +205,11 @@ static int RunPush(
 {
     var ctx = LoadContext(cloudOverride);
     if (ctx is null) return 2;
-    var (store, settings, storage, loggerFactory) = ctx.Value;
+    var (runner, settings, storage, loggerFactory) = ctx.Value;
 
     try
     {
-        var service = serviceFactory(loggerFactory);
-        var stateKey = SyncRunner.ToolStateKey(storage, toolKey);
-        var state = settings.ToolState.GetValueOrDefault(stateKey) ?? new ToolSyncState();
-
-        var result = service.Push(new PushOptions
-        {
-            Storage = storage,
-            MachineName = settings.MachineName,
-            ForceOverwriteOnConflict = force,
-            LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
-        });
+        var result = runner.Push(serviceFactory(loggerFactory), settings, storage, force);
 
         switch (result.Outcome)
         {
@@ -227,13 +217,6 @@ static int RunPush(
                 Console.WriteLine($"{toolDisplayName} Push 完了 version={result.RemoteVersion}");
                 if (!string.IsNullOrEmpty(result.Message)) Console.WriteLine($"  {result.Message}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
-                state.LastPushedVersion = result.RemoteVersion ?? state.LastPushedVersion;
-                state.LastPushedAt = DateTimeOffset.Now;
-                state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
-                settings.ToolState[stateKey] = state;
-                // Push 経由の Save では Top-level 設定を書き戻さない
-                // (GUI 等で変更された AutoSyncEnabled 等を巻き戻さないため)。
-                store.SaveToolStateOnly(settings);
                 return 0;
             case SyncOutcome.ConflictDetected:
                 Console.Error.WriteLine($"コンフリクト: リモート version={result.RemoteVersion}, ローカル lastPulled={result.LastPulledVersion}");
@@ -273,21 +256,15 @@ static int RunPull(
     string? cloudOverride,
     bool noBackup,
     string toolDisplayName,
-    Func<ILoggerFactory, ISyncService> serviceFactory,
-    string toolKey)
+    Func<ILoggerFactory, ISyncService> serviceFactory)
 {
     var ctx = LoadContext(cloudOverride);
     if (ctx is null) return 2;
-    var (store, settings, storage, loggerFactory) = ctx.Value;
+    var (runner, settings, storage, loggerFactory) = ctx.Value;
 
     try
     {
-        var service = serviceFactory(loggerFactory);
-        var result = service.Pull(new PullOptions
-        {
-            Storage = storage,
-            SkipBackup = noBackup,
-        });
+        var result = runner.Pull(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup);
 
         switch (result.Outcome)
         {
@@ -295,13 +272,6 @@ static int RunPull(
                 Console.WriteLine($"{toolDisplayName} Pull 完了 version={result.RemoteVersion}");
                 if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
-                var stateKey = SyncRunner.ToolStateKey(storage, toolKey);
-                var state = settings.ToolState.GetValueOrDefault(stateKey) ?? new ToolSyncState();
-                state.LastPulledVersion = result.RemoteVersion ?? state.LastPulledVersion;
-                state.LastPulledAt = DateTimeOffset.Now;
-                settings.ToolState[stateKey] = state;
-                // Pull 経由の Save では Top-level 設定を書き戻さない (Push と同様)。
-                store.SaveToolStateOnly(settings);
                 return 0;
             case SyncOutcome.NothingToDo:
             case SyncOutcome.SourceMissing:

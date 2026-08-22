@@ -15,6 +15,9 @@ public sealed class S3SyncStorage : ISyncStorage
     /// <summary>manifest の変更を確認する間隔。</summary>
     public static readonly TimeSpan ManifestPollInterval = TimeSpan.FromSeconds(60);
 
+    /// <summary>アップロード用の一時ファイルを掃除対象とみなすまでの時間。</summary>
+    private static readonly TimeSpan StagingRetention = TimeSpan.FromDays(1);
+
     private readonly S3Client _client;
     private readonly S3StorageOptions _options;
     private readonly string _keyPrefix;
@@ -100,8 +103,37 @@ public sealed class S3SyncStorage : ISyncStorage
         StorageKey.Validate(key);
         var stagingDirectory = Path.Combine(Path.GetTempPath(), "VRCToolsDataSync", "staging");
         Directory.CreateDirectory(stagingDirectory);
+        PruneStaleStagingFiles(stagingDirectory);
         var stagingPath = Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + ".tmp");
         return new StagedObject(this, key, stagingPath);
+    }
+
+    /// <summary>
+    /// 置き去りになった一時ファイルを片付ける。ここには SQLite の完全な複製
+    /// (数百 MB) が置かれるため、アップロード中にプロセスが落ちた分を放置すると
+    /// ディスクを食い続ける。進行中のアップロードを消さないよう、十分に古いものだけを対象にする。
+    /// </summary>
+    private void PruneStaleStagingFiles(string stagingDirectory)
+    {
+        var threshold = DateTime.UtcNow - StagingRetention;
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(stagingDirectory, "*.tmp"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) < threshold) File.Delete(path);
+                }
+                catch (IOException)
+                {
+                    // 別プロセスが使用中。次の機会に任せる。
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "一時ファイルの掃除に失敗しました: {Directory}", stagingDirectory);
+        }
     }
 
     public bool TryDownload(string key, string localPath)

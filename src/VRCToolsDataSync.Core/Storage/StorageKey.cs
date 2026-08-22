@@ -46,7 +46,19 @@ public static class StorageKey
     public static string ToLocalPath(string rootDirectory, string key)
     {
         Validate(key);
-        return Path.Combine(rootDirectory, key.Replace('/', Path.DirectorySeparatorChar));
+        var root = Path.GetFullPath(rootDirectory);
+        var resolved = Path.GetFullPath(Path.Combine(root, key.Replace('/', Path.DirectorySeparatorChar)));
+
+        // Validate を通ればここには来ないはずだが、キーの検証と実際のパス解決が
+        // 食い違った場合に備えて、結果が root の配下にあることも確かめる。
+        var prefix = root.EndsWith(Path.DirectorySeparatorChar)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+        if (!resolved.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SyncStorageException($"同期先のキーが対象フォルダの外を指しています: {key}");
+        }
+        return resolved;
     }
 
     /// <summary>ローカルの相対パスをキーの形 (区切りは '/') へ揃える。</summary>
