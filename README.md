@@ -117,6 +117,9 @@ GitHub Actions の `release` ワークフロー (`.github/workflows/release.yml`
 master へのマージでリリースが公開されるため、develop から master へマージする操作がリリース操作にあたる。
 minor や major を上げたいときは、先に目的の番号のタグを push してリリースを作る。
 
+master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、リリースは一本にまとまる。
+番号は一つだけ進み、まとめられた変更はそのリリースのノートに含まれる (ノートは直前のタグからの差分で生成される)。
+
 ## 第三者プロダクトに関する免責
 
 本ツールは [VRCX](https://github.com/vrcx-team/VRCX)（vrcx-team, MIT License）および VRC Friend Connect（たぴおかシステムズ, クローズドソース）の作者・開発元と一切の提携・支援関係はありません。
