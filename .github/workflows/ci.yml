@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+      - master
+
+permissions:
+  contents: read
+
+# 同じ PR / ブランチへの連続 push では最新のコミットだけをビルドする。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (Release)
+    # VRCToolsDataSync.App が WinUI 3 と Windows App SDK に依存しているため、
+    # Linux ランナーではビルドできない。
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      # solution 単位のビルドでは RID を指定できず (NETSDK1134)、指定しないと
+      # VRCToolsDataSync.App の runtime pack が restore されない (NETSDK1112)。
+      # release.yml の publish と同じく、プロジェクト単位で RID と Platform を
+      # 明示する。Core は両プロジェクトからの参照でビルドされる。
+      - name: Build Cli
+        # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
+        run: dotnet build src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj --configuration Release
+
+      # PublishTrimmed は Release 構成で既定 true になっており、self-contained
+      # でないビルドでは NETSDK1102 になる。トリミングはリリース時にだけ効けば
+      # よいので、build-release.ps1 と同じく無効にする。
+      - name: Build App
+        run: dotnet build src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj --configuration Release --runtime win-x64 -p:Platform=x64 -p:PublishTrimmed=false
