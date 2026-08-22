@@ -86,6 +86,11 @@ dotnet run --project src\VRCToolsDataSync.App
 
 設定カードで OneDrive フォルダを選択 → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
 
+## CI
+
+`.github/workflows/ci.yml` が PR と develop / master への push をトリガーに `VRCToolsDataSync.Cli` と `VRCToolsDataSync.App` を Release 構成でビルドする (`VRCToolsDataSync.Core` は両者からの参照でビルドされる)。
+`VRCToolsDataSync.App` が WinUI 3 と Windows App SDK に依存しているため、ランナーは `windows-latest` を使う。
+
 ## リリースビルド
 
 ローカルで self-contained な実行ファイルを作る場合:
