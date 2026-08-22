@@ -156,22 +156,6 @@ public sealed class S3SyncStorage : ISyncStorage
         _client.DeleteObject(ToObjectKey(key));
     }
 
-    public IReadOnlyList<string> List(string keyPrefix)
-    {
-        var objectKeys = _client.ListKeys(ToObjectKey(keyPrefix));
-        if (_keyPrefix.Length == 0)
-        {
-            return objectKeys;
-        }
-        // 呼び出し側にはキー接頭辞を取り除いた論理キーを返す。manifest に記録する
-        // 値も論理キーなので、接頭辞を変えても manifest はそのまま通用する。
-        var trimLength = _keyPrefix.Length + 1;
-        return objectKeys
-            .Where(k => k.Length > trimLength)
-            .Select(k => k[trimLength..])
-            .ToList();
-    }
-
     public IManifestWatcher CreateManifestWatcher()
         => new PollingManifestWatcher(this, ManifestPollInterval);
 

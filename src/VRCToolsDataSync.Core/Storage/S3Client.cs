@@ -114,10 +114,22 @@ internal sealed class S3Client
         var tmp = localPath + ".downloading-" + Guid.NewGuid().ToString("N");
         try
         {
-            using (var source = response.Content.ReadAsStream(cts.Token))
-            using (var destination = File.Create(tmp))
+            // ResponseHeadersRead ではヘッダー受信で Send が返るため、本文の同期読み取りに
+            // タイムアウトが効かない。相手がヘッダーだけ返して黙り込むと止まったままになる。
+            // 期限が来たら応答を破棄して、止まっている読み取りを失敗させる。
+            using (cts.Token.Register(static state => ((HttpResponseMessage)state!).Dispose(), response))
             {
-                source.CopyTo(destination);
+                try
+                {
+                    using var source = response.Content.ReadAsStream(cts.Token);
+                    using var destination = File.Create(tmp);
+                    source.CopyTo(destination);
+                }
+                catch (Exception ex) when (cts.Token.IsCancellationRequested)
+                {
+                    throw new SyncStorageException(
+                        $"オブジェクトの取得がタイムアウトしました ({key})", ex);
+                }
             }
             if (File.Exists(localPath))
             {
@@ -173,10 +185,21 @@ internal sealed class S3Client
 
         // 応答本文は一度しか読めないので、ここで読み切ってから判定と例外に回す。
         var errorBody = ReadBody(response, cts.Token);
-        if (conditionHeaders is { Count: > 0 }
-            && IsConditionalWriteUnsupported(response.StatusCode, errorBody))
+        if (conditionHeaders is { Count: > 0 })
         {
-            return S3PutOutcome.ConditionalWriteUnsupported;
+            // S3 は条件付き書き込みの衝突を 412 ではなく 409 で返すことがある。
+            // 汎用の失敗として扱うと ManifestStore の再試行へ戻れず、
+            // 読み直せば解消する競合で Push が落ちる。
+            var (code, _) = ParseError(errorBody);
+            if (response.StatusCode == HttpStatusCode.Conflict
+                && code is "ConditionalRequestConflict" or "OperationAborted")
+            {
+                return S3PutOutcome.PreconditionFailed;
+            }
+            if (IsConditionalWriteUnsupported(response.StatusCode, errorBody))
+            {
+                return S3PutOutcome.ConditionalWriteUnsupported;
+            }
         }
         throw BuildFailure(response.StatusCode, errorBody, $"オブジェクトの書き込み ({key})");
     }
@@ -226,59 +249,6 @@ internal sealed class S3Client
             throw BuildFailure(response.StatusCode, body, $"オブジェクトの削除 ({key})");
         }
         EnsureSuccess(response, $"オブジェクトの削除 ({key})", cts.Token);
-    }
-
-    /// <summary>接頭辞に一致するオブジェクトのキーを列挙する。</summary>
-    public IReadOnlyList<string> ListKeys(string keyPrefix)
-    {
-        var results = new List<string>();
-        string? continuationToken = null;
-
-        do
-        {
-            using var cts = new CancellationTokenSource(_options.Timeout);
-            var query = new List<KeyValuePair<string, string>>
-            {
-                new("list-type", "2"),
-                new("prefix", keyPrefix),
-                new("max-keys", "1000"),
-            };
-            if (continuationToken is not null)
-            {
-                query.Add(new KeyValuePair<string, string>("continuation-token", continuationToken));
-            }
-
-            using var response = Send(
-                HttpMethod.Get, key: string.Empty, query, contentFactory: null,
-                AwsV4Signer.EmptyPayloadHash, headers: null,
-                HttpCompletionOption.ResponseContentRead, cts.Token);
-            EnsureSuccess(response, "オブジェクト一覧の取得");
-
-            using var stream = response.Content.ReadAsStream(cts.Token);
-            var document = XDocument.Load(stream);
-            var root = document.Root
-                ?? throw new SyncStorageException("オブジェクト一覧の応答が空でした");
-
-            foreach (var contents in ChildElements(root, "Contents"))
-            {
-                var key = ChildElements(contents, "Key").FirstOrDefault()?.Value;
-                if (!string.IsNullOrEmpty(key))
-                {
-                    results.Add(key);
-                }
-            }
-
-            var truncated = string.Equals(
-                ChildElements(root, "IsTruncated").FirstOrDefault()?.Value,
-                "true",
-                StringComparison.OrdinalIgnoreCase);
-            continuationToken = truncated
-                ? ChildElements(root, "NextContinuationToken").FirstOrDefault()?.Value
-                : null;
-        }
-        while (!string.IsNullOrEmpty(continuationToken));
-
-        return results;
     }
 
     // --- マルチパートアップロード ---

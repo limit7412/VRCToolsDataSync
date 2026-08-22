@@ -160,7 +160,7 @@ public sealed class FriendConnectSyncService : ISyncService
         // manifest が新しい集合を指してから、参照されなくなったオブジェクトを消す。
         // 逆順にすると、manifest 更新が競合で失敗したときに
         // 「manifest はまだ参照しているのに実体が無い」状態が残る。
-        RemoveStaleRemoteNotes(storage, noteFiles);
+        RemoveStaleRemoteNotes(storage, remoteFiles, noteFiles);
 
         _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
@@ -369,9 +369,8 @@ public sealed class FriendConnectSyncService : ISyncService
     }
 
     /// <summary>
-    /// notes フォルダを送る。ローカルに無くなったファイルは同期先からも消す。
-    /// 削除対象は同期先の列挙から求める。manifest だけを見ると、過去に中断した
-    /// Push が残した孤児オブジェクトを取りこぼす。
+    /// notes フォルダを送る。ローカルから消えたファイルの後始末は
+    /// <see cref="RemoveStaleRemoteNotes"/> が manifest の更新後に行う。
     /// </summary>
     private List<ManifestFile> PushNotes(
         ISyncStorage storage,
@@ -411,18 +410,29 @@ public sealed class FriendConnectSyncService : ISyncService
     /// 成功してから呼ぶこと。先に消すと、manifest 更新が競合で失敗したときに
     /// 「manifest はまだ参照しているのに実体が無い」状態が残る。
     /// <para>
-    /// 削除対象は同期先の列挙から求める。manifest だけを見ると、過去に中断した
-    /// Push が残した孤児オブジェクトを取りこぼす。
+    /// 削除対象は「今回の Push の基準にした manifest が参照していた note」から、
+    /// 今回も残るものを除いた分に限る。同期先を列挙して差分を取ると、基準にした
+    /// manifest を読んだ後に他の PC が上げた note まで消してしまい、相手の
+    /// manifest が実体の無いオブジェクトを指すことになる。
+    /// </para>
+    /// <para>
+    /// この方法では、中断した Push が残した孤児オブジェクト (どの manifest からも
+    /// 参照されていないもの) は残る。回収はオブジェクトの寿命の設計と合わせて
+    /// 扱う必要があるため #27 に委ねる。
     /// </para>
     /// </summary>
-    private void RemoveStaleRemoteNotes(ISyncStorage storage, IReadOnlyList<ManifestFile> keptNotes)
+    private void RemoveStaleRemoteNotes(
+        ISyncStorage storage,
+        IReadOnlyList<ManifestFile> previousFiles,
+        IReadOnlyList<ManifestFile> keptNotes)
     {
         var keep = new HashSet<string>(keptNotes.Select(f => f.RelativePath), StringComparer.Ordinal);
-        foreach (var remoteKey in storage.List(NotesKeyPrefix))
+        foreach (var previous in previousFiles)
         {
-            if (keep.Contains(remoteKey)) continue;
-            storage.Delete(remoteKey);
-            _logger.LogInformation("同期先から削除: {Key}", remoteKey);
+            if (!previous.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal)) continue;
+            if (keep.Contains(previous.RelativePath)) continue;
+            storage.Delete(previous.RelativePath);
+            _logger.LogInformation("同期先から削除: {Key}", previous.RelativePath);
         }
     }
 

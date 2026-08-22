@@ -159,33 +159,6 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         }
     }
 
-    public IReadOnlyList<string> List(string keyPrefix)
-    {
-        // キーの接頭辞はフォルダ境界とは限らないので、対象フォルダを列挙してから
-        // 接頭辞で絞る。S3 互換実装の ListObjectsV2 と同じ意味になる。
-        var separator = keyPrefix.LastIndexOf('/');
-        var directoryKey = separator < 0 ? string.Empty : keyPrefix[..separator];
-        var directory = directoryKey.Length == 0
-            ? _rootDirectory
-            : StorageKey.ToLocalPath(_rootDirectory, directoryKey);
-
-        if (!Directory.Exists(directory))
-        {
-            return Array.Empty<string>();
-        }
-
-        var results = new List<string>();
-        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
-        {
-            var key = StorageKey.FromRelativePath(Path.GetRelativePath(_rootDirectory, file));
-            if (key.StartsWith(keyPrefix, StringComparison.Ordinal))
-            {
-                results.Add(key);
-            }
-        }
-        return results;
-    }
-
     public IManifestWatcher CreateManifestWatcher() => new CloudWatcher(this);
 
     private sealed class StagedFile : IStagedUpload

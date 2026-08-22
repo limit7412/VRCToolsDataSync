@@ -74,13 +74,6 @@ public interface ISyncStorage
     void Delete(string key);
 
     /// <summary>
-    /// <paramref name="keyPrefix"/> で始まるキーを列挙する。
-    /// notes フォルダのように、ローカルから消えたファイルを同期先からも
-    /// 取り除くために使う。
-    /// </summary>
-    IReadOnlyList<string> List(string keyPrefix);
-
-    /// <summary>
     /// manifest の更新を監視する仕組みを作る。ローカルフォルダはファイル監視、
     /// S3 互換モードは定期的な問い合わせで実現する。
     /// </summary>
