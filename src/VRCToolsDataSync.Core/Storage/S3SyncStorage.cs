@@ -190,7 +190,7 @@ public sealed class S3SyncStorage : ISyncStorage
 
         // 書き込みと削除の権限。名前が衝突しないよう GUID を使い、後始末する。
         var probeKey = ToObjectKey($"_access-check/{Guid.NewGuid():N}");
-        _client.PutBytes(probeKey, ProbePayload, "application/octet-stream", conditions: null);
+        _client.PutBytes(probeKey, ProbePayload, "application/octet-stream", conditionHeaders: null);
         try
         {
             _client.DeleteObject(probeKey);
