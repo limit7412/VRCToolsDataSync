@@ -2,6 +2,8 @@ name: release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
   release:
@@ -14,6 +16,11 @@ on:
 
 permissions:
   contents: write
+
+# タグの採番が競合しないよう、リリースは同時に 1 本だけ走らせる。
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -50,9 +57,19 @@ jobs:
   release:
     name: GitHub Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != '' || github.event_name == 'release'
+    if: >-
+      startsWith(github.ref, 'refs/tags/')
+      || github.event.inputs.tag != ''
+      || github.event_name == 'release'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-latest
     steps:
+      # master への push では直近のタグから採番するため、タグを含めて取得する。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -62,24 +79,50 @@ jobs:
       - name: List artifacts
         run: ls -lR artifacts
 
+      # master への push は patch を一つ進めた新しいタグで公開する。
+      # タグ push、リリース作成、手動実行は従来どおり Draft を作る。
       - name: Determine tag
         id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "release" ]; then
-            echo "name=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            name="$RELEASE_TAG"
+            draft=true
+          elif [ -n "$INPUT_TAG" ]; then
+            name="$INPUT_TAG"
+            draft=true
+          elif [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            latest=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+            if [ -z "$latest" ]; then
+              name="0.0.1"
+            else
+              major="${latest%%.*}"
+              rest="${latest#*.}"
+              minor="${rest%%.*}"
+              patch="${rest#*.}"
+              name="$major.$minor.$((patch + 1))"
+            fi
+            draft=false
           else
-            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            name="$REF_NAME"
+            draft=true
           fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "タグ: $name (draft=$draft)"
 
       - name: Check if release exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.tag.outputs.name }}
         run: |
-          if gh release view "${{ steps.tag.outputs.name }}" >/dev/null 2>&1; then
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -90,14 +133,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-        run: gh release upload "${{ steps.tag.outputs.name }}" artifacts/*.zip --clobber
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: gh release upload "$TAG_NAME" artifacts/*.zip --clobber
 
-      - name: Create draft release
+      # タグが無ければこのアクションが github.sha に対して作る。
+      - name: Create release
         if: steps.check.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
           name: ${{ steps.tag.outputs.name }}
-          draft: true
+          draft: ${{ steps.tag.outputs.draft }}
           generate_release_notes: true
           files: artifacts/*.zip
