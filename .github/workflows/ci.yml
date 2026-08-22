@@ -31,9 +31,12 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
+      # RID を明示しないと、restore が VRCToolsDataSync.App の runtime pack を
+      # 取得せず build が NETSDK1112 で失敗する。restore と build の両方に同じ
+      # RID を渡す。x64 はリリースで配布しているアーキテクチャの一つ。
       - name: Restore
-        run: dotnet restore VRCToolsDataSync.slnx
+        run: dotnet restore VRCToolsDataSync.slnx --runtime win-x64
 
       - name: Build
         # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
-        run: dotnet build VRCToolsDataSync.slnx --configuration Release --no-restore
+        run: dotnet build VRCToolsDataSync.slnx --configuration Release --runtime win-x64 --no-restore

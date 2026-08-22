@@ -88,7 +88,7 @@ dotnet run --project src\VRCToolsDataSync.App
 
 ## CI
 
-`.github/workflows/ci.yml` が PR と develop / master への push をトリガーに `dotnet build VRCToolsDataSync.slnx --configuration Release` を実行する。
+`.github/workflows/ci.yml` が PR と develop / master への push をトリガーに `dotnet build VRCToolsDataSync.slnx --configuration Release --runtime win-x64` を実行する。
 `VRCToolsDataSync.App` が WinUI 3 と Windows App SDK に依存しているため、ランナーは `windows-latest` を使う。
 
 ## リリースビルド
