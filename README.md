@@ -108,7 +108,8 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 **Amazon S3 の場合**
 
 1. バケットを作る。パブリックアクセスはすべてブロックのままにする。
-2. そのバケットに対する `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` だけを許可する IAM ポリシーを作り、専用の IAM ユーザに付ける。
+2. そのバケットに対する `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:AbortMultipartUpload` / `s3:ListBucket` だけを許可する IAM ポリシーを作り、専用の IAM ユーザに付ける。
+   `s3:AbortMultipartUpload` は 64MB を超えるファイルの送信に要る。本ツールはその場合マルチパートで送り、途中で失敗したら開始済みのアップロードを中断する。この権限が無いと中断できず、送信済みのパートが未完了のまま残って課金され続ける。念のため、未完了のマルチパートアップロードを数日で破棄するライフサイクルルールもバケットに付けておくとよい。
 3. そのユーザのアクセスキーを発行し、エンドポイント `https://s3.<リージョン>.amazonaws.com` とあわせて控える。
 
 ### 本ツールに設定する

@@ -425,6 +425,10 @@ public sealed class FriendConnectSyncService : ISyncService
     /// この方法では、中断した Push が残した孤児オブジェクト (どの manifest からも
     /// 参照されていないもの) は残る。回収も #27 に委ねる。
     /// </para>
+    /// <para>
+    /// 失敗しても例外は投げない。manifest を公開した後に呼ぶため、ここで失敗を
+    /// 伝えると成立した Push が失敗として扱われてしまう。
+    /// </para>
     /// </summary>
     private void RemoveStaleRemoteNotes(
         ManifestStore manifestStore,
@@ -439,10 +443,25 @@ public sealed class FriendConnectSyncService : ISyncService
             .ToList();
         if (candidates.Count == 0) return;
 
+        // ここは manifest を公開した後なので、失敗しても Push 自体は成立している。
+        // 例外を投げると SyncRunner が成功した version を同期履歴へ記録できず、
+        // 利用者には Push 失敗と映り、次の通常 Push もリモートだけが新しいとして
+        // コンフリクトになる。消し残すのは manifest から参照されない孤児なので、
+        // 警告に留めて Push は成功として返す (孤児の回収は #27)。
         var live = new HashSet<string>(StringComparer.Ordinal);
-        if (manifestStore.Load().Tools.TryGetValue(Key, out var current))
+        try
         {
-            foreach (var file in current.Files) live.Add(file.RelativePath);
+            if (manifestStore.Load().Tools.TryGetValue(Key, out var current))
+            {
+                foreach (var file in current.Files) live.Add(file.RelativePath);
+            }
+        }
+        catch (SyncStorageException ex)
+        {
+            // 生きているキーを確かめられない状態で消すと、他の PC が復活させた
+            // note を消しかねない。今回は見送る。
+            _logger.LogWarning(ex, "manifest を読み直せないため、不要な note の削除を見送りました");
+            return;
         }
 
         foreach (var key in candidates)
@@ -452,8 +471,15 @@ public sealed class FriendConnectSyncService : ISyncService
                 _logger.LogInformation("削除を見送り (他の PC が復活させた): {Key}", key);
                 continue;
             }
-            storage.Delete(key);
-            _logger.LogInformation("同期先から削除: {Key}", key);
+            try
+            {
+                storage.Delete(key);
+                _logger.LogInformation("同期先から削除: {Key}", key);
+            }
+            catch (SyncStorageException ex)
+            {
+                _logger.LogWarning(ex, "不要な note の削除に失敗しました: {Key}", key);
+            }
         }
     }
 
