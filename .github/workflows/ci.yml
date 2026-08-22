@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+      - master
+
+permissions:
+  contents: read
+
+# 同じ PR / ブランチへの連続 push では最新のコミットだけをビルドする。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (Release)
+    # VRCToolsDataSync.App が WinUI 3 と Windows App SDK に依存しているため、
+    # Linux ランナーではビルドできない。
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Restore
+        run: dotnet restore VRCToolsDataSync.slnx
+
+      - name: Build
+        # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
+        run: dotnet build VRCToolsDataSync.slnx --configuration Release --no-restore
