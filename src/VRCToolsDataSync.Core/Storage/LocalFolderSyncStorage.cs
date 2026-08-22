@@ -13,6 +13,9 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     /// <summary>同期フォルダの同期履歴キーに付く接頭辞の先頭。</summary>
     public const string StateKeyScheme = "folder|";
 
+    /// <summary>読み書きの権限を確認するために書いて読み戻す中身。</summary>
+    private static readonly byte[] ProbePayload = "VRCToolsDataSync access check"u8.ToArray();
+
     private readonly string _rootDirectory;
 
     public LocalFolderSyncStorage(string rootDirectory)
@@ -39,9 +42,13 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     public string StateKeyPrefix => $"{StateKeyScheme}{_rootDirectory.ToLowerInvariant()}|";
 
     /// <summary>
-    /// フォルダが存在し、書き込めるかを確かめる。読み取り専用の場所や、
-    /// 同期クライアントがまだ実体化していないプレースホルダを指しているケースを、
-    /// 設定を保存する前に弾く。
+    /// フォルダが存在し、同期に必要な読み書きと削除ができるかを確かめる。
+    /// 読み取り専用の場所や、同期クライアントがまだ実体化していないプレースホルダを
+    /// 指しているケースを、設定を保存する前に弾く。
+    /// <para>
+    /// NTFS では作成・読み取り・削除が別々の権限なので、3 つとも実際に試す。
+    /// どれか 1 つでも欠けると、設定は保存できても後の同期が失敗する。
+    /// </para>
     /// </summary>
     public void VerifyAccess()
     {
@@ -52,12 +59,35 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         var probe = Path.Combine(_rootDirectory, $".vrctoolsdatasync-access-check-{Guid.NewGuid():N}");
         try
         {
-            File.WriteAllBytes(probe, Array.Empty<byte>());
+            File.WriteAllBytes(probe, ProbePayload);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             throw new SyncStorageConfigurationException(
                 $"同期フォルダへ書き込めません: {_rootDirectory} ({ex.Message})");
+        }
+
+        // 読み取りの可否。NTFS では読み取りだけを拒否できるので、書き込みが通っても
+        // manifest の読み込みや Pull が失敗する構成があり得る。書いた内容を読み戻して
+        // 確かめる (S3 側は LoadManifest で読み取りを確認しており、それに合わせる)。
+        string? readFailure = null;
+        try
+        {
+            if (!File.ReadAllBytes(probe).AsSpan().SequenceEqual(ProbePayload))
+            {
+                readFailure = "書いた内容と異なる内容が読み出されました";
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            readFailure = ex.Message;
+        }
+        if (readFailure is not null)
+        {
+            // 読めないだけで削除は通ることがあるので、後始末は試みる。
+            try { File.Delete(probe); } catch { /* best-effort cleanup */ }
+            throw new SyncStorageConfigurationException(
+                $"同期フォルダから読み取れません: {_rootDirectory} ({readFailure})");
         }
 
         // 削除の可否も確かめる。NTFS では「ファイルの作成」と「削除」が別の権限
