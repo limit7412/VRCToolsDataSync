@@ -456,7 +456,12 @@ internal sealed class S3Client
             // 相手側の一時的な不調とみて、待ち時間を倍にしながら再試行する。
             var delayMilliseconds = 500 * (int)Math.Pow(2, attempt - 1);
             cancellationToken.WaitHandle.WaitOne(TimeSpan.FromMilliseconds(delayMilliseconds));
-            cancellationToken.ThrowIfCancellationRequested();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // 待機中にタイムアウトへ達した経路。ここも呼び出し側から見れば
+                // 「保存先へ到達できない」でしかないので、同期先の例外に揃える。
+                throw new SyncStorageException($"同期先への通信がタイムアウトしました ({uri.Host})");
+            }
         }
     }
 

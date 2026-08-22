@@ -18,7 +18,6 @@ public sealed class PollingManifestWatcher : IManifestWatcher
     private readonly object _pollLock = new();
 
     private string? _lastSignature;
-    private bool _baselineTaken;
     private bool _started;
 
     public event Action<SyncManifest>? ManifestChanged;
@@ -41,10 +40,21 @@ public sealed class PollingManifestWatcher : IManifestWatcher
         _started = true;
         // ここで manifest を読みに行かない。呼び出し元 (AutoSyncCoordinator.Start)
         // はライフサイクルのロックを保持しており、通信が詰まると GUI の
-        // 「設定を保存」まで巻き込んで固まる。基準値は最初の問い合わせで取る。
+        // 「設定を保存」まで巻き込んで固まる。
         _timer.Start();
     }
 
+    /// <summary>
+    /// manifest を読み直し、前回と内容が変わっていれば通知する。
+    /// <para>
+    /// 監視開始後の最初の問い合わせでも通知する。ここで「最初の内容を基準にする」
+    /// 扱いにすると、監視を始めてから最初の問い合わせまでの間 (最大で間隔ぶん) に
+    /// 他 PC が Push した分を取りこぼし、次に manifest が変わるまで気付けなくなる。
+    /// 通知先の <see cref="Watch.AutoSyncCoordinator"/> は、ローカルの
+    /// LastPulledVersion より新しく、かつ自分以外のマシンが書いたエントリだけを
+    /// 拾うため、余分に通知しても実害は無い。
+    /// </para>
+    /// </summary>
     private void Poll()
     {
         try
@@ -53,14 +63,7 @@ public sealed class PollingManifestWatcher : IManifestWatcher
             {
                 var snapshot = _storage.LoadManifest();
                 var signature = BuildSignature(snapshot);
-                if (!_baselineTaken)
-                {
-                    // 監視を始めた時点の内容を基準にする。ここで通知すると、
-                    // 起動のたびに「リモート更新あり」と誤って伝えてしまう。
-                    _baselineTaken = true;
-                    _lastSignature = signature;
-                }
-                else if (signature != _lastSignature)
+                if (signature != _lastSignature)
                 {
                     _lastSignature = signature;
                     ManifestChanged?.Invoke(snapshot.Manifest);

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -21,6 +22,7 @@ public sealed class S3SyncStorage : ISyncStorage
     private readonly S3Client _client;
     private readonly S3StorageOptions _options;
     private readonly string _keyPrefix;
+    private readonly string _endpointIdentity;
     private readonly ILogger _logger;
 
     // 条件付き書き込みに対応していないプロバイダを検知したら降格する。
@@ -32,6 +34,7 @@ public sealed class S3SyncStorage : ISyncStorage
         _options = options;
         _client = new S3Client(options);
         _keyPrefix = options.NormalizedKeyPrefix;
+        _endpointIdentity = BuildEndpointIdentity(options.ServiceUrl);
         _conditionalWrites = options.UseConditionalWrites;
         _logger = logger ?? NullLogger<S3SyncStorage>.Instance;
     }
@@ -41,8 +44,10 @@ public sealed class S3SyncStorage : ISyncStorage
         : $"s3://{_options.BucketName}/{_keyPrefix} ({_client.Host})";
 
     // 同期先が変わると manifest の version の意味も変わるため、ToolState を
-    // 同期先ごとに分ける。バケットとキー接頭辞まで含めて識別する。
-    public string StateKeyPrefix => $"s3|{_client.Host}/{_options.BucketName}/{_keyPrefix}|";
+    // 同期先ごとに分ける。ポートとサブパスを持つエンドポイント (MinIO を
+    // サブパスに置いた構成など) も区別する必要があるので、ホスト名だけでなく
+    // エンドポイント全体を識別に含める。
+    public string StateKeyPrefix => $"s3|{_endpointIdentity}/{_options.BucketName}/{_keyPrefix}|";
 
     public ManifestSnapshot LoadManifest()
     {
@@ -181,6 +186,19 @@ public sealed class S3SyncStorage : ISyncStorage
 
     private string ToObjectKey(string key)
         => _keyPrefix.Length == 0 ? key : _keyPrefix + "/" + key;
+
+    /// <summary>
+    /// 同期先の識別に使うエンドポイントの正規形。スキーム、ホスト、既定でない
+    /// ポート、サブパスまでを含める。
+    /// </summary>
+    private static string BuildEndpointIdentity(string serviceUrl)
+    {
+        var uri = new Uri(serviceUrl.Trim(), UriKind.Absolute);
+        var port = uri.IsDefaultPort
+            ? string.Empty
+            : ":" + uri.Port.ToString(CultureInfo.InvariantCulture);
+        return $"{uri.Scheme}://{uri.Host.ToLowerInvariant()}{port}{uri.AbsolutePath.TrimEnd('/')}";
+    }
 
     /// <summary>
     /// 一時ファイルへ書き出してから、Commit でアップロードする。
