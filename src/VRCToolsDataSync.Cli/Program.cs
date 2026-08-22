@@ -354,16 +354,24 @@ static int ShowStatus()
 static int ConfigureLocalStorage(string path)
 {
     var trimmed = path.Trim();
-    if (!Directory.Exists(trimmed))
-    {
-        Console.Error.WriteLine($"指定されたフォルダが存在しません: {trimmed}");
-        return 2;
-    }
 
     var store = new SettingsStore();
     var settings = store.Load();
     settings.StorageMode = SyncStorageMode.LocalFolder;
     settings.CloudFolderPath = trimmed;
+
+    try
+    {
+        // S3 側と同じく、保存する前に読み書きできることを確かめる。
+        SyncStorageFactory.Create(settings).VerifyAccess();
+    }
+    catch (SyncStorageException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Console.Error.WriteLine("設定は保存していません。");
+        return 2;
+    }
+
     store.Save(settings);
 
     Console.WriteLine($"保存先をローカル同期フォルダに設定しました: {trimmed}");

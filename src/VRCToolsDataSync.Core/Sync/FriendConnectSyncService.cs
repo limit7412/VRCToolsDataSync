@@ -292,20 +292,27 @@ public sealed class FriendConnectSyncService : ISyncService
             // 毎回混ざり、その世代を復元すると実データとして残ってしまう。
             backupPath = _backup.CreateSnapshot(
                 Key, filesToBackup, dirsToBackup,
-                shouldBackupFile: path => !Path.GetFileName(path)
-                    .Contains(PullStaging.IncomingMarker, StringComparison.Ordinal));
+                shouldBackupFile: path => !PullStaging.IsIncomingFile(path));
         }
 
-        // DB を差し替えるものだけ WAL/SHM を消す。残したまま差し替えると古い WAL が
-        // 新しい本体に対して再生されてデータが破損するため、--no-backup でも飛ばさない。
-        // 逆に差し替えない DB の WAL は残す。消すと、本体へ未反映のローカル変更を
-        // 差し替えるものが無いのに捨てることになる。
-        if (staging.IsStaged(_paths.DbFile))
+        // WAL/SHM を消すのは、その DB の本体を差し替えるか削除するとき。残したままだと
+        // 古い WAL が別内容の本体に対して再生されてデータが破損するため、
+        // --no-backup でも飛ばさない。
+        //
+        // 明示的な Pull はリモートの内容へ戻す操作なので、本体を差し替えない場合でも
+        // 消す (手元の未反映分は破棄される。バックアップには含めてある)。
+        // 起動時の自動 Pull (SkipIfNotNewer) では消さない。差し替えるものが無いのに
+        // 未反映のローカル変更を捨てることになるため。
+        var explicitPull = !options.SkipIfNotNewer;
+        if (staging.IsStaged(_paths.DbFile) || explicitPull)
         {
             DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
             DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
         }
-        if (staging.IsStaged(_paths.DbV11File))
+        // db_1.1 はリモートから消えた場合に本体だけ削除する経路がある。
+        // そのときも WAL を残すと、次に Friend Connect が本体を作り直したときに
+        // 別 DB の WAL が再生されうる。
+        if (staging.IsStaged(_paths.DbV11File) || explicitPull || remoteDbV11 is null)
         {
             DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
             DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
@@ -378,10 +385,7 @@ public sealed class FriendConnectSyncService : ISyncService
             foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
             {
                 // 中断した Pull が残した取り出し中のファイルは同期対象ではない。
-                if (Path.GetFileName(localPath).Contains(PullStaging.IncomingMarker, StringComparison.Ordinal))
-                {
-                    continue;
-                }
+                if (PullStaging.IsIncomingFile(localPath)) continue;
                 var relative = StorageKey.FromRelativePath(
                     Path.GetRelativePath(_paths.NotesDirectory, localPath));
                 var key = NotesKeyPrefix + relative;

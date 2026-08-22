@@ -78,7 +78,7 @@ internal sealed class S3Client
         {
             return null;
         }
-        EnsureSuccess(response, $"オブジェクトの取得 ({key})");
+        EnsureSuccess(response, $"オブジェクトの取得 ({key})", cts.Token);
 
         using var stream = response.Content.ReadAsStream(cts.Token);
         using var buffer = new MemoryStream();
@@ -211,12 +211,19 @@ internal sealed class S3Client
             HttpCompletionOption.ResponseContentRead, cts.Token);
 
         // 存在しないキーの削除は成功扱い。S3 互換 API は 204 を返すのが普通だが、
-        // 404 を返す実装もあるので受け入れる。ただしバケット名の誤りによる 404 は
-        // 取得側と同様にエラーとして扱う。
-        if (response.StatusCode == HttpStatusCode.NotFound
-            && IsMissingObject(response, $"オブジェクトの削除 ({key})", cts.Token))
+        // 404 を返す実装もあるので受け入れる。
+        // ただしバケット自体が無い場合は設定の誤りなのでエラーにする。取得側と違い
+        // 「NoSuchKey 以外は失敗」にはしない。実装によって欠落時のコードが異なり、
+        // 任意ファイルの削除は毎回の Push で通るため、狭く判定すると常時失敗する。
+        if (response.StatusCode == HttpStatusCode.NotFound)
         {
-            return;
+            var body = ReadBody(response, cts.Token);
+            var (code, _) = ParseError(body);
+            if (!string.Equals(code, "NoSuchBucket", StringComparison.Ordinal))
+            {
+                return;
+            }
+            throw BuildFailure(response.StatusCode, body, $"オブジェクトの削除 ({key})");
         }
         EnsureSuccess(response, $"オブジェクトの削除 ({key})", cts.Token);
     }

@@ -274,14 +274,16 @@ public sealed class VrcxSyncService : ISyncService
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
 
-        // 本体 DB を差し替えるときだけ WAL/SHM を消す。残したまま差し替えると
+        // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
         // 古い WAL が新しい本体に対して再生されてデータが破損するため、
         // --no-backup でも飛ばさない。
         //
-        // 逆に、リモートで変わったのが latest.json だけで本体 DB を差し替えない場合は
-        // 消さない。消すと、本体へ未反映のローカル変更を、差し替えるものが無いのに
-        // 捨てることになる。
-        if (staging.IsStaged(_paths.SqliteFile))
+        // 明示的な Pull はリモートの内容へ戻す操作なので、本体を差し替えない場合でも
+        // 消す (手元の未反映分は破棄される。バックアップには含めてある)。
+        // 起動時の自動 Pull (SkipIfNotNewer) では消さない。リモートで変わったのが
+        // latest.json だけだった場合に、差し替えるものが無いのに未反映のローカル変更を
+        // 捨てることになるため。
+        if (staging.IsStaged(_paths.SqliteFile) || !options.SkipIfNotNewer)
         {
             DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
             DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");

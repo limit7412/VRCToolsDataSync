@@ -7,6 +7,13 @@ namespace VRCToolsDataSync.Core.Sync;
 
 public sealed class SyncRunner
 {
+    // 同一プロセス内の Push を直列化する。manifest は read-modify-write なので、
+    // 自動 Push・手動 Push・終了時 Push が重なると互いの更新を潰しうる。
+    // 特に終了時 Push は期限切れで切り離されることがあり、その間に
+    // AutoSyncCoordinator が再開して自動 Push を始める経路がある。
+    // (PC をまたぐ競合は manifest の条件付き更新と version 検査で扱う)
+    private static readonly object PushLock = new();
+
     private readonly SettingsStore _store;
     private readonly ILoggerFactory _loggerFactory;
 
@@ -32,28 +39,31 @@ public sealed class SyncRunner
         ISyncStorage storage,
         bool force)
     {
-        var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
-        var result = service.Push(new PushOptions
+        lock (PushLock)
         {
-            Storage = storage,
-            MachineName = settings.MachineName,
-            ForceOverwriteOnConflict = force,
-            LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
-        });
+            var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
+            var result = service.Push(new PushOptions
+            {
+                Storage = storage,
+                MachineName = settings.MachineName,
+                ForceOverwriteOnConflict = force,
+                LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
+            });
 
-        if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
-        {
-            state.LastPushedVersion = result.RemoteVersion.Value;
-            state.LastPushedAt = DateTimeOffset.Now;
-            state.LastPulledVersion = result.RemoteVersion.Value;
-            settings.ToolState[stateKey] = state;
-            // Push 経由の Save は ToolState の更新だけが目的。Top-level 設定は
-            // disk 値を優先しないと、古いインスタンスを持った別経路 (CLI / 別
-            // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
-            // 等を巻き戻してしまう。
-            _store.SaveToolStateOnly(settings);
+            if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
+            {
+                state.LastPushedVersion = result.RemoteVersion.Value;
+                state.LastPushedAt = DateTimeOffset.Now;
+                state.LastPulledVersion = result.RemoteVersion.Value;
+                settings.ToolState[stateKey] = state;
+                // Push 経由の Save は ToolState の更新だけが目的。Top-level 設定は
+                // disk 値を優先しないと、古いインスタンスを持った別経路 (CLI / 別
+                // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
+                // 等を巻き戻してしまう。
+                _store.SaveToolStateOnly(settings);
+            }
+            return result;
         }
-        return result;
     }
 
     public SyncResult Pull(
@@ -106,19 +116,8 @@ public sealed class SyncRunner
 
     /// <summary>
     /// 同期先とツールに対応する同期履歴を取り出す。
-    /// <para>
-    /// 保存先ごとにキーを分ける前の settings.json では、履歴がツールキーだけで
-    /// 入っていた。その履歴は「当時 settings に設定されていた同期フォルダ」に対する
-    /// ものなので、同じフォルダを指しているときに限って引き継ぐ。別のフォルダや
-    /// S3 互換ストレージへは持ち込まない。
-    /// </para>
-    /// <para>
-    /// 引き継ぎは一度だけ行う。フォルダ別のキーが既にあれば、旧キーが残っていても
-    /// 参照しない。旧キーは <see cref="SettingsStore.MergeForSave"/> がディスク側の
-    /// 値を残すため消えないので、「引き継ぎ済みかどうか」はフォルダ別キーの有無で
-    /// 判断する。これをしないと、別のフォルダへ切り替えたときに旧キーが再び
-    /// 拾われ、前のフォルダの履歴が復活してしまう。
-    /// </para>
+    /// 旧形式のキーからの移行は <see cref="SettingsStore.Load"/> が読み込み時に
+    /// 済ませているので、ここでは現行のキーを引くだけでよい。
     /// </summary>
     private static ToolSyncState? ResolveState(
         SyncSettings settings,
@@ -129,54 +128,8 @@ public sealed class SyncRunner
         // JSON デシリアライズで ToolState が明示的に null になる可能性に備え、
         // SettingsStore.MergeForSave と同様に null ガードを入れる。
         settings.ToolState ??= new Dictionary<string, ToolSyncState>();
-
         stateKey = ToolStateKey(storage, toolKey);
-        var state = settings.ToolState.GetValueOrDefault(stateKey);
-        if (state is not null) return state;
-
-        if (storage is LocalFolderSyncStorage local
-            && IsConfiguredFolder(settings, local)
-            && !HasFolderScopedState(settings, toolKey)
-            && settings.ToolState.TryGetValue(toolKey, out var legacy))
-        {
-            // 値を複製する。参照をそのまま返すと、以後の更新が旧キー側の
-            // エントリにも反映され、引き継ぎ済みかどうかの判断が狂う。
-            return legacy.Clone();
-        }
-        return null;
-    }
-
-    /// <summary>いずれかの同期フォルダについて、このツールの履歴が既にあるか。</summary>
-    private static bool HasFolderScopedState(SyncSettings settings, string toolKey)
-    {
-        var suffix = "|" + toolKey;
-        foreach (var key in settings.ToolState.Keys)
-        {
-            if (key.StartsWith(LocalFolderSyncStorage.StateKeyScheme, StringComparison.Ordinal)
-                && key.EndsWith(suffix, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static bool IsConfiguredFolder(SyncSettings settings, LocalFolderSyncStorage storage)
-    {
-        var configured = settings.CloudFolderPath?.Trim();
-        if (string.IsNullOrEmpty(configured)) return false;
-        try
-        {
-            return string.Equals(
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured)),
-                storage.RootDirectory,
-                StringComparison.OrdinalIgnoreCase);
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
-        {
-            // 設定に壊れたパスが入っている場合は引き継がない。
-            return false;
-        }
+        return settings.ToolState.GetValueOrDefault(stateKey);
     }
 
     public ILogger<T> CreateLogger<T>() => _loggerFactory.CreateLogger<T>();

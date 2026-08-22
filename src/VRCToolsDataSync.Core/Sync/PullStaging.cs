@@ -21,6 +21,28 @@ internal sealed class PullStaging : IDisposable
     /// <summary>取り出し中のファイルに付ける目印。同期対象と取り違えないために使う。</summary>
     public const string IncomingMarker = ".incoming-";
 
+    /// <summary>目印に続く GUID の長さ ("N" 書式)。</summary>
+    private const int IncomingSuffixLength = 32;
+
+    /// <summary>
+    /// 取り出し中のファイルかを判定する。目印を含むだけで判定すると、
+    /// "2024.incoming-notes.txt" のような正当なファイルまで同期対象から外れてしまうため、
+    /// 「目印 + 32 桁の 16 進」で終わることまで見る。
+    /// </summary>
+    public static bool IsIncomingFile(string path)
+    {
+        var name = Path.GetFileName(path);
+        var markerIndex = name.LastIndexOf(IncomingMarker, StringComparison.Ordinal);
+        if (markerIndex < 0) return false;
+        var suffix = name.AsSpan(markerIndex + IncomingMarker.Length);
+        if (suffix.Length != IncomingSuffixLength) return false;
+        foreach (var c in suffix)
+        {
+            if (!char.IsAsciiHexDigitLower(c)) return false;
+        }
+        return true;
+    }
+
     private readonly List<StagedFile> _staged = new();
     private readonly ILogger _logger;
 

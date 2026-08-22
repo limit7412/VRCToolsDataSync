@@ -28,6 +28,12 @@ public sealed class SyncSettings
     /// <summary><see cref="SyncStorageMode.S3"/> のときの接続設定。</summary>
     public S3Settings? S3 { get; set; }
 
+    /// <summary>
+    /// <see cref="ToolState"/> のキー体系の版。0 は保存先ごとの接頭辞を持たない
+    /// 旧形式で、<see cref="SettingsStore"/> が読み込み時に一度だけ移行する。
+    /// </summary>
+    public int ToolStateSchema { get; set; }
+
     public Dictionary<string, ToolSyncState> ToolState { get; set; } = new();
 
     // Issue #6: ツールごとの自動起動設定。キーは ISyncService.ToolKey と一致させる
@@ -90,14 +96,6 @@ public sealed class ToolSyncState
     public DateTimeOffset? LastPulledAt { get; set; }
     public long LastPushedVersion { get; set; }
     public DateTimeOffset? LastPushedAt { get; set; }
-
-    public ToolSyncState Clone() => new()
-    {
-        LastPulledVersion = LastPulledVersion,
-        LastPulledAt = LastPulledAt,
-        LastPushedVersion = LastPushedVersion,
-        LastPushedAt = LastPushedAt,
-    };
 }
 
 public sealed class ToolLaunchConfig
