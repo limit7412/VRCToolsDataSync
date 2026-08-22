@@ -71,7 +71,7 @@ public sealed class VrcxSyncService : ISyncService
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
-            if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, snapshot))
+            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
                 _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
             }
@@ -86,7 +86,7 @@ public sealed class VrcxSyncService : ISyncService
         if (File.Exists(_paths.SettingsJsonFile))
         {
             var settingsFile = SyncTransfer.Describe(_paths.SettingsJsonFile, SettingsKey);
-            if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, settingsFile))
+            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, settingsFile))
             {
                 _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
             }

@@ -150,6 +150,12 @@ public sealed class S3SyncStorage : ISyncStorage
         return _client.GetToFile(ToObjectKey(key), localPath);
     }
 
+    public bool Exists(string key)
+    {
+        StorageKey.Validate(key);
+        return _client.Exists(ToObjectKey(key));
+    }
+
     public void Delete(string key)
     {
         StorageKey.Validate(key);

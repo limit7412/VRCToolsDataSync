@@ -70,6 +70,9 @@ public interface ISyncStorage
     /// </summary>
     bool TryDownload(string key, string localPath);
 
+    /// <summary>キーが同期先にあるかを確かめる。</summary>
+    bool Exists(string key);
+
     /// <summary>キーを削除する。存在しない場合は何もしない。</summary>
     void Delete(string key);
 

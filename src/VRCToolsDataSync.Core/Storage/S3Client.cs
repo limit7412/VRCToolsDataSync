@@ -225,6 +225,25 @@ internal sealed class S3Client
         EnsureSuccess(response, $"オブジェクトの書き込み ({key})");
     }
 
+    /// <summary>オブジェクトの有無だけを確かめる。本文は受け取らない。</summary>
+    public bool Exists(string key)
+    {
+        using var cts = new CancellationTokenSource(_options.Timeout);
+        using var response = Send(
+            HttpMethod.Head, key, query: null, contentFactory: null,
+            AwsV4Signer.EmptyPayloadHash, headers: null,
+            HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            // HEAD は本文を返さないのでエラーコードで区別できない。
+            // バケット名の誤りは接続テスト (VerifyAccess) と取得側で弾く。
+            return false;
+        }
+        EnsureSuccess(response, $"オブジェクトの確認 ({key})", cts.Token);
+        return true;
+    }
+
     public void DeleteObject(string key)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);

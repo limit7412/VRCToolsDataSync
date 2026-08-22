@@ -44,7 +44,26 @@ internal static class SyncTransfer
     }
 
     /// <summary>
+    /// 送信を省けるか。manifest の記録と一致することに加えて、同期先に実体が
+    /// あることまで確かめる。
+    /// <para>
+    /// 記録だけを見ると、中断した Push などで実体が欠けている場合に送信を省き続け、
+    /// 欠落が直らない。その状態では他の PC の Pull が失敗し続ける。
+    /// 実体の確認は本文を伴わない問い合わせなので、転送量には効かない。
+    /// </para>
+    /// </summary>
+    public static bool CanSkipUpload(
+        ISyncStorage storage,
+        IReadOnlyList<ManifestFile> remoteFiles,
+        ManifestFile candidate)
+        => IsAlreadyOnRemote(remoteFiles, candidate) && storage.Exists(candidate.RelativePath);
+
+    /// <summary>
     /// 前回の manifest と今回のファイル集合を比べ、送るものが何も無かったかを判定する。
+    /// <para>
+    /// ここでは実体の有無は見ない。実体が欠けていた分は上の判定で送り直されており、
+    /// その時点で manifest の記録と実体が揃うため、manifest を書き直す必要は無い。
+    /// </para>
     /// </summary>
     public static bool IsUnchangedSet(ToolManifestEntry? previous, IReadOnlyList<ManifestFile> current)
     {

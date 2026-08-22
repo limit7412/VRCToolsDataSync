@@ -85,7 +85,7 @@ public sealed class FriendConnectSyncService : ISyncService
         if (File.Exists(_paths.ConfigJsonFile))
         {
             var config = SyncTransfer.Describe(_paths.ConfigJsonFile, ConfigKey);
-            if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, config))
+            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, config))
             {
                 _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
             }
@@ -160,7 +160,7 @@ public sealed class FriendConnectSyncService : ISyncService
         // manifest が新しい集合を指してから、参照されなくなったオブジェクトを消す。
         // 逆順にすると、manifest 更新が競合で失敗したときに
         // 「manifest はまだ参照しているのに実体が無い」状態が残る。
-        RemoveStaleRemoteNotes(storage, remoteFiles, noteFiles);
+        RemoveStaleRemoteNotes(manifestStore, storage, remoteFiles, noteFiles);
 
         _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
@@ -356,7 +356,7 @@ public sealed class FriendConnectSyncService : ISyncService
         using var staged = storage.BeginUpload(key);
         SqliteSnapshot.Create(sourceDb, staged.LocalPath);
         var described = SyncTransfer.Describe(staged.LocalPath, key);
-        if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, described))
+        if (SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
         {
             _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
         }
@@ -389,7 +389,7 @@ public sealed class FriendConnectSyncService : ISyncService
                     Path.GetRelativePath(_paths.NotesDirectory, localPath));
                 var key = NotesKeyPrefix + relative;
                 var described = SyncTransfer.Describe(localPath, key);
-                if (SyncTransfer.IsAlreadyOnRemote(remoteFiles, described))
+                if (SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
                 {
                     _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
                 }
@@ -416,23 +416,44 @@ public sealed class FriendConnectSyncService : ISyncService
     /// manifest が実体の無いオブジェクトを指すことになる。
     /// </para>
     /// <para>
+    /// さらに削除の直前に manifest を読み直し、その時点で参照されているキーは残す。
+    /// 自分が manifest を更新してから削除するまでの間に、他の PC が同じ note を
+    /// 上げ直して公開している場合があるため。読み直しと削除の間の窓は残るので、
+    /// 完全に断つにはオブジェクトを version 固有のキーにする必要がある (#27)。
+    /// </para>
+    /// <para>
     /// この方法では、中断した Push が残した孤児オブジェクト (どの manifest からも
-    /// 参照されていないもの) は残る。回収はオブジェクトの寿命の設計と合わせて
-    /// 扱う必要があるため #27 に委ねる。
+    /// 参照されていないもの) は残る。回収も #27 に委ねる。
     /// </para>
     /// </summary>
     private void RemoveStaleRemoteNotes(
+        ManifestStore manifestStore,
         ISyncStorage storage,
         IReadOnlyList<ManifestFile> previousFiles,
         IReadOnlyList<ManifestFile> keptNotes)
     {
-        var keep = new HashSet<string>(keptNotes.Select(f => f.RelativePath), StringComparer.Ordinal);
-        foreach (var previous in previousFiles)
+        var candidates = previousFiles
+            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
+            .Select(f => f.RelativePath)
+            .Except(keptNotes.Select(f => f.RelativePath), StringComparer.Ordinal)
+            .ToList();
+        if (candidates.Count == 0) return;
+
+        var live = new HashSet<string>(StringComparer.Ordinal);
+        if (manifestStore.Load().Tools.TryGetValue(Key, out var current))
         {
-            if (!previous.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal)) continue;
-            if (keep.Contains(previous.RelativePath)) continue;
-            storage.Delete(previous.RelativePath);
-            _logger.LogInformation("同期先から削除: {Key}", previous.RelativePath);
+            foreach (var file in current.Files) live.Add(file.RelativePath);
+        }
+
+        foreach (var key in candidates)
+        {
+            if (live.Contains(key))
+            {
+                _logger.LogInformation("削除を見送り (他の PC が復活させた): {Key}", key);
+                continue;
+            }
+            storage.Delete(key);
+            _logger.LogInformation("同期先から削除: {Key}", key);
         }
     }
 

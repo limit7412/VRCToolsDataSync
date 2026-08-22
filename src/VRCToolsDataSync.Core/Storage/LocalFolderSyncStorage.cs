@@ -150,6 +150,9 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         return true;
     }
 
+    public bool Exists(string key)
+        => File.Exists(StorageKey.ToLocalPath(_rootDirectory, key));
+
     public void Delete(string key)
     {
         var path = StorageKey.ToLocalPath(_rootDirectory, key);
