@@ -19,7 +19,16 @@ public sealed class LocalBackup
             "backup");
     }
 
-    public string CreateSnapshot(string toolKey, IEnumerable<string> filesToBackup, IEnumerable<string>? directoriesToBackup = null)
+    /// <summary>
+    /// 退避用の世代を作る。<paramref name="shouldBackupFile"/> を与えると、
+    /// false を返したファイルをディレクトリの退避から除外する
+    /// (Pull の取り出し中ファイルなど、復元しても意味の無いものを混ぜないため)。
+    /// </summary>
+    public string CreateSnapshot(
+        string toolKey,
+        IEnumerable<string> filesToBackup,
+        IEnumerable<string>? directoriesToBackup = null,
+        Func<string, bool>? shouldBackupFile = null)
     {
         // 同一ツールに対して 1 秒以内に複数回 Pull が走るケース (CLI 二重起動、
         // 自動通知からの連続承認 Pull など) で世代ディレクトリが衝突しないよう、
@@ -42,7 +51,7 @@ public sealed class LocalBackup
             {
                 if (!Directory.Exists(dir)) continue;
                 var destDir = Path.Combine(destRoot, Path.GetFileName(Path.TrimEndingDirectorySeparator(dir)));
-                AtomicFile.CopyDirectory(dir, destDir, overwrite: true);
+                AtomicFile.CopyDirectory(dir, destDir, overwrite: true, shouldCopy: shouldBackupFile);
             }
         }
 

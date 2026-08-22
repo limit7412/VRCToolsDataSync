@@ -287,7 +287,13 @@ public sealed class FriendConnectSyncService : ISyncService
             var dirsToBackup = new List<string>();
             if (Directory.Exists(_paths.NotesDirectory)) dirsToBackup.Add(_paths.NotesDirectory);
 
-            backupPath = _backup.CreateSnapshot(Key, filesToBackup, dirsToBackup);
+            // notes の退避からは取り出し中のファイルを外す。バックアップは
+            // 取り出しの後に取るので、除外しないとリモート版の複製が一時名のまま
+            // 毎回混ざり、その世代を復元すると実データとして残ってしまう。
+            backupPath = _backup.CreateSnapshot(
+                Key, filesToBackup, dirsToBackup,
+                shouldBackupFile: path => !Path.GetFileName(path)
+                    .Contains(PullStaging.IncomingMarker, StringComparison.Ordinal));
         }
 
         // DB を差し替えるものだけ WAL/SHM を消す。残したまま差し替えると古い WAL が

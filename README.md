@@ -91,7 +91,7 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 | 0 | 成功 |
 | 1 | 想定外エラー |
 | 2 | 設定不備 (保存先が未設定 / 到達できない) |
-| 3 | コンフリクト（リモートがローカルの最終 Pull より新しい） |
+| 3 | コンフリクト（リモートがローカルの最終 Pull より新しい / Push 中に他 PC が更新した） |
 | 4 | 同期対象が存在しない |
 | 5 | プロセス実行中で同期不可 |
 
@@ -135,7 +135,7 @@ VRCToolsDataSync.Cli.exe storage s3 `
 
 `--secret-key` を省略すると、シークレットアクセスキーは画面に表示されない形で入力を求められる。シェルの履歴やプロセス一覧に残さないため、こちらを勧める。スクリプトから渡す場合は環境変数 `VRCTOOLSDATASYNC_S3_SECRET_KEY` を使う。
 
-設定は保存前に実際の接続を試し、到達できなければ保存せずに終了する。あとから確認する場合は `storage test` を使う。
+設定は保存前に実際の接続を試し、到達できなければ保存せずに終了する。確認は読み取りだけでなく、検査用オブジェクトの書き込みと削除まで行う。読み取り専用の API キーを渡した場合もここで弾かれる。あとから確認する場合は `storage test` を使う。
 
 ```powershell
 VRCToolsDataSync.Cli.exe storage test

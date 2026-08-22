@@ -38,6 +38,36 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     // 指している場合に限り SyncRunner が引き継ぐ。
     public string StateKeyPrefix => $"{StateKeyScheme}{_rootDirectory.ToLowerInvariant()}|";
 
+    /// <summary>
+    /// フォルダが存在し、書き込めるかを確かめる。読み取り専用の場所や、
+    /// 同期クライアントがまだ実体化していないプレースホルダを指しているケースを、
+    /// 設定を保存する前に弾く。
+    /// </summary>
+    public void VerifyAccess()
+    {
+        if (!Directory.Exists(_rootDirectory))
+        {
+            throw new SyncStorageConfigurationException($"同期フォルダが存在しません: {_rootDirectory}");
+        }
+        var probe = Path.Combine(_rootDirectory, $".vrctoolsdatasync-access-check-{Guid.NewGuid():N}");
+        try
+        {
+            File.WriteAllBytes(probe, Array.Empty<byte>());
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new SyncStorageConfigurationException(
+                $"同期フォルダへ書き込めません: {_rootDirectory} ({ex.Message})");
+        }
+        finally
+        {
+            if (File.Exists(probe))
+            {
+                try { File.Delete(probe); } catch { /* best-effort cleanup */ }
+            }
+        }
+    }
+
     public ManifestSnapshot LoadManifest()
     {
         var path = StorageKey.ToLocalPath(_rootDirectory, ManifestStore.ManifestKey);

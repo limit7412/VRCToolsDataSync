@@ -339,10 +339,13 @@ public partial class MainPageViewModel : ObservableObject
             var manifest = await Task.Run(() =>
             {
                 var storage = _runner.CreateStorage(probe);
+                // 読み取りだけでなく書き込みと削除まで確認する。読み取り専用の
+                // 認証情報だと、保存した後の最初の Push で初めて失敗するため。
+                storage.VerifyAccess();
                 return storage.LoadManifest().Manifest;
             });
 
-            AppendLog($"接続を確認しました: {SyncStorageFactory.DescribeTarget(probe)}");
+            AppendLog($"接続を確認しました (読み取り / 書き込み / 削除): {SyncStorageFactory.DescribeTarget(probe)}");
             if (manifest.Tools.Count == 0)
             {
                 AppendLog("  同期先にはまだデータがありません");

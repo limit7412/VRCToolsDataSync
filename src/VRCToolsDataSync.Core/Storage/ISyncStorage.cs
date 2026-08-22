@@ -26,10 +26,18 @@ public interface ISyncStorage
     /// LastPulledVersion は「その同期先の manifest の version」に対する状態なので、
     /// 同期先を切り替えると意味を失う。同期先ごとに別のキーで持つことで、切り替え直後に
     /// 古い version でコンフリクト判定や Pull スキップが誤発火するのを防ぐ。
-    /// ローカルフォルダ実装は空文字を返し、既存の settings.json と互換を保つ。
+    /// 同期フォルダはフォルダのパスごと、S3 互換はエンドポイントとバケットと
+    /// キー接頭辞ごとに分かれる。
     /// </para>
     /// </summary>
     string StateKeyPrefix { get; }
+
+    /// <summary>
+    /// 同期先を実際に使えるかを確かめる。設定画面や CLI の接続テストから呼ぶ。
+    /// 読み取りだけでなく、同期に必要な書き込みと削除まで確認する。
+    /// 使えない場合は <see cref="SyncStorageException"/> を投げる。
+    /// </summary>
+    void VerifyAccess();
 
     /// <summary>
     /// manifest を読み込む。存在しない場合は空の manifest と null のタグを返す。

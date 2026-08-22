@@ -19,6 +19,9 @@ public sealed class S3SyncStorage : ISyncStorage
     /// <summary>アップロード用の一時ファイルを掃除対象とみなすまでの時間。</summary>
     private static readonly TimeSpan StagingRetention = TimeSpan.FromDays(1);
 
+    /// <summary>書き込み権限の確認に使う中身。</summary>
+    private static readonly byte[] ProbePayload = "VRCToolsDataSync access check"u8.ToArray();
+
     private readonly S3Client _client;
     private readonly S3StorageOptions _options;
     private readonly string _keyPrefix;
@@ -173,12 +176,31 @@ public sealed class S3SyncStorage : ISyncStorage
         => new PollingManifestWatcher(this, ManifestPollInterval);
 
     /// <summary>
-    /// 同期先へ到達できるかを確かめる。設定画面や CLI の接続テストから呼ぶ。
+    /// 同期先を実際に使えるかを確かめる。設定画面や CLI の接続テストから呼ぶ。
+    /// <para>
+    /// 読み取りだけでは足りない。読み取り専用の認証情報でも manifest の取得は
+    /// 通ってしまい、設定を保存した後の最初の Push で初めて失敗する。
+    /// 検査用のオブジェクトを書いて消し、書き込みと削除の権限まで確認する。
+    /// </para>
     /// </summary>
     public void VerifyAccess()
     {
-        // manifest の読み取りだけで、認証・バケットの存在・権限の有無をまとめて確認できる。
+        // 認証、バケットの存在、読み取り権限。
         LoadManifest();
+
+        // 書き込みと削除の権限。名前が衝突しないよう GUID を使い、後始末する。
+        var probeKey = ToObjectKey($"_access-check/{Guid.NewGuid():N}");
+        _client.PutBytes(probeKey, ProbePayload, "application/octet-stream", conditions: null);
+        try
+        {
+            _client.DeleteObject(probeKey);
+        }
+        catch (SyncStorageException ex)
+        {
+            // 書き込みは通ったので接続テストとしては成功扱いにする。
+            // 消し残しは小さく、次の接続テストでも別名になるだけ。
+            _logger.LogWarning(ex, "検査用オブジェクトの削除に失敗しました: {Key}", probeKey);
+        }
     }
 
     private bool Put(string objectKey, byte[] payload, IReadOnlyList<KeyValuePair<string, string>>? conditions)

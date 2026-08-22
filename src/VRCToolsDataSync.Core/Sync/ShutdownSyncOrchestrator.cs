@@ -245,7 +245,29 @@ public sealed class ShutdownSyncOrchestrator
 
             try
             {
-                var pushResult = await Task.Run(() => _runner.Push(def.ServiceFactory(), settings, pushStorage, force: false), ct).ConfigureAwait(false);
+                // Push 本体は同期処理で、S3 互換モードでは数十分かかりうる。ct を
+                // Task.Run へ渡しても開始前にしか効かないため、開始してしまうと
+                // 終了処理がその完了まで戻れない。シャットダウンを取り消した環境では
+                // Coordinator と終了フラグが長時間復旧しなくなる。
+                // 期限が来たら待つのをやめ、Push はそのまま走らせておく。
+                var pushTask = Task.Run(
+                    () => _runner.Push(def.ServiceFactory(), settings, pushStorage, force: false),
+                    CancellationToken.None);
+                var pushResult = await WaitForPushAsync(pushTask, ct).ConfigureAwait(false);
+
+                if (pushResult is null)
+                {
+                    steps.Add(new ShutdownSyncStep
+                    {
+                        ToolKey = def.Key,
+                        DisplayName = def.DisplayName,
+                        Kind = ShutdownSyncStepKind.PushFailed,
+                        Message = "終了処理の期限までに Push が終わりませんでした (処理は継続中)",
+                    });
+                    ct.ThrowIfCancellationRequested();
+                    continue;
+                }
+
                 steps.Add(new ShutdownSyncStep
                 {
                     ToolKey = def.Key,
@@ -269,6 +291,41 @@ public sealed class ShutdownSyncOrchestrator
         }
 
         return steps;
+    }
+
+    /// <summary>
+    /// Push の完了を、終了処理の期限まで待つ。
+    /// 期限が先に来た場合は null を返す。<paramref name="pushTask"/> はそのまま
+    /// 走り続けるので、プロセスが生き残れば完了する。放置した例外で
+    /// 未観測のまま落ちないよう、結果は必ず観測しておく。
+    /// </summary>
+    private async Task<SyncResult?> WaitForPushAsync(Task<SyncResult> pushTask, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var deadline = Task.Delay(Timeout.Infinite, cts.Token);
+        var completed = await Task.WhenAny(pushTask, deadline).ConfigureAwait(false);
+
+        if (completed == pushTask)
+        {
+            // 待ち終わったので Delay を畳む。
+            cts.Cancel();
+            return await pushTask.ConfigureAwait(false);
+        }
+
+        _ = pushTask.ContinueWith(
+            t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _logger.LogError(t.Exception, "終了処理の期限後に Push が失敗しました");
+                }
+                else
+                {
+                    _logger.LogInformation("終了処理の期限後に Push が完了しました");
+                }
+            },
+            TaskScheduler.Default);
+        return null;
     }
 
     /// <summary>

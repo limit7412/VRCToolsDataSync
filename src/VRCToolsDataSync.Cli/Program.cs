@@ -236,8 +236,16 @@ static int RunPush(
         Console.Error.WriteLine($"{toolDisplayName} を終了してから再実行してください。");
         return 5;
     }
-    catch (SyncStorageConfigurationException ex)
+    catch (SyncStorageConcurrencyException ex)
     {
+        // manifest の更新が競合し続けた。コンフリクトと同じ扱いにする。
+        Console.Error.WriteLine(ex.Message);
+        return 3;
+    }
+    catch (SyncStorageException ex)
+    {
+        // 設定不備と、保存先へ到達できない場合をまとめて扱う。README の
+        // 終了コード表で 2 と定めているのはこの両方。
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
@@ -288,8 +296,16 @@ static int RunPull(
         Console.Error.WriteLine($"{toolDisplayName} を終了してから再実行してください。");
         return 5;
     }
-    catch (SyncStorageConfigurationException ex)
+    catch (SyncStorageConcurrencyException ex)
     {
+        // manifest の更新が競合し続けた。コンフリクトと同じ扱いにする。
+        Console.Error.WriteLine(ex.Message);
+        return 3;
+    }
+    catch (SyncStorageException ex)
+    {
+        // 設定不備と、保存先へ到達できない場合をまとめて扱う。README の
+        // 終了コード表で 2 と定めているのはこの両方。
         Console.Error.WriteLine(ex.Message);
         return 2;
     }
@@ -388,9 +404,8 @@ static int ConfigureS3Storage(
 
     try
     {
-        // 保存する前に、設定の形と実際の到達性をまとめて確かめる。
-        var storage = (S3SyncStorage)SyncStorageFactory.Create(settings);
-        storage.VerifyAccess();
+        // 保存する前に、設定の形と、読み書きできるかをまとめて確かめる。
+        SyncStorageFactory.Create(settings).VerifyAccess();
     }
     catch (SyncStorageException ex)
     {
@@ -412,8 +427,9 @@ static int TestStorage()
     try
     {
         var storage = SyncStorageFactory.Create(settings);
+        storage.VerifyAccess();
         var manifest = storage.LoadManifest().Manifest;
-        Console.WriteLine("接続を確認しました。");
+        Console.WriteLine("接続を確認しました (読み取り / 書き込み / 削除)。");
         if (manifest.Tools.Count == 0)
         {
             Console.WriteLine("同期先にはまだデータがありません。");
