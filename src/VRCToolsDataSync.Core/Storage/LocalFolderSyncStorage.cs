@@ -10,6 +10,9 @@ namespace VRCToolsDataSync.Core.Storage;
 /// </summary>
 public sealed class LocalFolderSyncStorage : ISyncStorage
 {
+    /// <summary>同期フォルダの同期履歴キーに付く接頭辞の先頭。</summary>
+    public const string StateKeyScheme = "folder|";
+
     private readonly string _rootDirectory;
 
     public LocalFolderSyncStorage(string rootDirectory)
@@ -18,7 +21,9 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         {
             throw new SyncStorageConfigurationException("同期フォルダのパスが未設定です");
         }
-        _rootDirectory = Path.GetFullPath(rootDirectory.Trim());
+        // 末尾の区切りを落として揃える。"D:\\sync" と "D:\\sync\\" が
+        // 別の同期先として扱われると、同期履歴が分かれてしまう。
+        _rootDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootDirectory.Trim()));
     }
 
     public string RootDirectory => _rootDirectory;
@@ -31,7 +36,7 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     // 見逃して切り替え先を上書きしたりする。
     // 更新前の settings.json が持つツールキーだけの履歴は、同じフォルダを
     // 指している場合に限り SyncRunner が引き継ぐ。
-    public string StateKeyPrefix => $"folder|{_rootDirectory.ToLowerInvariant()}|";
+    public string StateKeyPrefix => $"{StateKeyScheme}{_rootDirectory.ToLowerInvariant()}|";
 
     public ManifestSnapshot LoadManifest()
     {

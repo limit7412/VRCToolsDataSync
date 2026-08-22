@@ -788,22 +788,22 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 同期履歴の表示を更新する。同期履歴は保存先ごとに分かれているので、
+    /// 現在の保存先の分だけを拾う。保存先を組み立てられない (未設定など) 段階では
+    /// 未同期として表示する。
+    /// </summary>
     private void RefreshStatusSummaries()
     {
-        // ToolState のキーは保存先ごとに接頭辞が付く。表示中の保存先の分だけを拾う。
-        var prefix = ToolStateKeyPrefix();
-        VrcxStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(prefix + VrcxSyncService.Key));
-        FriendConnectStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(prefix + FriendConnectSyncService.Key));
+        if (!SyncStorageFactory.TryCreate(_settings, out var storage, out _, CloudFolderPath?.Trim()))
+        {
+            VrcxStatus = FormatStatus(null);
+            FriendConnectStatus = FormatStatus(null);
+            return;
+        }
+        VrcxStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, VrcxSyncService.Key));
+        FriendConnectStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, FriendConnectSyncService.Key));
     }
-
-    /// <summary>
-    /// 現在の保存先に対応する ToolState の接頭辞。保存先を組み立てられない
-    /// (未設定など) 段階でも状態表示は出したいので、その場合は接頭辞なしとして扱う。
-    /// </summary>
-    private string ToolStateKeyPrefix()
-        => SyncStorageFactory.TryCreate(_settings, out var storage, out _, CloudFolderPath?.Trim())
-            ? storage!.StateKeyPrefix
-            : string.Empty;
 
     private static string FormatStatus(ToolSyncState? state)
     {

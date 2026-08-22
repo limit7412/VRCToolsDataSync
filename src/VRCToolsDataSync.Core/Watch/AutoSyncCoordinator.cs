@@ -379,8 +379,10 @@ public sealed class AutoSyncCoordinator : IDisposable
         foreach (var binding in _bindings)
         {
             if (!manifest.Tools.TryGetValue(binding.ToolKey, out var entry)) continue;
-            var localState = _settings.ToolState.GetValueOrDefault(
-                SyncRunner.ToolStateKey(storage, binding.ToolKey));
+            // キーを直に引かず SyncRunner を通す。更新前の settings.json からの
+            // 引き継ぎが効かないと、直後は履歴なし扱いになって
+            // 「リモートが新しい」と誤通知してしまう。
+            var localState = SyncRunner.FindToolState(_settings, storage, binding.ToolKey);
             var localVersion = localState?.LastPulledVersion ?? 0;
             // 自分が最後に push した分も version は進むので、自分のマシン名で更新された
             // entry は無視する。リモートからの新着のみ通知する。

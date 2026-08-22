@@ -211,12 +211,14 @@ internal sealed class S3Client
             HttpCompletionOption.ResponseContentRead, cts.Token);
 
         // 存在しないキーの削除は成功扱い。S3 互換 API は 204 を返すのが普通だが、
-        // 404 を返す実装もあるので受け入れる。
-        if (response.StatusCode == HttpStatusCode.NotFound)
+        // 404 を返す実装もあるので受け入れる。ただしバケット名の誤りによる 404 は
+        // 取得側と同様にエラーとして扱う。
+        if (response.StatusCode == HttpStatusCode.NotFound
+            && IsMissingObject(response, $"オブジェクトの削除 ({key})", cts.Token))
         {
             return;
         }
-        EnsureSuccess(response, $"オブジェクトの削除 ({key})");
+        EnsureSuccess(response, $"オブジェクトの削除 ({key})", cts.Token);
     }
 
     /// <summary>接頭辞に一致するオブジェクトのキーを列挙する。</summary>

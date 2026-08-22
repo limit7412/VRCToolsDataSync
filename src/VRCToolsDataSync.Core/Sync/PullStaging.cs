@@ -18,6 +18,9 @@ namespace VRCToolsDataSync.Core.Sync;
 /// </summary>
 internal sealed class PullStaging : IDisposable
 {
+    /// <summary>取り出し中のファイルに付ける目印。同期対象と取り違えないために使う。</summary>
+    public const string IncomingMarker = ".incoming-";
+
     private readonly List<StagedFile> _staged = new();
     private readonly ILogger _logger;
 
@@ -47,7 +50,7 @@ internal sealed class PullStaging : IDisposable
             Directory.CreateDirectory(directory);
         }
 
-        var stagingPath = targetPath + ".incoming-" + Guid.NewGuid().ToString("N");
+        var stagingPath = targetPath + IncomingMarker + Guid.NewGuid().ToString("N");
         if (!storage.TryDownload(remote.RelativePath, stagingPath))
         {
             return false;
@@ -75,19 +78,54 @@ internal sealed class PullStaging : IDisposable
         return null;
     }
 
-    /// <summary>取り出したファイルを目的の場所へ移す。</summary>
-    public void Apply(List<string> affected)
+    /// <summary>
+    /// <paramref name="targetPath"/> を差し替える予定があるか。
+    /// 手元が既に同じ内容で取得を省いた場合は false になる。
+    /// </summary>
+    public bool IsStaged(string targetPath)
     {
         foreach (var staged in _staged)
         {
-            if (File.Exists(staged.TargetPath))
+            if (string.Equals(staged.TargetPath, targetPath, StringComparison.OrdinalIgnoreCase))
             {
-                File.Replace(staged.StagingPath, staged.TargetPath, destinationBackupFileName: null);
+                return true;
             }
-            else
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 取り出したファイルを目的の場所へ移す。
+    /// <para>
+    /// ファイル間で不可分ではない。途中で失敗した場合は、どこまで反映したかを
+    /// 添えて例外にする。Pull は manifest を正として組み立てるので、
+    /// 同じ Pull をやり直せば残りが反映される。
+    /// </para>
+    /// </summary>
+    public void Apply(List<string> affected)
+    {
+        var applied = new List<string>();
+        foreach (var staged in _staged)
+        {
+            try
             {
-                File.Move(staged.StagingPath, staged.TargetPath);
+                if (File.Exists(staged.TargetPath))
+                {
+                    File.Replace(staged.StagingPath, staged.TargetPath, destinationBackupFileName: null);
+                }
+                else
+                {
+                    File.Move(staged.StagingPath, staged.TargetPath);
+                }
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                var done = applied.Count == 0 ? "(なし)" : string.Join(", ", applied);
+                throw new IOException(
+                    $"取得したファイルの差し替えに失敗しました: {staged.TargetPath}。" +
+                    $"反映済み: {done}。もう一度 Pull すると残りが反映されます。", ex);
+            }
+            applied.Add(staged.TargetPath);
             affected.Add(staged.TargetPath);
         }
         _staged.Clear();

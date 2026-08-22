@@ -90,6 +90,14 @@ public sealed class ToolSyncState
     public DateTimeOffset? LastPulledAt { get; set; }
     public long LastPushedVersion { get; set; }
     public DateTimeOffset? LastPushedAt { get; set; }
+
+    public ToolSyncState Clone() => new()
+    {
+        LastPulledVersion = LastPulledVersion,
+        LastPulledAt = LastPulledAt,
+        LastPushedVersion = LastPushedVersion,
+        LastPushedAt = LastPushedAt,
+    };
 }
 
 public sealed class ToolLaunchConfig

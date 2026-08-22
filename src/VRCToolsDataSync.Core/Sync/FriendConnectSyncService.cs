@@ -109,8 +109,9 @@ public sealed class FriendConnectSyncService : ISyncService
             // 送るものが何も無いなら manifest も触らない。version を進めると
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
             // ダウンロードを誘発してしまう。
-            // (manifest は既に noteFiles と同じ集合を指しているので、孤児の掃除だけは行う)
-            RemoveStaleRemoteNotes(storage, noteFiles);
+            // ここでは同期先の note を消さない。この経路は manifest の version 検査を
+            // 通っていないため、Load してから今までに他 PC が追加した note を
+            // 消してしまう恐れがある。孤児の掃除は次の実際の Push に任せる。
             _logger.LogInformation("Friend Connect Push: 変更なし version={Version}", existing!.Version);
             return new SyncResult
             {
@@ -136,7 +137,11 @@ public sealed class FriendConnectSyncService : ISyncService
             // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が
             // 同じ tool を Push した。ここで押し切ると、相手が上書きしたオブジェクトに
             // 対して「内容が同じだから送らない」と判断した記録を残すことになり、
-            // manifest と実データがずれる。コンフリクトとして扱い、先に Pull させる。
+            // manifest と実データがずれる。
+            //
+            // なお、この時点で既にファイルは送信済みなので、同期先の実データと
+            // manifest の記録がずれた状態になりうる。その状態は Pull 側の
+            // ハッシュ検証で検出され、次に Push が通れば解消する (#27)。
             _logger.LogInformation(
                 "Friend Connect Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
                 ex.ExpectedVersion, ex.ActualVersion);
@@ -145,7 +150,10 @@ public sealed class FriendConnectSyncService : ISyncService
                 Outcome = SyncOutcome.ConflictDetected,
                 RemoteVersion = ex.ActualVersion,
                 LastPulledVersion = options.LastPulledVersion,
-                Message = "Push の途中で他の PC が同期先を更新しました。先に Pull してください。",
+                Message = "Push の途中で他の PC が同期先を更新しました。" +
+                          "同期先のファイルと manifest がずれている可能性があるため、" +
+                          "この PC のデータで上書きしてよければ強制 Push、" +
+                          "相手のデータを採用するなら Pull し直してから Push してください。",
             };
         }
 
@@ -253,7 +261,9 @@ public sealed class FriendConnectSyncService : ISyncService
             return new SyncResult
             {
                 Outcome = SyncOutcome.Aborted,
-                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}",
+                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}。" +
+                          "同期先のファイルと manifest がずれています。" +
+                          "正しいデータを持つ PC から Push し直すと解消します。",
             };
         }
 
@@ -280,13 +290,20 @@ public sealed class FriendConnectSyncService : ISyncService
             backupPath = _backup.CreateSnapshot(Key, filesToBackup, dirsToBackup);
         }
 
-        // WAL/SHM の掃除はバックアップ有無に関わらず必ず実行する。
-        // 残しておくと新しい本体 DB に対して古い WAL が適用されて
-        // データが破損するため、--no-backup でも飛ばさない。
-        DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
-        DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
-        DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
-        DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
+        // DB を差し替えるものだけ WAL/SHM を消す。残したまま差し替えると古い WAL が
+        // 新しい本体に対して再生されてデータが破損するため、--no-backup でも飛ばさない。
+        // 逆に差し替えない DB の WAL は残す。消すと、本体へ未反映のローカル変更を
+        // 差し替えるものが無いのに捨てることになる。
+        if (staging.IsStaged(_paths.DbFile))
+        {
+            DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
+            DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
+        }
+        if (staging.IsStaged(_paths.DbV11File))
+        {
+            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
+            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
+        }
 
         var affected = new List<string>();
         staging.Apply(affected);
@@ -354,6 +371,11 @@ public sealed class FriendConnectSyncService : ISyncService
         {
             foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
             {
+                // 中断した Pull が残した取り出し中のファイルは同期対象ではない。
+                if (Path.GetFileName(localPath).Contains(PullStaging.IncomingMarker, StringComparison.Ordinal))
+                {
+                    continue;
+                }
                 var relative = StorageKey.FromRelativePath(
                     Path.GetRelativePath(_paths.NotesDirectory, localPath));
                 var key = NotesKeyPrefix + relative;

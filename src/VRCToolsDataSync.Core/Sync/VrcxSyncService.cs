@@ -135,7 +135,11 @@ public sealed class VrcxSyncService : ISyncService
             // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が
             // 同じ tool を Push した。ここで押し切ると、相手が上書きしたオブジェクトに
             // 対して「内容が同じだから送らない」と判断した記録を残すことになり、
-            // manifest と実データがずれる。コンフリクトとして扱い、先に Pull させる。
+            // manifest と実データがずれる。
+            //
+            // なお、この時点で既にファイルは送信済みなので、同期先の実データと
+            // manifest の記録がずれた状態になりうる。その状態は Pull 側の
+            // ハッシュ検証で検出され、次に Push が通れば解消する (#27)。
             _logger.LogInformation(
                 "VRCX Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
                 ex.ExpectedVersion, ex.ActualVersion);
@@ -144,7 +148,10 @@ public sealed class VrcxSyncService : ISyncService
                 Outcome = SyncOutcome.ConflictDetected,
                 RemoteVersion = ex.ActualVersion,
                 LastPulledVersion = options.LastPulledVersion,
-                Message = "Push の途中で他の PC が同期先を更新しました。先に Pull してください。",
+                Message = "Push の途中で他の PC が同期先を更新しました。" +
+                          "同期先のファイルと manifest がずれている可能性があるため、" +
+                          "この PC のデータで上書きしてよければ強制 Push、" +
+                          "相手のデータを採用するなら Pull し直してから Push してください。",
             };
         }
 
@@ -245,7 +252,9 @@ public sealed class VrcxSyncService : ISyncService
             return new SyncResult
             {
                 Outcome = SyncOutcome.Aborted,
-                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}",
+                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}。" +
+                          "同期先のファイルと manifest がずれています。" +
+                          "正しいデータを持つ PC から Push し直すと解消します。",
             };
         }
 
@@ -265,15 +274,18 @@ public sealed class VrcxSyncService : ISyncService
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
 
-        // WAL/SHM の掃除はバックアップ有無に関わらず必ず実行する。
-        // 残しておくと新しい本体 DB に対して古い WAL が適用されて
-        // データが破損するため、--no-backup でも飛ばさない。
+        // 本体 DB を差し替えるときだけ WAL/SHM を消す。残したまま差し替えると
+        // 古い WAL が新しい本体に対して再生されてデータが破損するため、
+        // --no-backup でも飛ばさない。
         //
-        // 取得を省略した場合も同じく消す。ローカル DB がリモートのスナップショットと
-        // 一致するのは直前の Pull 直後だけで、その後に積まれた WAL は上書き Pull なら
-        // どのみち失われる。省略しても結果は丸ごとコピーした場合と同じになる。
-        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
-        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
+        // 逆に、リモートで変わったのが latest.json だけで本体 DB を差し替えない場合は
+        // 消さない。消すと、本体へ未反映のローカル変更を、差し替えるものが無いのに
+        // 捨てることになる。
+        if (staging.IsStaged(_paths.SqliteFile))
+        {
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
+        }
 
         var affected = new List<string>();
         staging.Apply(affected);

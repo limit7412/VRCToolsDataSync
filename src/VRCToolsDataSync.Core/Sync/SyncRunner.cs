@@ -99,11 +99,25 @@ public sealed class SyncRunner
 
     /// <summary>
     /// 同期先とツールに対応する同期履歴を取り出す。
+    /// 表示や通知の判定など、更新を伴わない用途からも使う。
+    /// </summary>
+    public static ToolSyncState? FindToolState(SyncSettings settings, ISyncStorage storage, string toolKey)
+        => ResolveState(settings, storage, toolKey, out _);
+
+    /// <summary>
+    /// 同期先とツールに対応する同期履歴を取り出す。
     /// <para>
     /// 保存先ごとにキーを分ける前の settings.json では、履歴がツールキーだけで
     /// 入っていた。その履歴は「当時 settings に設定されていた同期フォルダ」に対する
     /// ものなので、同じフォルダを指しているときに限って引き継ぐ。別のフォルダや
     /// S3 互換ストレージへは持ち込まない。
+    /// </para>
+    /// <para>
+    /// 引き継ぎは一度だけ行う。フォルダ別のキーが既にあれば、旧キーが残っていても
+    /// 参照しない。旧キーは <see cref="SettingsStore.MergeForSave"/> がディスク側の
+    /// 値を残すため消えないので、「引き継ぎ済みかどうか」はフォルダ別キーの有無で
+    /// 判断する。これをしないと、別のフォルダへ切り替えたときに旧キーが再び
+    /// 拾われ、前のフォルダの履歴が復活してしまう。
     /// </para>
     /// </summary>
     private static ToolSyncState? ResolveState(
@@ -122,11 +136,29 @@ public sealed class SyncRunner
 
         if (storage is LocalFolderSyncStorage local
             && IsConfiguredFolder(settings, local)
+            && !HasFolderScopedState(settings, toolKey)
             && settings.ToolState.TryGetValue(toolKey, out var legacy))
         {
-            return legacy;
+            // 値を複製する。参照をそのまま返すと、以後の更新が旧キー側の
+            // エントリにも反映され、引き継ぎ済みかどうかの判断が狂う。
+            return legacy.Clone();
         }
         return null;
+    }
+
+    /// <summary>いずれかの同期フォルダについて、このツールの履歴が既にあるか。</summary>
+    private static bool HasFolderScopedState(SyncSettings settings, string toolKey)
+    {
+        var suffix = "|" + toolKey;
+        foreach (var key in settings.ToolState.Keys)
+        {
+            if (key.StartsWith(LocalFolderSyncStorage.StateKeyScheme, StringComparison.Ordinal)
+                && key.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static bool IsConfiguredFolder(SyncSettings settings, LocalFolderSyncStorage storage)
@@ -136,7 +168,7 @@ public sealed class SyncRunner
         try
         {
             return string.Equals(
-                Path.GetFullPath(configured),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured)),
                 storage.RootDirectory,
                 StringComparison.OrdinalIgnoreCase);
         }
