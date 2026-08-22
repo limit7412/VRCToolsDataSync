@@ -343,13 +343,23 @@ public sealed class FriendConnectSyncService : ISyncService
             // ローカルパスに写す。notes フォルダの外へ書き出させない。
             var localPath = StorageKey.ToLocalPath(
                 _paths.NotesDirectory, note.RelativePath[NotesKeyPrefix.Length..]);
-            SyncTransfer.Restore(storage, note, localPath, affected, _logger);
+            if (!SyncTransfer.Restore(storage, note, localPath, affected, _logger))
+            {
+                // manifest には載っているのに実体が無い。Push が途中で落ちた後などに
+                // 起こりうる。note は任意ファイルなので Pull 全体は止めず、記録に残す。
+                _logger.LogWarning("同期先に note が見つかりません: {Key}", note.RelativePath);
+                continue;
+            }
             restored.Add(Path.GetFullPath(localPath));
         }
 
         // リモートから消えた note はローカルからも消して状態を揃える。
         // 握りつぶすと次の Push で古い note が manifest に再登録されてしまう。
-        foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
+        // 列挙しながら削除すると取りこぼしうるので、先に一覧を確定させる。
+        var localNotes = Directory
+            .EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories)
+            .ToList();
+        foreach (var localPath in localNotes)
         {
             if (restored.Contains(Path.GetFullPath(localPath))) continue;
             File.Delete(localPath);
