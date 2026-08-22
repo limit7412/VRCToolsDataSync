@@ -264,7 +264,9 @@ public sealed class ShutdownSyncOrchestrator
                         Kind = ShutdownSyncStepKind.PushFailed,
                         Message = "終了処理の期限までに Push が終わりませんでした (処理は継続中)",
                     });
-                    ct.ThrowIfCancellationRequested();
+                    // ここでキャンセルを投げると、この try の catch が拾って
+                    // 同じツールに二重のステップを積んでしまう。残りのツールは
+                    // ループ先頭の ThrowIfCancellationRequested で止まる。
                     continue;
                 }
 
