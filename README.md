@@ -105,7 +105,20 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Arch arm64
 
 出力先は `artifacts/win-<arch>/{app,cli}/` と `artifacts/VRCToolsDataSync-win-<arch>.zip`。`app/VRCToolsDataSync.App.exe` が GUI、`cli/VRCToolsDataSync.Cli.exe` が CLI。
 
-GitHub Actions では `v*` タグの push で自動的に x64 / arm64 をビルドし、Draft の GitHub Release に zip を添付する（`.github/workflows/release.yml`）。手動で動かしたい場合は Actions タブから `release` ワークフローの **Run workflow** で実行できる。
+GitHub Actions の `release` ワークフロー (`.github/workflows/release.yml`) が x64 と arm64 をビルドし、GitHub Release に zip を添付する。
+トリガーによって作られるリリースの状態が変わる。
+
+| トリガー | タグ | リリース |
+| --- | --- | --- |
+| master への push | 直近のタグの patch を一つ進めた番号を自動採番 | 公開 |
+| `0.0.4` 形式のタグの push | push したタグ | Draft |
+| Actions タブからの手動実行 | 入力したタグ名（空ならアーティファクトのみ） | Draft |
+
+master へのマージでリリースが公開されるため、develop から master へマージする操作がリリース操作にあたる。
+minor や major を上げたいときは、先に目的の番号のタグを push してリリースを作る。
+
+master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、リリースは一本にまとまる。
+番号は一つだけ進み、まとめられた変更はそのリリースのノートに含まれる (ノートは直前のタグからの差分で生成される)。
 
 ## 第三者プロダクトに関する免責
 
