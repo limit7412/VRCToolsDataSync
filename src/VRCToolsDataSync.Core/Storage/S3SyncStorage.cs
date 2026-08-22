@@ -179,6 +179,12 @@ public sealed class S3SyncStorage : ISyncStorage
         LoadManifest();
 
         // 書き込みと削除の権限。名前が衝突しないよう GUID を使い、後始末する。
+        //
+        // 削除の失敗も接続テストの失敗として扱う。Push は通常の経路で削除を行う
+        // (ローカルから消えた任意ファイルの削除と、古い note の回収) ため、
+        // s3:DeleteObject を欠く認証情報では設定を保存できても同期が失敗する。
+        // 消し残した検査用オブジェクトはここでは回収できないが、設定が保存されない
+        // 以上、利用者は権限を直して再度試すことになる。
         var probeKey = ToObjectKey($"_access-check/{Guid.NewGuid():N}");
         _client.PutBytes(probeKey, ProbePayload, "application/octet-stream", conditionHeaders: null);
         try
@@ -187,9 +193,10 @@ public sealed class S3SyncStorage : ISyncStorage
         }
         catch (SyncStorageException ex)
         {
-            // 書き込みは通ったので接続テストとしては成功扱いにする。
-            // 消し残しは小さく、次の接続テストでも別名になるだけ。
             _logger.LogWarning(ex, "検査用オブジェクトの削除に失敗しました: {Key}", probeKey);
+            throw new SyncStorageException(
+                "同期先のオブジェクトを削除できません。Push ではローカルから消えたファイルの" +
+                $"削除も行うため、削除の権限 (s3:DeleteObject) が必要です。({ex.Message})", ex);
         }
     }
 
