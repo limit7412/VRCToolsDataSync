@@ -114,6 +114,36 @@ public sealed class ManifestStoreTests
         Assert.Empty(manifest.Tools);
     }
 
+    [Fact(DisplayName = "読み直しと保存の間に割り込まれたら、やり直して両方を残す")]
+    public void RetriesWhenAnotherWriterSlipsInBetweenLoadAndSave()
+    {
+        // S3 互換モードでは ETag による条件付き更新で割り込みを検出し、読み直して
+        // やり直す。押し切ると、割り込んだ側の更新が黙って消える。
+        var storage = new FakeSyncStorage();
+        new ManifestStore(storage).UpdateToolEntry("friendconnect", 0, EntryWith);
+
+        // 最初の保存の直前に、他の PC が別 tool を Push したことにする。
+        var interrupted = false;
+        storage.OnBeforeSaveManifest = () =>
+        {
+            if (interrupted) return;
+            interrupted = true;
+            storage.OnBeforeSaveManifest = null;
+            new ManifestStore(storage).UpdateToolEntry("friendconnect", 1, EntryWith);
+        };
+
+        var version = new ManifestStore(storage).UpdateToolEntry("vrcx", 0, EntryWith);
+
+        // 1 度は弾かれ、読み直して成功していること。
+        Assert.Contains("PreconditionFailed", storage.Calls);
+        Assert.Equal(1, version);
+
+        // 割り込んだ側の更新が残っていること。
+        var manifest = new ManifestStore(storage).Load();
+        Assert.Equal(2, manifest.Tools["friendconnect"].Version);
+        Assert.Equal(1, manifest.Tools["vrcx"].Version);
+    }
+
     [Fact(DisplayName = "旧形式の記録は RelativePath をキーとして解決する")]
     public void OldSchemaFileResolvesToRelativePath()
     {

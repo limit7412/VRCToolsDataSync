@@ -72,6 +72,52 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
         Assert.True(storage.Exists(first.File.BlobKey!));
     }
 
+    [Fact(DisplayName = "同じ確定先へ並行に Commit しても全部成功する")]
+    public void ConcurrentCommitsToTheSameDestinationAllSucceed()
+    {
+        // 逐次に送ると 2 回目は必ず「確定先が既にある」経路を通るため、
+        // File.Exists の確認から File.Move までに別の Commit が割り込む経路を
+        // 一度も通らない。同時に走らせて、そちらも通るようにする。
+        //
+        // 割り込みが起きるかどうかは実行のたびに変わる。ここで固定しているのは
+        // 「同じ内容を同時に送っても、全部成功して実体が 1 つ残る」という結果で、
+        // どちらの経路を通ったかではない。
+        const int degree = 8;
+        var storage = Storage();
+        var sources = Enumerable.Range(0, degree)
+            .Select(i => WriteAgedFile($"note{i}.txt", "identical content", TimeSpan.FromDays(1)))
+            .ToArray();
+
+        // スレッドプールではなく実スレッドを使う。Parallel.For や Task.Run だと
+        // 8 本が同時に走る保証が無く、Barrier で待ち合わせると止まりうる。
+        var barrier = new Barrier(degree);
+        var results = new ManifestFile?[degree];
+        var failures = new Exception?[degree];
+        var threads = Enumerable.Range(0, degree)
+            .Select(i => new Thread(() =>
+            {
+                barrier.SignalAndWait();
+                try
+                {
+                    results[i] = SyncTransfer.Send(
+                        storage, Array.Empty<ManifestFile>(), sources[i], $"fc/notes/{i}.txt").File;
+                }
+                catch (Exception ex)
+                {
+                    failures[i] = ex;
+                }
+            }))
+            .ToArray();
+
+        foreach (var thread in threads) thread.Start();
+        foreach (var thread in threads) Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "Commit が終わらない");
+
+        Assert.All(failures, f => Assert.Null(f));
+        // 内容が同じなのでキーも 1 つに揃い、実体も 1 つだけ残る。
+        Assert.Single(results.Select(r => r!.BlobKey).Distinct());
+        Assert.Single(storage.List(BlobKeys.Prefix));
+    }
+
     [Fact(DisplayName = "既にある実体を送り直すと時刻が刻み直される")]
     public void RecommittingRefreshesTheWriteTime()
     {

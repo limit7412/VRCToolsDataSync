@@ -39,7 +39,7 @@ public sealed class SyncTransferTests : IDisposable
 
         Assert.True(sent);
         Assert.Equal(BlobKeys.FromSha256(file.Sha256), file.BlobKey);
-        Assert.Equal("original", storage.ContentOf(file.BlobKey!));
+        Assert.Equal("original", storage.TextOf(file.BlobKey!));
     }
 
     [Fact(DisplayName = "ハッシュを取った後に元ファイルが変わっても、キーと内容はずれない")]
@@ -59,7 +59,8 @@ public sealed class SyncTransferTests : IDisposable
         Assert.True(sent);
         // 記録したハッシュと、実際に置かれた内容のハッシュが一致していること。
         // どちらの内容が送られたかは問わない。ずれないことだけが要る。
-        var storedPath = WriteFile("stored", storage.ContentOf(file.BlobKey!));
+        var storedPath = Path.Combine(_workDirectory, "stored");
+        File.WriteAllBytes(storedPath, storage.ContentOf(file.BlobKey!));
         Assert.Equal(file.Sha256, FileHasher.Sha256(storedPath));
         Assert.Equal(BlobKeys.FromSha256(file.Sha256), file.BlobKey);
     }
@@ -177,4 +178,23 @@ public sealed class SyncTransferTests : IDisposable
     [Fact(DisplayName = "前回の記録が無ければ未変更と見なさない")]
     public void NoPreviousEntryCountsAsChanged()
         => Assert.False(SyncTransfer.IsUnchangedSet(null, Array.Empty<ManifestFile>()));
+
+    [Fact(DisplayName = "任意のバイト列でもキーと内容がずれない")]
+    public void BinaryContentKeepsTheKeyAndContentConsistent()
+    {
+        // 同期の対象は SQLite のスナップショットが主で、テキストではない。
+        // 文字列に通す経路があると不正な UTF-8 が置換され、ハッシュの元と
+        // 保存した内容がずれる。
+        var storage = new FakeSyncStorage();
+        var bytes = new byte[256];
+        for (var i = 0; i < bytes.Length; i++) bytes[i] = (byte)i;
+        var source = Path.Combine(_workDirectory, "snapshot.sqlite3");
+        File.WriteAllBytes(source, bytes);
+
+        var (file, sent) = SyncTransfer.Send(storage, Array.Empty<ManifestFile>(), source, "vrcx/latest.sqlite3");
+
+        Assert.True(sent);
+        Assert.Equal(bytes, storage.ContentOf(file.BlobKey!));
+        Assert.Equal(BlobKeys.FromSha256(file.Sha256), file.BlobKey);
+    }
 }

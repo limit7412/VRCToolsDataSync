@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
@@ -35,6 +36,12 @@ internal sealed class FakeSyncStorage : ISyncStorage
     /// </summary>
     public Action? OnBeginUpload { get; set; }
 
+    /// <summary>
+    /// <see cref="TrySaveManifest"/> の直前に呼ばれる。読み直しから保存までの間に
+    /// 他の PC が manifest を更新した状況を作る。
+    /// </summary>
+    public Action? OnBeforeSaveManifest { get; set; }
+
     public string DisplayName => "fake";
 
     public string StateKeyPrefix => "fake|";
@@ -42,8 +49,12 @@ internal sealed class FakeSyncStorage : ISyncStorage
     public void VerifyAccess() { }
 
     /// <summary>テストの前提として、キーに中身を置く。</summary>
-    public void Seed(string key, string content, DateTimeOffset? lastModified = null)
+    public void Seed(string key, byte[] content, DateTimeOffset? lastModified = null)
         => _objects[key] = new StoredEntry(content, lastModified ?? Now);
+
+    /// <summary>テストの前提として、キーに中身を置く (テキストの場合)。</summary>
+    public void Seed(string key, string content, DateTimeOffset? lastModified = null)
+        => Seed(key, Encoding.UTF8.GetBytes(content), lastModified);
 
     /// <summary>テストの前提として、manifest を置く。</summary>
     public void SeedManifest(SyncManifest manifest)
@@ -54,7 +65,11 @@ internal sealed class FakeSyncStorage : ISyncStorage
 
     public bool Has(string key) => _objects.ContainsKey(key);
 
-    public string ContentOf(string key) => _objects[key].Content;
+    /// <summary>置かれている中身。バイト列のまま返す。</summary>
+    public byte[] ContentOf(string key) => _objects[key].Content;
+
+    /// <summary>置かれている中身をテキストとして読む。ASCII の内容にだけ使う。</summary>
+    public string TextOf(string key) => Encoding.UTF8.GetString(_objects[key].Content);
 
     public IReadOnlyCollection<string> Keys => _objects.Keys.ToList();
 
@@ -67,9 +82,28 @@ internal sealed class FakeSyncStorage : ISyncStorage
             : new ManifestSnapshot(Clone(_manifest.Manifest), _manifest.VersionTag);
     }
 
+    /// <summary>
+    /// タグを見て条件付きに保存する。S3 互換モードと同じ扱いにしておく。
+    /// <para>
+    /// タグを無視して常に成功させると、読み直しと保存の間に割り込まれた更新が
+    /// 黙って失われる。<see cref="ManifestStore.UpdateToolEntry"/> の再試行は
+    /// まさにその検出のためにあるので、無視する偽物では再試行の経路を
+    /// 「通ったことにして」しまう。
+    /// </para>
+    /// </summary>
     public bool TrySaveManifest(SyncManifest manifest, string? expectedTag)
     {
         Calls.Add("TrySaveManifest");
+        OnBeforeSaveManifest?.Invoke();
+
+        // expectedTag が null なら「読んだ時点で manifest が無かった」。その間に
+        // 誰かが作っていたら弾く (実装は If-None-Match:* で同じことをする)。
+        if (!string.Equals(expectedTag, _manifest?.VersionTag, StringComparison.Ordinal))
+        {
+            Calls.Add("PreconditionFailed");
+            return false;
+        }
+
         _manifest = new ManifestSnapshot(Clone(manifest), "tag-" + Guid.NewGuid().ToString("N"));
         return true;
     }
@@ -85,7 +119,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
     public bool TryDownload(string key, string localPath)
     {
         if (!_objects.TryGetValue(key, out var entry)) return false;
-        File.WriteAllText(localPath, entry.Content);
+        File.WriteAllBytes(localPath, entry.Content);
         return true;
     }
 
@@ -142,7 +176,12 @@ internal sealed class FakeSyncStorage : ISyncStorage
                ManifestJson.Options)
            ?? new SyncManifest();
 
-    private sealed record StoredEntry(string Content, DateTimeOffset LastModified);
+    /// <summary>
+    /// 中身はバイト列で持つ。同期の対象には SQLite のような任意のバイト列が含まれる。
+    /// 文字列に通すと不正な UTF-8 が置換され、ハッシュの元と保存した内容がずれるので、
+    /// 「キーが表す内容と実際に置かれる内容が一致する」を確かめられなくなる。
+    /// </summary>
+    private sealed record StoredEntry(byte[] Content, DateTimeOffset LastModified);
 
     private sealed class StagedUpload : IStagedUpload
     {
@@ -160,7 +199,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
         public void Commit(string key)
         {
             _storage.Calls.Add("Commit:" + key);
-            _storage._objects[key] = new StoredEntry(File.ReadAllText(LocalPath), _storage.Now);
+            _storage._objects[key] = new StoredEntry(File.ReadAllBytes(LocalPath), _storage.Now);
             _committed = true;
             Cleanup();
         }
