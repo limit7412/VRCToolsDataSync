@@ -66,6 +66,43 @@ internal static class SyncTransfer
            && storage.Exists(ManifestFileKeys.StorageKeyOf(candidate));
 
     /// <summary>
+    /// ローカルにある既存ファイルを同期先へ送り、manifest のエントリを返す。
+    /// 送信を省いた場合は <c>Sent</c> が false になる。
+    /// <para>
+    /// 送る場合は、まず内容が動かない写しを取り、<b>ハッシュも送信もその写しに対して</b>
+    /// 行う。元のファイルを直接ハッシュして直接送ると、その間に書き換えられた場合に
+    /// 「キーが表す内容」と「実際に置かれる内容」がずれる。置き場所を内容から決めて
+    /// いる以上、これは同じキーに別の内容が入るということで、この設計が拠って立つ
+    /// 不変性そのものが崩れる。同じ内容を参照している他のエントリまで巻き添えになり、
+    /// そちらの Pull もハッシュ不一致で止まる。
+    /// </para>
+    /// <para>
+    /// 写しを取るのは送ると決めた後だけにしている。省略できる場合に写しを作ると、
+    /// 同期フォルダモードではファイル数ぶんの書き込みが同期フォルダの中で起きる。
+    /// 省略した場合に返すハッシュは元のファイルのものだが、それは
+    /// <see cref="CanSkipUpload"/> が実在を確かめた実体の内容と一致している。
+    /// </para>
+    /// </summary>
+    public static (ManifestFile File, bool Sent) Send(
+        ISyncStorage storage,
+        IReadOnlyList<ManifestFile> remoteFiles,
+        string localPath,
+        string logicalPath)
+    {
+        var probe = Describe(localPath, logicalPath);
+        if (CanSkipUpload(storage, remoteFiles, probe))
+        {
+            return (probe, false);
+        }
+
+        using var staged = storage.BeginUpload();
+        File.Copy(localPath, staged.LocalPath, overwrite: true);
+        var described = Describe(staged.LocalPath, logicalPath);
+        staged.Commit(ManifestFileKeys.StorageKeyOf(described));
+        return (described, true);
+    }
+
+    /// <summary>
     /// 前回の manifest と今回のファイル集合を比べ、manifest を書き直す必要が無いかを判定する。
     /// <para>
     /// ここでは実体の有無は見ない。実体が欠けていた分は上の判定で送り直されており、

@@ -80,15 +80,15 @@ public sealed class FriendConnectSyncService : ISyncService
 
         if (File.Exists(_paths.ConfigJsonFile))
         {
-            var config = SyncTransfer.Describe(_paths.ConfigJsonFile, ConfigKey);
-            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, config))
+            var (config, sent) = SyncTransfer.Send(
+                storage, remoteFiles, _paths.ConfigJsonFile, ConfigKey);
+            if (sent)
             {
-                _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
+                affected.Add(ConfigKey);
             }
             else
             {
-                storage.Upload(_paths.ConfigJsonFile, ManifestFileKeys.StorageKeyOf(config));
-                affected.Add(ConfigKey);
+                _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
             }
             files.Add(config);
         }
@@ -382,15 +382,14 @@ public sealed class FriendConnectSyncService : ISyncService
                 var relative = StorageKey.FromRelativePath(
                     Path.GetRelativePath(_paths.NotesDirectory, localPath));
                 var key = NotesKeyPrefix + relative;
-                var described = SyncTransfer.Describe(localPath, key);
-                if (SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
+                var (described, sent) = SyncTransfer.Send(storage, remoteFiles, localPath, key);
+                if (sent)
                 {
-                    _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
+                    affected.Add(key);
                 }
                 else
                 {
-                    storage.Upload(localPath, ManifestFileKeys.StorageKeyOf(described));
-                    affected.Add(key);
+                    _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
                 }
                 files.Add(described);
             }

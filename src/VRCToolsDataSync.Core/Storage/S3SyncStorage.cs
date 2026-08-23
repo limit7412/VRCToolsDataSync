@@ -102,7 +102,7 @@ public sealed class S3SyncStorage : ISyncStorage
         }
     }
 
-    public void Upload(string localPath, string key)
+    private void Upload(string localPath, string key)
     {
         StorageKey.Validate(key);
         _client.PutFile(ToObjectKey(key), localPath);

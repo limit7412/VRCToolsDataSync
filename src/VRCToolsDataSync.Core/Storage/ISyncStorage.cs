@@ -52,17 +52,19 @@ public interface ISyncStorage
     /// </summary>
     bool TrySaveManifest(SyncManifest manifest, string? expectedTag);
 
-    /// <summary>ローカルファイルを <paramref name="key"/> として同期先へ書き込む。</summary>
-    void Upload(string localPath, string key);
-
     /// <summary>
-    /// 生成してから書き込むファイル (SQLite の VACUUM INTO 出力) 用に、
-    /// 書き込み先を確保する。<see cref="IStagedUpload.LocalPath"/> へ書き出してから
+    /// 同期先へファイルを書き込む。<see cref="IStagedUpload.LocalPath"/> へ書き出してから
     /// <see cref="IStagedUpload.Commit"/> にキーを渡すと同期先へ反映される。
     /// Commit せずに破棄すれば同期先は変化しない。
     /// <para>
     /// キーを開始時ではなく Commit 時に決めるのは、置き場所を内容から決めているため。
     /// 書き出しが終わるまでハッシュが分からず、キーも確定しない。
+    /// </para>
+    /// <para>
+    /// 送りたいものが既にファイルとしてある場合も、直接書き込む口は用意せずここを通す。
+    /// 別の口があると、ハッシュを取ったファイルと送るファイルが別の実体になりうる。
+    /// 置き場所を内容から決めている以上、それは同じキーに別の内容が入ることを意味する
+    /// (<see cref="Sync.SyncTransfer.Send"/>)。
     /// </para>
     /// </summary>
     IStagedUpload BeginUpload();

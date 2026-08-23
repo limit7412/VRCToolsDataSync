@@ -175,13 +175,6 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         return true;
     }
 
-    public void Upload(string localPath, string key)
-    {
-        var destination = StorageKey.ToLocalPath(_rootDirectory, key);
-        AtomicFile.Copy(localPath, destination, overwrite: true);
-        StampWriteTime(destination);
-    }
-
     /// <summary>
     /// 同期先へ書いた時刻を最終更新時刻として刻む。
     /// <para>

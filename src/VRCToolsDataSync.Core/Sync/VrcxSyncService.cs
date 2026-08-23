@@ -85,15 +85,15 @@ public sealed class VrcxSyncService : ISyncService
 
         if (File.Exists(_paths.SettingsJsonFile))
         {
-            var settingsFile = SyncTransfer.Describe(_paths.SettingsJsonFile, SettingsKey);
-            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, settingsFile))
+            var (settingsFile, sent) = SyncTransfer.Send(
+                storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey);
+            if (sent)
             {
-                _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
+                affected.Add(SettingsKey);
             }
             else
             {
-                storage.Upload(_paths.SettingsJsonFile, ManifestFileKeys.StorageKeyOf(settingsFile));
-                affected.Add(SettingsKey);
+                _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
             }
             files.Add(settingsFile);
         }
