@@ -12,7 +12,7 @@ Always review in Japanese.
 
 ## github
 
-- 機能実装時はdevelopへのPRを作成する
+- 機能実装時はmasterへのPRを作成する
 - ある程度の単位でcommit、pushしPRとissueが存在すれば更新する
   - 不要なbranchは都度削除する
 - PRに付いた指摘が無いか都度確認してあれば必要な対応か検討して、必要なら修正する

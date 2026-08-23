@@ -164,7 +164,7 @@ dotnet run --project src\VRCToolsDataSync.App
 
 ## CI
 
-`.github/workflows/ci.yml` が PR と develop / master への push をトリガーに `VRCToolsDataSync.Cli` と `VRCToolsDataSync.App` を Release 構成でビルドする (`VRCToolsDataSync.Core` は両者からの参照でビルドされる)。
+`.github/workflows/ci.yml` が PR と master への push をトリガーに `VRCToolsDataSync.Cli` と `VRCToolsDataSync.App` を Release 構成でビルドする (`VRCToolsDataSync.Core` は両者からの参照でビルドされる)。
 `VRCToolsDataSync.App` が WinUI 3 と Windows App SDK に依存しているため、ランナーは `windows-latest` を使う。
 
 ## リリースビルド
@@ -190,7 +190,7 @@ GitHub Actions の `release` ワークフロー (`.github/workflows/release.yml`
 | `0.0.4` 形式のタグの push | push したタグ | Draft |
 | Actions タブからの手動実行 | 入力したタグ名（空ならアーティファクトのみ） | Draft |
 
-master へのマージでリリースが公開されるため、develop から master へマージする操作がリリース操作にあたる。
+master へのマージでリリースが公開されるため、PR を master へマージする操作がリリース操作にあたる。
 minor や major を上げたいときは、先に目的の番号のタグを push してリリースを作る。
 
 master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、リリースは一本にまとまる。
