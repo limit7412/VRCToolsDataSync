@@ -6,4 +6,7 @@
     <Project Path="src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj" />
     <Project Path="src/VRCToolsDataSync.Core/VRCToolsDataSync.Core.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/VRCToolsDataSync.Core.Tests/VRCToolsDataSync.Core.Tests.csproj" />
+  </Folder>
 </Solution>

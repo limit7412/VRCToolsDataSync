@@ -37,6 +37,14 @@ jobs:
         # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
         run: dotnet build VRCToolsDataSync.slnx --configuration Release
 
+      # solution のビルドが通った後に走らせる。ビルドは通るが振る舞いが壊れている、
+      # という状態を CI で捕まえる手段がここまで無かった (issue #38)。
+      # solution ではなくテストプロジェクトを直接指す。solution 経由だと App の
+      # Platform 割り当てと WinUI のワークロードまで巻き込むため、テストの成否と
+      # 関係の無いところで落ちうる。
+      - name: Test
+        run: dotnet test tests/VRCToolsDataSync.Core.Tests/VRCToolsDataSync.Core.Tests.csproj --configuration Release
+
       # リリースと同じ形 (RID と Platform を明示) でも通ることを確かめる。
       # solution 経由では Platform が slnx の割り当てで決まるため、こちらは
       # release.yml の publish に近い経路の確認になる。

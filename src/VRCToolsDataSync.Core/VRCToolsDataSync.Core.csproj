@@ -15,4 +15,10 @@
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.11" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- SyncTransfer など internal のまま置いている型をテストから触るため。
+         公開範囲を広げずに済ませたいので、テストプロジェクトにだけ開ける。 -->
+    <InternalsVisibleTo Include="VRCToolsDataSync.Core.Tests" />
+  </ItemGroup>
+
 </Project>
