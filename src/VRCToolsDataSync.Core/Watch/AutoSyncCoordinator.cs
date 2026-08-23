@@ -45,6 +45,13 @@ public sealed class AutoSyncCoordinator : IDisposable
     // ProcessExited から切り離された HandleProcessExited タスクは、
     // この token を見て grace sleep / Push 直前で打ち切る。
     private CancellationTokenSource _generationCts = new();
+    // 検出状況の通知の世代。Start / Stop / UpdateSettings のたびに進める。
+    // 通知は錠の外で出すため、錠を離してから流すまでの間に次の世代が始まりうる。
+    // その場合、手元に持っているのは既に古い状態なので流さない。
+    private long _detectionGeneration;
+    // 通知の送出そのものを直列化する。_lifecycleLock とは別に持つ。同じ錠にすると、
+    // 購読側が動いているあいだ Stop や UpdateSettings が待たされる。
+    private readonly object _detectionPublishGate = new();
 
     public event Action<AutoPushEvent>? AutoPushTriggered;
     public event Action<AutoPushEvent>? AutoPushCompleted;
@@ -77,11 +84,16 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Start()
     {
+        long generation;
         List<ProcessDetectionEvent> detections;
-        lock (_lifecycleLock) { detections = StartCore(); }
+        lock (_lifecycleLock)
+        {
+            generation = NextDetectionGeneration();
+            detections = StartCore();
+        }
         // 通知は錠の外で出す。購読側が何をするかはここからは分からず、錠を持ったまま
         // 呼ぶと、そのあいだ Stop や UpdateSettings が待たされる。
-        Publish(detections);
+        Publish(generation, detections);
     }
 
     private List<ProcessDetectionEvent> StartCore()
@@ -162,9 +174,14 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Stop()
     {
+        long generation;
         List<ProcessDetectionEvent> detections;
-        lock (_lifecycleLock) { detections = StopCore(); }
-        Publish(detections);
+        lock (_lifecycleLock)
+        {
+            generation = NextDetectionGeneration();
+            detections = StopCore();
+        }
+        Publish(generation, detections);
     }
 
     private List<ProcessDetectionEvent> StopCore()
@@ -200,9 +217,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         // Start / Stop と同じ lock を取って、未完了の Start と並走しないようにする。
         // 内部で StopCore / StartCore を呼ぶことで再入を避ける (同じ lock を二重取得しない)。
+        long generation;
         List<ProcessDetectionEvent> detections;
         lock (_lifecycleLock)
         {
+            generation = NextDetectionGeneration();
             _settings = settings;
             var stopped = StopCore();
             detections = StartCore();
@@ -211,7 +230,7 @@ public sealed class AutoSyncCoordinator : IDisposable
             detections.InsertRange(0, stopped.Where(
                 e => !detections.Any(d => d.ToolKey == e.ToolKey)));
         }
-        Publish(detections);
+        Publish(generation, detections);
     }
 
     /// <summary>
@@ -235,8 +254,13 @@ public sealed class AutoSyncCoordinator : IDisposable
         // 検出状況の通知。どの候補が実際に当たっているかを GUI に出すために使う
         // (issue #11)。起動と終了の両方で流すのは、閉じ直しのように同じ走査で
         // 両方出る場合に、最後の 1 回が現在の状態になるため。
-        watcher.ProcessStarted += _ => RaiseProcessDetection(binding);
-        watcher.ProcessExited += _ => RaiseProcessDetection(binding);
+        //
+        // この binding が属する世代を捕まえておく。Stop は監視の終了を 2 秒までしか
+        // 待たないので、待ちきれなかった走査の通知が停止後に届きうる。世代が変わって
+        // いれば捨てられる。
+        var generation = Interlocked.Read(ref _detectionGeneration);
+        watcher.ProcessStarted += _ => Publish(generation, new[] { DetectionOf(binding) });
+        watcher.ProcessExited += _ => Publish(generation, new[] { DetectionOf(binding) });
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
@@ -332,19 +356,44 @@ public sealed class AutoSyncCoordinator : IDisposable
     /// </summary>
     public void PublishProcessDetection()
     {
+        long generation;
         List<ProcessDetectionEvent> detections;
         lock (_lifecycleLock)
         {
+            // 世代は進めない。状態を流し直すだけで、ライフサイクルは動いていない。
+            generation = Interlocked.Read(ref _detectionGeneration);
             detections = _bindings.Select(DetectionOf).ToList();
             detections.AddRange(NotWatchingForUnbound());
         }
-        Publish(detections);
+        Publish(generation, detections);
     }
 
-    private void Publish(IReadOnlyList<ProcessDetectionEvent> detections)
+    /// <summary>次のライフサイクルの世代を始める。<see cref="_lifecycleLock"/> の中で呼ぶ。</summary>
+    private long NextDetectionGeneration() => Interlocked.Increment(ref _detectionGeneration);
+
+    /// <summary>
+    /// <paramref name="generation"/> 時点の状態を流す。流すまでに次の世代が始まっていれば捨てる。
+    /// <para>
+    /// 送出そのものも直列化する。錠の外で組み立てているので、これが無いと 2 つの世代の
+    /// 通知が混ざって届き、最後に届いたものが現在の状態とは限らなくなる。
+    /// </para>
+    /// </summary>
+    private void Publish(long generation, IReadOnlyList<ProcessDetectionEvent> detections)
     {
-        foreach (var detection in detections) ProcessDetectionChanged?.Invoke(detection);
+        if (detections.Count == 0) return;
+        OnBeforePublishForTests?.Invoke();
+        lock (_detectionPublishGate)
+        {
+            if (Interlocked.Read(ref _detectionGeneration) != generation) return;
+            foreach (var detection in detections) ProcessDetectionChanged?.Invoke(detection);
+        }
     }
+
+    /// <summary>
+    /// 錠を離してから通知を流すまでの間に割り込むための穴。テストからのみ使う。
+    /// この隙間に別の世代を始められないと、古い通知を捨てていることを確かめられない。
+    /// </summary>
+    internal Action? OnBeforePublishForTests;
 
     /// <summary>監視中のツール 1 つぶんの検出状況。</summary>
     private static ProcessDetectionEvent DetectionOf(ToolBinding binding)
@@ -365,9 +414,6 @@ public sealed class AutoSyncCoordinator : IDisposable
             .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName))
             .ToList();
 
-    /// <summary>監視から届いた変化を流す。走査のスレッドから呼ばれる。</summary>
-    private void RaiseProcessDetection(ToolBinding binding)
-        => ProcessDetectionChanged?.Invoke(DetectionOf(binding));
 
     /// <summary>
     /// プロセス終了検知後の AutoPush 本体。Push まで成功したら true を返す。

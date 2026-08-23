@@ -110,6 +110,29 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
         Assert.Equal(BothTools, events.Select(e => e.ToolKey).Order().ToArray());
     }
 
+    [Fact(DisplayName = "錠を離した後に次の世代が始まれば、古い通知は流さない")]
+    public void StaleDetectionsAreDroppedOnceANewGenerationStarts()
+    {
+        // 通知は錠の外で組み立てて流すため、離してから流すまでの間に別のスレッドの
+        // Stop や UpdateSettings が割り込める。そのまま流すと、停止済みなのに
+        // 「検出中」が後から届き、次の変化まで表示が戻らない。
+        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
+        var (_, events) = Watched(coordinator);
+
+        // Start が錠を離してから流すまでの隙間に、Stop が割り込んだことにする。
+        coordinator.OnBeforePublishForTests = () =>
+        {
+            coordinator.OnBeforePublishForTests = null;
+            coordinator.Stop();
+        };
+
+        coordinator.Start();
+
+        // 割り込んだ Stop の側は流れてよい。Start が抱えていた古い方は流れない。
+        Assert.All(events, e => Assert.False(e.IsWatching));
+        Assert.Equal(0, events.Count(e => e.IsWatching));
+    }
+
     [Fact(DisplayName = "監視していないツールの検出名は空になる")]
     public void NotWatchedToolsCarryNoDetectedNames()
     {
