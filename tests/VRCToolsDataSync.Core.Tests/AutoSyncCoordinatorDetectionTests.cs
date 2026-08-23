@@ -6,15 +6,15 @@ using Xunit;
 namespace VRCToolsDataSync.Core.Tests;
 
 /// <summary>
-/// プロセス検出状況の通知を固定する。
+/// プロセス検出状況の読み出しと通知を固定する。
 /// <para>
-/// 表示は「何も届かない」と「監視していないと届いた」を区別できない。届かない側に
-/// 落ちると、設定で外しているツールが初期表示のまま残る (issue #11)。ここでは
-/// <b>通知が出ること</b>を主に確かめる。
+/// 通知は「変わった」ことしか伝えず、状態は <see cref="AutoSyncCoordinator.GetProcessDetections"/>
+/// から読む。<b>読むたびに現在の状態が返る</b>ので、通知が遅れて届いても古い状態を
+/// 表示することはない。ここでは読み出しが常に現在を返すことを確かめる。
 /// </para>
 /// <para>
 /// 同期先を組み立てられない設定で作る。監視そのものを走らせずに、binding を持たない
-/// ツールへの通知だけを見たいため。
+/// ツールの扱いだけを見たいため。
 /// </para>
 /// </summary>
 public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
@@ -37,46 +37,41 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
     private AutoSyncCoordinator Coordinator(SyncSettings settings)
         => new(new SyncRunner(new SettingsStore(_settingsPath)), settings);
 
-    private static (AutoSyncCoordinator Coordinator, List<ProcessDetectionEvent> Events) Watched(
-        AutoSyncCoordinator coordinator)
-    {
-        var events = new List<ProcessDetectionEvent>();
-        coordinator.ProcessDetectionChanged += e => events.Add(e);
-        return (coordinator, events);
-    }
-
     /// <summary>並び順に依存しないよう、比較する側と揃えて並べておく。</summary>
     private static readonly string[] BothTools =
         new[] { VrcxSyncService.Key, FriendConnectSyncService.Key }.Order().ToArray();
 
-    [Fact(DisplayName = "自動同期を切っていても監視していないことを流す")]
-    public void DisabledAutoSyncStillReportsThatNothingIsWatched()
+    private static string[] ToolKeysOf(AutoSyncCoordinator coordinator)
+        => coordinator.GetProcessDetections().Select(d => d.ToolKey).Order().ToArray();
+
+    [Fact(DisplayName = "自動同期を切っていれば、どのツールも監視していないと読める")]
+    public void DisabledAutoSyncReportsThatNothingIsWatched()
     {
-        // 黙ると表示が初期値のまま残り、設定で切っていることが読み取れない。
+        // 表示は「何も読めない」と「監視していないと読めた」を区別できない。
+        // 一覧から漏れると、設定で切っていることが読み取れないまま初期表示が残る。
         using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
-        var (_, events) = Watched(coordinator);
 
         coordinator.Start();
 
-        Assert.Equal(BothTools, events.Select(e => e.ToolKey).Order().ToArray());
-        Assert.All(events, e => Assert.False(e.IsWatching));
+        var detections = coordinator.GetProcessDetections();
+        Assert.Equal(BothTools, detections.Select(d => d.ToolKey).Order().ToArray());
+        Assert.All(detections, d => Assert.False(d.IsWatching));
     }
 
-    [Fact(DisplayName = "同期先を組み立てられない場合も監視していないことを流す")]
-    public void AnUnusableTargetStillReportsThatNothingIsWatched()
+    [Fact(DisplayName = "同期先を組み立てられない場合も監視していないと読める")]
+    public void AnUnusableTargetReportsThatNothingIsWatched()
     {
         // 保存先が未設定のまま自動同期を入れた状態。監視は始まらない。
         using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = true });
-        var (_, events) = Watched(coordinator);
 
         coordinator.Start();
 
-        Assert.Equal(BothTools, events.Select(e => e.ToolKey).Order().ToArray());
-        Assert.All(events, e => Assert.False(e.IsWatching));
+        Assert.Equal(BothTools, ToolKeysOf(coordinator));
+        Assert.All(coordinator.GetProcessDetections(), d => Assert.False(d.IsWatching));
     }
 
-    [Fact(DisplayName = "同期対象から外したツールにも監視していないことを流す")]
-    public void ToolsExcludedFromSyncAreReportedAsNotWatched()
+    [Fact(DisplayName = "同期対象から外したツールも一覧から漏れない")]
+    public void ToolsExcludedFromSyncAreStillListed()
     {
         using var coordinator = Coordinator(new SyncSettings
         {
@@ -84,67 +79,77 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
             SyncVrcx = true,
             SyncFriendConnect = false,
         });
-        var (_, events) = Watched(coordinator);
 
         coordinator.Start();
 
-        Assert.Contains(events, e => e.ToolKey == FriendConnectSyncService.Key && !e.IsWatching);
-    }
-
-    [Fact(DisplayName = "購読が遅れても、流し直せば現在の状態を受け取れる")]
-    public void PublishingAgainDeliversTheCurrentStateToALateSubscriber()
-    {
-        // App は Coordinator.Start を背後で走らせてから画面を組み立てるため、
-        // 購読が Start より後になることがある。既に起動していたプロセスは監視の
-        // 開始時に黙って取り込まれるので、流し直さないとそのツールを閉じるまで
-        // 表示が変わらない。
-        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
-        coordinator.Start();
-
-        // ここで初めて購読する。Start の通知は既に流れ終わっている。
-        var (_, events) = Watched(coordinator);
-        Assert.Empty(events);
-
-        coordinator.PublishProcessDetection();
-
-        Assert.Equal(BothTools, events.Select(e => e.ToolKey).Order().ToArray());
-    }
-
-    [Fact(DisplayName = "錠を離した後に次の世代が始まれば、古い通知は流さない")]
-    public void StaleDetectionsAreDroppedOnceANewGenerationStarts()
-    {
-        // 通知は錠の外で組み立てて流すため、離してから流すまでの間に別のスレッドの
-        // Stop や UpdateSettings が割り込める。そのまま流すと、停止済みなのに
-        // 「検出中」が後から届き、次の変化まで表示が戻らない。
-        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
-        var (_, events) = Watched(coordinator);
-
-        // Start が錠を離してから流すまでの隙間に、Stop が割り込んだことにする。
-        coordinator.OnBeforePublishForTests = () =>
-        {
-            coordinator.OnBeforePublishForTests = null;
-            coordinator.Stop();
-        };
-
-        coordinator.Start();
-
-        // 割り込んだ Stop の側は流れてよい。Start が抱えていた古い方は流れない。
-        Assert.All(events, e => Assert.False(e.IsWatching));
-        Assert.Equal(0, events.Count(e => e.IsWatching));
+        Assert.Contains(
+            coordinator.GetProcessDetections(),
+            d => d.ToolKey == FriendConnectSyncService.Key && !d.IsWatching);
     }
 
     [Fact(DisplayName = "監視していないツールの検出名は空になる")]
     public void NotWatchedToolsCarryNoDetectedNames()
     {
         using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
-        var (_, events) = Watched(coordinator);
 
         coordinator.Start();
 
-        Assert.All(events, e =>
+        Assert.All(coordinator.GetProcessDetections(), d =>
         {
-            Assert.Empty(e.DetectedProcessNames);
-            Assert.False(e.IsRunning);
+            Assert.Empty(d.DetectedProcessNames);
+            Assert.False(d.IsRunning);
         });
+    }
+
+    [Fact(DisplayName = "ライフサイクルが動けば通知が出る")]
+    public void LifecycleChangesRaiseTheNotification()
+    {
+        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
+        var raised = 0;
+        coordinator.ProcessDetectionChanged += () => raised++;
+
+        coordinator.Start();
+        Assert.Equal(1, raised);
+
+        coordinator.Stop();
+        Assert.Equal(2, raised);
+
+        coordinator.UpdateSettings(new SyncSettings { AutoSyncEnabled = false });
+        Assert.Equal(3, raised);
+    }
+
+    [Fact(DisplayName = "通知が遅れて届いても、読み直せば現在の状態が返る")]
+    public void ReadingAfterALateNotificationStillReturnsTheCurrentState()
+    {
+        // 通知に状態を載せると、錠を離してから届くまでの間に次の変化が起きた場合に
+        // 古い方を届けうる。載せなければ、遅れて届いた通知は読み直させるだけになる。
+        //
+        // ここでは通知の中で読み直し、その時点の状態が返ることを確かめる。通知が
+        // 出た時点より後にライフサイクルが動いていても、読むのは現在である。
+        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
+        coordinator.Start();
+
+        IReadOnlyList<ProcessDetectionEvent>? readInsideHandler = null;
+        coordinator.ProcessDetectionChanged += () =>
+            readInsideHandler ??= coordinator.GetProcessDetections();
+
+        coordinator.Stop();
+
+        Assert.NotNull(readInsideHandler);
+        Assert.Equal(BothTools, readInsideHandler!.Select(d => d.ToolKey).Order().ToArray());
+        Assert.All(readInsideHandler!, d => Assert.False(d.IsWatching));
+    }
+
+    [Fact(DisplayName = "Start を重ねて呼んでも、その後の読み出しは壊れない")]
+    public void CallingStartTwiceKeepsTheReadingIntact()
+    {
+        // 2 度目の Start は何も変えずに戻る。ここで内部の状態を進めてしまうと、
+        // 以後の通知や読み出しが噛み合わなくなる。
+        using var coordinator = Coordinator(new SyncSettings { AutoSyncEnabled = false });
+
+        coordinator.Start();
+        coordinator.Start();
+
+        Assert.Equal(BothTools, ToolKeysOf(coordinator));
     }
 }

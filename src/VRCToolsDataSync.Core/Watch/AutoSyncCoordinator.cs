@@ -45,19 +45,24 @@ public sealed class AutoSyncCoordinator : IDisposable
     // ProcessExited から切り離された HandleProcessExited タスクは、
     // この token を見て grace sleep / Push 直前で打ち切る。
     private CancellationTokenSource _generationCts = new();
-    // 検出状況の通知の世代。Start / Stop / UpdateSettings のたびに進める。
-    // 通知は錠の外で出すため、錠を離してから流すまでの間に次の世代が始まりうる。
-    // その場合、手元に持っているのは既に古い状態なので流さない。
-    private long _detectionGeneration;
-    // 通知の送出そのものを直列化する。_lifecycleLock とは別に持つ。同じ錠にすると、
-    // 購読側が動いているあいだ Stop や UpdateSettings が待たされる。
-    private readonly object _detectionPublishGate = new();
+    // 検出状況を読むための、_bindings の写し。_lifecycleLock を取らずに読めるよう、
+    // 中身を変えずに丸ごと差し替える形で持つ。読み手は GUI のスレッドにいるため、
+    // 進行中の Start の裏で待たせたくない。
+    private volatile IReadOnlyList<ToolBinding> _detectionSources = Array.Empty<ToolBinding>();
 
     public event Action<AutoPushEvent>? AutoPushTriggered;
     public event Action<AutoPushEvent>? AutoPushCompleted;
     public event Action<AutoPushConflictEvent>? AutoPushConflict;
     public event Action<RemoteUpdateEvent>? RemoteUpdateAvailable;
-    public event Action<ProcessDetectionEvent>? ProcessDetectionChanged;
+    /// <summary>
+    /// 検出状況が変わったことを知らせる。<b>中身は持たない。</b>
+    /// <para>
+    /// 状態そのものは <see cref="GetProcessDetections"/> から読む。通知に状態を載せると、
+    /// 錠を離してから届くまでの間に次の変化が起きた場合に古い方を届けうる。載せなければ、
+    /// 遅れて届いた通知は現在の状態を読み直させるだけになり、順序が問題にならない。
+    /// </para>
+    /// </summary>
+    public event Action? ProcessDetectionChanged;
 
     /// <summary>
     /// 監視しうるツール。設定で外されていて binding が作られなかったものにも
@@ -84,24 +89,16 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Start()
     {
-        long generation;
-        List<ProcessDetectionEvent> detections;
-        lock (_lifecycleLock)
-        {
-            generation = NextDetectionGeneration();
-            detections = StartCore();
-        }
+        lock (_lifecycleLock) { StartCore(); }
         // 通知は錠の外で出す。購読側が何をするかはここからは分からず、錠を持ったまま
         // 呼ぶと、そのあいだ Stop や UpdateSettings が待たされる。
-        Publish(generation, detections);
+        ProcessDetectionChanged?.Invoke();
     }
 
-    private List<ProcessDetectionEvent> StartCore()
+    private void StartCore()
     {
         if (_started) return new List<ProcessDetectionEvent>();
-        // 自動同期を切っている場合も「監視していない」を流す。黙ると表示が初期値の
-        // まま残り、設定で切っていることが読み取れない。
-        if (!_settings.AutoSyncEnabled) return NotWatchingForUnbound();
+        if (!_settings.AutoSyncEnabled) return;
 
         ISyncStorage storage;
         try
@@ -111,7 +108,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         catch (SyncStorageException ex)
         {
             _logger.LogInformation("AutoSync 起動スキップ: {Reason}", ex.Message);
-            return NotWatchingForUnbound();
+            return;
         }
         _storage = storage;
 
@@ -149,16 +146,11 @@ public sealed class AutoSyncCoordinator : IDisposable
                 () => new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>())));
         }
 
-        var detections = new List<ProcessDetectionEvent>();
         foreach (var binding in _bindings)
         {
             binding.Watcher.Start();
-            // 監視を始めた時点の状態を一度流す。以後は変化のたびに出るが、
-            // 最初の 1 回が無いと、既に起動していたツールが変化するまで表示されない。
-            detections.Add(DetectionOf(binding));
         }
-        // 同期対象から外されているツールにも状態を流す。
-        detections.AddRange(NotWatchingForUnbound());
+        RefreshDetectionSources();
 
         // 同期先が変更を知らせる仕組みを作る。ローカルフォルダはファイル監視、
         // S3 互換モードは manifest の定期確認になる。
@@ -169,38 +161,28 @@ public sealed class AutoSyncCoordinator : IDisposable
         _started = true;
         _logger.LogInformation(
             "AutoSync 起動 bindings={Count} target={Target}", _bindings.Count, storage.DisplayName);
-        return detections;
     }
 
     public void Stop()
     {
-        long generation;
-        List<ProcessDetectionEvent> detections;
-        lock (_lifecycleLock)
-        {
-            generation = NextDetectionGeneration();
-            detections = StopCore();
-        }
-        Publish(generation, detections);
+        lock (_lifecycleLock) { StopCore(); }
+        ProcessDetectionChanged?.Invoke();
     }
 
-    private List<ProcessDetectionEvent> StopCore()
+    private void StopCore()
     {
-        if (!_started) return new List<ProcessDetectionEvent>();
+        if (!_started) return;
 
         // 切り離された HandleProcessExited タスクを中断するため、
         // Watcher 破棄より先に Cancel する。
         try { _generationCts.Cancel(); } catch { /* best-effort */ }
 
-        var detections = new List<ProcessDetectionEvent>();
         foreach (var binding in _bindings)
         {
             binding.Watcher.Dispose();
-            // 監視をやめたことを流す。ここで黙ると、表示が最後に見えた状態のまま
-            // 残り、監視していないことと「動いていない」ことの区別が付かなくなる。
-            detections.Add(NotWatching(binding.ToolKey, binding.DisplayName));
         }
         _bindings.Clear();
+        RefreshDetectionSources();
 
         if (_manifestWatcher is not null)
         {
@@ -210,27 +192,21 @@ public sealed class AutoSyncCoordinator : IDisposable
         }
         _storage = null;
         _started = false;
-        return detections;
     }
 
     public void UpdateSettings(SyncSettings settings)
     {
         // Start / Stop と同じ lock を取って、未完了の Start と並走しないようにする。
         // 内部で StopCore / StartCore を呼ぶことで再入を避ける (同じ lock を二重取得しない)。
-        long generation;
-        List<ProcessDetectionEvent> detections;
         lock (_lifecycleLock)
         {
-            generation = NextDetectionGeneration();
             _settings = settings;
-            var stopped = StopCore();
-            detections = StartCore();
-            // Stop の「監視していない」は、続く Start が出す状態に置き換わる。
-            // 同じツールについて両方流すと、購読側が一瞬だけ停止中を表示する。
-            detections.InsertRange(0, stopped.Where(
-                e => !detections.Any(d => d.ToolKey == e.ToolKey)));
+            StopCore();
+            StartCore();
         }
-        Publish(generation, detections);
+        // 通知は 1 回で足りる。読み直す側が見るのは Start を終えた後の状態なので、
+        // Stop と Start で 2 回流しても同じものを 2 度読むだけになる。
+        ProcessDetectionChanged?.Invoke();
     }
 
     /// <summary>
@@ -255,12 +231,11 @@ public sealed class AutoSyncCoordinator : IDisposable
         // (issue #11)。起動と終了の両方で流すのは、閉じ直しのように同じ走査で
         // 両方出る場合に、最後の 1 回が現在の状態になるため。
         //
-        // この binding が属する世代を捕まえておく。Stop は監視の終了を 2 秒までしか
-        // 待たないので、待ちきれなかった走査の通知が停止後に届きうる。世代が変わって
-        // いれば捨てられる。
-        var generation = Interlocked.Read(ref _detectionGeneration);
-        watcher.ProcessStarted += _ => Publish(generation, new[] { DetectionOf(binding) });
-        watcher.ProcessExited += _ => Publish(generation, new[] { DetectionOf(binding) });
+        // Stop は監視の終了を 2 秒までしか待たないので、待ちきれなかった走査の通知が
+        // 停止後に届きうる。通知は状態を持たないため、その場合も読み直させるだけで
+        // 済み、停止中の表示を古い状態で上書きすることにはならない。
+        watcher.ProcessStarted += _ => ProcessDetectionChanged?.Invoke();
+        watcher.ProcessExited += _ => ProcessDetectionChanged?.Invoke();
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
@@ -346,54 +321,32 @@ public sealed class AutoSyncCoordinator : IDisposable
     }
 
     /// <summary>
-    /// いまの検出状況を購読側へ流し直す。
+    /// いまの検出状況。ツールごとに 1 件返す。
     /// <para>
-    /// GUI は <c>Coordinator.Start</c> を背後で走らせてから画面を組み立てるため、
-    /// 購読が Start より後になることがある。既に起動していたプロセスは
-    /// <see cref="ProcessWatcher.Start"/> が黙って取り込むので、以後そのツールを
-    /// 閉じるまで通知が出ない。購読した側からこれを呼べば、取り逃がした分を拾える。
+    /// 通知は「変わった」ことしか伝えないので、購読側はここから読む。<b>読むたびに
+    /// 現在の状態が返る</b>ため、通知が遅れて届いても古い状態を表示することはない。
+    /// </para>
+    /// <para>
+    /// <see cref="_lifecycleLock"/> は取らない。読み手は GUI のスレッドにいるので、
+    /// 進行中の <see cref="Start"/> の裏で待たせたくない。代わりに
+    /// <see cref="_detectionSources"/> を丸ごと差し替える形で読ませる。
     /// </para>
     /// </summary>
-    public void PublishProcessDetection()
+    public IReadOnlyList<ProcessDetectionEvent> GetProcessDetections()
     {
-        long generation;
-        List<ProcessDetectionEvent> detections;
-        lock (_lifecycleLock)
-        {
-            // 世代は進めない。状態を流し直すだけで、ライフサイクルは動いていない。
-            generation = Interlocked.Read(ref _detectionGeneration);
-            detections = _bindings.Select(DetectionOf).ToList();
-            detections.AddRange(NotWatchingForUnbound());
-        }
-        Publish(generation, detections);
-    }
-
-    /// <summary>次のライフサイクルの世代を始める。<see cref="_lifecycleLock"/> の中で呼ぶ。</summary>
-    private long NextDetectionGeneration() => Interlocked.Increment(ref _detectionGeneration);
-
-    /// <summary>
-    /// <paramref name="generation"/> 時点の状態を流す。流すまでに次の世代が始まっていれば捨てる。
-    /// <para>
-    /// 送出そのものも直列化する。錠の外で組み立てているので、これが無いと 2 つの世代の
-    /// 通知が混ざって届き、最後に届いたものが現在の状態とは限らなくなる。
-    /// </para>
-    /// </summary>
-    private void Publish(long generation, IReadOnlyList<ProcessDetectionEvent> detections)
-    {
-        if (detections.Count == 0) return;
-        OnBeforePublishForTests?.Invoke();
-        lock (_detectionPublishGate)
-        {
-            if (Interlocked.Read(ref _detectionGeneration) != generation) return;
-            foreach (var detection in detections) ProcessDetectionChanged?.Invoke(detection);
-        }
+        var sources = _detectionSources;
+        var detections = sources.Select(DetectionOf).ToList();
+        detections.AddRange(KnownTools
+            .Where(tool => !sources.Any(b => b.ToolKey == tool.ToolKey))
+            .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName)));
+        return detections;
     }
 
     /// <summary>
-    /// 錠を離してから通知を流すまでの間に割り込むための穴。テストからのみ使う。
-    /// この隙間に別の世代を始められないと、古い通知を捨てていることを確かめられない。
+    /// 検出状況を読む先を、いまの <see cref="_bindings"/> に合わせる。
+    /// <see cref="_lifecycleLock"/> の中で呼ぶ。
     /// </summary>
-    internal Action? OnBeforePublishForTests;
+    private void RefreshDetectionSources() => _detectionSources = _bindings.ToArray();
 
     /// <summary>監視中のツール 1 つぶんの検出状況。</summary>
     private static ProcessDetectionEvent DetectionOf(ToolBinding binding)
@@ -401,18 +354,6 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     private static ProcessDetectionEvent NotWatching(string toolKey, string displayName)
         => new(toolKey, displayName, IsWatching: false, Array.Empty<string>());
-
-    /// <summary>
-    /// binding を持たないツールの「監視していない」を並べる。自動同期を切っている、
-    /// あるいはそのツールを同期対象から外している場合、通知が一度も出ないと表示が
-    /// 初期値のまま残り、設定で外していることが読み取れない。
-    /// <para>呼び出し側が <see cref="_lifecycleLock"/> を持っていること。</para>
-    /// </summary>
-    private List<ProcessDetectionEvent> NotWatchingForUnbound()
-        => KnownTools
-            .Where(tool => !_bindings.Any(b => b.ToolKey == tool.ToolKey))
-            .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName))
-            .ToList();
 
 
     /// <summary>

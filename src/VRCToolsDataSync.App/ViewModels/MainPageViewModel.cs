@@ -138,11 +138,12 @@ public partial class MainPageViewModel : ObservableObject
         });
         coordinator.AutoPushConflict += e => OnUi(() => _ = HandleAutoPushConflictAsync(e));
         coordinator.RemoteUpdateAvailable += e => OnUi(() => _ = HandleRemoteUpdateAsync(e));
-        coordinator.ProcessDetectionChanged += e => OnUi(() => ApplyProcessDetection(e));
+        coordinator.ProcessDetectionChanged += () => OnUi(RefreshProcessDetection);
         // App は Coordinator.Start を背後で走らせてから画面を組み立てるため、ここへ来る
         // 前に最初の通知が出ていることがある。既に起動していたプロセスは監視の開始時に
-        // 黙って取り込まれるので、流し直さないとそのツールを閉じるまで表示が変わらない。
-        coordinator.PublishProcessDetection();
+        // 黙って取り込まれるので、ここで一度読まないとそのツールを閉じるまで表示が
+        // 変わらない。
+        RefreshProcessDetection();
     }
 
     private void OnUi(Action action)
@@ -826,8 +827,22 @@ public partial class MainPageViewModel : ObservableObject
     }
 
     /// <summary>
-    /// プロセス検出状況の表示を更新する。ツールごとに宛先が違うので振り分ける。
+    /// プロセス検出状況の表示を更新する。
+    /// <para>
+    /// 通知は「変わった」ことしか伝えないので、そのたびに現在の状態を読み直す。
+    /// 通知に状態を載せると、遅れて届いた分が新しい表示を古い状態で上書きしうる。
+    /// </para>
     /// </summary>
+    private void RefreshProcessDetection()
+    {
+        if (_coordinator is null) return;
+        foreach (var detection in _coordinator.GetProcessDetections())
+        {
+            ApplyProcessDetection(detection);
+        }
+    }
+
+    /// <summary>検出状況 1 件を宛先の表示へ振り分ける。</summary>
     private void ApplyProcessDetection(ProcessDetectionEvent e)
     {
         var text = FormatProcessDetection(e);
