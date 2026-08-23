@@ -139,6 +139,10 @@ public partial class MainPageViewModel : ObservableObject
         coordinator.AutoPushConflict += e => OnUi(() => _ = HandleAutoPushConflictAsync(e));
         coordinator.RemoteUpdateAvailable += e => OnUi(() => _ = HandleRemoteUpdateAsync(e));
         coordinator.ProcessDetectionChanged += e => OnUi(() => ApplyProcessDetection(e));
+        // App は Coordinator.Start を背後で走らせてから画面を組み立てるため、ここへ来る
+        // 前に最初の通知が出ていることがある。既に起動していたプロセスは監視の開始時に
+        // 黙って取り込まれるので、流し直さないとそのツールを閉じるまで表示が変わらない。
+        coordinator.PublishProcessDetection();
     }
 
     private void OnUi(Action action)

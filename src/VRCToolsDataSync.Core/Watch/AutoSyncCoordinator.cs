@@ -52,6 +52,22 @@ public sealed class AutoSyncCoordinator : IDisposable
     public event Action<RemoteUpdateEvent>? RemoteUpdateAvailable;
     public event Action<ProcessDetectionEvent>? ProcessDetectionChanged;
 
+    /// <summary>
+    /// 監視しうるツール。設定で外されていて binding が作られなかったものにも
+    /// 状態を流す必要があるので、設定に依らない形で持つ。
+    /// <para>
+    /// 定義がここと <see cref="StartCore"/> に分かれているのは #18 で扱う。
+    /// </para>
+    /// </summary>
+    private static readonly IReadOnlyList<(string ToolKey, string DisplayName)> KnownTools = new[]
+    {
+        (VrcxSyncService.Key, "VRCX"),
+        (FriendConnectSyncService.Key, "VRC Friend Connect"),
+    };
+
+    private static string DisplayNameOf(string toolKey)
+        => KnownTools.First(t => t.ToolKey == toolKey).DisplayName;
+
     public AutoSyncCoordinator(SyncRunner runner, SyncSettings settings, ILogger<AutoSyncCoordinator>? logger = null)
     {
         _runner = runner;
@@ -61,13 +77,19 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     public void Start()
     {
-        lock (_lifecycleLock) { StartCore(); }
+        List<ProcessDetectionEvent> detections;
+        lock (_lifecycleLock) { detections = StartCore(); }
+        // 通知は錠の外で出す。購読側が何をするかはここからは分からず、錠を持ったまま
+        // 呼ぶと、そのあいだ Stop や UpdateSettings が待たされる。
+        Publish(detections);
     }
 
-    private void StartCore()
+    private List<ProcessDetectionEvent> StartCore()
     {
-        if (_started) return;
-        if (!_settings.AutoSyncEnabled) return;
+        if (_started) return new List<ProcessDetectionEvent>();
+        // 自動同期を切っている場合も「監視していない」を流す。黙ると表示が初期値の
+        // まま残り、設定で切っていることが読み取れない。
+        if (!_settings.AutoSyncEnabled) return NotWatchingForUnbound();
 
         ISyncStorage storage;
         try
@@ -77,7 +99,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         catch (SyncStorageException ex)
         {
             _logger.LogInformation("AutoSync 起動スキップ: {Reason}", ex.Message);
-            return;
+            return NotWatchingForUnbound();
         }
         _storage = storage;
 
@@ -101,7 +123,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _bindings.Add(CreateBinding(
                 VrcxSyncService.Key,
-                "VRCX",
+                DisplayNameOf(VrcxSyncService.Key),
                 ProcessGuard.VrcxProcessNames,
                 () => new VrcxSyncService(logger: _runner.CreateLogger<VrcxSyncService>())));
         }
@@ -110,18 +132,21 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _bindings.Add(CreateBinding(
                 FriendConnectSyncService.Key,
-                "VRC Friend Connect",
+                DisplayNameOf(FriendConnectSyncService.Key),
                 ProcessGuard.FriendConnectProcessNames,
                 () => new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>())));
         }
 
+        var detections = new List<ProcessDetectionEvent>();
         foreach (var binding in _bindings)
         {
             binding.Watcher.Start();
             // 監視を始めた時点の状態を一度流す。以後は変化のたびに出るが、
             // 最初の 1 回が無いと、既に起動していたツールが変化するまで表示されない。
-            RaiseProcessDetection(binding);
+            detections.Add(DetectionOf(binding));
         }
+        // 同期対象から外されているツールにも状態を流す。
+        detections.AddRange(NotWatchingForUnbound());
 
         // 同期先が変更を知らせる仕組みを作る。ローカルフォルダはファイル監視、
         // S3 互換モードは manifest の定期確認になる。
@@ -132,28 +157,31 @@ public sealed class AutoSyncCoordinator : IDisposable
         _started = true;
         _logger.LogInformation(
             "AutoSync 起動 bindings={Count} target={Target}", _bindings.Count, storage.DisplayName);
+        return detections;
     }
 
     public void Stop()
     {
-        lock (_lifecycleLock) { StopCore(); }
+        List<ProcessDetectionEvent> detections;
+        lock (_lifecycleLock) { detections = StopCore(); }
+        Publish(detections);
     }
 
-    private void StopCore()
+    private List<ProcessDetectionEvent> StopCore()
     {
-        if (!_started) return;
+        if (!_started) return new List<ProcessDetectionEvent>();
 
         // 切り離された HandleProcessExited タスクを中断するため、
         // Watcher 破棄より先に Cancel する。
         try { _generationCts.Cancel(); } catch { /* best-effort */ }
 
+        var detections = new List<ProcessDetectionEvent>();
         foreach (var binding in _bindings)
         {
             binding.Watcher.Dispose();
             // 監視をやめたことを流す。ここで黙ると、表示が最後に見えた状態のまま
             // 残り、監視していないことと「動いていない」ことの区別が付かなくなる。
-            ProcessDetectionChanged?.Invoke(new ProcessDetectionEvent(
-                binding.ToolKey, binding.DisplayName, IsWatching: false, Array.Empty<string>()));
+            detections.Add(NotWatching(binding.ToolKey, binding.DisplayName));
         }
         _bindings.Clear();
 
@@ -165,18 +193,25 @@ public sealed class AutoSyncCoordinator : IDisposable
         }
         _storage = null;
         _started = false;
+        return detections;
     }
 
     public void UpdateSettings(SyncSettings settings)
     {
         // Start / Stop と同じ lock を取って、未完了の Start と並走しないようにする。
         // 内部で StopCore / StartCore を呼ぶことで再入を避ける (同じ lock を二重取得しない)。
+        List<ProcessDetectionEvent> detections;
         lock (_lifecycleLock)
         {
             _settings = settings;
-            StopCore();
-            StartCore();
+            var stopped = StopCore();
+            detections = StartCore();
+            // Stop の「監視していない」は、続く Start が出す状態に置き換わる。
+            // 同じツールについて両方流すと、購読側が一瞬だけ停止中を表示する。
+            detections.InsertRange(0, stopped.Where(
+                e => !detections.Any(d => d.ToolKey == e.ToolKey)));
         }
+        Publish(detections);
     }
 
     /// <summary>
@@ -287,17 +322,52 @@ public sealed class AutoSyncCoordinator : IDisposable
     }
 
     /// <summary>
-    /// いまの検出状況を購読側へ流す。監視中に呼ぶ前提で、<see cref="ProcessDetectionEvent.IsWatching"/>
-    /// は常に true になる。監視をやめたことは <see cref="StopCore"/> が直接流す。
+    /// いまの検出状況を購読側へ流し直す。
+    /// <para>
+    /// GUI は <c>Coordinator.Start</c> を背後で走らせてから画面を組み立てるため、
+    /// 購読が Start より後になることがある。既に起動していたプロセスは
+    /// <see cref="ProcessWatcher.Start"/> が黙って取り込むので、以後そのツールを
+    /// 閉じるまで通知が出ない。購読した側からこれを呼べば、取り逃がした分を拾える。
+    /// </para>
     /// </summary>
-    private void RaiseProcessDetection(ToolBinding binding)
+    public void PublishProcessDetection()
     {
-        ProcessDetectionChanged?.Invoke(new ProcessDetectionEvent(
-            binding.ToolKey,
-            binding.DisplayName,
-            IsWatching: true,
-            binding.Watcher.DetectedProcessNames));
+        List<ProcessDetectionEvent> detections;
+        lock (_lifecycleLock)
+        {
+            detections = _bindings.Select(DetectionOf).ToList();
+            detections.AddRange(NotWatchingForUnbound());
+        }
+        Publish(detections);
     }
+
+    private void Publish(IReadOnlyList<ProcessDetectionEvent> detections)
+    {
+        foreach (var detection in detections) ProcessDetectionChanged?.Invoke(detection);
+    }
+
+    /// <summary>監視中のツール 1 つぶんの検出状況。</summary>
+    private static ProcessDetectionEvent DetectionOf(ToolBinding binding)
+        => new(binding.ToolKey, binding.DisplayName, IsWatching: true, binding.Watcher.DetectedProcessNames);
+
+    private static ProcessDetectionEvent NotWatching(string toolKey, string displayName)
+        => new(toolKey, displayName, IsWatching: false, Array.Empty<string>());
+
+    /// <summary>
+    /// binding を持たないツールの「監視していない」を並べる。自動同期を切っている、
+    /// あるいはそのツールを同期対象から外している場合、通知が一度も出ないと表示が
+    /// 初期値のまま残り、設定で外していることが読み取れない。
+    /// <para>呼び出し側が <see cref="_lifecycleLock"/> を持っていること。</para>
+    /// </summary>
+    private List<ProcessDetectionEvent> NotWatchingForUnbound()
+        => KnownTools
+            .Where(tool => !_bindings.Any(b => b.ToolKey == tool.ToolKey))
+            .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName))
+            .ToList();
+
+    /// <summary>監視から届いた変化を流す。走査のスレッドから呼ばれる。</summary>
+    private void RaiseProcessDetection(ToolBinding binding)
+        => ProcessDetectionChanged?.Invoke(DetectionOf(binding));
 
     /// <summary>
     /// プロセス終了検知後の AutoPush 本体。Push まで成功したら true を返す。
