@@ -27,19 +27,21 @@ public sealed class S3SyncStorage : ISyncStorage
     private readonly string _keyPrefix;
     private readonly string _endpointIdentity;
     private readonly ILogger _logger;
+    private readonly ILogger<PollingManifestWatcher>? _watcherLogger;
 
     // 条件付き書き込みに対応していないプロバイダを検知したら降格する。
     // 複数スレッドから読み書きするため volatile にする。
     private volatile bool _conditionalWrites;
 
-    public S3SyncStorage(S3StorageOptions options, ILogger<S3SyncStorage>? logger = null)
+    public S3SyncStorage(S3StorageOptions options, ILoggerFactory? loggerFactory = null)
     {
         _options = options;
         _client = new S3Client(options);
         _keyPrefix = options.NormalizedKeyPrefix;
         _endpointIdentity = BuildEndpointIdentity(options.ServiceUrl);
         _conditionalWrites = options.UseConditionalWrites;
-        _logger = logger ?? NullLogger<S3SyncStorage>.Instance;
+        _logger = loggerFactory?.CreateLogger<S3SyncStorage>() ?? (ILogger)NullLogger<S3SyncStorage>.Instance;
+        _watcherLogger = loggerFactory?.CreateLogger<PollingManifestWatcher>();
     }
 
     public string DisplayName => _keyPrefix.Length == 0
@@ -163,7 +165,7 @@ public sealed class S3SyncStorage : ISyncStorage
     }
 
     public IManifestWatcher CreateManifestWatcher()
-        => new PollingManifestWatcher(this, ManifestPollInterval);
+        => new PollingManifestWatcher(this, ManifestPollInterval, _watcherLogger);
 
     /// <summary>
     /// 同期先を実際に使えるかを確かめる。設定画面や CLI の接続テストから呼ぶ。

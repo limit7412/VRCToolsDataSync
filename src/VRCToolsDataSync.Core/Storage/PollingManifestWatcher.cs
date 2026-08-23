@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Sync;
 
 namespace VRCToolsDataSync.Core.Storage;
@@ -16,15 +18,23 @@ public sealed class PollingManifestWatcher : IManifestWatcher
     private readonly ISyncStorage _storage;
     private readonly System.Timers.Timer _timer;
     private readonly object _pollLock = new();
+    private readonly ILogger _logger;
 
     private string? _lastSignature;
     private bool _started;
 
+    // 失敗が続く間に毎回記録するとログが失敗で埋まる。状態が変わったときだけ残す。
+    private bool _failureLogged;
+
     public event Action<SyncManifest>? ManifestChanged;
 
-    public PollingManifestWatcher(ISyncStorage storage, TimeSpan interval)
+    public PollingManifestWatcher(
+        ISyncStorage storage,
+        TimeSpan interval,
+        ILogger<PollingManifestWatcher>? logger = null)
     {
         _storage = storage;
+        _logger = logger ?? NullLogger<PollingManifestWatcher>.Instance;
         _timer = new System.Timers.Timer(interval.TotalMilliseconds)
         {
             // 前回の問い合わせが終わってから次を張り直す。通信が遅いときに
@@ -62,17 +72,37 @@ public sealed class PollingManifestWatcher : IManifestWatcher
             lock (_pollLock)
             {
                 var snapshot = _storage.LoadManifest();
-                var signature = BuildSignature(snapshot);
+                var signature = ManifestSignature.Build(snapshot);
                 if (signature != _lastSignature)
                 {
                     _lastSignature = signature;
                     ManifestChanged?.Invoke(snapshot.Manifest);
                 }
+
+                // 復帰の判定は一周を最後まで終えてから。読み込みが通った時点で
+                // 解除すると、その後 (署名の生成や通知) が毎回失敗する状況で、
+                // 復帰と警告を交互に出し続けることになる。
+                if (_failureLogged)
+                {
+                    _failureLogged = false;
+                    _logger.LogInformation("manifest の確認が復帰しました: {Target}", _storage.DisplayName);
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // 一時的な通信失敗は次の間隔で拾い直す。
+            // 一時的な通信失敗は次の間隔で拾い直せるので、ここでは再試行しない。
+            // ただし黙って捨てると、到達できない状態が続いても利用者は
+            // 「他 PC の更新が来ない」ことしか分からない。状態が変わったときだけ記録する。
+            if (!_failureLogged)
+            {
+                _failureLogged = true;
+                _logger.LogWarning(
+                    ex,
+                    "manifest を確認できませんでした。次の確認まで ({Interval} 秒) リモートの更新に気付けません: {Target}",
+                    _timer.Interval / 1000,
+                    _storage.DisplayName);
+            }
         }
         finally
         {
@@ -81,22 +111,6 @@ public sealed class PollingManifestWatcher : IManifestWatcher
                 try { _timer.Start(); } catch (ObjectDisposedException) { /* Dispose と競合 */ }
             }
         }
-    }
-
-    /// <summary>
-    /// 変更検知に使う指紋。ETag を出す同期先はそれを使い、出さない同期先では
-    /// ツールごとの version の組で代用する。
-    /// </summary>
-    private static string BuildSignature(ManifestSnapshot snapshot)
-    {
-        if (snapshot.VersionTag is { Length: > 0 } tag)
-        {
-            return "tag:" + tag;
-        }
-        var versions = snapshot.Manifest.Tools
-            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => $"{pair.Key}={pair.Value.Version}");
-        return "versions:" + string.Join(",", versions);
     }
 
     public void Dispose()

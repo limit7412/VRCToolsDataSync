@@ -20,9 +20,7 @@ public static class SyncStorageFactory
         switch (settings.StorageMode)
         {
             case SyncStorageMode.S3:
-                return new S3SyncStorage(
-                    BuildS3Options(settings.S3),
-                    loggerFactory?.CreateLogger<S3SyncStorage>());
+                return new S3SyncStorage(BuildS3Options(settings.S3), loggerFactory);
 
             case SyncStorageMode.LocalFolder:
             default:
@@ -38,7 +36,7 @@ public static class SyncStorageFactory
                 {
                     throw new SyncStorageConfigurationException($"指定された同期フォルダが存在しません: {folder}");
                 }
-                return new LocalFolderSyncStorage(folder);
+                return new LocalFolderSyncStorage(folder, loggerFactory);
         }
     }
 
