@@ -179,13 +179,12 @@ public sealed class ProcessWatcherTests
         Assert.Equal(new[] { "exited:" + Name }, events);
     }
 
-    [Fact(DisplayName = "複数動いているうち 1 つが消えれば終了を通知する")]
-    public void LosingOneOfSeveralInstancesReportsAnExit()
+    [Fact(DisplayName = "複数動いているうち 1 つが消えただけでは終了を通知しない")]
+    public void LosingOneOfSeveralInstancesDoesNotReportAnExit()
     {
-        // 通知の意味は「見ていた実体が終わった」であって「その名前が全部消えた」では
-        // ない。後者にすると、閉じ直しの取りこぼしがそのまま戻る。
-        // なお Push 側は ProcessGuard で実行中を弾くため、残りが動いていれば
-        // その Push は中止される。
+        // AutoSyncCoordinator は終了通知からファイル解放待ちの 3 秒を数える。1 つ目が
+        // 消えた時点で数え始めると、その 3 秒が経つ間際に最後の 1 つが消えた場合、
+        // 最後の書き手が終わってから 3 秒を待たずに読み始めることになる。
         var processes = new FakeProcesses();
         processes.Set(Name, Instance(1000, 9), Instance(1001, 10));
         var (watcher, events) = Watch(processes);
@@ -195,7 +194,41 @@ public sealed class ProcessWatcherTests
         processes.Set(Name, Instance(1001, 10));
         watcher.Poll();
 
+        Assert.Empty(events);
+    }
+
+    [Fact(DisplayName = "複数動いているうち最後の 1 つが消えれば終了を通知する")]
+    public void LosingTheLastInstanceReportsAnExit()
+    {
+        var processes = new FakeProcesses();
+        processes.Set(Name, Instance(1000, 9), Instance(1001, 10));
+        var (watcher, events) = Watch(processes);
+        watcher.Poll();
+        events.Clear();
+
+        processes.Set(Name, Instance(1001, 10));
+        watcher.Poll();
+        processes.Set(Name);
+        watcher.Poll();
+
         Assert.Equal(new[] { "exited:" + Name }, events);
+    }
+
+    [Fact(DisplayName = "開始時刻を読めるようになっただけでは入れ替わりと見なさない")]
+    public void AStartTimeBecomingReadableDoesNotLookLikeAReplacement()
+    {
+        // 読めない側から読める側への遷移も、読める側から読めない側への遷移と同じく
+        // 揺れでしかない。片方向だけ抑えても、もう一方で不要な AutoPush が走る。
+        var processes = new FakeProcesses();
+        processes.Set(Name, new ProcessInstance(1000, null));
+        var (watcher, events) = Watch(processes);
+        watcher.Poll();
+        events.Clear();
+
+        processes.Set(Name, Instance(1000));
+        watcher.Poll();
+
+        Assert.Empty(events);
     }
 
     [Fact(DisplayName = "走査に失敗した名前は、動いているものを終了として通知しない")]

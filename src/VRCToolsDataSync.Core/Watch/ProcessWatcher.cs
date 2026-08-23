@@ -19,8 +19,16 @@ internal readonly record struct ProcessInstance(int Id, DateTime? StartedAt);
 /// <para>
 /// 見ているのは名前ではなく<b>実体</b>である。名前ごとに「動いているか」の真偽値だけを
 /// 持つと、閉じてから次の走査までの間に同じ名前で開き直された場合、真のままなので
-/// 終了を通知できない。<see cref="ProcessInstance"/> の集合を持ち、前回見えていた実体が
-/// 消えたかどうかで判定する。
+/// 終了を通知できない。<see cref="ProcessInstance"/> を並べて持ち、前回見えていた実体が
+/// 残っているかどうかで判定する。
+/// </para>
+/// <para>
+/// 通知の意味は<b>入れ替わり</b>である。見ていた実体が 1 つも残っていないときに
+/// <see cref="ProcessExited"/>、見えている実体がどれも見ていなかったものであるときに
+/// <see cref="ProcessStarted"/> を出す。同じ名前で複数動いているうちの 1 つが消えただけでは
+/// 終了を通知しない。<see cref="AutoSyncCoordinator"/> は終了通知からファイル解放待ちの
+/// 3 秒を数えるので、1 つ目が消えた時点で数え始めると、最後の書き手が終わってからの
+/// 猶予を取り直せない。
 /// </para>
 /// <para>
 /// 走査の間隔を詰めても、この取りこぼしは狭くなるだけで無くならない。間隔は 1 秒のまま
@@ -34,7 +42,7 @@ public sealed class ProcessWatcher : IDisposable
     private readonly TimeSpan _interval;
     private readonly Func<string, IReadOnlyList<ProcessInstance>> _probe;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Dictionary<string, HashSet<ProcessInstance>> _running =
+    private readonly Dictionary<string, List<ProcessInstance>> _running =
         new(StringComparer.OrdinalIgnoreCase);
     private Task? _loop;
 
@@ -59,7 +67,7 @@ public sealed class ProcessWatcher : IDisposable
         _interval = interval ?? TimeSpan.FromSeconds(1);
         foreach (var name in _processNames)
         {
-            _running[name] = new HashSet<ProcessInstance>();
+            _running[name] = new List<ProcessInstance>();
         }
     }
 
@@ -71,7 +79,7 @@ public sealed class ProcessWatcher : IDisposable
         // 既にそこにあっただけなので、起動として扱うと後段が意味を取り違える。
         foreach (var name in _processNames)
         {
-            _running[name] = Reconcile(SafeProbe(name), _running[name]);
+            _running[name] = SafeProbe(name).ToList();
         }
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
@@ -82,13 +90,18 @@ public sealed class ProcessWatcher : IDisposable
         foreach (var name in _processNames)
         {
             var previous = _running[name];
-            var current = Reconcile(SafeProbe(name), previous);
+            var current = SafeProbe(name).ToList();
 
-            // 前回見えていた実体が 1 つでも消えていれば終了、前回に無かった実体が
-            // 見えていれば起動。集合どうしの比較なので、閉じてから開き直されて
-            // 「動いている数」が変わらない場合でも取り違えない。
-            var exited = previous.Any(p => !current.Contains(p));
-            var started = current.Any(c => !previous.Contains(c));
+            // 見ていた実体が 1 つでも残っているか。残っていなければ、見ていたものは
+            // すべて終わり、見えているものはすべて新しい。閉じてから開き直された場合も、
+            // 残っている実体は無いのでここに入る。「動いている数」ではなく実体で見ている
+            // ため、数が変わらなくても取り違えない。
+            //
+            // 1 つでも残っていれば、消えたものがあっても終了を通知しない。残りが動いて
+            // いる間に Push へ進むと、最後の書き手が終わってからの猶予を取り直せない。
+            var survives = previous.Any(p => current.Any(c => IsSameInstance(p, c)));
+            var exited = previous.Count > 0 && !survives;
+            var started = current.Count > 0 && !survives;
             _running[name] = current;
 
             // 終了を先に通知する。同じ走査の中で閉じ直されていた場合、逆順にすると
@@ -99,32 +112,20 @@ public sealed class ProcessWatcher : IDisposable
     }
 
     /// <summary>
-    /// 開始時刻を読めなかった実体に、前回の同じ PID の見え方を引き継ぐ。
+    /// 2 つの見え方が同じ実体を指すかを判定する。
     /// <para>
-    /// 開始時刻は読めないことがある (下記 <see cref="TryGetStartedAt"/>)。読めたり読めなかったり
-    /// 揺れるだけで識別子が変わると、同じプロセスが入れ替わったように見えてしまう。
+    /// 開始時刻はどちらの側でも読めないことがある (下記 <see cref="TryGetStartedAt"/>)。
+    /// 片方でも読めていなければ PID だけで判断する。読める・読めないが揺れるだけで
+    /// 別の実体と見なすと、動き続けているツールに対して終了を通知してしまう。
+    /// </para>
+    /// <para>
+    /// 両方読めている場合は開始時刻まで一致を求める。Windows は終了したプロセスの PID を
+    /// 再利用するため、PID だけでは別の実体を同じものと取り違える。
     /// </para>
     /// </summary>
-    private static HashSet<ProcessInstance> Reconcile(
-        IReadOnlyList<ProcessInstance> current,
-        HashSet<ProcessInstance> previous)
-    {
-        var result = new HashSet<ProcessInstance>();
-        foreach (var instance in current)
-        {
-            if (instance.StartedAt is null)
-            {
-                ProcessInstance? carried = null;
-                foreach (var seen in previous)
-                {
-                    if (seen.Id == instance.Id) { carried = seen; break; }
-                }
-                if (carried is not null) { result.Add(carried.Value); continue; }
-            }
-            result.Add(instance);
-        }
-        return result;
-    }
+    private static bool IsSameInstance(ProcessInstance a, ProcessInstance b)
+        => a.Id == b.Id
+            && (a.StartedAt is null || b.StartedAt is null || a.StartedAt == b.StartedAt);
 
     /// <summary>
     /// 1 つの名前の走査に失敗しても、その名前を次回に回すだけにする。
@@ -139,7 +140,7 @@ public sealed class ProcessWatcher : IDisposable
         catch
         {
             return _running.TryGetValue(name, out var previous)
-                ? previous.ToList()
+                ? previous
                 : Array.Empty<ProcessInstance>();
         }
     }
