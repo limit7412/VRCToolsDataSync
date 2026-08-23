@@ -97,6 +97,11 @@ internal static class SyncTransfer
 
         using var staged = storage.BeginUpload();
         File.Copy(localPath, staged.LocalPath, overwrite: true);
+        // File.Copy はコピー元の最終更新時刻を引き継ぐ。同期先は置き去りになった
+        // 書き出し中ファイルをこの時刻で見分けるため、刻み直さないと、1 日以上前に
+        // 更新された config や note を送っている最中に、別プロセスの BeginUpload が
+        // これを置き去りと誤判定して消しうる。
+        File.SetLastWriteTimeUtc(staged.LocalPath, DateTime.UtcNow);
         var described = Describe(staged.LocalPath, logicalPath);
         staged.Commit(ManifestFileKeys.StorageKeyOf(described));
         return (described, true);

@@ -205,6 +205,13 @@ public sealed class S3SyncStorage : ISyncStorage
         // 認証、バケットの存在、読み取り権限。
         LoadManifest();
 
+        // 一覧の権限。S3 では s3:GetObject と s3:ListBucket を別々に許可できるため、
+        // 取得だけ通る認証情報がここまで素通りする。回収 (storage gc) は
+        // ListObjectsV2 を必ず呼ぶので、確認しないと設定は保存できても実行時に
+        // 403 となり、孤児を片付ける唯一の手段が使えない。
+        // 1 ページ目を取れれば十分なので、1 件だけ引いて打ち切る。
+        _ = _client.ListObjects(ToObjectKey(BlobKeys.Prefix)).Take(1).ToList();
+
         // 書き込みと削除の権限。名前が衝突しないよう GUID を使い、後始末する。
         //
         // 削除の失敗も接続テストの失敗として扱う。Push は実データを消さないが、

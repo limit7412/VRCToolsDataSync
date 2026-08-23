@@ -176,21 +176,9 @@ public sealed class BlobGarbageCollector
         var live = new HashSet<string>(StringComparer.Ordinal);
         var manifest = new ManifestStore(_storage).Load();
 
-        // この版が知らない形式の manifest からは、参照を数え切れない。デシリアライズは
-        // 知らないフィールドを黙って捨てるので、新しい形式が Files と BlobKey では
-        // 表せない参照を持っていても、こちらからは見えない。見えない参照は孤児に見え、
-        // 猶予期間を過ぎた時点で消してしまう。
-        //
-        // ゼロ件の検査では防げない。既知の形式のエントリが 1 つでも残っていれば
-        // live は空にならず、新しい形式だけが参照する実体を巻き込む。
-        if (manifest.SchemaVersion > SyncManifest.CurrentSchemaVersion)
-        {
-            throw new SyncStorageException(
-                $"同期先の manifest.json は、この版が扱えない形式です " +
-                $"(schemaVersion={manifest.SchemaVersion}、" +
-                $"この版が扱えるのは {SyncManifest.CurrentSchemaVersion} まで)。" +
-                "参照を数え切れないため、回収を中止しました。VRCToolsDataSync を更新してください。");
-        }
+        // 扱えない形式なら Load が投げる。知らない形式が持つ参照は数え切れず、
+        // 見えない参照は孤児に見えるため、読めた範囲で進めてはいけない。
+        // 下のゼロ件の検査では防げない (既知のエントリが 1 つでもあれば素通りする)。
 
         foreach (var entry in manifest.Tools.Values)
         {

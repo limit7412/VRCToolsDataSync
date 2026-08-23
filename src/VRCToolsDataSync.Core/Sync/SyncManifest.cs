@@ -105,7 +105,36 @@ public sealed class ManifestStore
         _storage = storage;
     }
 
-    public SyncManifest Load() => _storage.LoadManifest().Manifest;
+    /// <summary>
+    /// manifest を読み込む。この版で扱えない形式なら投げる
+    /// (<see cref="EnsureSupported"/>)。
+    /// </summary>
+    public SyncManifest Load()
+    {
+        var manifest = _storage.LoadManifest().Manifest;
+        EnsureSupported(manifest);
+        return manifest;
+    }
+
+    /// <summary>
+    /// この版で扱える形式かを確かめる。扱えなければ <see cref="SyncStorageException"/>。
+    /// <para>
+    /// デシリアライズは知らないフィールドを黙って捨てる。捨てた結果を「manifest の
+    /// すべて」として扱うと、内容を書き換える側が軒並み壊れる。Push は落ちた情報を
+    /// 捨てたまま書き戻し、Pull は新しい形式が別の意味で使っているエントリを古い解釈で
+    /// ローカルへ反映し (notes フォルダの削除まで行う)、回収は見えない参照を孤児と
+    /// 判定して消す。読めた範囲で進めるより、扱えないと言って止まる方が安全である。
+    /// </para>
+    /// </summary>
+    public static void EnsureSupported(SyncManifest manifest)
+    {
+        if (manifest.SchemaVersion <= SyncManifest.CurrentSchemaVersion) return;
+        throw new SyncStorageException(
+            $"同期先の manifest.json は、この版が扱えない形式です " +
+            $"(schemaVersion={manifest.SchemaVersion}、" +
+            $"この版が扱えるのは {SyncManifest.CurrentSchemaVersion} まで)。" +
+            "他の PC がより新しい版で Push しています。VRCToolsDataSync を更新してください。");
+    }
 
     /// <summary>
     /// 指定 tool のエントリを read-modify-write で更新し、採番した version を返す。
@@ -131,18 +160,10 @@ public sealed class ManifestStore
         {
             var snapshot = _storage.LoadManifest();
 
-            // この版が知らない形式の manifest には触らない。デシリアライズは知らない
-            // フィールドを黙って捨てるため、読んで書き戻すだけで新しい版が書いた情報が
-            // 落ちる。しかもその結果を現行形式として宣言することになり、新しい版から
-            // 見て「形式は 2 だが中身が壊れている」manifest ができあがる。
-            if (snapshot.Manifest.SchemaVersion > SyncManifest.CurrentSchemaVersion)
-            {
-                throw new SyncStorageException(
-                    $"同期先の manifest.json は、この版が扱えない形式です " +
-                    $"(schemaVersion={snapshot.Manifest.SchemaVersion}、" +
-                    $"この版が扱えるのは {SyncManifest.CurrentSchemaVersion} まで)。" +
-                    "他の PC がより新しい版で Push しています。VRCToolsDataSync を更新してください。");
-            }
+            // 保存の直前に読み直しているので、ここでも確かめる。Load を経由しない経路
+            // なので、読み込みから保存までの間に他の PC がより新しい版で公開した場合を
+            // ここで捕まえる。
+            EnsureSupported(snapshot.Manifest);
 
             var currentVersion =
                 snapshot.Manifest.Tools.TryGetValue(toolKey, out var previous) ? previous.Version : 0;
