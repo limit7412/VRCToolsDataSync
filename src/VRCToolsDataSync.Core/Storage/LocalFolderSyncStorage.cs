@@ -325,23 +325,26 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     public bool TryDelete(StoredObject expected)
     {
         var path = StorageKey.ToLocalPath(_rootDirectory, expected.Key);
-        var info = new FileInfo(path);
-        if (!info.Exists) return true;
-
-        // 見たときと変わっていたら消さない。別の PC の Push が同じ内容を再利用して
-        // 置き直した実体は、これから公開される manifest に参照される。
-        var lastModified = new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
-        if (lastModified != expected.LastModified) return false;
-
         try
         {
+            var info = new FileInfo(path);
+            if (!info.Exists) return true;
+
+            // 見たときと変わっていたら消さない。別の PC の Push が同じ内容を再利用して
+            // 置き直した実体は、これから公開される manifest に参照される。
+            var lastModified = new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
+            if (lastModified != expected.LastModified) return false;
+
             File.Delete(path);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            // 読み直しも同じ範囲に入れる。同期クライアントがファイルを掴んでいると
+            // 更新時刻の取得だけでも失敗しうるので、外に出すと回収がそこで止まり、
+            // 1 件の失敗として次回に回せない。
             throw new SyncStorageException($"ファイルを削除できません: {path} ({ex.Message})", ex);
         }
-        return true;
     }
 
     public IManifestWatcher CreateManifestWatcher()

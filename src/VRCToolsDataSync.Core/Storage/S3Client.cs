@@ -18,18 +18,6 @@ internal enum S3PutOutcome
     ConditionalWriteUnsupported,
 }
 
-internal enum S3DeleteOutcome
-{
-    /// <summary>削除した (もともと無かった場合を含む)。</summary>
-    Deleted,
-
-    /// <summary>条件付き削除が弾かれた。見たときから変わっている。</summary>
-    PreconditionFailed,
-
-    /// <summary>相手が条件付き削除に対応していない。</summary>
-    ConditionalDeleteUnsupported,
-}
-
 internal sealed record S3ObjectBody(byte[] Content, string? ETag);
 
 /// <summary>
@@ -261,7 +249,7 @@ internal sealed class S3Client
     /// 一覧の結果は取った時点の写しでしかないため、回収がその判断を使う直前に
     /// これで見直す。
     /// </summary>
-    public (DateTimeOffset LastModified, long Size, string? ETag)? Head(string key)
+    public (DateTimeOffset LastModified, long Size)? Head(string key)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
         using var response = Send(
@@ -275,27 +263,15 @@ internal sealed class S3Client
         // Last-Modified が読めない場合は「今書かれたばかり」に倒す。回収の判断に使う
         // 値なので、分からないときは消さない側へ寄せる。
         var lastModified = response.Content.Headers.LastModified ?? DateTimeOffset.UtcNow;
-        return (lastModified, response.Content.Headers.ContentLength ?? 0L, ReadETag(response));
+        return (lastModified, response.Content.Headers.ContentLength ?? 0L);
     }
 
-    /// <summary>
-    /// オブジェクトを削除する。<paramref name="ifMatchETag"/> を渡すと、その ETag の
-    /// ままである場合だけ削除する条件付きになる。
-    /// <para>
-    /// 条件付き削除に対応していない相手を、返り値で呼び出し側へ伝える。判定できないのは
-    /// 「ヘッダを黙って無視して無条件に消す」実装で、これは応答からは区別が付かない。
-    /// </para>
-    /// </summary>
-    public S3DeleteOutcome DeleteObject(string key, string? ifMatchETag = null)
+    public void DeleteObject(string key)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
-        var headers = ifMatchETag is null
-            ? null
-            : new List<KeyValuePair<string, string>> { new("If-Match", ifMatchETag) };
-
         using var response = Send(
             HttpMethod.Delete, key, query: null, contentFactory: null,
-            AwsV4Signer.EmptyPayloadHash, headers,
+            AwsV4Signer.EmptyPayloadHash, headers: null,
             HttpCompletionOption.ResponseContentRead, cts.Token);
 
         // 存在しないキーの削除は成功扱い。S3 互換 API は 204 を返すのが普通だが、
@@ -305,47 +281,22 @@ internal sealed class S3Client
         // 狭く判定すると回収が常時失敗する。
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
-            var missingBody = ReadErrorBody(response, cts.Token);
-            var (missingCode, _) = ParseError(missingBody);
-            if (!string.Equals(missingCode, "NoSuchBucket", StringComparison.Ordinal))
+            var body = ReadErrorBody(response, cts.Token);
+            var (code, _) = ParseError(body);
+            if (!string.Equals(code, "NoSuchBucket", StringComparison.Ordinal))
             {
-                return S3DeleteOutcome.Deleted;
+                return;
             }
-            throw BuildFailure(response.StatusCode, missingBody, $"オブジェクトの削除 ({key})");
+            throw BuildFailure(response.StatusCode, body, $"オブジェクトの削除 ({key})");
         }
-
-        if (response.IsSuccessStatusCode)
-        {
-            return S3DeleteOutcome.Deleted;
-        }
-        if (response.StatusCode == HttpStatusCode.PreconditionFailed)
-        {
-            return S3DeleteOutcome.PreconditionFailed;
-        }
-
-        var errorBody = ReadErrorBody(response, cts.Token);
-        if (ifMatchETag is not null)
-        {
-            // 書き込み側と同じく、衝突を 412 ではなく 409 で返す実装がある。
-            var (code, _) = ParseError(errorBody);
-            if (response.StatusCode == HttpStatusCode.Conflict
-                && code is "ConditionalRequestConflict" or "OperationAborted")
-            {
-                return S3DeleteOutcome.PreconditionFailed;
-            }
-            if (IsConditionalWriteUnsupported(response.StatusCode, errorBody))
-            {
-                return S3DeleteOutcome.ConditionalDeleteUnsupported;
-            }
-        }
-        throw BuildFailure(response.StatusCode, errorBody, $"オブジェクトの削除 ({key})");
+        EnsureSuccess(response, $"オブジェクトの削除 ({key})", cts.Token);
     }
 
     /// <summary>
     /// 接頭辞に一致するオブジェクトを ListObjectsV2 で列挙する。
     /// 1 回の応答は最大 1000 件なので、継続トークンを辿って読み切る。
     /// </summary>
-    public IEnumerable<(string Key, DateTimeOffset LastModified, long Size, string? ETag)> ListObjects(string keyPrefix)
+    public IEnumerable<(string Key, DateTimeOffset LastModified, long Size)> ListObjects(string keyPrefix)
     {
         string? continuationToken = null;
         do
@@ -403,8 +354,7 @@ internal sealed class S3Client
                     out var parsedSize)
                     ? parsedSize
                     : 0L;
-                var etag = ChildElements(element, "ETag").FirstOrDefault()?.Value;
-                yield return (key, modified, size, etag);
+                yield return (key, modified, size);
             }
 
             var truncated = ChildElements(root, "IsTruncated").FirstOrDefault()?.Value;

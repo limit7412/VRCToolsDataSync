@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using VRCToolsDataSync.Core.Storage;
@@ -57,7 +56,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
 
     /// <summary>テストの前提として、キーに中身を置く。</summary>
     public void Seed(string key, byte[] content, DateTimeOffset? lastModified = null)
-        => _objects[key] = new StoredEntry(content, lastModified ?? Now, NextETag());
+        => _objects[key] = new StoredEntry(content, lastModified ?? Now);
 
     /// <summary>テストの前提として、キーに中身を置く (テキストの場合)。</summary>
     public void Seed(string key, string content, DateTimeOffset? lastModified = null)
@@ -143,15 +142,15 @@ internal sealed class FakeSyncStorage : ISyncStorage
 
         // 返す値を先に固定してから割り込ませる。呼び出し側が持つのは読み直した時点の
         // 状態で、その後に同期先が変わっている、という状況を作るため。
-        var snapshot = new StoredObject(key, entry.LastModified, entry.Content.Length, entry.ETag);
+        var snapshot = new StoredObject(key, entry.LastModified, entry.Content.Length);
         OnStat?.Invoke(key);
         return snapshot;
     }
 
     /// <summary>
-    /// 印が一致する場合だけ削除する。S3 互換モードの <c>If-Match</c> に相当する。
+    /// 見たときのままなら削除する。実装と同じく更新日時で判定する。
     /// <para>
-    /// 印を見ずに常に消す偽物にすると、条件付き削除が効いていることを確かめられない。
+    /// 条件を見ずに常に消す偽物にすると、この判定が効いていることを確かめられない。
     /// 実装より甘い偽物は、テストがあること自体を誤った安心に変える。
     /// </para>
     /// </summary>
@@ -163,7 +162,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
             throw new SyncStorageException($"削除できません (テスト): {expected.Key}");
         }
         if (!_objects.TryGetValue(expected.Key, out var entry)) return true;
-        if (!string.Equals(entry.ETag, expected.ETag, StringComparison.Ordinal))
+        if (entry.LastModified != expected.LastModified)
         {
             Calls.Add("PreconditionFailed:" + expected.Key);
             return false;
@@ -182,7 +181,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
             if (!_objects.TryGetValue(key, out var entry)) continue;
             // 写しを先に固定してから割り込ませる。呼び出し側が受け取るのは列挙時点の
             // 値で、その後に同期先が変わっている、という状況を作るため。
-            var snapshot = new StoredObject(key, entry.LastModified, entry.Content.Length, entry.ETag);
+            var snapshot = new StoredObject(key, entry.LastModified, entry.Content.Length);
             OnListed?.Invoke(key);
             yield return snapshot;
         }
@@ -206,12 +205,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
     /// 文字列に通すと不正な UTF-8 が置換され、ハッシュの元と保存した内容がずれるので、
     /// 「キーが表す内容と実際に置かれる内容が一致する」を確かめられなくなる。
     /// </summary>
-    private sealed record StoredEntry(byte[] Content, DateTimeOffset LastModified, string ETag);
-
-    private int _etagSeed;
-
-    /// <summary>書き込むたびに変わる印。同じ内容でも書き直せば別の印になる。</summary>
-    private string NextETag() => "\"etag-" + (++_etagSeed).ToString(CultureInfo.InvariantCulture) + "\"";
+    private sealed record StoredEntry(byte[] Content, DateTimeOffset LastModified);
 
     private sealed class StagedUpload : IStagedUpload
     {
@@ -229,8 +223,7 @@ internal sealed class FakeSyncStorage : ISyncStorage
         public void Commit(string key)
         {
             _storage.Calls.Add("Commit:" + key);
-            _storage._objects[key] =
-                new StoredEntry(File.ReadAllBytes(LocalPath), _storage.Now, _storage.NextETag());
+            _storage._objects[key] = new StoredEntry(File.ReadAllBytes(LocalPath), _storage.Now);
             _committed = true;
             Cleanup();
         }

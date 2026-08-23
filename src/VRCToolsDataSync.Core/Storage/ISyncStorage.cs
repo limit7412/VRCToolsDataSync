@@ -103,9 +103,14 @@ public interface ISyncStorage
     /// 扱えるよう、同期先の種類によらない型に揃える)。
     /// </para>
     /// <para>
-    /// どこまで不可分に判定できるかは同期先による。S3 互換モードは
-    /// <c>If-Match</c> で不可分に判定する。同期フォルダには同等の操作が無いため、
-    /// 削除の直前に読み直す形になり、そこからの一瞬は残る。
+    /// <b>どちらの同期先でも不可分にはできない。</b> できるのは削除の直前に読み直す
+    /// ところまでで、そこから削除までの一瞬は残る。S3 の条件付き削除は ETag を条件に
+    /// 取るが、ETag は内容の関数なので、内容から決まるキーでは送り直しを区別できない。
+    /// Win32 にも更新時刻を条件にする不可分な削除は無い。
+    /// </para>
+    /// <para>
+    /// 残る幅は 1 往復ぶんで、猶予期間 (既定 7 日) に対しては無視できる。ここに入った
+    /// 場合も、次の Push が実体の欠落を見つけて送り直すため自然に回復する。
     /// </para>
     /// </summary>
     bool TryDelete(StoredObject expected);
@@ -152,9 +157,9 @@ public interface IManifestWatcher : IDisposable
 /// <param name="Key">同期先のルートから見たキー。</param>
 /// <param name="LastModified">最後に書かれた時刻。猶予期間の判定に使う。</param>
 /// <param name="Size">大きさ (バイト)。回収でどれだけ空いたかの報告に使う。</param>
-/// <param name="ETag">
-/// 内容が変わっていないことを示す印。<see cref="ISyncStorage.TryDelete"/> の条件に使う。
-/// 同期フォルダのように印を持たない同期先では null になり、その場合は
-/// <see cref="LastModified"/> で代用する。
-/// </param>
-public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size, string? ETag = null);
+/// <remarks>
+/// ETag は持たない。置き場所を内容から決めている以上、同じキーの内容は常に同じで、
+/// 別の PC が送り直しても ETag は変わらない。「送り直された直後か」を判別できないので、
+/// 削除の条件には <see cref="LastModified"/> を使う。
+/// </remarks>
+public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size);

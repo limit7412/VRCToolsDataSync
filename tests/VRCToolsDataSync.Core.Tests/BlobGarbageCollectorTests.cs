@@ -150,18 +150,20 @@ public sealed class BlobGarbageCollectorTests
         // 列挙後の読み直しでも捕まらない、さらに内側の隙間。読み直してから削除するまでに
         // 別の PC が置き直すと、その実体はこれから公開される manifest に参照される。
         // 削除を「読み直したときのまま」を条件にすることで、ここを取り違えない。
+        //
+        // なお、この判定は更新日時に頼っている。実装がそれ以上を望めないため
+        // (ETag は内容の関数なので、内容から決まるキーでは送り直しを区別できない)。
         var storage = StorageAt(LongAgo);
         storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
         storage.Seed(BlobKeys.Prefix + "reused", "orphan for now", LongAgo);
         storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
 
-        // Stat を返した直後に、別の PC が同じ日時のまま置き直したことにする。
-        // 日時での判定はすり抜けるので、印 (ETag) でしか捕まらない。
+        // Stat を返した直後に、別の PC が置き直したことにする。
         storage.OnStat = key =>
         {
             if (key != BlobKeys.Prefix + "reused") return;
             storage.OnStat = null;
-            storage.Seed(BlobKeys.Prefix + "reused", "orphan for now", LongAgo);
+            storage.Seed(BlobKeys.Prefix + "reused", "orphan for now", DateTimeOffset.UtcNow);
         };
 
         var result = new BlobGarbageCollector(storage).Collect(Grace);
