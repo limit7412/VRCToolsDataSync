@@ -89,11 +89,33 @@ public interface ISyncStorage
     StoredObject? Stat(string key);
 
     /// <summary>
-    /// キーを削除する。存在しない場合は何もしない。
-    /// 削除できなかった場合は <see cref="SyncStorageException"/> を投げる
-    /// (呼び出し側が 1 件の失敗として扱えるよう、同期先の種類によらない型に揃える)。
+    /// <paramref name="expected"/> が指す状態のままなら削除する。既に無い場合も
+    /// true を返す (消したいものが消えているため)。
+    /// <para>
+    /// 読み直してから削除するまでの間に別の PC が同じキーへ書き直していることがある。
+    /// その実体はこれから公開される manifest に参照されるので、消すと欠落になる。
+    /// 削除を「見たときのまま」を条件にすることで、そこを取り違えない。
+    /// </para>
+    /// <para>
+    /// 条件が合わずに消さなかった場合は false を返す。失敗ではないので、呼び出し側は
+    /// 次の機会に回せばよい。削除そのものができなかった場合は
+    /// <see cref="SyncStorageException"/> を投げる (呼び出し側が 1 件の失敗として
+    /// 扱えるよう、同期先の種類によらない型に揃える)。
+    /// </para>
+    /// <para>
+    /// <b>どちらの同期先でも不可分にはできない。</b> できるのは削除の直前に読み直す
+    /// ところまでで、そこから削除までの一瞬は残る。S3 の条件付き削除は ETag を条件に
+    /// 取るが、ETag は内容の関数なので、内容から決まるキーでは送り直しを区別できない。
+    /// Win32 にも更新時刻を条件にする不可分な削除は無い。
+    /// </para>
+    /// <para>
+    /// 残る幅は同期先による。S3 互換モードは HEAD から DELETE までの 1 往復ぶんで、
+    /// 猶予期間 (既定 7 日) に対しては無視できる。同期フォルダモードでは、ここで読めるのが
+    /// 同期クライアントの持ってきた写しでしかないため、<b>幅は伝播遅延そのもの</b>になる。
+    /// いずれの場合も、次の Push が実体の欠落を見つけて送り直すため自然に回復する。
+    /// </para>
     /// </summary>
-    void Delete(string key);
+    bool TryDelete(StoredObject expected);
 
     /// <summary>
     /// 接頭辞に一致するオブジェクトを列挙する。孤児の回収 (GC) だけが使う。
@@ -137,4 +159,9 @@ public interface IManifestWatcher : IDisposable
 /// <param name="Key">同期先のルートから見たキー。</param>
 /// <param name="LastModified">最後に書かれた時刻。猶予期間の判定に使う。</param>
 /// <param name="Size">大きさ (バイト)。回収でどれだけ空いたかの報告に使う。</param>
+/// <remarks>
+/// ETag は持たない。置き場所を内容から決めている以上、同じキーの内容は常に同じで、
+/// 別の PC が送り直しても ETag は変わらない。「送り直された直後か」を判別できないので、
+/// 削除の条件には <see cref="LastModified"/> を使う。
+/// </remarks>
 public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size);

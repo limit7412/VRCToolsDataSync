@@ -266,19 +266,38 @@ internal sealed class S3Client
         return (lastModified, response.Content.Headers.ContentLength ?? 0L);
     }
 
-    public void DeleteObject(string key)
+    /// <summary>
+    /// オブジェクトを削除する。
+    /// </summary>
+    /// <param name="retryTransientFailures">
+    /// 一時的な不調で再送してよいか。
+    /// <para>
+    /// <b>他の書き手と競合しうるキーでは false にする。</b> 削除が相手に届いたのに
+    /// 応答だけ失われた場合、再送までの数秒の間に別の PC が同じキーへ送り直していると、
+    /// 2 度目の削除がその実体を消す。回収は「読み直したときのまま」を条件に削除を
+    /// 組み立てているが、再送はその条件を確かめ直さずに繰り返すことになる。
+    /// 消し損ねても孤児が残って次回に回るだけなので、消しすぎるより安い。
+    /// </para>
+    /// <para>
+    /// 逆に、他の誰も触らないキー (接続検査の検査用オブジェクトなど) では既定の
+    /// まま再送する。そこで再送を止めると、一時的な 5xx だけで「削除できない保存先」と
+    /// 判定してしまう。
+    /// </para>
+    /// </param>
+    public void DeleteObject(string key, bool retryTransientFailures = true)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
         using var response = Send(
             HttpMethod.Delete, key, query: null, contentFactory: null,
             AwsV4Signer.EmptyPayloadHash, headers: null,
-            HttpCompletionOption.ResponseContentRead, cts.Token);
+            HttpCompletionOption.ResponseContentRead, cts.Token,
+            retryTransientFailures);
 
         // 存在しないキーの削除は成功扱い。S3 互換 API は 204 を返すのが普通だが、
         // 404 を返す実装もあるので受け入れる。
         // ただしバケット自体が無い場合は設定の誤りなのでエラーにする。取得側と違い
         // 「NoSuchKey 以外は失敗」にはしない。実装によって欠落時のコードが異なり、
-        // 任意ファイルの削除は毎回の Push で通るため、狭く判定すると常時失敗する。
+        // 狭く判定すると回収が常時失敗する。
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             var body = ReadErrorBody(response, cts.Token);
@@ -497,10 +516,12 @@ internal sealed class S3Client
         string payloadHash,
         IReadOnlyList<KeyValuePair<string, string>>? headers,
         HttpCompletionOption completionOption,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool retryTransientFailures = true)
     {
         var canonicalQuery = AwsV4Signer.BuildCanonicalQuery(query);
         var (uri, canonicalPath) = BuildUri(key, canonicalQuery);
+        var maxAttempts = retryTransientFailures ? MaxAttempts : 1;
 
         for (var attempt = 1; ; attempt++)
         {
@@ -525,7 +546,7 @@ internal sealed class S3Client
 
                 response = Http.Send(request, completionOption, cancellationToken);
 
-                if (attempt >= MaxAttempts || !IsTransient(response.StatusCode))
+                if (attempt >= maxAttempts || !IsTransient(response.StatusCode))
                 {
                     return response;
                 }
@@ -540,7 +561,7 @@ internal sealed class S3Client
                 // 「保存先へ到達できない」という一つの結果でしかない。HTTP 層の
                 // 例外をそのまま漏らすと、設定不備として扱う経路をすり抜けるため、
                 // 同期先の例外に包み直す。
-                if (attempt >= MaxAttempts || cancellationToken.IsCancellationRequested)
+                if (attempt >= maxAttempts || cancellationToken.IsCancellationRequested)
                 {
                     throw new SyncStorageException(BuildTransportMessage(uri, ex, cancellationToken), ex);
                 }

@@ -42,6 +42,12 @@ internal sealed class FakeSyncStorage : ISyncStorage
     /// </summary>
     public Action? OnBeforeSaveManifest { get; set; }
 
+    /// <summary>
+    /// <see cref="Stat"/> が値を返した直後に呼ばれる。読み直しから削除までの間に
+    /// 他の PC が同じキーへ書き直した状況を作る。
+    /// </summary>
+    public Action<string>? OnStat { get; set; }
+
     public string DisplayName => "fake";
 
     public string StateKeyPrefix => "fake|";
@@ -132,19 +138,37 @@ internal sealed class FakeSyncStorage : ISyncStorage
     public StoredObject? Stat(string key)
     {
         Calls.Add("Stat:" + key);
-        return _objects.TryGetValue(key, out var entry)
-            ? new StoredObject(key, entry.LastModified, entry.Content.Length)
-            : null;
+        if (!_objects.TryGetValue(key, out var entry)) return null;
+
+        // 返す値を先に固定してから割り込ませる。呼び出し側が持つのは読み直した時点の
+        // 状態で、その後に同期先が変わっている、という状況を作るため。
+        var snapshot = new StoredObject(key, entry.LastModified, entry.Content.Length);
+        OnStat?.Invoke(key);
+        return snapshot;
     }
 
-    public void Delete(string key)
+    /// <summary>
+    /// 見たときのままなら削除する。実装と同じく更新日時で判定する。
+    /// <para>
+    /// 条件を見ずに常に消す偽物にすると、この判定が効いていることを確かめられない。
+    /// 実装より甘い偽物は、テストがあること自体を誤った安心に変える。
+    /// </para>
+    /// </summary>
+    public bool TryDelete(StoredObject expected)
     {
-        Calls.Add("Delete:" + key);
-        if (DeleteFailures.Contains(key))
+        Calls.Add("TryDelete:" + expected.Key);
+        if (DeleteFailures.Contains(expected.Key))
         {
-            throw new SyncStorageException($"削除できません (テスト): {key}");
+            throw new SyncStorageException($"削除できません (テスト): {expected.Key}");
         }
-        _objects.Remove(key);
+        if (!_objects.TryGetValue(expected.Key, out var entry)) return true;
+        if (entry.LastModified != expected.LastModified)
+        {
+            Calls.Add("PreconditionFailed:" + expected.Key);
+            return false;
+        }
+        _objects.Remove(expected.Key);
+        return true;
     }
 
     public IEnumerable<StoredObject> List(string keyPrefix)

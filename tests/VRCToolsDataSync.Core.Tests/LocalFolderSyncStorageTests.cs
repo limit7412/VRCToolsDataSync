@@ -167,10 +167,48 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
         Assert.Equal(file.BlobKey, Assert.Single(listed));
     }
 
-    [Fact(DisplayName = "存在しないキーの削除は何もしない")]
-    public void DeletingAMissingKeyIsANoOp()
+    [Fact(DisplayName = "見たときから変わっていれば削除しない")]
+    public void TryDeleteKeepsAnObjectThatChangedSinceItWasSeen()
     {
-        Storage().Delete(BlobKeys.Prefix + new string('a', 64));
+        var storage = Storage();
+        var source = WriteAgedFile("note.txt", "content", TimeSpan.FromDays(1));
+        var (file, _) = SyncTransfer.Send(storage, Array.Empty<ManifestFile>(), source, "fc/notes/a.txt");
+        var seen = storage.Stat(file.BlobKey!);
+        Assert.NotNull(seen);
+
+        // 見た後に別の PC が置き直したことにする。
+        //
+        // DateTime.UtcNow を使わない。直前の Send が刻んだ時刻と同じ刻みに入ったり、
+        // TEMP が更新時刻を粗く丸めるボリューム (FAT/exFAT など) にあったりすると
+        // 同じ値になり、実装が壊れていなくてもテストが落ちる。
+        File.SetLastWriteTimeUtc(
+            StorageKey.ToLocalPath(_root, file.BlobKey!),
+            seen!.LastModified.UtcDateTime.AddHours(1));
+
+        Assert.False(storage.TryDelete(seen!));
+        Assert.True(storage.Exists(file.BlobKey!));
+    }
+
+    [Fact(DisplayName = "見たときのままなら削除する")]
+    public void TryDeleteRemovesAnUnchangedObject()
+    {
+        var storage = Storage();
+        var source = WriteAgedFile("note.txt", "content", TimeSpan.FromDays(1));
+        var (file, _) = SyncTransfer.Send(storage, Array.Empty<ManifestFile>(), source, "fc/notes/a.txt");
+        var seen = storage.Stat(file.BlobKey!);
+        Assert.NotNull(seen);
+
+        Assert.True(storage.TryDelete(seen!));
+        Assert.False(storage.Exists(file.BlobKey!));
+    }
+
+    [Fact(DisplayName = "存在しないキーの削除は成功として扱う")]
+    public void TryDeleteTreatsAMissingKeyAsDone()
+    {
+        var missing = new StoredObject(
+            BlobKeys.Prefix + new string('a', 64), DateTimeOffset.UtcNow, 0);
+
+        Assert.True(Storage().TryDelete(missing));
     }
 
     [Fact(DisplayName = "存在しないキーの Stat は null を返す")]

@@ -183,10 +183,39 @@ public sealed class S3SyncStorage : ISyncStorage
         return head is null ? null : new StoredObject(key, head.Value.LastModified, head.Value.Size);
     }
 
-    public void Delete(string key)
+    /// <summary>
+    /// 見たときのままなら削除する。削除の直前に HEAD で読み直し、更新日時が
+    /// <paramref name="expected"/> と一致する場合だけ消す。
+    /// <para>
+    /// <b>ここは不可分にできない。</b> S3 の条件付き削除は <c>If-Match</c> に ETag を
+    /// 取るが、ETag は内容の関数である。置き場所を内容から決めている以上、同じキーの
+    /// 内容は常に同じで、別の PC が送り直しても ETag は変わらない。つまり
+    /// 「送り直された直後か」を ETag では区別できず、防ぎたい競合にはまったく効かない。
+    /// 汎用バケットの <c>DeleteObject</c> には更新日時を条件にする手段も無い。
+    /// </para>
+    /// <para>
+    /// できるのは削除の直前に読み直すところまでで、そこから DELETE までの一瞬は残る。
+    /// 幅は 1 往復ぶんで、猶予期間 (既定 7 日) に対しては無視できる。ここに入った場合も、
+    /// 次の Push が実体の欠落を見つけて送り直すため自然に回復する。
+    /// </para>
+    /// <para>
+    /// なお同期フォルダモードでは事情が違う。あちらで読めるのは同期クライアントが
+    /// 手元へ持ってきた写しなので、残る幅は伝播遅延そのものになる
+    /// (<see cref="LocalFolderSyncStorage.TryDelete"/>)。
+    /// </para>
+    /// </summary>
+    public bool TryDelete(StoredObject expected)
     {
-        StorageKey.Validate(key);
-        _client.DeleteObject(ToObjectKey(key));
+        StorageKey.Validate(expected.Key);
+
+        var current = _client.Head(ToObjectKey(expected.Key));
+        if (current is null) return true;
+        if (current.Value.LastModified != expected.LastModified) return false;
+
+        // 回収の削除は再送しない。届いたのに応答だけ失われた場合、再送までの間に
+        // 別の PC が送り直していると 2 度目がそれを消す。
+        _client.DeleteObject(ToObjectKey(expected.Key), retryTransientFailures: false);
+        return true;
     }
 
     public IManifestWatcher CreateManifestWatcher()

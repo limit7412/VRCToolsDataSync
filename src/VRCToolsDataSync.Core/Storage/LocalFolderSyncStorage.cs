@@ -309,23 +309,49 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     }
 
     /// <summary>
-    /// キーを削除する。
+    /// 見たときのままなら削除する。
     /// <para>
-    /// 同期クライアントがファイルを掴んでいる、権限が足りないといった理由で失敗しうる。
-    /// 呼び出し側 (回収) が 1 件の失敗として扱えるよう、同期先の種類によらない
-    /// <see cref="SyncStorageException"/> に揃えて投げる。
+    /// Win32 には「更新時刻が一致する場合だけ削除する」不可分な操作が無い。
+    /// できるのは削除の直前に読み直すところまでである。
+    /// </para>
+    /// <para>
+    /// <b>ここで読めるのは、同期クライアントが手元へ持ってきた写しでしかない。</b>
+    /// 別の PC が同じキーへ置き直しても、その更新が届くまでは古い時刻が読める。
+    /// つまり残る幅は 1 回のシステムコールぶんではなく、<b>同期クライアントの伝播
+    /// 遅延そのもの</b>である。猶予期間もこれを埋めない。猶予期間はここで読める
+    /// 時刻を基準に測るので、届いていない更新は「古いまま」に見える。
+    /// </para>
+    /// <para>
+    /// これは同期フォルダモードに元からある性質で、列挙も読み直しも同じ写しを見ている。
+    /// 削除だけの問題ではないため、ここでは閉じない。
+    /// </para>
+    /// <para>
+    /// 同期クライアントがファイルを掴んでいる、権限が足りないといった理由で削除自体が
+    /// 失敗しうる。呼び出し側 (回収) が 1 件の失敗として扱えるよう、同期先の種類に
+    /// よらない <see cref="SyncStorageException"/> に揃えて投げる。
     /// </para>
     /// </summary>
-    public void Delete(string key)
+    public bool TryDelete(StoredObject expected)
     {
-        var path = StorageKey.ToLocalPath(_rootDirectory, key);
-        if (!File.Exists(path)) return;
+        var path = StorageKey.ToLocalPath(_rootDirectory, expected.Key);
         try
         {
+            var info = new FileInfo(path);
+            if (!info.Exists) return true;
+
+            // 見たときと変わっていたら消さない。別の PC の Push が同じ内容を再利用して
+            // 置き直した実体は、これから公開される manifest に参照される。
+            var lastModified = new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
+            if (lastModified != expected.LastModified) return false;
+
             File.Delete(path);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            // 読み直しも同じ範囲に入れる。同期クライアントがファイルを掴んでいると
+            // 更新時刻の取得だけでも失敗しうるので、外に出すと回収がそこで止まり、
+            // 1 件の失敗として次回に回せない。
             throw new SyncStorageException($"ファイルを削除できません: {path} ({ex.Message})", ex);
         }
     }
