@@ -34,6 +34,15 @@ public sealed class CloudWatcher : IManifestWatcher
     // 再試行の待機中に Dispose された場合、待つのをやめて抜ける。
     private readonly ManualResetEventSlim _disposed = new(false);
 
+    // 読み込みは同時に 1 つだけ走らせる。再試行の待機中に次のファイルイベントが
+    // 来るとタイマーが張り直され、別の Elapsed が重なりうるため。
+    private readonly object _gate = new();
+    private bool _running;
+    private bool _rerunRequested;
+
+    // 直前に通知した内容。同じ内容で二度通知しないための比較にだけ使う。
+    private string? _lastSignature;
+
     private FileSystemWatcher? _watcher;
 
     public event Action<SyncManifest>? ManifestChanged;
@@ -76,10 +85,60 @@ public sealed class CloudWatcher : IManifestWatcher
     }
 
     /// <summary>
+    /// manifest の読み込みを 1 つだけ走らせる。
+    /// <para>
+    /// 再試行で待っている間も、ファイルイベントが来れば debounce タイマーは張り直され、
+    /// 別の <c>Elapsed</c> がここへ入ってくる。素通しすると同じ更新に対して
+    /// <see cref="ManifestChanged"/> が二重に上がり、GUI ではトーストと Pull 確認
+    /// ダイアログが重複する。
+    /// </para>
+    /// <para>
+    /// 走っている最中に来た分は「もう一周する」ことだけ伝えて戻る。取りこぼしを
+    /// 防ぐために捨てはせず、何回来ても後続の 1 周にまとめる。
+    /// </para>
+    /// </summary>
+    private void EmitManifestChanged()
+    {
+        lock (_gate)
+        {
+            if (_running)
+            {
+                _rerunRequested = true;
+                return;
+            }
+            _running = true;
+            _rerunRequested = false;
+        }
+
+        try
+        {
+            do
+            {
+                ReadAndNotify();
+            }
+            while (!_disposed.IsSet && ConsumeRerunRequest());
+        }
+        finally
+        {
+            lock (_gate) { _running = false; }
+        }
+    }
+
+    private bool ConsumeRerunRequest()
+    {
+        lock (_gate)
+        {
+            if (!_rerunRequested) return false;
+            _rerunRequested = false;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// manifest を読んで通知する。読めなかった場合は <see cref="RetryDelays"/> の
     /// 間隔で読み直し、それでも駄目なら警告を残す。
     /// </summary>
-    private void EmitManifestChanged()
+    private void ReadAndNotify()
     {
         Exception? lastError = null;
 
@@ -97,6 +156,14 @@ public sealed class CloudWatcher : IManifestWatcher
                     _logger.LogInformation(
                         "manifest を読み直して取得しました ({Attempt} 回目)", attempt + 1);
                 }
+
+                // 内容が前回の通知から変わっていなければ黙って戻る。
+                // ファイルイベントは 1 回の更新で複数回上がることがあり、
+                // 中身が同じなら通知すべき新しい更新は無い。
+                var signature = ManifestSignature.Build(snapshot);
+                if (signature == _lastSignature) return;
+                _lastSignature = signature;
+
                 ManifestChanged?.Invoke(snapshot.Manifest);
                 return;
             }

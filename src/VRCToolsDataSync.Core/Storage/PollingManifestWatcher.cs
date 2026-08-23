@@ -77,7 +77,7 @@ public sealed class PollingManifestWatcher : IManifestWatcher
                     _failureLogged = false;
                     _logger.LogInformation("manifest の確認が復帰しました: {Target}", _storage.DisplayName);
                 }
-                var signature = BuildSignature(snapshot);
+                var signature = ManifestSignature.Build(snapshot);
                 if (signature != _lastSignature)
                 {
                     _lastSignature = signature;
@@ -107,22 +107,6 @@ public sealed class PollingManifestWatcher : IManifestWatcher
                 try { _timer.Start(); } catch (ObjectDisposedException) { /* Dispose と競合 */ }
             }
         }
-    }
-
-    /// <summary>
-    /// 変更検知に使う指紋。ETag を出す同期先はそれを使い、出さない同期先では
-    /// ツールごとの version の組で代用する。
-    /// </summary>
-    private static string BuildSignature(ManifestSnapshot snapshot)
-    {
-        if (snapshot.VersionTag is { Length: > 0 } tag)
-        {
-            return "tag:" + tag;
-        }
-        var versions = snapshot.Manifest.Tools
-            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => $"{pair.Key}={pair.Value.Version}");
-        return "versions:" + string.Join(",", versions);
     }
 
     public void Dispose()
