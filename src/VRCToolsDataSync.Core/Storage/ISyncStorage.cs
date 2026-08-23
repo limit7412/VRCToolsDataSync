@@ -78,6 +78,15 @@ public interface ISyncStorage
     bool Exists(string key);
 
     /// <summary>
+    /// キー 1 件の現在の情報を読み直す。無ければ null。
+    /// <para>
+    /// <see cref="List"/> が返すのは取った時点の写しでしかない。回収は削除の直前に
+    /// これで見直し、列挙してからの間に書き直された実体を消さないようにする。
+    /// </para>
+    /// </summary>
+    StoredObject? Stat(string key);
+
+    /// <summary>
     /// キーを削除する。存在しない場合は何もしない。
     /// 削除できなかった場合は <see cref="SyncStorageException"/> を投げる
     /// (呼び出し側が 1 件の失敗として扱えるよう、同期先の種類によらない型に揃える)。

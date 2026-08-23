@@ -284,6 +284,13 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     public bool Exists(string key)
         => File.Exists(StorageKey.ToLocalPath(_rootDirectory, key));
 
+    public StoredObject? Stat(string key)
+    {
+        var info = new FileInfo(StorageKey.ToLocalPath(_rootDirectory, key));
+        if (!info.Exists) return null;
+        return new StoredObject(key, new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero), info.Length);
+    }
+
     /// <summary>
     /// キーを削除する。
     /// <para>

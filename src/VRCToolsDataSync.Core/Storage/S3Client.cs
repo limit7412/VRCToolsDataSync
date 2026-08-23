@@ -184,7 +184,7 @@ internal sealed class S3Client
         }
 
         // 応答本文は一度しか読めないので、ここで読み切ってから判定と例外に回す。
-        var errorBody = ReadBody(response, cts.Token);
+        var errorBody = ReadErrorBody(response, cts.Token);
         if (conditionHeaders is { Count: > 0 })
         {
             // S3 は条件付き書き込みの衝突を 412 ではなく 409 で返すことがある。
@@ -244,6 +244,28 @@ internal sealed class S3Client
         return true;
     }
 
+    /// <summary>
+    /// オブジェクトの現在の更新日時と大きさを HEAD で読み直す。無ければ null。
+    /// 一覧の結果は取った時点の写しでしかないため、回収がその判断を使う直前に
+    /// これで見直す。
+    /// </summary>
+    public (DateTimeOffset LastModified, long Size)? Head(string key)
+    {
+        using var cts = new CancellationTokenSource(_options.Timeout);
+        using var response = Send(
+            HttpMethod.Head, key, query: null, contentFactory: null,
+            AwsV4Signer.EmptyPayloadHash, headers: null,
+            HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+        if (response.StatusCode == HttpStatusCode.NotFound) return null;
+        EnsureSuccess(response, $"オブジェクトの確認 ({key})", cts.Token);
+
+        // Last-Modified が読めない場合は「今書かれたばかり」に倒す。回収の判断に使う
+        // 値なので、分からないときは消さない側へ寄せる。
+        var lastModified = response.Content.Headers.LastModified ?? DateTimeOffset.UtcNow;
+        return (lastModified, response.Content.Headers.ContentLength ?? 0L);
+    }
+
     public void DeleteObject(string key)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
@@ -259,7 +281,7 @@ internal sealed class S3Client
         // 任意ファイルの削除は毎回の Push で通るため、狭く判定すると常時失敗する。
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
-            var body = ReadBody(response, cts.Token);
+            var body = ReadErrorBody(response, cts.Token);
             var (code, _) = ParseError(body);
             if (!string.Equals(code, "NoSuchBucket", StringComparison.Ordinal))
             {
@@ -297,7 +319,7 @@ internal sealed class S3Client
                     AwsV4Signer.EmptyPayloadHash, headers: null,
                     HttpCompletionOption.ResponseContentRead, cts.Token);
                 EnsureSuccess(response, $"オブジェクトの一覧 ({keyPrefix})", cts.Token);
-                body = ReadBody(response, cts.Token);
+                body = ReadFullBody(response, cts.Token);
             }
 
             XDocument document;
@@ -445,7 +467,7 @@ internal sealed class S3Client
         EnsureSuccess(response, $"マルチパートアップロードの完了 ({key})");
 
         // 完了要求は HTTP 200 を返してから本文でエラーを伝えることがある。
-        var text = ReadBody(response, cts.Token);
+        var text = ReadErrorBody(response, cts.Token);
         if (text.Contains("<Error", StringComparison.Ordinal))
         {
             var (code, message) = ParseError(text);
@@ -610,7 +632,7 @@ internal sealed class S3Client
     /// </summary>
     private static bool IsMissingObject(HttpResponseMessage response, string operation, CancellationToken cancellationToken)
     {
-        var body = ReadBody(response, cancellationToken);
+        var body = ReadErrorBody(response, cancellationToken);
         var (code, _) = ParseError(body);
         if (code.Length == 0 || string.Equals(code, "NoSuchKey", StringComparison.Ordinal))
         {
@@ -622,7 +644,7 @@ internal sealed class S3Client
     private static void EnsureSuccess(HttpResponseMessage response, string operation, CancellationToken cancellationToken = default)
     {
         if (response.IsSuccessStatusCode) return;
-        throw BuildFailure(response.StatusCode, ReadBody(response, cancellationToken), operation);
+        throw BuildFailure(response.StatusCode, ReadErrorBody(response, cancellationToken), operation);
     }
 
     private static SyncStorageException BuildFailure(HttpStatusCode status, string body, string operation)
@@ -633,7 +655,9 @@ internal sealed class S3Client
     }
 
     /// <summary>
-    /// 応答本文を読み出す。本文のストリームは一度しか読めないので、
+    /// 失敗を説明するための応答本文を読み出す。<see cref="MaxErrorBodyChars"/> で
+    /// 打ち切るので、本文そのものが結果である応答には使えない (一覧なら
+    /// <see cref="ReadFullBody"/>)。本文のストリームは一度しか読めないので、
     /// 呼び出し側は結果を使い回すこと。
     /// <para>
     /// ResponseHeadersRead で受けた応答ではバッファされていないネットワーク
@@ -642,7 +666,7 @@ internal sealed class S3Client
     /// 期限が来たら応答を破棄して、止まっている読み取りを失敗させる。
     /// </para>
     /// </summary>
-    private static string ReadBody(HttpResponseMessage response, CancellationToken cancellationToken)
+    private static string ReadErrorBody(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         using var registration = cancellationToken.Register(
             static state => ((HttpResponseMessage)state!).Dispose(), response);
@@ -665,6 +689,34 @@ internal sealed class S3Client
         {
             // 本文が読めなくても、状態コードだけで失敗の内容は組み立てられる。
             return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// 応答本文を最後まで読み出す。一覧のように、本文そのものが結果である応答に使う。
+    /// <para>
+    /// 読めなかった場合は空文字を返さずに投げる。一覧で空を返すと「オブジェクトが
+    /// 1 件も無い」と区別が付かず、回収が何も見つけなかったものとして静かに終わる。
+    /// </para>
+    /// </summary>
+    private static string ReadFullBody(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        // ReadErrorBody と同じ理由で、期限が来たら応答を破棄して読み取りを失敗させる。
+        using var registration = cancellationToken.Register(
+            static state => ((HttpResponseMessage)state!).Dispose(), response);
+        try
+        {
+            using var stream = response.Content.ReadAsStream(cancellationToken);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            return reader.ReadToEnd();
+        }
+        catch when (cancellationToken.IsCancellationRequested)
+        {
+            throw new SyncStorageException("応答本文の読み取りがタイムアウトしました");
+        }
+        catch (Exception ex)
+        {
+            throw new SyncStorageException("応答本文を読み取れませんでした", ex);
         }
     }
 

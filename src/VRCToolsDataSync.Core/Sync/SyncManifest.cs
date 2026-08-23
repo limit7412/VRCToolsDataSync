@@ -130,6 +130,20 @@ public sealed class ManifestStore
         for (var attempt = 1; ; attempt++)
         {
             var snapshot = _storage.LoadManifest();
+
+            // この版が知らない形式の manifest には触らない。デシリアライズは知らない
+            // フィールドを黙って捨てるため、読んで書き戻すだけで新しい版が書いた情報が
+            // 落ちる。しかもその結果を現行形式として宣言することになり、新しい版から
+            // 見て「形式は 2 だが中身が壊れている」manifest ができあがる。
+            if (snapshot.Manifest.SchemaVersion > SyncManifest.CurrentSchemaVersion)
+            {
+                throw new SyncStorageException(
+                    $"同期先の manifest.json は、この版が扱えない形式です " +
+                    $"(schemaVersion={snapshot.Manifest.SchemaVersion}、" +
+                    $"この版が扱えるのは {SyncManifest.CurrentSchemaVersion} まで)。" +
+                    "他の PC がより新しい版で Push しています。VRCToolsDataSync を更新してください。");
+            }
+
             var currentVersion =
                 snapshot.Manifest.Tools.TryGetValue(toolKey, out var previous) ? previous.Version : 0;
 
@@ -144,7 +158,8 @@ public sealed class ManifestStore
             // 読み込んだ manifest には、その manifest を書いた版の schemaVersion が
             // 入っている。ここで書き出す内容は現行形式 (BlobKey を含む) なので、
             // 宣言も現行値へ揃える。揃えないと、形式で分岐する読み手に 1 と伝えたまま
-            // 2 の内容を渡すことになる。
+            // 2 の内容を渡すことになる。上で弾いているので、ここへ来るのは
+            // CurrentSchemaVersion 以下、つまり引き上げにしかならない。
             snapshot.Manifest.SchemaVersion = SyncManifest.CurrentSchemaVersion;
 
             if (_storage.TrySaveManifest(snapshot.Manifest, snapshot.VersionTag))

@@ -176,6 +176,13 @@ public sealed class S3SyncStorage : ISyncStorage
         return _client.Exists(ToObjectKey(key));
     }
 
+    public StoredObject? Stat(string key)
+    {
+        StorageKey.Validate(key);
+        var head = _client.Head(ToObjectKey(key));
+        return head is null ? null : new StoredObject(key, head.Value.LastModified, head.Value.Size);
+    }
+
     public void Delete(string key)
     {
         StorageKey.Validate(key);

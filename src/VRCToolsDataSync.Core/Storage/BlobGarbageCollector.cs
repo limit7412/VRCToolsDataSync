@@ -36,6 +36,12 @@ public sealed record BlobGarbageCollectionResult(
 /// 参照が 1 件も集まらなかった場合は回収そのものを中止する。manifest を読めない
 /// 一瞬に当たっただけかもしれず、その判断のまま走らせると全部消すことになる。
 /// </para>
+/// <para>
+/// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直す。列挙は取った
+/// 時点の写しなので、走査に時間がかかるほど判断が古くなる。読み直しても Stat と
+/// Delete の間は残るが、その幅は 1 往復ぶんで、猶予期間 (既定 7 日) に対して無視できる。
+/// 列挙から削除までの数分と違い、Push がその隙間に収まることはない。
+/// </para>
 /// </summary>
 public sealed class BlobGarbageCollector
 {
@@ -123,9 +129,26 @@ public sealed class BlobGarbageCollector
 
             try
             {
+                // 列挙は取った時点の写しでしかない。列挙してからここへ来るまでの間に、
+                // 別の PC の Push が同じ内容を再利用して置き直していることがある。
+                // その実体はこれから公開される manifest に参照されるので、列挙時の
+                // 古い日時のまま消すと欠落になる。削除の直前に読み直して判定し直す。
+                var current = _storage.Stat(stored.Key);
+                if (current is null)
+                {
+                    // 既に無い。他の PC の回収と重なっただけなので、成功でも失敗でもない。
+                    continue;
+                }
+                if (current.LastModified > threshold)
+                {
+                    young++;
+                    _logger.LogInformation("列挙後に書き直されたため残します: {Key}", stored.Key);
+                    continue;
+                }
+
                 _storage.Delete(stored.Key);
                 deleted++;
-                deletedBytes += stored.Size;
+                deletedBytes += current.Size;
                 _logger.LogInformation("回収しました: {Key}", stored.Key);
             }
             catch (SyncStorageException ex)
