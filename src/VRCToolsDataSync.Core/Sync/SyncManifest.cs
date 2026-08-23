@@ -6,7 +6,18 @@ namespace VRCToolsDataSync.Core.Sync;
 
 public sealed class SyncManifest
 {
-    public int SchemaVersion { get; set; } = 1;
+    /// <summary>
+    /// 書き出す manifest の形式。
+    /// <para>
+    /// 2 で、実データの置き場所を内容から決まるキー (<see cref="BlobKeys"/>) に変えた。
+    /// 1 を書いた版は <see cref="ManifestFile.RelativePath"/> をそのままキーとして扱う
+    /// ため、2 の manifest からは目的のオブジェクトを見つけられない。読み込み側は
+    /// 1 も扱えるが、逆は成り立たない。
+    /// </para>
+    /// </summary>
+    public const int CurrentSchemaVersion = 2;
+
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public Dictionary<string, ToolManifestEntry> Tools { get; set; } = new();
 }
 
@@ -28,6 +39,29 @@ public sealed class ManifestFile
     public string RelativePath { get; set; } = string.Empty;
     public long Size { get; set; }
     public string Sha256 { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 実データを置いてあるキー。内容から決まる (<see cref="BlobKeys.FromSha256"/>)。
+    /// <para>
+    /// schemaVersion 1 の manifest には無い。その場合は
+    /// <see cref="RelativePath"/> がそのままキーだったので、読み込み側は
+    /// <see cref="ManifestFileKeys.StorageKeyOf"/> を通して解決する。
+    /// </para>
+    /// </summary>
+    public string? BlobKey { get; set; }
+}
+
+/// <summary>
+/// <see cref="ManifestFile"/> から実データのキーを取り出す。
+/// </summary>
+public static class ManifestFileKeys
+{
+    /// <summary>
+    /// 実データが置いてあるキー。schemaVersion 1 の manifest (BlobKey が無い) では
+    /// RelativePath がそのままキーだったので、そちらへ落とす。
+    /// </summary>
+    public static string StorageKeyOf(ManifestFile file)
+        => string.IsNullOrEmpty(file.BlobKey) ? file.RelativePath : file.BlobKey;
 }
 
 /// <summary>
@@ -71,7 +105,36 @@ public sealed class ManifestStore
         _storage = storage;
     }
 
-    public SyncManifest Load() => _storage.LoadManifest().Manifest;
+    /// <summary>
+    /// manifest を読み込む。この版で扱えない形式なら投げる
+    /// (<see cref="EnsureSupported"/>)。
+    /// </summary>
+    public SyncManifest Load()
+    {
+        var manifest = _storage.LoadManifest().Manifest;
+        EnsureSupported(manifest);
+        return manifest;
+    }
+
+    /// <summary>
+    /// この版で扱える形式かを確かめる。扱えなければ <see cref="SyncStorageException"/>。
+    /// <para>
+    /// デシリアライズは知らないフィールドを黙って捨てる。捨てた結果を「manifest の
+    /// すべて」として扱うと、内容を書き換える側が軒並み壊れる。Push は落ちた情報を
+    /// 捨てたまま書き戻し、Pull は新しい形式が別の意味で使っているエントリを古い解釈で
+    /// ローカルへ反映し (notes フォルダの削除まで行う)、回収は見えない参照を孤児と
+    /// 判定して消す。読めた範囲で進めるより、扱えないと言って止まる方が安全である。
+    /// </para>
+    /// </summary>
+    public static void EnsureSupported(SyncManifest manifest)
+    {
+        if (manifest.SchemaVersion <= SyncManifest.CurrentSchemaVersion) return;
+        throw new SyncStorageException(
+            $"同期先の manifest.json は、この版が扱えない形式です " +
+            $"(schemaVersion={manifest.SchemaVersion}、" +
+            $"この版が扱えるのは {SyncManifest.CurrentSchemaVersion} まで)。" +
+            "他の PC がより新しい版で Push しています。VRCToolsDataSync を更新してください。");
+    }
 
     /// <summary>
     /// 指定 tool のエントリを read-modify-write で更新し、採番した version を返す。
@@ -96,6 +159,12 @@ public sealed class ManifestStore
         for (var attempt = 1; ; attempt++)
         {
             var snapshot = _storage.LoadManifest();
+
+            // 保存の直前に読み直しているので、ここでも確かめる。Load を経由しない経路
+            // なので、読み込みから保存までの間に他の PC がより新しい版で公開した場合を
+            // ここで捕まえる。
+            EnsureSupported(snapshot.Manifest);
+
             var currentVersion =
                 snapshot.Manifest.Tools.TryGetValue(toolKey, out var previous) ? previous.Version : 0;
 
@@ -106,6 +175,13 @@ public sealed class ManifestStore
 
             var nextVersion = currentVersion + 1;
             snapshot.Manifest.Tools[toolKey] = buildEntry(nextVersion);
+
+            // 読み込んだ manifest には、その manifest を書いた版の schemaVersion が
+            // 入っている。ここで書き出す内容は現行形式 (BlobKey を含む) なので、
+            // 宣言も現行値へ揃える。揃えないと、形式で分岐する読み手に 1 と伝えたまま
+            // 2 の内容を渡すことになる。上で弾いているので、ここへ来るのは
+            // CurrentSchemaVersion 以下、つまり引き上げにしかならない。
+            snapshot.Manifest.SchemaVersion = SyncManifest.CurrentSchemaVersion;
 
             if (_storage.TrySaveManifest(snapshot.Manifest, snapshot.VersionTag))
             {

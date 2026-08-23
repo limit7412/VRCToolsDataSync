@@ -102,20 +102,38 @@ public sealed class S3SyncStorage : ISyncStorage
         }
     }
 
-    public void Upload(string localPath, string key)
+    private void Upload(string localPath, string key)
     {
         StorageKey.Validate(key);
         _client.PutFile(ToObjectKey(key), localPath);
     }
 
-    public IStagedUpload BeginUpload(string key)
+    public IStagedUpload BeginUpload()
     {
-        StorageKey.Validate(key);
         var stagingDirectory = Path.Combine(Path.GetTempPath(), "VRCToolsDataSync", "staging");
         Directory.CreateDirectory(stagingDirectory);
         PruneStaleStagingFiles(stagingDirectory);
         var stagingPath = Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + ".tmp");
-        return new StagedObject(this, key, stagingPath);
+        return new StagedObject(this, stagingPath);
+    }
+
+    public IEnumerable<StoredObject> List(string keyPrefix)
+    {
+        var prefix = ToObjectKey(keyPrefix);
+        foreach (var (key, lastModified, size) in _client.ListObjects(prefix))
+        {
+            // キー接頭辞を設定している場合、呼び出し側にはそれを除いた形で返す。
+            if (_keyPrefix.Length > 0)
+            {
+                var scoped = _keyPrefix + "/";
+                if (!key.StartsWith(scoped, StringComparison.Ordinal)) continue;
+                yield return new StoredObject(key[scoped.Length..], lastModified, size);
+            }
+            else
+            {
+                yield return new StoredObject(key, lastModified, size);
+            }
+        }
     }
 
     /// <summary>
@@ -158,6 +176,13 @@ public sealed class S3SyncStorage : ISyncStorage
         return _client.Exists(ToObjectKey(key));
     }
 
+    public StoredObject? Stat(string key)
+    {
+        StorageKey.Validate(key);
+        var head = _client.Head(ToObjectKey(key));
+        return head is null ? null : new StoredObject(key, head.Value.LastModified, head.Value.Size);
+    }
+
     public void Delete(string key)
     {
         StorageKey.Validate(key);
@@ -180,11 +205,18 @@ public sealed class S3SyncStorage : ISyncStorage
         // 認証、バケットの存在、読み取り権限。
         LoadManifest();
 
+        // 一覧の権限。S3 では s3:GetObject と s3:ListBucket を別々に許可できるため、
+        // 取得だけ通る認証情報がここまで素通りする。回収 (storage gc) は
+        // ListObjectsV2 を必ず呼ぶので、確認しないと設定は保存できても実行時に
+        // 403 となり、孤児を片付ける唯一の手段が使えない。
+        // 1 ページ目を取れれば十分なので、1 件だけ引いて打ち切る。
+        _ = _client.ListObjects(ToObjectKey(BlobKeys.Prefix)).Take(1).ToList();
+
         // 書き込みと削除の権限。名前が衝突しないよう GUID を使い、後始末する。
         //
-        // 削除の失敗も接続テストの失敗として扱う。Push は通常の経路で削除を行う
-        // (ローカルから消えた任意ファイルの削除と、古い note の回収) ため、
-        // s3:DeleteObject を欠く認証情報では設定を保存できても同期が失敗する。
+        // 削除の失敗も接続テストの失敗として扱う。Push は実データを消さないが、
+        // 参照されなくなった実体の回収 (storage gc) が削除を行うため、
+        // s3:DeleteObject を欠く認証情報では設定を保存できても回収が失敗し続ける。
         // 消し残した検査用オブジェクトはここでは回収できないが、設定が保存されない
         // 以上、利用者は権限を直して再度試すことになる。
         var probeKey = ToObjectKey($"_access-check/{Guid.NewGuid():N}");
@@ -197,8 +229,8 @@ public sealed class S3SyncStorage : ISyncStorage
         {
             _logger.LogWarning(ex, "検査用オブジェクトの削除に失敗しました: {Key}", probeKey);
             throw new SyncStorageException(
-                "同期先のオブジェクトを削除できません。Push ではローカルから消えたファイルの" +
-                $"削除も行うため、削除の権限 (s3:DeleteObject) が必要です。({ex.Message})", ex);
+                "同期先のオブジェクトを削除できません。参照されなくなった実体の回収 " +
+                $"(storage gc) に削除の権限 (s3:DeleteObject) が必要です。({ex.Message})", ex);
         }
     }
 
@@ -229,18 +261,16 @@ public sealed class S3SyncStorage : ISyncStorage
     private sealed class StagedObject : IStagedUpload
     {
         private readonly S3SyncStorage _storage;
-        private readonly string _key;
 
-        public StagedObject(S3SyncStorage storage, string key, string stagingPath)
+        public StagedObject(S3SyncStorage storage, string stagingPath)
         {
             _storage = storage;
-            _key = key;
             LocalPath = stagingPath;
         }
 
         public string LocalPath { get; }
 
-        public void Commit() => _storage.Upload(LocalPath, _key);
+        public void Commit(string key) => _storage.Upload(LocalPath, key);
 
         public void Dispose()
         {

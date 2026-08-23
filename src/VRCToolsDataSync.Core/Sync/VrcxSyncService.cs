@@ -67,7 +67,7 @@ public sealed class VrcxSyncService : ISyncService
         // WAL を統合したスナップショットを作ってから送る。ローカルフォルダなら
         // 同期先の一時ファイルへ直接 VACUUM し、S3 互換なら一時ファイル経由で
         // アップロードする (どちらを使うかは同期先の実装が決める)。
-        using (var staged = storage.BeginUpload(SnapshotKey))
+        using (var staged = storage.BeginUpload())
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
@@ -77,7 +77,7 @@ public sealed class VrcxSyncService : ISyncService
             }
             else
             {
-                staged.Commit();
+                staged.Commit(ManifestFileKeys.StorageKeyOf(snapshot));
                 affected.Add(SnapshotKey);
             }
             files.Add(snapshot);
@@ -85,25 +85,26 @@ public sealed class VrcxSyncService : ISyncService
 
         if (File.Exists(_paths.SettingsJsonFile))
         {
-            var settingsFile = SyncTransfer.Describe(_paths.SettingsJsonFile, SettingsKey);
-            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, settingsFile))
+            var (settingsFile, sent) = SyncTransfer.Send(
+                storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey);
+            if (sent)
             {
-                _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
+                affected.Add(SettingsKey);
             }
             else
             {
-                storage.Upload(_paths.SettingsJsonFile, SettingsKey);
-                affected.Add(SettingsKey);
+                _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
             }
             files.Add(settingsFile);
         }
-        else
-        {
-            // ローカルから消えた任意ファイルは同期先からも削除する。
-            // ここで握りつぶすと Pull 側で古い latest.json が他 PC へ復元され、
-            // 削除した設定が復活する。失敗した場合は Push 全体を失敗扱いにする。
-            storage.Delete(SettingsKey);
-        }
+        // ローカルから消えた任意ファイルは、manifest の files[] に載せないことで
+        // 「無い」ことを表す。Pull 側は manifest を正としてローカルへ反映するので、
+        // 削除はそれで伝わる。
+        //
+        // 実データの削除はここでは行わない。置き場所は内容から決まるので、同じ内容を
+        // 他の tool や他の世代が参照していることがあり、Push の後始末として消すと
+        // 他の PC が参照しているオブジェクトを巻き込む。参照されなくなったものは
+        // 猶予期間を置いて GC (BlobGarbageCollector) が回収する。
 
         if (SyncTransfer.IsUnchangedSet(existing, files))
         {

@@ -21,16 +21,23 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
 ```text
 <保存先のルート>/
   manifest.json                    # ツール別の version / machineName / files[]
-  vrcx/
-    latest.sqlite3                 # VACUUM INTO で WAL を統合した単一ファイル
-    latest.json                    # VRCX.json
-  friend-connect/
-    db/
-      db.sqlite                    # VACUUM INTO スナップショット
-      db_1.1.sqlite
-    config.json
-    notes/                         # 存在する場合のみ
+  blobs/
+    <sha256>                       # 実データ。置き場所は内容から決まる
 ```
+
+実データの置き場所は**内容の SHA-256 から決める**。`manifest.json` の `files[]` が、ツールの中での位置 (`vrcx/latest.sqlite3` など) と、その実体がある `blobs/<sha256>` を対応付ける。
+
+```json
+{
+  "relativePath": "vrcx/latest.sqlite3",
+  "sha256": "9f2c…",
+  "blobKey": "blobs/9f2c…"
+}
+```
+
+固定のキーへ上書きしないので、**同じキーには常に同じ中身しか入らない**。2 台が同時に Push しても、manifest の記録と実体がずれることがない。同じ内容を二度送らずに済む利点もある (変わっていないファイルはキーも変わらないため、既にあるものとして送信を省ける)。
+
+参照されなくなった実体はその場では消さない。他の PC が送っている最中のものを巻き込まないよう、猶予期間を置いて `storage gc` が回収する。
 
 S3 互換モードでは、この全体をバケット内の任意の接頭辞の下に置ける（`--prefix`）。
 
@@ -148,11 +155,41 @@ VRCToolsDataSync.Cli.exe storage test
 VRCToolsDataSync.Cli.exe storage local --path "D:\OneDrive\VRCToolsDataSync"
 ```
 
+### 不要になったデータを回収する
+
+Push は実データを消さない。置き場所が内容から決まるため、同じ内容を別の世代が参照していることがあり、その場で消すと他の PC が公開したばかりの manifest が実体を失いかねないためである。
+
+参照されなくなった実体は `storage gc` で回収する。
+
+```powershell
+# まず対象を確認する (削除はしない)
+VRCToolsDataSync.Cli.exe storage gc --dry-run
+
+# 回収する
+VRCToolsDataSync.Cli.exe storage gc
+```
+
+現在の `manifest.json` から参照されていない実体のうち、**最後に書かれてから 7 日以上経ったもの**が対象になる。この猶予期間は、他の PC が送っている最中の実体 (まだどの manifest からも参照されていない) を巻き込まないためのもので、`--grace-days` で変えられる。
+
+複数 PC で使っている場合、猶予期間を極端に短くすると進行中の Push を壊しうる。既定のままを勧める。
+
+`manifest.json` から参照されている実体が 1 件も見つからない場合、回収は何もせずに中止する。同期クライアントが `manifest.json` を置き換えている一瞬に当たると空の manifest を読みうるためで、その判断のまま進めると生きている実体まで消してしまう。
+
 ### 注意点
 
 - エンドポイントは `https` のみ受け付ける。ファイルの送信では本文のハッシュを署名に含めない代わりに、内容の完全性を TLS に委ねているため。
 - シークレットアクセスキーは DPAPI で保護して保存する。復号できるのは保存した Windows ユーザだけなので、`settings.json` を別 PC へコピーしても S3 の設定は引き継げない。PC ごとに設定し直すこと。
 - 同期履歴 (`toolState`) は保存先ごとに別のキーで持つ。保存先を切り替えても、元の保存先の履歴はそのまま残る。同期フォルダも、フォルダのパスごとに別の履歴になる。
+
+## 更新時の注意 (0.0.6 以前からの移行)
+
+0.0.7 で `manifest.json` の形式が変わった (`schemaVersion` 1 → 2)。実データの置き場所を固定のキーから内容由来のキーへ移したためである。
+
+**同じ保存先を共有するすべての PC を更新すること。** 0.0.7 以降は 1 と 2 のどちらの manifest も読めるが、0.0.6 以前は 2 を読めない。更新していない PC で Pull すると、実体が見つからず「同期先にファイルがありません」で失敗する (データが壊れることはない)。
+
+更新した PC が一度 Push すれば manifest は 2 になる。移行のための操作は要らない。
+
+古い形式で置かれていた実データ (`vrcx/latest.sqlite3` など) は、新しい形式に切り替わった後どの manifest からも参照されなくなるが、`blobs/` の外にあるため `storage gc` の対象にはならない。不要になったら手作業で消す。
 
 ## GUI
 

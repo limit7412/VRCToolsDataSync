@@ -73,7 +73,9 @@ internal sealed class PullStaging : IDisposable
         }
 
         var stagingPath = targetPath + IncomingMarker + Guid.NewGuid().ToString("N");
-        if (!storage.TryDownload(remote.RelativePath, stagingPath))
+        // 取り出し元は内容から決まるキー。schemaVersion 1 の manifest では
+        // RelativePath がそのままキーだったので、そちらへ落ちる。
+        if (!storage.TryDownload(ManifestFileKeys.StorageKeyOf(remote), stagingPath))
         {
             return false;
         }
