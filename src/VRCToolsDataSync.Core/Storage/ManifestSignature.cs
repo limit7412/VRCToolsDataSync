@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text.Json;
 using VRCToolsDataSync.Core.Sync;
 
 namespace VRCToolsDataSync.Core.Storage;
@@ -9,9 +11,16 @@ namespace VRCToolsDataSync.Core.Storage;
 internal static class ManifestSignature
 {
     /// <summary>
-    /// ETag を出す同期先はそれを使い、出さない同期先ではツールごとの version の組で
-    /// 代用する。version は Push のたびに増えるので、これが同じなら通知すべき新しい
-    /// 更新は無い。
+    /// ETag を出す同期先はそれを使う。出さない同期先 (ローカルフォルダ) では
+    /// manifest の中身そのものから作る。
+    /// <para>
+    /// 中身を使うのは、ツール名と version だけでは足りないため。ローカルフォルダ
+    /// モードには条件付き書き込みが無いので、同じ旧 version から 2 台が並行して
+    /// Push すると、どちらも同じ次の version を持つ manifest を作れる。自分の
+    /// version 2 を見た後に別 PC の version 2 が届くと、version だけの指紋では
+    /// 同じと判定してリモートの更新を握り潰してしまう。MachineName やファイルの
+    /// 一覧まで含めれば、この 2 つは別物として扱える。
+    /// </para>
     /// </summary>
     public static string Build(ManifestSnapshot snapshot)
     {
@@ -19,9 +28,10 @@ internal static class ManifestSignature
         {
             return "tag:" + tag;
         }
-        var versions = snapshot.Manifest.Tools
-            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => $"{pair.Key}={pair.Value.Version}");
-        return "versions:" + string.Join(",", versions);
+
+        // 直列化したものをそのまま持たず、ハッシュにして比較する。note が多い
+        // manifest でも指紋の大きさが一定になる。
+        var payload = JsonSerializer.SerializeToUtf8Bytes(snapshot.Manifest, ManifestJson.Options);
+        return "content:" + Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
     }
 }

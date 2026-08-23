@@ -72,16 +72,20 @@ public sealed class PollingManifestWatcher : IManifestWatcher
             lock (_pollLock)
             {
                 var snapshot = _storage.LoadManifest();
-                if (_failureLogged)
-                {
-                    _failureLogged = false;
-                    _logger.LogInformation("manifest の確認が復帰しました: {Target}", _storage.DisplayName);
-                }
                 var signature = ManifestSignature.Build(snapshot);
                 if (signature != _lastSignature)
                 {
                     _lastSignature = signature;
                     ManifestChanged?.Invoke(snapshot.Manifest);
+                }
+
+                // 復帰の判定は一周を最後まで終えてから。読み込みが通った時点で
+                // 解除すると、その後 (署名の生成や通知) が毎回失敗する状況で、
+                // 復帰と警告を交互に出し続けることになる。
+                if (_failureLogged)
+                {
+                    _failureLogged = false;
+                    _logger.LogInformation("manifest の確認が復帰しました: {Target}", _storage.DisplayName);
                 }
             }
         }

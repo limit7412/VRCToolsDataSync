@@ -112,25 +112,30 @@ public sealed class CloudWatcher : IManifestWatcher
 
         try
         {
-            do
+            while (true)
             {
                 ReadAndNotify();
-            }
-            while (!_disposed.IsSet && ConsumeRerunRequest());
-        }
-        finally
-        {
-            lock (_gate) { _running = false; }
-        }
-    }
 
-    private bool ConsumeRerunRequest()
-    {
-        lock (_gate)
+                // 「もう一周するか」の判断と実行権の解放は同じロックの中で行う。
+                // 分けると、抜けると決めてから _running を下ろすまでの間に入ってきた
+                // 呼び出しが「走っている」と見て要求だけ置いて帰り、その要求を誰も
+                // 拾わないまま終わる。次のファイルイベントまで通知が失われる。
+                lock (_gate)
+                {
+                    if (_disposed.IsSet || !_rerunRequested)
+                    {
+                        _running = false;
+                        return;
+                    }
+                    _rerunRequested = false;
+                }
+            }
+        }
+        catch
         {
-            if (!_rerunRequested) return false;
-            _rerunRequested = false;
-            return true;
+            // 想定外の例外で実行権を握ったままにすると、以後の通知が一切出なくなる。
+            lock (_gate) { _running = false; }
+            throw;
         }
     }
 
