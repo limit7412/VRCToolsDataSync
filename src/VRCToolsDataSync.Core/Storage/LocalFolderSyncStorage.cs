@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 
@@ -17,8 +18,9 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     private static readonly byte[] ProbePayload = "VRCToolsDataSync access check"u8.ToArray();
 
     private readonly string _rootDirectory;
+    private readonly ILoggerFactory? _loggerFactory;
 
-    public LocalFolderSyncStorage(string rootDirectory)
+    public LocalFolderSyncStorage(string rootDirectory, ILoggerFactory? loggerFactory = null)
     {
         if (string.IsNullOrWhiteSpace(rootDirectory))
         {
@@ -27,6 +29,7 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         // 末尾の区切りを落として揃える。"D:\\sync" と "D:\\sync\\" が
         // 別の同期先として扱われると、同期履歴が分かれてしまう。
         _rootDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootDirectory.Trim()));
+        _loggerFactory = loggerFactory;
     }
 
     public string RootDirectory => _rootDirectory;
@@ -202,7 +205,8 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         }
     }
 
-    public IManifestWatcher CreateManifestWatcher() => new CloudWatcher(this);
+    public IManifestWatcher CreateManifestWatcher()
+        => new CloudWatcher(this, logger: _loggerFactory?.CreateLogger<CloudWatcher>());
 
     private sealed class StagedFile : IStagedUpload
     {
