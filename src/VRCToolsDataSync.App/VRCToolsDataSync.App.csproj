@@ -6,7 +6,15 @@
     <RootNamespace>VRCToolsDataSync_App</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Platforms>x86;x64;ARM64</Platforms>
-    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</RuntimeIdentifier>
+    <!--
+      Platform を唯一の基準にして、そこから RID を導く。
+      以前は RID をホストのプロセッサアーキテクチャから決めていたが、Platform とは
+      無関係に決まるため両者が食い違いうる (solution の割り当てが x86、ホストが x64 だと
+      NETSDK1032 でビルドが落ちる)。導出元を一つにすれば、この食い違いは起こらない。
+      アーキテクチャを変えたい場合は Platform を指定する (build-release.ps1 の -Arch)。
+    -->
+    <Platform Condition="'$(Platform)' == '' or '$(Platform)' == 'AnyCPU'">x64</Platform>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-$(Platform.ToLowerInvariant())</RuntimeIdentifier>
     <PublishProfile Condition="Exists('Properties\PublishProfiles\win-$(Platform).pubxml')">win-$(Platform).pubxml</PublishProfile>
     <UseWinUI>true</UseWinUI>
     <WinUISDKReferences>false</WinUISDKReferences>
@@ -77,11 +85,17 @@
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
 
-  <!-- Publish Properties -->
-  <PropertyGroup>
-    <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
-    <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
-  </PropertyGroup>
+  <!--
+    ReadyToRun とトリミングの指定はここには置かない。
+
+    以前は Configuration が Debug 以外なら PublishTrimmed=true としていたが、これは
+    publish のときだけでなく通常のビルドにも効いてしまう。self-contained でない
+    ビルドでトリミングは使えないため NETSDK1102 になり、CI は毎回
+    -p:PublishTrimmed=false で打ち消す必要があった。ReadyToRun も同様に RID 固有の
+    runtime pack を要求するので、solution 単位のビルドが NETSDK1112 で落ちていた。
+
+    実際のリリースを作る scripts/build-release.ps1 は publish の引数で
+    PublishReadyToRun=true / PublishTrimmed=false を明示しており、ここでの指定は
+    そちらに上書きされていた。つまり通常のビルドを壊すだけの設定だった。
+  -->
 </Project>
