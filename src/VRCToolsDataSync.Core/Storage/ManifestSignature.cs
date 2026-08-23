@@ -1,3 +1,5 @@
+using VRCToolsDataSync.Core.Sync;
+
 namespace VRCToolsDataSync.Core.Storage;
 
 /// <summary>
