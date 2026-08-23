@@ -198,6 +198,11 @@ public sealed class S3SyncStorage : ISyncStorage
     /// 幅は 1 往復ぶんで、猶予期間 (既定 7 日) に対しては無視できる。ここに入った場合も、
     /// 次の Push が実体の欠落を見つけて送り直すため自然に回復する。
     /// </para>
+    /// <para>
+    /// なお同期フォルダモードでは事情が違う。あちらで読めるのは同期クライアントが
+    /// 手元へ持ってきた写しなので、残る幅は伝播遅延そのものになる
+    /// (<see cref="LocalFolderSyncStorage.TryDelete"/>)。
+    /// </para>
     /// </summary>
     public bool TryDelete(StoredObject expected)
     {
@@ -207,7 +212,9 @@ public sealed class S3SyncStorage : ISyncStorage
         if (current is null) return true;
         if (current.Value.LastModified != expected.LastModified) return false;
 
-        _client.DeleteObject(ToObjectKey(expected.Key));
+        // 回収の削除は再送しない。届いたのに応答だけ失われた場合、再送までの間に
+        // 別の PC が送り直していると 2 度目がそれを消す。
+        _client.DeleteObject(ToObjectKey(expected.Key), retryTransientFailures: false);
         return true;
     }
 

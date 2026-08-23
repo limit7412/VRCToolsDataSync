@@ -268,25 +268,30 @@ internal sealed class S3Client
 
     /// <summary>
     /// オブジェクトを削除する。
-    /// <para>
-    /// <b>再送しない。</b> 削除が相手に届いたのに応答だけ失われた場合、再送までの
-    /// 数秒の間に別の PC が同じキーへ送り直していると、2 度目の削除がその実体を消す。
-    /// 呼び出し側 (回収) は「読み直したときのまま」を条件に削除を組み立てているが、
-    /// 再送はその条件を確かめ直さずに繰り返すことになる。
-    /// </para>
-    /// <para>
-    /// 一時的な不調で削除できなかった場合は、回収が 1 件の失敗として数えて次回に回す。
-    /// 消し損ねても孤児が残るだけなので、消しすぎるより安い。
-    /// </para>
     /// </summary>
-    public void DeleteObject(string key)
+    /// <param name="retryTransientFailures">
+    /// 一時的な不調で再送してよいか。
+    /// <para>
+    /// <b>他の書き手と競合しうるキーでは false にする。</b> 削除が相手に届いたのに
+    /// 応答だけ失われた場合、再送までの数秒の間に別の PC が同じキーへ送り直していると、
+    /// 2 度目の削除がその実体を消す。回収は「読み直したときのまま」を条件に削除を
+    /// 組み立てているが、再送はその条件を確かめ直さずに繰り返すことになる。
+    /// 消し損ねても孤児が残って次回に回るだけなので、消しすぎるより安い。
+    /// </para>
+    /// <para>
+    /// 逆に、他の誰も触らないキー (接続検査の検査用オブジェクトなど) では既定の
+    /// まま再送する。そこで再送を止めると、一時的な 5xx だけで「削除できない保存先」と
+    /// 判定してしまう。
+    /// </para>
+    /// </param>
+    public void DeleteObject(string key, bool retryTransientFailures = true)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
         using var response = Send(
             HttpMethod.Delete, key, query: null, contentFactory: null,
             AwsV4Signer.EmptyPayloadHash, headers: null,
             HttpCompletionOption.ResponseContentRead, cts.Token,
-            retryTransientFailures: false);
+            retryTransientFailures);
 
         // 存在しないキーの削除は成功扱い。S3 互換 API は 204 を返すのが普通だが、
         // 404 を返す実装もあるので受け入れる。
