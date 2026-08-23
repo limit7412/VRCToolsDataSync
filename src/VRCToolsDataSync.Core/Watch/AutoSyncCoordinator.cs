@@ -97,7 +97,7 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     private void StartCore()
     {
-        if (_started) return new List<ProcessDetectionEvent>();
+        if (_started) return;
         if (!_settings.AutoSyncEnabled) return;
 
         ISyncStorage storage;
@@ -228,8 +228,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         var watcher = new ProcessWatcher(processNames);
         var binding = new ToolBinding(toolKey, displayName, watcher, serviceFactory);
         // 検出状況の通知。どの候補が実際に当たっているかを GUI に出すために使う
-        // (issue #11)。起動と終了の両方で流すのは、閉じ直しのように同じ走査で
-        // 両方出る場合に、最後の 1 回が現在の状態になるため。
+        // (issue #11)。起動でも終了でも検出状況は変わるので、両方から流す。
         //
         // Stop は監視の終了を 2 秒までしか待たないので、待ちきれなかった走査の通知が
         // 停止後に届きうる。通知は状態を持たないため、その場合も読み直させるだけで
