@@ -58,10 +58,14 @@ public interface ISyncStorage
     /// <summary>
     /// 生成してから書き込むファイル (SQLite の VACUUM INTO 出力) 用に、
     /// 書き込み先を確保する。<see cref="IStagedUpload.LocalPath"/> へ書き出してから
-    /// <see cref="IStagedUpload.Commit"/> を呼ぶと同期先へ反映される。
+    /// <see cref="IStagedUpload.Commit"/> にキーを渡すと同期先へ反映される。
     /// Commit せずに破棄すれば同期先は変化しない。
+    /// <para>
+    /// キーを開始時ではなく Commit 時に決めるのは、置き場所を内容から決めているため。
+    /// 書き出しが終わるまでハッシュが分からず、キーも確定しない。
+    /// </para>
     /// </summary>
-    IStagedUpload BeginUpload(string key);
+    IStagedUpload BeginUpload();
 
     /// <summary>
     /// <paramref name="key"/> を <paramref name="localPath"/> へ取り出す。
@@ -75,6 +79,16 @@ public interface ISyncStorage
 
     /// <summary>キーを削除する。存在しない場合は何もしない。</summary>
     void Delete(string key);
+
+    /// <summary>
+    /// 接頭辞に一致するオブジェクトを列挙する。孤児の回収 (GC) だけが使う。
+    /// <para>
+    /// 同期の経路では使わない。同期先を列挙して差分を取ると、列挙してから
+    /// 判断するまでの間に他の PC が上げたものまで巻き込むため、参照を基準に
+    /// 判断する。回収では、その巻き込みを猶予期間で避ける。
+    /// </para>
+    /// </summary>
+    IEnumerable<StoredObject> List(string keyPrefix);
 
     /// <summary>
     /// manifest の更新を監視する仕組みを作る。ローカルフォルダはファイル監視、
@@ -92,8 +106,8 @@ public interface IStagedUpload : IDisposable
     /// <summary>書き出し先のローカルパス。</summary>
     string LocalPath { get; }
 
-    /// <summary><see cref="LocalPath"/> の内容を同期先へ確定させる。</summary>
-    void Commit();
+    /// <summary><see cref="LocalPath"/> の内容を <paramref name="key"/> として確定させる。</summary>
+    void Commit(string key);
 }
 
 /// <summary>manifest の更新通知。</summary>
@@ -103,3 +117,9 @@ public interface IManifestWatcher : IDisposable
 
     void Start();
 }
+
+/// <summary>同期先に置かれているオブジェクト 1 件。回収の判断に使う。</summary>
+/// <param name="Key">同期先のルートから見たキー。</param>
+/// <param name="LastModified">最後に書かれた時刻。猶予期間の判定に使う。</param>
+/// <param name="Size">大きさ (バイト)。回収でどれだけ空いたかの報告に使う。</param>
+public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size);

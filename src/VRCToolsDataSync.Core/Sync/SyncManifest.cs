@@ -6,7 +6,18 @@ namespace VRCToolsDataSync.Core.Sync;
 
 public sealed class SyncManifest
 {
-    public int SchemaVersion { get; set; } = 1;
+    /// <summary>
+    /// 書き出す manifest の形式。
+    /// <para>
+    /// 2 で、実データの置き場所を内容から決まるキー (<see cref="BlobKeys"/>) に変えた。
+    /// 1 を書いた版は <see cref="ManifestFile.RelativePath"/> をそのままキーとして扱う
+    /// ため、2 の manifest からは目的のオブジェクトを見つけられない。読み込み側は
+    /// 1 も扱えるが、逆は成り立たない。
+    /// </para>
+    /// </summary>
+    public const int CurrentSchemaVersion = 2;
+
+    public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     public Dictionary<string, ToolManifestEntry> Tools { get; set; } = new();
 }
 
@@ -28,6 +39,29 @@ public sealed class ManifestFile
     public string RelativePath { get; set; } = string.Empty;
     public long Size { get; set; }
     public string Sha256 { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 実データを置いてあるキー。内容から決まる (<see cref="BlobKeys.FromSha256"/>)。
+    /// <para>
+    /// schemaVersion 1 の manifest には無い。その場合は
+    /// <see cref="RelativePath"/> がそのままキーだったので、読み込み側は
+    /// <see cref="ManifestFileKeys.StorageKeyOf"/> を通して解決する。
+    /// </para>
+    /// </summary>
+    public string? BlobKey { get; set; }
+}
+
+/// <summary>
+/// <see cref="ManifestFile"/> から実データのキーを取り出す。
+/// </summary>
+public static class ManifestFileKeys
+{
+    /// <summary>
+    /// 実データが置いてあるキー。schemaVersion 1 の manifest (BlobKey が無い) では
+    /// RelativePath がそのままキーだったので、そちらへ落とす。
+    /// </summary>
+    public static string StorageKeyOf(ManifestFile file)
+        => string.IsNullOrEmpty(file.BlobKey) ? file.RelativePath : file.BlobKey;
 }
 
 /// <summary>

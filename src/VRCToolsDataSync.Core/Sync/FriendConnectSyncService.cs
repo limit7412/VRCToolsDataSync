@@ -74,13 +74,9 @@ public sealed class FriendConnectSyncService : ISyncService
         {
             files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected));
         }
-        else
-        {
-            // 削除失敗を握りつぶすと Pull 側でリモートの古いファイルが
-            // 復元されて削除済みデータが復活するため、失敗時は Push を
-            // 失敗扱いにする。
-            storage.Delete(DbV11Key);
-        }
+        // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
+        // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
+        // 実データはここでは消さない (理由は下の note の後始末と同じ)。
 
         if (File.Exists(_paths.ConfigJsonFile))
         {
@@ -91,14 +87,10 @@ public sealed class FriendConnectSyncService : ISyncService
             }
             else
             {
-                storage.Upload(_paths.ConfigJsonFile, ConfigKey);
+                storage.Upload(_paths.ConfigJsonFile, ManifestFileKeys.StorageKeyOf(config));
                 affected.Add(ConfigKey);
             }
             files.Add(config);
-        }
-        else
-        {
-            storage.Delete(ConfigKey);
         }
 
         var noteFiles = PushNotes(storage, remoteFiles, affected);
@@ -157,10 +149,11 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        // manifest が新しい集合を指してから、参照されなくなったオブジェクトを消す。
-        // 逆順にすると、manifest 更新が競合で失敗したときに
-        // 「manifest はまだ参照しているのに実体が無い」状態が残る。
-        RemoveStaleRemoteNotes(manifestStore, storage, remoteFiles, noteFiles);
+        // 参照されなくなった note の実データはここでは消さない。置き場所は内容から
+        // 決まるので、同じ内容を他の世代や他の PC が参照していることがある。Push の
+        // 後始末として消すと、読み直しから削除までの間に他の PC が公開した manifest が
+        // 欠落オブジェクトを指しうる (この経路は以前ここにあった競合そのもの)。
+        // 参照されなくなったものは猶予期間を置いて GC (BlobGarbageCollector) が回収する。
 
         _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
@@ -353,7 +346,7 @@ public sealed class FriendConnectSyncService : ISyncService
         IReadOnlyList<ManifestFile> remoteFiles,
         List<string> affected)
     {
-        using var staged = storage.BeginUpload(key);
+        using var staged = storage.BeginUpload();
         SqliteSnapshot.Create(sourceDb, staged.LocalPath);
         var described = SyncTransfer.Describe(staged.LocalPath, key);
         if (SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
@@ -362,15 +355,16 @@ public sealed class FriendConnectSyncService : ISyncService
         }
         else
         {
-            staged.Commit();
+            staged.Commit(ManifestFileKeys.StorageKeyOf(described));
             affected.Add(key);
         }
         return described;
     }
 
     /// <summary>
-    /// notes フォルダを送る。ローカルから消えたファイルの後始末は
-    /// <see cref="RemoveStaleRemoteNotes"/> が manifest の更新後に行う。
+    /// notes フォルダを送る。ローカルから消えたファイルは、ここで作る一覧に
+    /// 載らないことで「無い」ことを表す。実データの回収は
+    /// <see cref="Storage.BlobGarbageCollector"/> に任せる。
     /// </summary>
     private List<ManifestFile> PushNotes(
         ISyncStorage storage,
@@ -395,7 +389,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 }
                 else
                 {
-                    storage.Upload(localPath, key);
+                    storage.Upload(localPath, ManifestFileKeys.StorageKeyOf(described));
                     affected.Add(key);
                 }
                 files.Add(described);
@@ -403,84 +397,6 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         return files;
-    }
-
-    /// <summary>
-    /// ローカルに無くなった note を同期先から取り除く。manifest の更新が
-    /// 成功してから呼ぶこと。先に消すと、manifest 更新が競合で失敗したときに
-    /// 「manifest はまだ参照しているのに実体が無い」状態が残る。
-    /// <para>
-    /// 削除対象は「今回の Push の基準にした manifest が参照していた note」から、
-    /// 今回も残るものを除いた分に限る。同期先を列挙して差分を取ると、基準にした
-    /// manifest を読んだ後に他の PC が上げた note まで消してしまい、相手の
-    /// manifest が実体の無いオブジェクトを指すことになる。
-    /// </para>
-    /// <para>
-    /// さらに削除の直前に manifest を読み直し、その時点で参照されているキーは残す。
-    /// 自分が manifest を更新してから削除するまでの間に、他の PC が同じ note を
-    /// 上げ直して公開している場合があるため。読み直しと削除の間の窓は残るので、
-    /// 完全に断つにはオブジェクトを version 固有のキーにする必要がある (#27)。
-    /// </para>
-    /// <para>
-    /// この方法では、中断した Push が残した孤児オブジェクト (どの manifest からも
-    /// 参照されていないもの) は残る。回収も #27 に委ねる。
-    /// </para>
-    /// <para>
-    /// 失敗しても例外は投げない。manifest を公開した後に呼ぶため、ここで失敗を
-    /// 伝えると成立した Push が失敗として扱われてしまう。
-    /// </para>
-    /// </summary>
-    private void RemoveStaleRemoteNotes(
-        ManifestStore manifestStore,
-        ISyncStorage storage,
-        IReadOnlyList<ManifestFile> previousFiles,
-        IReadOnlyList<ManifestFile> keptNotes)
-    {
-        var candidates = previousFiles
-            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
-            .Select(f => f.RelativePath)
-            .Except(keptNotes.Select(f => f.RelativePath), StringComparer.Ordinal)
-            .ToList();
-        if (candidates.Count == 0) return;
-
-        // ここは manifest を公開した後なので、失敗しても Push 自体は成立している。
-        // 例外を投げると SyncRunner が成功した version を同期履歴へ記録できず、
-        // 利用者には Push 失敗と映り、次の通常 Push もリモートだけが新しいとして
-        // コンフリクトになる。消し残すのは manifest から参照されない孤児なので、
-        // 警告に留めて Push は成功として返す (孤児の回収は #27)。
-        var live = new HashSet<string>(StringComparer.Ordinal);
-        try
-        {
-            if (manifestStore.Load().Tools.TryGetValue(Key, out var current))
-            {
-                foreach (var file in current.Files) live.Add(file.RelativePath);
-            }
-        }
-        catch (SyncStorageException ex)
-        {
-            // 生きているキーを確かめられない状態で消すと、他の PC が復活させた
-            // note を消しかねない。今回は見送る。
-            _logger.LogWarning(ex, "manifest を読み直せないため、不要な note の削除を見送りました");
-            return;
-        }
-
-        foreach (var key in candidates)
-        {
-            if (live.Contains(key))
-            {
-                _logger.LogInformation("削除を見送り (他の PC が復活させた): {Key}", key);
-                continue;
-            }
-            try
-            {
-                storage.Delete(key);
-                _logger.LogInformation("同期先から削除: {Key}", key);
-            }
-            catch (SyncStorageException ex)
-            {
-                _logger.LogWarning(ex, "不要な note の削除に失敗しました: {Key}", key);
-            }
-        }
     }
 
     /// <summary>

@@ -13,15 +13,21 @@ namespace VRCToolsDataSync.Core.Sync;
 /// </summary>
 internal static class SyncTransfer
 {
-    /// <summary>ローカルファイルから manifest のエントリを作る。</summary>
-    public static ManifestFile Describe(string localPath, string key)
+    /// <summary>
+    /// ローカルファイルから manifest のエントリを作る。
+    /// <paramref name="logicalPath"/> は同期先の中での位置を表す名前で、
+    /// 実データの置き場所は内容から決める (<see cref="BlobKeys"/>)。
+    /// </summary>
+    public static ManifestFile Describe(string localPath, string logicalPath)
     {
-        StorageKey.Validate(key);
+        StorageKey.Validate(logicalPath);
+        var sha256 = FileHasher.Sha256(localPath);
         return new ManifestFile
         {
-            RelativePath = key,
+            RelativePath = logicalPath,
             Size = new FileInfo(localPath).Length,
-            Sha256 = FileHasher.Sha256(localPath),
+            Sha256 = sha256,
+            BlobKey = BlobKeys.FromSha256(sha256),
         };
     }
 
@@ -56,7 +62,8 @@ internal static class SyncTransfer
         ISyncStorage storage,
         IReadOnlyList<ManifestFile> remoteFiles,
         ManifestFile candidate)
-        => IsAlreadyOnRemote(remoteFiles, candidate) && storage.Exists(candidate.RelativePath);
+        => IsAlreadyOnRemote(remoteFiles, candidate)
+           && storage.Exists(ManifestFileKeys.StorageKeyOf(candidate));
 
     /// <summary>
     /// 前回の manifest と今回のファイル集合を比べ、送るものが何も無かったかを判定する。

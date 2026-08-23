@@ -108,14 +108,32 @@ public sealed class S3SyncStorage : ISyncStorage
         _client.PutFile(ToObjectKey(key), localPath);
     }
 
-    public IStagedUpload BeginUpload(string key)
+    public IStagedUpload BeginUpload()
     {
-        StorageKey.Validate(key);
         var stagingDirectory = Path.Combine(Path.GetTempPath(), "VRCToolsDataSync", "staging");
         Directory.CreateDirectory(stagingDirectory);
         PruneStaleStagingFiles(stagingDirectory);
         var stagingPath = Path.Combine(stagingDirectory, Guid.NewGuid().ToString("N") + ".tmp");
-        return new StagedObject(this, key, stagingPath);
+        return new StagedObject(this, stagingPath);
+    }
+
+    public IEnumerable<StoredObject> List(string keyPrefix)
+    {
+        var prefix = ToObjectKey(keyPrefix);
+        foreach (var (key, lastModified, size) in _client.ListObjects(prefix))
+        {
+            // キー接頭辞を設定している場合、呼び出し側にはそれを除いた形で返す。
+            if (_keyPrefix.Length > 0)
+            {
+                var scoped = _keyPrefix + "/";
+                if (!key.StartsWith(scoped, StringComparison.Ordinal)) continue;
+                yield return new StoredObject(key[scoped.Length..], lastModified, size);
+            }
+            else
+            {
+                yield return new StoredObject(key, lastModified, size);
+            }
+        }
     }
 
     /// <summary>
@@ -229,18 +247,16 @@ public sealed class S3SyncStorage : ISyncStorage
     private sealed class StagedObject : IStagedUpload
     {
         private readonly S3SyncStorage _storage;
-        private readonly string _key;
 
-        public StagedObject(S3SyncStorage storage, string key, string stagingPath)
+        public StagedObject(S3SyncStorage storage, string stagingPath)
         {
             _storage = storage;
-            _key = key;
             LocalPath = stagingPath;
         }
 
         public string LocalPath { get; }
 
-        public void Commit() => _storage.Upload(LocalPath, _key);
+        public void Commit(string key) => _storage.Upload(LocalPath, key);
 
         public void Dispose()
         {

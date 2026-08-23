@@ -270,6 +270,79 @@ internal sealed class S3Client
         EnsureSuccess(response, $"オブジェクトの削除 ({key})", cts.Token);
     }
 
+    /// <summary>
+    /// 接頭辞に一致するオブジェクトを ListObjectsV2 で列挙する。
+    /// 1 回の応答は最大 1000 件なので、継続トークンを辿って読み切る。
+    /// </summary>
+    public IEnumerable<(string Key, DateTimeOffset LastModified, long Size)> ListObjects(string keyPrefix)
+    {
+        string? continuationToken = null;
+        do
+        {
+            var query = new List<KeyValuePair<string, string>>
+            {
+                new("list-type", "2"),
+                new("prefix", keyPrefix),
+            };
+            if (continuationToken is not null)
+            {
+                query.Add(new KeyValuePair<string, string>("continuation-token", continuationToken));
+            }
+
+            string body;
+            using (var cts = new CancellationTokenSource(_options.Timeout))
+            {
+                using var response = Send(
+                    HttpMethod.Get, key: string.Empty, query, contentFactory: null,
+                    AwsV4Signer.EmptyPayloadHash, headers: null,
+                    HttpCompletionOption.ResponseContentRead, cts.Token);
+                EnsureSuccess(response, $"オブジェクトの一覧 ({keyPrefix})", cts.Token);
+                body = ReadBody(response, cts.Token);
+            }
+
+            XDocument document;
+            try
+            {
+                document = XDocument.Parse(body);
+            }
+            catch (Exception ex)
+            {
+                throw new SyncStorageException($"オブジェクトの一覧を解釈できませんでした ({keyPrefix})", ex);
+            }
+
+            var root = document.Root;
+            if (root is null) yield break;
+
+            foreach (var element in ChildElements(root, "Contents"))
+            {
+                var key = ChildElements(element, "Key").FirstOrDefault()?.Value;
+                if (string.IsNullOrEmpty(key)) continue;
+                var modifiedText = ChildElements(element, "LastModified").FirstOrDefault()?.Value;
+                var modified = DateTimeOffset.TryParse(
+                    modifiedText,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal,
+                    out var parsed)
+                    ? parsed
+                    : DateTimeOffset.UtcNow;
+                var size = long.TryParse(
+                    ChildElements(element, "Size").FirstOrDefault()?.Value,
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out var parsedSize)
+                    ? parsedSize
+                    : 0L;
+                yield return (key, modified, size);
+            }
+
+            var truncated = ChildElements(root, "IsTruncated").FirstOrDefault()?.Value;
+            continuationToken = string.Equals(truncated, "true", StringComparison.OrdinalIgnoreCase)
+                ? ChildElements(root, "NextContinuationToken").FirstOrDefault()?.Value
+                : null;
+        }
+        while (continuationToken is not null);
+    }
+
     // --- マルチパートアップロード ---
 
     private void PutFileMultipart(string key, string localPath, long length)

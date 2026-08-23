@@ -170,16 +170,37 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         AtomicFile.Copy(localPath, StorageKey.ToLocalPath(_rootDirectory, key), overwrite: true);
     }
 
-    public IStagedUpload BeginUpload(string key)
+    public IStagedUpload BeginUpload()
     {
-        var destination = StorageKey.ToLocalPath(_rootDirectory, key);
-        var directory = Path.GetDirectoryName(destination);
-        if (!string.IsNullOrEmpty(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
+        // 置き場所は内容から決まるので、確定するのは Commit 時。ただし最後の移動を
+        // 安価に済ませたいので、書き出し自体は確定先と同じフォルダで行う
+        // (別ドライブを経由すると数百 MB のコピーになる)。
+        var blobDirectory = StorageKey.ToLocalPath(_rootDirectory, BlobKeys.Prefix.TrimEnd('/'));
+        Directory.CreateDirectory(blobDirectory);
         // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
-        return new StagedFile(destination + ".building-" + Guid.NewGuid().ToString("N"), destination);
+        var stagingPath = Path.Combine(blobDirectory, ".building-" + Guid.NewGuid().ToString("N"));
+        return new StagedFile(stagingPath, this);
+    }
+
+    public IEnumerable<StoredObject> List(string keyPrefix)
+    {
+        var root = StorageKey.ToLocalPath(_rootDirectory, keyPrefix.TrimEnd('/'));
+        if (!Directory.Exists(root)) yield break;
+
+        foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+        {
+            // 書き出し中の一時ファイルは回収の対象にしない。
+            var name = Path.GetFileName(path);
+            if (name.StartsWith(".building-", StringComparison.Ordinal)) continue;
+
+            var info = new FileInfo(path);
+            if (!info.Exists) continue;
+            var relative = Path.GetRelativePath(_rootDirectory, path);
+            yield return new StoredObject(
+                StorageKey.FromRelativePath(relative),
+                new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero),
+                info.Length);
+        }
     }
 
     public bool TryDownload(string key, string localPath)
@@ -210,26 +231,34 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
 
     private sealed class StagedFile : IStagedUpload
     {
-        private readonly string _destination;
+        private readonly LocalFolderSyncStorage _storage;
         private bool _committed;
 
-        public StagedFile(string stagingPath, string destination)
+        public StagedFile(string stagingPath, LocalFolderSyncStorage storage)
         {
             LocalPath = stagingPath;
-            _destination = destination;
+            _storage = storage;
         }
 
         public string LocalPath { get; }
 
-        public void Commit()
+        public void Commit(string key)
         {
-            if (File.Exists(_destination))
+            StorageKey.Validate(key);
+            var destination = StorageKey.ToLocalPath(_storage._rootDirectory, key);
+            var directory = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrEmpty(directory))
             {
-                File.Replace(LocalPath, _destination, destinationBackupFileName: null);
+                Directory.CreateDirectory(directory);
+            }
+            if (File.Exists(destination))
+            {
+                // 内容から決まるキーなので、既にあるなら中身は同じ。置き換えずに済ませる。
+                File.Delete(LocalPath);
             }
             else
             {
-                File.Move(LocalPath, _destination);
+                File.Move(LocalPath, destination);
             }
             _committed = true;
         }

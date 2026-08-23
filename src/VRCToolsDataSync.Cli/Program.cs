@@ -161,6 +161,27 @@ storageTestCommand.SetHandler((System.CommandLine.Invocation.InvocationContext c
 });
 storageCommand.AddCommand(storageTestCommand);
 
+var gcGraceOption = new Option<int>(
+    aliases: new[] { "--grace-days" },
+    getDefaultValue: () => 7,
+    description: "この日数より新しいオブジェクトは、参照されていなくても残す");
+var gcDryRunOption = new Option<bool>(
+    aliases: new[] { "--dry-run" },
+    description: "削除せず、対象になるものを数えるだけにする");
+
+var storageGcCommand = new Command(
+    "gc",
+    "どの manifest からも参照されていないオブジェクトを回収する");
+storageGcCommand.AddOption(gcGraceOption);
+storageGcCommand.AddOption(gcDryRunOption);
+storageGcCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
+{
+    ctx.ExitCode = CollectGarbage(
+        ctx.ParseResult.GetValueForOption(gcGraceOption),
+        ctx.ParseResult.GetValueForOption(gcDryRunOption));
+});
+storageCommand.AddCommand(storageGcCommand);
+
 rootCommand.AddCommand(pushCommand);
 rootCommand.AddCommand(pullCommand);
 rootCommand.AddCommand(statusCommand);
@@ -454,6 +475,54 @@ static int TestStorage()
         Console.Error.WriteLine($"接続できませんでした: {ex.Message}");
         return 2;
     }
+}
+
+static int CollectGarbage(int graceDays, bool dryRun)
+{
+    if (graceDays < 0)
+    {
+        Console.Error.WriteLine("--grace-days に負の値は指定できません。");
+        return 2;
+    }
+
+    var settings = new SettingsStore().Load();
+    Console.WriteLine($"保存先: {SyncStorageFactory.DescribeTarget(settings)}");
+    try
+    {
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Information);
+            builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
+        });
+        var storage = SyncStorageFactory.Create(settings, loggerFactory: loggerFactory);
+        var collector = new BlobGarbageCollector(
+            storage, loggerFactory.CreateLogger<BlobGarbageCollector>());
+
+        var result = collector.Collect(TimeSpan.FromDays(graceDays), dryRun);
+
+        Console.WriteLine(dryRun
+            ? $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収対象 {result.Deleted} 件 ({FormatBytes(result.DeletedBytes)})"
+            : $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収 {result.Deleted} 件 ({FormatBytes(result.DeletedBytes)})");
+        if (result.Failed > 0)
+        {
+            Console.Error.WriteLine($"{result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります。");
+            return 1;
+        }
+        return 0;
+    }
+    catch (SyncStorageException ex)
+    {
+        Console.Error.WriteLine($"回収できませんでした: {ex.Message}");
+        return 2;
+    }
+}
+
+static string FormatBytes(long bytes)
+{
+    if (bytes < 1024) return $"{bytes} B";
+    if (bytes < 1024L * 1024) return $"{bytes / 1024.0:0.#} KB";
+    if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):0.#} MB";
+    return $"{bytes / (1024.0 * 1024 * 1024):0.##} GB";
 }
 
 /// <summary>
