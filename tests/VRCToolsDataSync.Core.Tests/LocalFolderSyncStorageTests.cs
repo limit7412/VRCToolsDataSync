@@ -77,45 +77,57 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
     {
         // 逐次に送ると 2 回目は必ず「確定先が既にある」経路を通るため、
         // File.Exists の確認から File.Move までに別の Commit が割り込む経路を
-        // 一度も通らない。同時に走らせて、そちらも通るようにする。
+        // 一度も通らない。
         //
-        // 割り込みが起きるかどうかは実行のたびに変わる。ここで固定しているのは
-        // 「同じ内容を同時に送っても、全部成功して実体が 1 つ残る」という結果で、
-        // どちらの経路を通ったかではない。
+        // 待ち合わせは Commit の直前に置く。Send の手前で揃えても、ハッシュ計算と
+        // File.Copy に掛かる時間で各スレッドがばらけ、先頭が Move まで終えてから
+        // 後続が動く。それでは結局みな「既にある」経路を通る。
         const int degree = 8;
         var storage = Storage();
-        var sources = Enumerable.Range(0, degree)
-            .Select(i => WriteAgedFile($"note{i}.txt", "identical content", TimeSpan.FromDays(1)))
-            .ToArray();
+        var content = "identical content"u8.ToArray();
+        var source = Path.Combine(_work, "source.bin");
+        File.WriteAllBytes(source, content);
+        var key = BlobKeys.FromSha256(FileHasher.Sha256(source));
+
+        // 書き出しまでは先に済ませ、揃えるのは確定だけにする。
+        var staged = new IStagedUpload[degree];
+        for (var i = 0; i < degree; i++)
+        {
+            staged[i] = storage.BeginUpload();
+            File.WriteAllBytes(staged[i].LocalPath, content);
+        }
 
         // スレッドプールではなく実スレッドを使う。Parallel.For や Task.Run だと
         // 8 本が同時に走る保証が無く、Barrier で待ち合わせると止まりうる。
         var barrier = new Barrier(degree);
-        var results = new ManifestFile?[degree];
         var failures = new Exception?[degree];
         var threads = Enumerable.Range(0, degree)
             .Select(i => new Thread(() =>
             {
                 barrier.SignalAndWait();
-                try
-                {
-                    results[i] = SyncTransfer.Send(
-                        storage, Array.Empty<ManifestFile>(), sources[i], $"fc/notes/{i}.txt").File;
-                }
-                catch (Exception ex)
-                {
-                    failures[i] = ex;
-                }
+                try { staged[i].Commit(key); }
+                catch (Exception ex) { failures[i] = ex; }
             }))
             .ToArray();
 
-        foreach (var thread in threads) thread.Start();
-        foreach (var thread in threads) Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "Commit が終わらない");
+        try
+        {
+            foreach (var thread in threads) thread.Start();
+            foreach (var thread in threads)
+            {
+                Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "Commit が終わらない");
+            }
+        }
+        finally
+        {
+            foreach (var s in staged) s.Dispose();
+        }
 
+        // 内容から決まるキーなので、競合した側も同じ内容を置いたことになる。
+        // 全部成功し、実体が 1 つだけ残ること。
         Assert.All(failures, f => Assert.Null(f));
-        // 内容が同じなのでキーも 1 つに揃い、実体も 1 つだけ残る。
-        Assert.Single(results.Select(r => r!.BlobKey).Distinct());
-        Assert.Single(storage.List(BlobKeys.Prefix));
+        Assert.Equal(key, Assert.Single(storage.List(BlobKeys.Prefix)).Key);
+        Assert.Equal(content, File.ReadAllBytes(StorageKey.ToLocalPath(_root, key)));
     }
 
     [Fact(DisplayName = "既にある実体を送り直すと時刻が刻み直される")]
