@@ -41,7 +41,15 @@ public static class AtomicFile
         }
     }
 
-    public static void CopyDirectory(string sourceDir, string destinationDir, bool overwrite = true)
+    /// <summary>
+    /// ディレクトリを再帰的にコピーする。
+    /// <paramref name="shouldCopy"/> を与えると、false を返したファイルを飛ばす。
+    /// </summary>
+    public static void CopyDirectory(
+        string sourceDir,
+        string destinationDir,
+        bool overwrite = true,
+        Func<string, bool>? shouldCopy = null)
     {
         if (!Directory.Exists(sourceDir))
         {
@@ -52,6 +60,7 @@ public static class AtomicFile
 
         foreach (var sourceFile in Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories))
         {
+            if (shouldCopy is not null && !shouldCopy(sourceFile)) continue;
             var relative = Path.GetRelativePath(sourceDir, sourceFile);
             var destFile = Path.Combine(destinationDir, relative);
             Copy(sourceFile, destFile, overwrite);

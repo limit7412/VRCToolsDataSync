@@ -1,14 +1,22 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Settings;
 
 public sealed class SettingsStore
 {
+    /// <summary>現在の <see cref="SyncSettings.ToolStateSchema"/>。</summary>
+    private const int CurrentToolStateSchema = 1;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        // StorageMode を数値ではなく "localFolder" / "s3" として読み書きする。
+        // 数値表記の既存ファイルもこのコンバータで読める。
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
     private readonly object _saveLock = new();
@@ -41,12 +49,70 @@ public sealed class SettingsStore
 
     public SyncSettings Load()
     {
-        if (!File.Exists(FilePath))
+        SyncSettings settings;
+        if (File.Exists(FilePath))
         {
-            return new SyncSettings();
+            using var stream = File.OpenRead(FilePath);
+            settings = JsonSerializer.Deserialize<SyncSettings>(stream, JsonOptions) ?? new SyncSettings();
         }
-        using var stream = File.OpenRead(FilePath);
-        return JsonSerializer.Deserialize<SyncSettings>(stream, JsonOptions) ?? new SyncSettings();
+        else
+        {
+            settings = new SyncSettings();
+        }
+        MigrateToolStateKeys(settings);
+        return settings;
+    }
+
+    /// <summary>
+    /// 保存先ごとの接頭辞を持たない旧形式の同期履歴を、同期フォルダのキーへ移す。
+    /// <para>
+    /// 旧形式には「どの保存先に対する履歴か」が記録されていないため、判断材料は
+    /// <see cref="SyncSettings.CloudFolderPath"/> しかない。読み込みの直後に一度だけ
+    /// 行うことで、利用者が画面や CLI で保存先を変更する前の値を使える。
+    /// 遅延して判断すると、変更後の保存先へ別の保存先の履歴を持ち込むことになる。
+    /// </para>
+    /// <para>
+    /// 同期フォルダが未設定の場合、引き継ぎ先を決められないので旧エントリは捨てる。
+    /// 次の同期で新しい履歴が作られる。
+    /// </para>
+    /// </summary>
+    private static void MigrateToolStateKeys(SyncSettings settings)
+    {
+        if (settings.ToolStateSchema >= CurrentToolStateSchema) return;
+        settings.ToolStateSchema = CurrentToolStateSchema;
+
+        settings.ToolState ??= new Dictionary<string, ToolSyncState>();
+        var legacyKeys = settings.ToolState.Keys.Where(k => !k.Contains('|')).ToList();
+        if (legacyKeys.Count == 0) return;
+
+        string? prefix = null;
+        var folder = settings.CloudFolderPath?.Trim();
+        if (!string.IsNullOrEmpty(folder))
+        {
+            try
+            {
+                prefix = new LocalFolderSyncStorage(folder).StateKeyPrefix;
+            }
+            catch (Exception ex) when (ex is SyncStorageException
+                                        or ArgumentException
+                                        or NotSupportedException
+                                        or PathTooLongException)
+            {
+                // 設定に壊れたパスが入っている。引き継がない。
+            }
+        }
+
+        foreach (var key in legacyKeys)
+        {
+            var state = settings.ToolState[key];
+            settings.ToolState.Remove(key);
+            if (prefix is null) continue;
+            var migrated = prefix + key;
+            if (!settings.ToolState.ContainsKey(migrated))
+            {
+                settings.ToolState[migrated] = state;
+            }
+        }
     }
 
     public void Save(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: false);
@@ -54,7 +120,7 @@ public sealed class SettingsStore
     /// <summary>
     /// ToolState の更新だけが目的の Save。Top-level の設定
     /// (CloudFolderPath / MachineName / SyncVrcx / SyncFriendConnect /
-    /// AutoSyncEnabled) はディスク側の現行値を採用し、incoming は ToolState
+    /// AutoSyncEnabled / StorageMode / S3) はディスク側の現行値を採用し、incoming は ToolState
     /// のみを差し込む形でマージする。
     ///
     /// 通常の Save (= GUI の「設定を保存」ボタン) と違い、Push/Pull のような
@@ -133,6 +199,9 @@ public sealed class SettingsStore
                     settings.SyncVrcx = merged.SyncVrcx;
                     settings.SyncFriendConnect = merged.SyncFriendConnect;
                     settings.AutoSyncEnabled = merged.AutoSyncEnabled;
+                    settings.StorageMode = merged.StorageMode;
+                    settings.S3 = merged.S3;
+                    settings.ToolStateSchema = merged.ToolStateSchema;
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
                 }
@@ -160,7 +229,7 @@ public sealed class SettingsStore
     /// <para>
     /// <paramref name="mergeTopLevelFromDisk"/> が false (通常の Save) の場合、
     /// Top-level 設定 (CloudFolderPath, MachineName, SyncVrcx, SyncFriendConnect,
-    /// AutoSyncEnabled) は incoming を優先する。
+    /// AutoSyncEnabled, StorageMode, S3) は incoming を優先する。
     /// </para>
     /// <para>
     /// true (SaveToolStateOnly) の場合、Top-level 設定はディスク側を採用する。
@@ -198,6 +267,12 @@ public sealed class SettingsStore
             SyncVrcx = topLevelSource.SyncVrcx,
             SyncFriendConnect = topLevelSource.SyncFriendConnect,
             AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
+            // 保存先の種類と S3 接続設定も Top-level と同じ採用元から取る。
+            // Push/Pull 経由の Save がユーザの保存先変更を巻き戻さないようにする。
+            StorageMode = topLevelSource.StorageMode,
+            S3 = topLevelSource.S3?.Clone(),
+            // 読み込み時に移行済みなので、ディスク側も incoming 側も現行の版になっている。
+            ToolStateSchema = CurrentToolStateSchema,
             ToolState = new Dictionary<string, ToolSyncState>(),
             Launch = new Dictionary<string, ToolLaunchConfig>(),
         };

@@ -1,21 +1,24 @@
+using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 
 namespace VRCToolsDataSync.Core.Watch;
 
-public sealed class CloudWatcher : IDisposable
+/// <summary>
+/// ローカル同期フォルダの manifest.json をファイル監視で追いかける。
+/// OneDrive などのクライアントが他 PC の更新を書き戻したタイミングで発火する。
+/// </summary>
+public sealed class CloudWatcher : IManifestWatcher
 {
-    private readonly string _cloudFolder;
-    private readonly TimeSpan _debounce;
+    private readonly LocalFolderSyncStorage _storage;
     private readonly System.Timers.Timer _debounceTimer;
     private FileSystemWatcher? _watcher;
 
     public event Action<SyncManifest>? ManifestChanged;
 
-    public CloudWatcher(string cloudFolder, TimeSpan? debounce = null)
+    public CloudWatcher(LocalFolderSyncStorage storage, TimeSpan? debounce = null)
     {
-        _cloudFolder = cloudFolder;
-        _debounce = debounce ?? TimeSpan.FromSeconds(2);
-        _debounceTimer = new System.Timers.Timer(_debounce.TotalMilliseconds)
+        _storage = storage;
+        _debounceTimer = new System.Timers.Timer((debounce ?? TimeSpan.FromSeconds(2)).TotalMilliseconds)
         {
             AutoReset = false,
         };
@@ -25,9 +28,9 @@ public sealed class CloudWatcher : IDisposable
     public void Start()
     {
         if (_watcher is not null) return;
-        if (!Directory.Exists(_cloudFolder)) return;
+        if (!Directory.Exists(_storage.RootDirectory)) return;
 
-        _watcher = new FileSystemWatcher(_cloudFolder, "manifest.json")
+        _watcher = new FileSystemWatcher(_storage.RootDirectory, ManifestStore.ManifestKey)
         {
             NotifyFilter = NotifyFilters.LastWrite
                          | NotifyFilters.FileName
@@ -49,10 +52,9 @@ public sealed class CloudWatcher : IDisposable
     {
         try
         {
-            var store = new ManifestStore(_cloudFolder);
-            if (!File.Exists(store.FilePath)) return;
-            var manifest = store.Load();
-            ManifestChanged?.Invoke(manifest);
+            var snapshot = _storage.LoadManifest();
+            if (snapshot.Manifest.Tools.Count == 0) return;
+            ManifestChanged?.Invoke(snapshot.Manifest);
         }
         catch
         {

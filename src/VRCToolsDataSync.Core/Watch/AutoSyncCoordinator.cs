@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 
 namespace VRCToolsDataSync.Core.Watch;
@@ -34,7 +35,9 @@ public sealed class AutoSyncCoordinator : IDisposable
     // 完了時はこの集合に ToolKey を追加し、Start 時に明示クリアする
     // (= 同一 Coordinator 世代の中だけ覚えていれば十分)。
     private readonly HashSet<string> _recentlyCompletedAutoPushes = new(StringComparer.Ordinal);
-    private CloudWatcher? _cloudWatcher;
+    private IManifestWatcher? _manifestWatcher;
+    // 監視と自動 Push で使い回す同期先。Start で作り、Stop で捨てる。
+    private ISyncStorage? _storage;
     private SyncSettings _settings;
     private bool _started;
     // Start/Stop の世代を表す CancellationTokenSource。
@@ -64,11 +67,18 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         if (_started) return;
         if (!_settings.AutoSyncEnabled) return;
-        if (string.IsNullOrWhiteSpace(_settings.CloudFolderPath) || !Directory.Exists(_settings.CloudFolderPath))
+
+        ISyncStorage storage;
+        try
         {
-            _logger.LogInformation("AutoSync 起動スキップ: クラウドフォルダ未設定");
+            storage = _runner.CreateStorage(_settings);
+        }
+        catch (SyncStorageException ex)
+        {
+            _logger.LogInformation("AutoSync 起動スキップ: {Reason}", ex.Message);
             return;
         }
+        _storage = storage;
 
         // 直前の Stop でキャンセル済みの可能性があるので、新しい世代用に張り直す。
         if (_generationCts.IsCancellationRequested)
@@ -109,12 +119,15 @@ public sealed class AutoSyncCoordinator : IDisposable
             binding.Watcher.Start();
         }
 
-        _cloudWatcher = new CloudWatcher(_settings.CloudFolderPath);
-        _cloudWatcher.ManifestChanged += OnManifestChanged;
-        _cloudWatcher.Start();
+        // 同期先が変更を知らせる仕組みを作る。ローカルフォルダはファイル監視、
+        // S3 互換モードは manifest の定期確認になる。
+        _manifestWatcher = storage.CreateManifestWatcher();
+        _manifestWatcher.ManifestChanged += OnManifestChanged;
+        _manifestWatcher.Start();
 
         _started = true;
-        _logger.LogInformation("AutoSync 起動 bindings={Count}", _bindings.Count);
+        _logger.LogInformation(
+            "AutoSync 起動 bindings={Count} target={Target}", _bindings.Count, storage.DisplayName);
     }
 
     public void Stop()
@@ -136,12 +149,13 @@ public sealed class AutoSyncCoordinator : IDisposable
         }
         _bindings.Clear();
 
-        if (_cloudWatcher is not null)
+        if (_manifestWatcher is not null)
         {
-            _cloudWatcher.ManifestChanged -= OnManifestChanged;
-            _cloudWatcher.Dispose();
-            _cloudWatcher = null;
+            _manifestWatcher.ManifestChanged -= OnManifestChanged;
+            _manifestWatcher.Dispose();
+            _manifestWatcher = null;
         }
+        _storage = null;
         _started = false;
     }
 
@@ -304,7 +318,15 @@ public sealed class AutoSyncCoordinator : IDisposable
                     _logger.LogInformation("AutoPush キャンセル (lock後) tool={Tool}", binding.ToolKey);
                     return false;
                 }
-                result = _runner.Push(service, _settings, _settings.CloudFolderPath, force: false);
+                // Start 時に作った同期先を使う。Stop と競合して null になっていたら
+                // 世代が切れているので Push しない。
+                var storage = _storage;
+                if (storage is null)
+                {
+                    _logger.LogInformation("AutoPush キャンセル (同期先が解放済み) tool={Tool}", binding.ToolKey);
+                    return false;
+                }
+                result = _runner.Push(service, _settings, storage, force: false);
             }
             switch (result.Outcome)
             {
@@ -350,10 +372,17 @@ public sealed class AutoSyncCoordinator : IDisposable
 
     private void OnManifestChanged(SyncManifest manifest)
     {
+        // 監視のイベントは Stop と競合しうる。世代が切れていたら何もしない。
+        var storage = _storage;
+        if (storage is null) return;
+
         foreach (var binding in _bindings)
         {
             if (!manifest.Tools.TryGetValue(binding.ToolKey, out var entry)) continue;
-            var localState = _settings.ToolState.GetValueOrDefault(binding.ToolKey);
+            // キーを直に引かず SyncRunner を通す。更新前の settings.json からの
+            // 引き継ぎが効かないと、直後は履歴なし扱いになって
+            // 「リモートが新しい」と誤通知してしまう。
+            var localState = SyncRunner.FindToolState(_settings, storage, binding.ToolKey);
             var localVersion = localState?.LastPulledVersion ?? 0;
             // 自分が最後に push した分も version は進むので、自分のマシン名で更新された
             // entry は無視する。リモートからの新着のみ通知する。

@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
 
@@ -48,20 +49,24 @@ public sealed class StartupSyncOrchestrator
     public IReadOnlyList<StartupSyncStep> Run(SyncSettings settings)
     {
         var steps = new List<StartupSyncStep>();
-        var cloud = settings.CloudFolderPath?.Trim() ?? string.Empty;
 
-        // CloudFolderPath が未設定の場合は何もしない。GUI で設定を促す。
+        // 保存先が未設定の場合は何もしない。GUI で設定を促す。
         // (StartupRegistration の自動起動経路で誤って Push 等を走らせないため)
-        if (string.IsNullOrEmpty(cloud) || !Directory.Exists(cloud))
+        ISyncStorage storage;
+        try
         {
-            _logger.LogInformation("StartupSync skipped: cloud folder not configured ('{Path}')", cloud);
+            storage = _runner.CreateStorage(settings);
+        }
+        catch (SyncStorageException ex)
+        {
+            _logger.LogInformation("StartupSync skipped: {Reason}", ex.Message);
             return steps;
         }
 
         foreach (var def in EnumerateTools(settings, _runner))
         {
             // (1) Pull
-            TryPull(def, settings, cloud, steps);
+            TryPull(def, settings, storage, steps);
 
             // (2) Launch
             // Pull 失敗時もユーザの設定通りに Launch を試みる。Pull が失敗していても
@@ -72,7 +77,7 @@ public sealed class StartupSyncOrchestrator
         return steps;
     }
 
-    private SyncResult? TryPull(ToolDefinition def, SyncSettings settings, string cloud, List<StartupSyncStep> steps)
+    private SyncResult? TryPull(ToolDefinition def, SyncSettings settings, ISyncStorage storage, List<StartupSyncStep> steps)
     {
         if (!def.SyncEnabled)
         {
@@ -98,7 +103,7 @@ public sealed class StartupSyncOrchestrator
             // Issue #19: 起動時自動 Pull はローカルが既に最新なら何もしない。
             // 手動 Pull や AutoPushConflict 経路の "先に Pull" は呼び出し側で
             // デフォルト false のまま使い、従来通り上書き Pull させる。
-            var result = _runner.Pull(def.ServiceFactory(), settings, cloud, skipBackup: false, skipIfNotNewer: true);
+            var result = _runner.Pull(def.ServiceFactory(), settings, storage, skipBackup: false, skipIfNotNewer: true);
             // NothingToDo / SourceMissing は通常運用で起こり得る (クラウド未作成や
             // 初回セットアップ直後) ため、失敗ではなく Skip 扱い。それ以外の非成功
             // は予期しない異常なので PullFailed とする。

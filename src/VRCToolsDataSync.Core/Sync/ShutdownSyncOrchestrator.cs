@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
 
@@ -89,8 +90,19 @@ public sealed class ShutdownSyncOrchestrator
         CancellationToken ct = default)
     {
         var steps = new List<ShutdownSyncStep>();
-        var cloud = settings.CloudFolderPath?.Trim() ?? string.Empty;
-        var cloudAvailable = !string.IsNullOrEmpty(cloud) && Directory.Exists(cloud);
+
+        // 保存先を先に組み立てておく。作れない場合 (未設定 / S3 の設定不備) は
+        // Push できないので、後段で全件スキップの理由として使う。
+        ISyncStorage? storage = null;
+        string? storageError = null;
+        try
+        {
+            storage = _runner.CreateStorage(settings);
+        }
+        catch (SyncStorageException ex)
+        {
+            storageError = ex.Message;
+        }
 
         // (1) 各ツールについて「終了済みか」をチェックする。SessionEnding 経路
         //     (WaitForToolsToExit が指定されている) なら、最大そのタイムアウトまで
@@ -149,15 +161,15 @@ public sealed class ShutdownSyncOrchestrator
             }
         }
 
-        // (2) Push。CloudFolderPath が無ければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
+        // (2) Push。保存先を作れなければ / 呼び出し元から SkipPush が来ていたら全件スキップ。
         //     ここでは toolDefs ベース (= 同期 OFF も含む) で PushSkipped を出す。
         //     UI/ログでは全ツールの結果が並ぶことになるが、同期 OFF ツールは Stop
         //     フェーズには登場しない (上の (1) で exitChecks に投入していないため)。
-        if (!cloudAvailable || options.SkipPush)
+        if (storage is null || options.SkipPush)
         {
             var reason = options.SkipPush
                 ? "呼び出し元の指示で Push をスキップ"
-                : "OneDrive フォルダ未設定";
+                : storageError ?? "保存先が未設定";
             _logger.LogInformation("ShutdownSync push skipped: {Reason}", reason);
             foreach (var def in toolDefs)
             {
@@ -171,6 +183,9 @@ public sealed class ShutdownSyncOrchestrator
             }
             return steps;
         }
+
+        // ラムダへ渡すので non-null の局所変数に移す。
+        var pushStorage = storage;
 
         // 同期 OFF のツールは exitResults に乗っていないので、ここで先に
         // PushSkipped("同期が無効化されています") を出してから、同期 ON ツールの
@@ -230,7 +245,32 @@ public sealed class ShutdownSyncOrchestrator
 
             try
             {
-                var pushResult = await Task.Run(() => _runner.Push(def.ServiceFactory(), settings, cloud, force: false), ct).ConfigureAwait(false);
+                // Push 本体は同期処理で、S3 互換モードでは数十分かかりうる。ct を
+                // Task.Run へ渡しても開始前にしか効かないため、開始してしまうと
+                // 終了処理がその完了まで戻れない。シャットダウンを取り消した環境では
+                // Coordinator と終了フラグが長時間復旧しなくなる。
+                // 期限が来たら待つのをやめ、Push はそのまま走らせておく。
+                var pushTask = Task.Run(
+                    () => _runner.Push(def.ServiceFactory(), settings, pushStorage, force: false),
+                    CancellationToken.None);
+                var pushResult = await WaitForPushAsync(pushTask, ct).ConfigureAwait(false);
+
+                if (pushResult is null)
+                {
+                    steps.Add(new ShutdownSyncStep
+                    {
+                        ToolKey = def.Key,
+                        DisplayName = def.DisplayName,
+                        Kind = ShutdownSyncStepKind.PushFailed,
+                        Message = "終了処理の期限までに Push が終わりませんでした (処理は継続中)",
+                    });
+                    // ここで continue すると、次の周回の先頭で
+                    // ThrowIfCancellationRequested が投げ、RunAsync が steps を
+                    // 返さずに抜ける。積んだステップが呼び出し元に届かないので、
+                    // ループを抜けてこれまでの結果を返す。
+                    break;
+                }
+
                 steps.Add(new ShutdownSyncStep
                 {
                     ToolKey = def.Key,
@@ -254,6 +294,41 @@ public sealed class ShutdownSyncOrchestrator
         }
 
         return steps;
+    }
+
+    /// <summary>
+    /// Push の完了を、終了処理の期限まで待つ。
+    /// 期限が先に来た場合は null を返す。<paramref name="pushTask"/> はそのまま
+    /// 走り続けるので、プロセスが生き残れば完了する。放置した例外で
+    /// 未観測のまま落ちないよう、結果は必ず観測しておく。
+    /// </summary>
+    private async Task<SyncResult?> WaitForPushAsync(Task<SyncResult> pushTask, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var deadline = Task.Delay(Timeout.Infinite, cts.Token);
+        var completed = await Task.WhenAny(pushTask, deadline).ConfigureAwait(false);
+
+        if (completed == pushTask)
+        {
+            // 待ち終わったので Delay を畳む。
+            cts.Cancel();
+            return await pushTask.ConfigureAwait(false);
+        }
+
+        _ = pushTask.ContinueWith(
+            t =>
+            {
+                if (t.IsFaulted)
+                {
+                    _logger.LogError(t.Exception, "終了処理の期限後に Push が失敗しました");
+                }
+                else
+                {
+                    _logger.LogInformation("終了処理の期限後に Push が完了しました");
+                }
+            },
+            TaskScheduler.Default);
+        return null;
     }
 
     /// <summary>
