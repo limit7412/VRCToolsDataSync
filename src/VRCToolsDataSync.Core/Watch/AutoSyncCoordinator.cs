@@ -50,6 +50,7 @@ public sealed class AutoSyncCoordinator : IDisposable
     public event Action<AutoPushEvent>? AutoPushCompleted;
     public event Action<AutoPushConflictEvent>? AutoPushConflict;
     public event Action<RemoteUpdateEvent>? RemoteUpdateAvailable;
+    public event Action<ProcessDetectionEvent>? ProcessDetectionChanged;
 
     public AutoSyncCoordinator(SyncRunner runner, SyncSettings settings, ILogger<AutoSyncCoordinator>? logger = null)
     {
@@ -117,6 +118,9 @@ public sealed class AutoSyncCoordinator : IDisposable
         foreach (var binding in _bindings)
         {
             binding.Watcher.Start();
+            // 監視を始めた時点の状態を一度流す。以後は変化のたびに出るが、
+            // 最初の 1 回が無いと、既に起動していたツールが変化するまで表示されない。
+            RaiseProcessDetection(binding);
         }
 
         // 同期先が変更を知らせる仕組みを作る。ローカルフォルダはファイル監視、
@@ -146,6 +150,10 @@ public sealed class AutoSyncCoordinator : IDisposable
         foreach (var binding in _bindings)
         {
             binding.Watcher.Dispose();
+            // 監視をやめたことを流す。ここで黙ると、表示が最後に見えた状態のまま
+            // 残り、監視していないことと「動いていない」ことの区別が付かなくなる。
+            ProcessDetectionChanged?.Invoke(new ProcessDetectionEvent(
+                binding.ToolKey, binding.DisplayName, IsWatching: false, Array.Empty<string>()));
         }
         _bindings.Clear();
 
@@ -189,6 +197,11 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         var watcher = new ProcessWatcher(processNames);
         var binding = new ToolBinding(toolKey, displayName, watcher, serviceFactory);
+        // 検出状況の通知。どの候補が実際に当たっているかを GUI に出すために使う
+        // (issue #11)。起動と終了の両方で流すのは、閉じ直しのように同じ走査で
+        // 両方出る場合に、最後の 1 回が現在の状態になるため。
+        watcher.ProcessStarted += _ => RaiseProcessDetection(binding);
+        watcher.ProcessExited += _ => RaiseProcessDetection(binding);
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
@@ -271,6 +284,19 @@ public sealed class AutoSyncCoordinator : IDisposable
         public Task Task { get; set; } = Task.CompletedTask;
         public bool Pushed { get; set; }
         public InFlightPush(string toolKey) { ToolKey = toolKey; }
+    }
+
+    /// <summary>
+    /// いまの検出状況を購読側へ流す。監視中に呼ぶ前提で、<see cref="ProcessDetectionEvent.IsWatching"/>
+    /// は常に true になる。監視をやめたことは <see cref="StopCore"/> が直接流す。
+    /// </summary>
+    private void RaiseProcessDetection(ToolBinding binding)
+    {
+        ProcessDetectionChanged?.Invoke(new ProcessDetectionEvent(
+            binding.ToolKey,
+            binding.DisplayName,
+            IsWatching: true,
+            binding.Watcher.DetectedProcessNames));
     }
 
     /// <summary>
@@ -423,6 +449,33 @@ public sealed record AutoPushConflictEvent(
     long RemoteVersion,
     long LastPulledVersion,
     Func<ISyncService> ServiceFactory);
+
+/// <summary>
+/// ツール 1 つのプロセス検出状況。
+/// <para>
+/// 起動しているかどうかだけでなく、<b>どの名前で見つかったか</b>を載せる。
+/// 実行ファイル名は配布のされ方で変わりうるため候補を複数持っており
+/// (<see cref="Sync.ProcessGuard.FriendConnectProcessNames"/>)、どれも当たらない場合、
+/// 利用者には「自動 Push が動かない」ことしか見えない。当たった名前を出すことで、
+/// 候補に無い名前で配布されていることに気付けるようにする。
+/// </para>
+/// </summary>
+/// <param name="ToolKey">ツールの識別子。</param>
+/// <param name="DisplayName">表示名。</param>
+/// <param name="IsWatching">
+/// 監視しているかどうか。自動同期を切っている間や停止中は false になる。
+/// 「監視していない」と「動いていない」は別物なので、表示で混ぜないために分けて持つ。
+/// </param>
+/// <param name="DetectedProcessNames">実体が見つかった名前。</param>
+public sealed record ProcessDetectionEvent(
+    string ToolKey,
+    string DisplayName,
+    bool IsWatching,
+    IReadOnlyList<string> DetectedProcessNames)
+{
+    /// <summary>1 つでも見つかっていれば起動中と見なす。</summary>
+    public bool IsRunning => DetectedProcessNames.Count > 0;
+}
 
 public sealed record RemoteUpdateEvent(
     string ToolKey,

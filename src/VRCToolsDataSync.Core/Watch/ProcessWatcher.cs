@@ -42,12 +42,32 @@ public sealed class ProcessWatcher : IDisposable
     private readonly TimeSpan _interval;
     private readonly Func<string, IReadOnlyList<ProcessInstance>> _probe;
     private readonly CancellationTokenSource _cts = new();
+    // _running は走査のスレッドが書き、DetectedProcessNames を UI のスレッドが読む。
+    // 走査そのものは 1 本しか走らないが、読み手が別にいる以上は錠が要る。
+    private readonly object _gate = new();
     private readonly Dictionary<string, List<ProcessInstance>> _running =
         new(StringComparer.OrdinalIgnoreCase);
     private Task? _loop;
 
     public event Action<string>? ProcessStarted;
     public event Action<string>? ProcessExited;
+
+    /// <summary>
+    /// いま実体が見えている名前。どの候補が実際に当たっているかを表示するために使う。
+    /// <para>
+    /// 返すのは呼んだ時点の写しである。次の走査で変わりうる。
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<string> DetectedProcessNames
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _processNames.Where(name => _running[name].Count > 0).ToList();
+            }
+        }
+    }
 
     public ProcessWatcher(IEnumerable<string> processNames, TimeSpan? interval = null)
         : this(processNames, ProbeByName, interval)
@@ -79,7 +99,9 @@ public sealed class ProcessWatcher : IDisposable
         // 既にそこにあっただけなので、起動として扱うと後段が意味を取り違える。
         foreach (var name in _processNames)
         {
-            _running[name] = Remember(SafeProbe(name), _running[name]);
+            var probed = TryProbe(name);
+            if (probed is null) continue;
+            lock (_gate) { _running[name] = Remember(probed, _running[name]); }
         }
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
@@ -89,21 +111,36 @@ public sealed class ProcessWatcher : IDisposable
     {
         foreach (var name in _processNames)
         {
-            var previous = _running[name];
-            var probed = SafeProbe(name);
+            // 列挙は錠の外で済ませる。ここは実際にプロセスを数えるぶん時間がかかるので、
+            // 中に入れると DetectedProcessNames を読む側をそのあいだ待たせる。
+            var probed = TryProbe(name);
 
-            // 見ていた実体が 1 つでも残っているか。残っていなければ、見ていたものは
-            // すべて終わり、見えているものはすべて新しい。閉じてから開き直された場合も、
-            // 残っている実体は無いのでここに入る。「動いている数」ではなく実体で見ている
-            // ため、数が変わらなくても取り違えない。
+            // 走査に失敗した名前は次回に回す。空と読むと、動いているものを終了として
+            // 通知してしまう。
+            if (probed is null) continue;
+
+            bool exited, started;
+            lock (_gate)
+            {
+                var previous = _running[name];
+
+                // 見ていた実体が 1 つでも残っているか。残っていなければ、見ていたものは
+                // すべて終わり、見えているものはすべて新しい。閉じてから開き直された場合も、
+                // 残っている実体は無いのでここに入る。「動いている数」ではなく実体で見ている
+                // ため、数が変わらなくても取り違えない。
+                //
+                // 1 つでも残っていれば、消えたものがあっても終了を通知しない。残りが動いて
+                // いる間に Push へ進むと、最後の書き手が終わってからの猶予を取り直せない。
+                var survives = previous.Any(p => probed.Any(c => IsSameInstance(p, c)));
+                exited = previous.Count > 0 && !survives;
+                started = probed.Count > 0 && !survives;
+                _running[name] = Remember(probed, previous);
+            }
+
+            // 通知は錠の外で出す。購読側が何をするかはここからは分からず、時間の掛かる
+            // 処理でも構わない。錠を持ったまま呼ぶと、そのあいだ
+            // DetectedProcessNames を読む側 (別のスレッドにいる) が待たされる。
             //
-            // 1 つでも残っていれば、消えたものがあっても終了を通知しない。残りが動いて
-            // いる間に Push へ進むと、最後の書き手が終わってからの猶予を取り直せない。
-            var survives = previous.Any(p => probed.Any(c => IsSameInstance(p, c)));
-            var exited = previous.Count > 0 && !survives;
-            var started = probed.Count > 0 && !survives;
-            _running[name] = Remember(probed, previous);
-
             // 終了を先に通知する。同じ走査の中で閉じ直されていた場合、逆順にすると
             // 呼び出し側の持つ状態が「停止中」で終わり、実際は動いているのとずれる。
             if (exited) ProcessExited?.Invoke(name);
@@ -158,10 +195,11 @@ public sealed class ProcessWatcher : IDisposable
     }
 
     /// <summary>
-    /// 1 つの名前の走査に失敗しても、その名前を次回に回すだけにする。
-    /// 空を返すと、実際には動いているものを終了として通知してしまう。
+    /// 1 つの名前を走査する。失敗した場合は null を返し、呼び出し側がその名前を
+    /// 次回に回せるようにする。空の一覧を返すと、実際には動いているものを終了として
+    /// 通知してしまう。
     /// </summary>
-    private IReadOnlyList<ProcessInstance> SafeProbe(string name)
+    private IReadOnlyList<ProcessInstance>? TryProbe(string name)
     {
         try
         {
@@ -169,9 +207,7 @@ public sealed class ProcessWatcher : IDisposable
         }
         catch
         {
-            return _running.TryGetValue(name, out var previous)
-                ? previous
-                : Array.Empty<ProcessInstance>();
+            return null;
         }
     }
 

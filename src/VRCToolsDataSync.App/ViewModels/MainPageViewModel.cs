@@ -138,6 +138,7 @@ public partial class MainPageViewModel : ObservableObject
         });
         coordinator.AutoPushConflict += e => OnUi(() => _ = HandleAutoPushConflictAsync(e));
         coordinator.RemoteUpdateAvailable += e => OnUi(() => _ = HandleRemoteUpdateAsync(e));
+        coordinator.ProcessDetectionChanged += e => OnUi(() => ApplyProcessDetection(e));
     }
 
     private void OnUi(Action action)
@@ -212,6 +213,18 @@ public partial class MainPageViewModel : ObservableObject
 
     [ObservableProperty]
     public partial string FriendConnectStatus { get; set; } = string.Empty;
+
+    // プロセスの検出状況。同期履歴を出す VrcxStatus / FriendConnectStatus とは
+    // 別に持つ。片方は「いつ同期したか」、こちらは「いま動いているか」で、
+    // 更新の切っ掛けも違う (前者は同期のたび、後者は起動と終了のたび)。
+    [ObservableProperty]
+    public partial string VrcxProcessStatus { get; set; } = ProcessDetectionUnknown;
+
+    [ObservableProperty]
+    public partial string FriendConnectProcessStatus { get; set; } = ProcessDetectionUnknown;
+
+    /// <summary>監視が始まる前の表示。「動いていない」と書いてしまうと事実と違う。</summary>
+    private const string ProcessDetectionUnknown = "プロセス監視: 未開始";
 
     [ObservableProperty]
     public partial bool IsBusy { get; set; }
@@ -806,6 +819,32 @@ public partial class MainPageViewModel : ObservableObject
         }
         VrcxStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, VrcxSyncService.Key));
         FriendConnectStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, FriendConnectSyncService.Key));
+    }
+
+    /// <summary>
+    /// プロセス検出状況の表示を更新する。ツールごとに宛先が違うので振り分ける。
+    /// </summary>
+    private void ApplyProcessDetection(ProcessDetectionEvent e)
+    {
+        var text = FormatProcessDetection(e);
+        if (e.ToolKey == VrcxSyncService.Key) VrcxProcessStatus = text;
+        else if (e.ToolKey == FriendConnectSyncService.Key) FriendConnectProcessStatus = text;
+    }
+
+    /// <summary>
+    /// 検出状況を 1 行にする。
+    /// <para>
+    /// 起動中は<b>当たった名前も出す</b>。実行ファイル名は配布のされ方で変わりうるため
+    /// 候補を複数持っており、どれも当たらない場合、利用者には「自動 Push が動かない」
+    /// ことしか見えない。当たった名前を出すことで、候補に無い名前で配布されていることに
+    /// 気付けるようにする (issue #11)。
+    /// </para>
+    /// </summary>
+    private static string FormatProcessDetection(ProcessDetectionEvent e)
+    {
+        if (!e.IsWatching) return "プロセス監視: 停止中";
+        if (!e.IsRunning) return "プロセス: 未検出";
+        return $"プロセス: 検出中 ({string.Join(", ", e.DetectedProcessNames)})";
     }
 
     private static string FormatStatus(ToolSyncState? state)
