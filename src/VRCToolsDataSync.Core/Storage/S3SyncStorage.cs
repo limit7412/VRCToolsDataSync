@@ -33,6 +33,11 @@ public sealed class S3SyncStorage : ISyncStorage
     // 複数スレッドから読み書きするため volatile にする。
     private volatile bool _conditionalWrites;
 
+    // 条件付き削除も同様に扱う。書き込みとは別の機能なので、片方だけ対応する
+    // 実装があり得る (S3 は汎用バケットの DeleteObject が If-Match を取るが、
+    // 互換実装では揃っていないことがある)。
+    private volatile bool _conditionalDeletes = true;
+
     public S3SyncStorage(S3StorageOptions options, ILoggerFactory? loggerFactory = null)
     {
         _options = options;
@@ -120,18 +125,18 @@ public sealed class S3SyncStorage : ISyncStorage
     public IEnumerable<StoredObject> List(string keyPrefix)
     {
         var prefix = ToObjectKey(keyPrefix);
-        foreach (var (key, lastModified, size) in _client.ListObjects(prefix))
+        foreach (var (key, lastModified, size, etag) in _client.ListObjects(prefix))
         {
             // キー接頭辞を設定している場合、呼び出し側にはそれを除いた形で返す。
             if (_keyPrefix.Length > 0)
             {
                 var scoped = _keyPrefix + "/";
                 if (!key.StartsWith(scoped, StringComparison.Ordinal)) continue;
-                yield return new StoredObject(key[scoped.Length..], lastModified, size);
+                yield return new StoredObject(key[scoped.Length..], lastModified, size, etag);
             }
             else
             {
-                yield return new StoredObject(key, lastModified, size);
+                yield return new StoredObject(key, lastModified, size, etag);
             }
         }
     }
@@ -180,13 +185,47 @@ public sealed class S3SyncStorage : ISyncStorage
     {
         StorageKey.Validate(key);
         var head = _client.Head(ToObjectKey(key));
-        return head is null ? null : new StoredObject(key, head.Value.LastModified, head.Value.Size);
+        return head is null
+            ? null
+            : new StoredObject(key, head.Value.LastModified, head.Value.Size, head.Value.ETag);
     }
 
-    public void Delete(string key)
+    /// <summary>
+    /// 見たときのままなら削除する。ETag が分かっていれば <c>If-Match</c> で
+    /// 不可分に判定する。
+    /// <para>
+    /// 対応していない相手を検知したら無条件の削除へ降格する。そこでは読み直しから
+    /// 削除までの隙間が残るが、削除できないよりは回収が回る方がよい。
+    /// なお「ヘッダを黙って無視して無条件に消す」実装は応答から区別が付かないため、
+    /// 検知できない。その場合の安全性は降格後と同じになる。
+    /// </para>
+    /// </summary>
+    public bool TryDelete(StoredObject expected)
     {
-        StorageKey.Validate(key);
-        _client.DeleteObject(ToObjectKey(key));
+        StorageKey.Validate(expected.Key);
+        var objectKey = ToObjectKey(expected.Key);
+
+        if (_conditionalDeletes && expected.ETag is { Length: > 0 } etag)
+        {
+            switch (_client.DeleteObject(objectKey, etag))
+            {
+                case S3DeleteOutcome.Deleted:
+                    return true;
+                case S3DeleteOutcome.PreconditionFailed:
+                    // 見たときから変わっている。他の PC が置き直した可能性があるので消さない。
+                    return false;
+                case S3DeleteOutcome.ConditionalDeleteUnsupported:
+                    _conditionalDeletes = false;
+                    _logger.LogWarning(
+                        "同期先が条件付き削除に対応していないため無効化しました。" +
+                        "回収が実体を読み直してから消すまでの間に他の PC が同じ内容を" +
+                        "送り直した場合、それを巻き込む可能性があります。");
+                    break;
+            }
+        }
+
+        _client.DeleteObject(objectKey);
+        return true;
     }
 
     public IManifestWatcher CreateManifestWatcher()

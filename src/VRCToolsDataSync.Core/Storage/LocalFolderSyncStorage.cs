@@ -309,17 +309,30 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     }
 
     /// <summary>
-    /// キーを削除する。
+    /// 見たときのままなら削除する。
     /// <para>
-    /// 同期クライアントがファイルを掴んでいる、権限が足りないといった理由で失敗しうる。
-    /// 呼び出し側 (回収) が 1 件の失敗として扱えるよう、同期先の種類によらない
-    /// <see cref="SyncStorageException"/> に揃えて投げる。
+    /// Win32 には「更新時刻が一致する場合だけ削除する」不可分な操作が無い。
+    /// できるのは削除の直前に読み直すところまでで、そこから <see cref="File.Delete"/>
+    /// までの一瞬は残る。幅は 1 回のシステムコールぶんで、猶予期間 (既定 7 日) に
+    /// 対しては無視できるが、閉じ切ってはいない。
+    /// </para>
+    /// <para>
+    /// 同期クライアントがファイルを掴んでいる、権限が足りないといった理由で削除自体が
+    /// 失敗しうる。呼び出し側 (回収) が 1 件の失敗として扱えるよう、同期先の種類に
+    /// よらない <see cref="SyncStorageException"/> に揃えて投げる。
     /// </para>
     /// </summary>
-    public void Delete(string key)
+    public bool TryDelete(StoredObject expected)
     {
-        var path = StorageKey.ToLocalPath(_rootDirectory, key);
-        if (!File.Exists(path)) return;
+        var path = StorageKey.ToLocalPath(_rootDirectory, expected.Key);
+        var info = new FileInfo(path);
+        if (!info.Exists) return true;
+
+        // 見たときと変わっていたら消さない。別の PC の Push が同じ内容を再利用して
+        // 置き直した実体は、これから公開される manifest に参照される。
+        var lastModified = new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
+        if (lastModified != expected.LastModified) return false;
+
         try
         {
             File.Delete(path);
@@ -328,6 +341,7 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         {
             throw new SyncStorageException($"ファイルを削除できません: {path} ({ex.Message})", ex);
         }
+        return true;
     }
 
     public IManifestWatcher CreateManifestWatcher()

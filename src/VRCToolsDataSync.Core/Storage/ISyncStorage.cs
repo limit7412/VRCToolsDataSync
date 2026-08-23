@@ -89,11 +89,26 @@ public interface ISyncStorage
     StoredObject? Stat(string key);
 
     /// <summary>
-    /// キーを削除する。存在しない場合は何もしない。
-    /// 削除できなかった場合は <see cref="SyncStorageException"/> を投げる
-    /// (呼び出し側が 1 件の失敗として扱えるよう、同期先の種類によらない型に揃える)。
+    /// <paramref name="expected"/> が指す状態のままなら削除する。既に無い場合も
+    /// true を返す (消したいものが消えているため)。
+    /// <para>
+    /// 読み直してから削除するまでの間に別の PC が同じキーへ書き直していることがある。
+    /// その実体はこれから公開される manifest に参照されるので、消すと欠落になる。
+    /// 削除を「見たときのまま」を条件にすることで、そこを取り違えない。
+    /// </para>
+    /// <para>
+    /// 条件が合わずに消さなかった場合は false を返す。失敗ではないので、呼び出し側は
+    /// 次の機会に回せばよい。削除そのものができなかった場合は
+    /// <see cref="SyncStorageException"/> を投げる (呼び出し側が 1 件の失敗として
+    /// 扱えるよう、同期先の種類によらない型に揃える)。
+    /// </para>
+    /// <para>
+    /// どこまで不可分に判定できるかは同期先による。S3 互換モードは
+    /// <c>If-Match</c> で不可分に判定する。同期フォルダには同等の操作が無いため、
+    /// 削除の直前に読み直す形になり、そこからの一瞬は残る。
+    /// </para>
     /// </summary>
-    void Delete(string key);
+    bool TryDelete(StoredObject expected);
 
     /// <summary>
     /// 接頭辞に一致するオブジェクトを列挙する。孤児の回収 (GC) だけが使う。
@@ -137,4 +152,9 @@ public interface IManifestWatcher : IDisposable
 /// <param name="Key">同期先のルートから見たキー。</param>
 /// <param name="LastModified">最後に書かれた時刻。猶予期間の判定に使う。</param>
 /// <param name="Size">大きさ (バイト)。回収でどれだけ空いたかの報告に使う。</param>
-public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size);
+/// <param name="ETag">
+/// 内容が変わっていないことを示す印。<see cref="ISyncStorage.TryDelete"/> の条件に使う。
+/// 同期フォルダのように印を持たない同期先では null になり、その場合は
+/// <see cref="LastModified"/> で代用する。
+/// </param>
+public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size, string? ETag = null);

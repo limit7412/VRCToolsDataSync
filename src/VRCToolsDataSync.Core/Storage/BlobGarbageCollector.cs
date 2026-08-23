@@ -37,10 +37,10 @@ public sealed record BlobGarbageCollectionResult(
 /// 一瞬に当たっただけかもしれず、その判断のまま走らせると全部消すことになる。
 /// </para>
 /// <para>
-/// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直す。列挙は取った
-/// 時点の写しなので、走査に時間がかかるほど判断が古くなる。読み直しても Stat と
-/// Delete の間は残るが、その幅は 1 往復ぶんで、猶予期間 (既定 7 日) に対して無視できる。
-/// 列挙から削除までの数分と違い、Push がその隙間に収まることはない。
+/// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直し、その状態を
+/// 条件にして <see cref="ISyncStorage.TryDelete"/> で消す。列挙は取った時点の写しなので、
+/// 走査に時間がかかるほど判断が古くなる。読み直しから削除までの隙間は同期先に判定させる
+/// (S3 互換モードは <c>If-Match</c> で不可分に、同期フォルダは削除の直前の読み直しで)。
 /// </para>
 /// </summary>
 public sealed class BlobGarbageCollector
@@ -146,7 +146,15 @@ public sealed class BlobGarbageCollector
                     continue;
                 }
 
-                _storage.Delete(stored.Key);
+                // 読み直した状態を条件にして消す。読み直してから削除するまでの間にも
+                // 別の PC が置き直しうるので、そこは同期先に判定させる。
+                if (!_storage.TryDelete(current))
+                {
+                    young++;
+                    _logger.LogInformation("読み直した後に書き直されたため残します: {Key}", stored.Key);
+                    continue;
+                }
+
                 deleted++;
                 deletedBytes += current.Size;
                 _logger.LogInformation("回収しました: {Key}", stored.Key);

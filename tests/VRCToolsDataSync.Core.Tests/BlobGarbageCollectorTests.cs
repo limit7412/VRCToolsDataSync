@@ -144,6 +144,34 @@ public sealed class BlobGarbageCollectorTests
         Assert.Equal(1, result.Young);
     }
 
+    [Fact(DisplayName = "読み直した後に書き直された実体は消さない")]
+    public void BlobRewrittenAfterStatIsKept()
+    {
+        // 列挙後の読み直しでも捕まらない、さらに内側の隙間。読み直してから削除するまでに
+        // 別の PC が置き直すと、その実体はこれから公開される manifest に参照される。
+        // 削除を「読み直したときのまま」を条件にすることで、ここを取り違えない。
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
+        storage.Seed(BlobKeys.Prefix + "reused", "orphan for now", LongAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+
+        // Stat を返した直後に、別の PC が同じ日時のまま置き直したことにする。
+        // 日時での判定はすり抜けるので、印 (ETag) でしか捕まらない。
+        storage.OnStat = key =>
+        {
+            if (key != BlobKeys.Prefix + "reused") return;
+            storage.OnStat = null;
+            storage.Seed(BlobKeys.Prefix + "reused", "orphan for now", LongAgo);
+        };
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace);
+
+        Assert.True(storage.Has(BlobKeys.Prefix + "reused"));
+        Assert.Contains("PreconditionFailed:" + BlobKeys.Prefix + "reused", storage.Calls);
+        Assert.Equal(0, result.Deleted);
+        Assert.Equal(1, result.Young);
+    }
+
     [Fact(DisplayName = "一件の削除失敗で全体を止めない")]
     public void SingleDeleteFailureDoesNotStopTheRun()
     {
@@ -174,7 +202,7 @@ public sealed class BlobGarbageCollectorTests
 
         Assert.Equal(1, result.Deleted);
         Assert.True(storage.Has(BlobKeys.Prefix + "bbb"));
-        Assert.DoesNotContain(storage.Calls, c => c.StartsWith("Delete:", StringComparison.Ordinal));
+        Assert.DoesNotContain(storage.Calls, c => c.StartsWith("TryDelete:", StringComparison.Ordinal));
     }
 
     [Fact(DisplayName = "manifest を読んでから列挙する")]
