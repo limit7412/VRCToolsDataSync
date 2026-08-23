@@ -79,7 +79,7 @@ public sealed class ProcessWatcher : IDisposable
         // 既にそこにあっただけなので、起動として扱うと後段が意味を取り違える。
         foreach (var name in _processNames)
         {
-            _running[name] = SafeProbe(name).ToList();
+            _running[name] = Remember(SafeProbe(name), _running[name]);
         }
         _loop = Task.Run(() => RunAsync(_cts.Token));
     }
@@ -90,7 +90,7 @@ public sealed class ProcessWatcher : IDisposable
         foreach (var name in _processNames)
         {
             var previous = _running[name];
-            var current = SafeProbe(name).ToList();
+            var probed = SafeProbe(name);
 
             // 見ていた実体が 1 つでも残っているか。残っていなければ、見ていたものは
             // すべて終わり、見えているものはすべて新しい。閉じてから開き直された場合も、
@@ -99,10 +99,10 @@ public sealed class ProcessWatcher : IDisposable
             //
             // 1 つでも残っていれば、消えたものがあっても終了を通知しない。残りが動いて
             // いる間に Push へ進むと、最後の書き手が終わってからの猶予を取り直せない。
-            var survives = previous.Any(p => current.Any(c => IsSameInstance(p, c)));
+            var survives = previous.Any(p => probed.Any(c => IsSameInstance(p, c)));
             var exited = previous.Count > 0 && !survives;
-            var started = current.Count > 0 && !survives;
-            _running[name] = current;
+            var started = probed.Count > 0 && !survives;
+            _running[name] = Remember(probed, previous);
 
             // 終了を先に通知する。同じ走査の中で閉じ直されていた場合、逆順にすると
             // 呼び出し側の持つ状態が「停止中」で終わり、実際は動いているのとずれる。
@@ -126,6 +126,36 @@ public sealed class ProcessWatcher : IDisposable
     private static bool IsSameInstance(ProcessInstance a, ProcessInstance b)
         => a.Id == b.Id
             && (a.StartedAt is null || b.StartedAt is null || a.StartedAt == b.StartedAt);
+
+    /// <summary>
+    /// 次の走査へ持ち越す見え方を決める。一度読めた開始時刻は、読めなかった走査で捨てない。
+    /// <para>
+    /// null は「開始時刻が無い」ではなく「今回は読めなかった」でしかない。null のまま
+    /// 覚えると、次に読めた時刻と突き合わせる相手を失う。読めない間に PID が再利用されて
+    /// いても、null はどの時刻とも一致するため入れ替わりを見逃す。
+    /// </para>
+    /// <para>
+    /// 読めない状態が続く間に入れ替わった場合は、突き合わせる材料が無いので見逃す。
+    /// 次にどちらかの走査で読めた時点で気付く。
+    /// </para>
+    /// </summary>
+    private static List<ProcessInstance> Remember(
+        IReadOnlyList<ProcessInstance> probed,
+        List<ProcessInstance> previous)
+    {
+        var result = new List<ProcessInstance>(probed.Count);
+        foreach (var instance in probed)
+        {
+            if (instance.StartedAt is null)
+            {
+                // 見つからなければ既定値 (開始時刻は null) が返るので、そのまま判別に使える。
+                var known = previous.FirstOrDefault(p => p.Id == instance.Id && p.StartedAt is not null);
+                if (known.StartedAt is not null) { result.Add(known); continue; }
+            }
+            result.Add(instance);
+        }
+        return result;
+    }
 
     /// <summary>
     /// 1 つの名前の走査に失敗しても、その名前を次回に回すだけにする。

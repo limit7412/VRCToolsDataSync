@@ -164,6 +164,29 @@ public sealed class ProcessWatcherTests
         Assert.Empty(events);
     }
 
+    [Fact(DisplayName = "一時的に読めなかった開始時刻は、読めていた値を覚えておく")]
+    public void ATemporarilyUnreadableStartTimeDoesNotDiscardTheKnownValue()
+    {
+        // null は「開始時刻が無い」ではなく「今回は読めなかった」でしかない。null のまま
+        // 覚えると次に読めた時刻と突き合わせる相手を失い、その間に PID が再利用されて
+        // いても入れ替わりを見逃す。
+        var processes = new FakeProcesses();
+        processes.Set(Name, Instance(1000, startedAtHour: 9));
+        var (watcher, events) = Watch(processes);
+        watcher.Poll();
+        events.Clear();
+
+        // 一度読めなくなり、次は読めた。ただし別の実体が同じ PID を割り当てられている。
+        processes.Set(Name, new ProcessInstance(1000, null));
+        watcher.Poll();
+        Assert.Empty(events);
+
+        processes.Set(Name, Instance(1000, startedAtHour: 10));
+        watcher.Poll();
+
+        Assert.Equal(new[] { "exited:" + Name, "started:" + Name }, events);
+    }
+
     [Fact(DisplayName = "開始時刻を読めない実体でも、消えれば終了を通知する")]
     public void AnInstanceWithoutAStartTimeStillReportsItsExit()
     {
