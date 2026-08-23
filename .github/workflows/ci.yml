@@ -30,16 +30,15 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      # solution 単位のビルドでは RID を指定できず (NETSDK1134)、指定しないと
-      # VRCToolsDataSync.App の runtime pack が restore されない (NETSDK1112)。
-      # release.yml の publish と同じく、プロジェクト単位で RID と Platform を
-      # 明示する。Core は両プロジェクトからの参照でビルドされる。
-      - name: Build Cli
+      # README のセットアップ手順そのもの。ここが通らないと、利用者は書いてある
+      # とおりの手順でビルドできない (issue #28)。プロジェクト単位のビルドだけを
+      # 見ていると、solution 経由でしか出ない不整合を取りこぼす。
+      - name: Build solution
         # 警告をエラー扱いにするかは既存コードの警告状況を見てから決める (issue #25)。
-        run: dotnet build src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj --configuration Release
+        run: dotnet build VRCToolsDataSync.slnx --configuration Release
 
-      # PublishTrimmed は Release 構成で既定 true になっており、self-contained
-      # でないビルドでは NETSDK1102 になる。トリミングはリリース時にだけ効けば
-      # よいので、build-release.ps1 と同じく無効にする。
-      - name: Build App
-        run: dotnet build src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj --configuration Release --runtime win-x64 -p:Platform=x64 -p:PublishTrimmed=false
+      # リリースと同じ形 (RID と Platform を明示) でも通ることを確かめる。
+      # solution 経由では Platform が slnx の割り当てで決まるため、こちらは
+      # release.yml の publish に近い経路の確認になる。
+      - name: Build App (win-x64)
+        run: dotnet build src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj --configuration Release --runtime win-x64 -p:Platform=x64
