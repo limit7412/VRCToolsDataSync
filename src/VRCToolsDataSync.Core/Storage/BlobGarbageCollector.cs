@@ -32,6 +32,10 @@ public sealed record BlobGarbageCollectionResult(
 /// 他の PC が今まさに送っている最中のオブジェクトは、まだどの manifest からも
 /// 参照されていないため、これが無いと進行中の Push を壊す。
 /// </para>
+/// <para>
+/// 参照が 1 件も集まらなかった場合は回収そのものを中止する。manifest を読めない
+/// 一瞬に当たっただけかもしれず、その判断のまま走らせると全部消すことになる。
+/// </para>
 /// </summary>
 public sealed class BlobGarbageCollector
 {
@@ -67,6 +71,23 @@ public sealed class BlobGarbageCollector
         // 新しいので猶予期間に守られる。逆順にすると、列挙してから manifest を読むまでの
         // 間に公開されたものを取りこぼす。
         var live = CollectLiveKeys();
+        if (live.Count == 0)
+        {
+            // 参照が 1 件も無い。ここから走査すると、猶予期間を過ぎた実体をすべて
+            // 孤児と判定して消す。
+            //
+            // ローカルフォルダでは、同期クライアントが manifest.json を置き換える
+            // 一瞬だけファイルが存在しない状態になりうる。そこに当たると
+            // LoadManifest は空の manifest を返し、実際には全部生きている実体を
+            // 全部孤児と判定する。存在しない manifest と「中身が空の manifest」を
+            // 読んだ結果から区別する手立ては無いので、どちらでも走らせない。
+            //
+            // 本当に何も同期していない場合は、回収すべき実体もまだ無い。止めて困らない。
+            throw new SyncStorageException(
+                "manifest から参照されている実体が 1 件もありません。" +
+                "manifest がまだ無いか、読めない状態だった可能性があります。" +
+                "この状態で回収すると生きている実体まで消すため、中止しました。");
+        }
         var threshold = DateTimeOffset.UtcNow - grace;
 
         var scanned = 0;

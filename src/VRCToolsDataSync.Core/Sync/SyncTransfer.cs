@@ -66,7 +66,7 @@ internal static class SyncTransfer
            && storage.Exists(ManifestFileKeys.StorageKeyOf(candidate));
 
     /// <summary>
-    /// 前回の manifest と今回のファイル集合を比べ、送るものが何も無かったかを判定する。
+    /// 前回の manifest と今回のファイル集合を比べ、manifest を書き直す必要が無いかを判定する。
     /// <para>
     /// ここでは実体の有無は見ない。実体が欠けていた分は上の判定で送り直されており、
     /// その時点で manifest の記録と実体が揃うため、manifest を書き直す必要は無い。
@@ -77,8 +77,37 @@ internal static class SyncTransfer
         if (previous is null || previous.Files.Count != current.Count) return false;
         foreach (var file in current)
         {
-            if (!IsAlreadyOnRemote(previous.Files, file)) return false;
+            if (!IsRecordedAsIs(previous.Files, file)) return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// manifest の記録が、今回作ったエントリとそのまま同じかを判定する。
+    /// <para>
+    /// 内容の一致 (<see cref="IsAlreadyOnRemote"/>) では足りず、実データの置き場所まで
+    /// 一致することを求める。schemaVersion 1 の manifest は
+    /// <see cref="ManifestFile.RelativePath"/> をそのままキーにしているため、内容が
+    /// 同じでも記録は古い置き場所を指したままになる。ここを内容だけで一致と見なすと、
+    /// <c>blobs/</c> 側へ送り直した実体を manifest がいつまでも指さず、送り直しだけを
+    /// Push のたびに繰り返す。
+    /// </para>
+    /// </summary>
+    private static bool IsRecordedAsIs(IReadOnlyList<ManifestFile> remoteFiles, ManifestFile candidate)
+    {
+        foreach (var remote in remoteFiles)
+        {
+            if (!string.Equals(remote.RelativePath, candidate.RelativePath, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            return !string.IsNullOrEmpty(remote.Sha256)
+                && string.Equals(remote.Sha256, candidate.Sha256, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(
+                    ManifestFileKeys.StorageKeyOf(remote),
+                    ManifestFileKeys.StorageKeyOf(candidate),
+                    StringComparison.Ordinal);
+        }
+        return false;
     }
 }

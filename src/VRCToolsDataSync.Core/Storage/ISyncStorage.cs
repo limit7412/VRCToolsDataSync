@@ -77,7 +77,11 @@ public interface ISyncStorage
     /// <summary>キーが同期先にあるかを確かめる。</summary>
     bool Exists(string key);
 
-    /// <summary>キーを削除する。存在しない場合は何もしない。</summary>
+    /// <summary>
+    /// キーを削除する。存在しない場合は何もしない。
+    /// 削除できなかった場合は <see cref="SyncStorageException"/> を投げる
+    /// (呼び出し側が 1 件の失敗として扱えるよう、同期先の種類によらない型に揃える)。
+    /// </summary>
     void Delete(string key);
 
     /// <summary>

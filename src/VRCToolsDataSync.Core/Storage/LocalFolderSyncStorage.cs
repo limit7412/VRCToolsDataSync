@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 
@@ -17,8 +18,15 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     /// <summary>読み書きの権限を確認するために書いて読み戻す中身。</summary>
     private static readonly byte[] ProbePayload = "VRCToolsDataSync access check"u8.ToArray();
 
+    /// <summary>書き出し中のファイルに付ける名前の先頭。回収も掃除もこれで見分ける。</summary>
+    private const string StagingPrefix = ".building-";
+
+    /// <summary>書き出し中のファイルを置き去りとみなすまでの時間。</summary>
+    private static readonly TimeSpan StagingRetention = TimeSpan.FromDays(1);
+
     private readonly string _rootDirectory;
     private readonly ILoggerFactory? _loggerFactory;
+    private readonly ILogger _logger;
 
     public LocalFolderSyncStorage(string rootDirectory, ILoggerFactory? loggerFactory = null)
     {
@@ -30,6 +38,8 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         // 別の同期先として扱われると、同期履歴が分かれてしまう。
         _rootDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootDirectory.Trim()));
         _loggerFactory = loggerFactory;
+        _logger = loggerFactory?.CreateLogger<LocalFolderSyncStorage>()
+                  ?? (ILogger)NullLogger<LocalFolderSyncStorage>.Instance;
     }
 
     public string RootDirectory => _rootDirectory;
@@ -94,9 +104,9 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         }
 
         // 削除の可否も確かめる。NTFS では「ファイルの作成」と「削除」が別の権限
-        // なので、作成だけ許して削除を拒むフォルダを作れる。Push はローカルから
-        // 消えた任意ファイルの削除と古い note の回収で削除を行うため、そこを
-        // 確認しないと設定を保存できても後の同期で失敗する。
+        // なので、作成だけ許して削除を拒むフォルダを作れる。Push は実データを消さない
+        // が、参照されなくなった実体の回収 (storage gc) が削除を行うため、そこを
+        // 確認しないと設定を保存できても後で回収が失敗し続ける。
         //
         // 失敗した場合、検査用ファイルは残る。設定が保存されない以上、利用者は
         // 権限を直して再度試すことになるので、S3 側と同じ扱いにしている。
@@ -167,7 +177,35 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
 
     public void Upload(string localPath, string key)
     {
-        AtomicFile.Copy(localPath, StorageKey.ToLocalPath(_rootDirectory, key), overwrite: true);
+        var destination = StorageKey.ToLocalPath(_rootDirectory, key);
+        AtomicFile.Copy(localPath, destination, overwrite: true);
+        StampWriteTime(destination);
+    }
+
+    /// <summary>
+    /// 同期先へ書いた時刻を最終更新時刻として刻む。
+    /// <para>
+    /// 回収 (<see cref="BlobGarbageCollector"/>) の猶予期間は「同期先へ書かれてからの
+    /// 経過時間」で判断する。ところが <see cref="File.Copy(string, string)"/> はコピー元の
+    /// 最終更新時刻を引き継ぐため、何か月も前に作られた設定ファイルを Push すると、
+    /// 書いた直後の実体が猶予期間を過ぎていると見なされる。manifest が他の PC へ
+    /// 届く前にその PC で回収が走ると、届いた manifest が消えた実体を指す。
+    /// </para>
+    /// <para>
+    /// 失敗しても Push 自体は止めない。時刻を刻めないのは回収の判断が本来より
+    /// 早まりうるという劣化であって、送ったデータが壊れるわけではない。
+    /// </para>
+    /// </summary>
+    private void StampWriteTime(string path)
+    {
+        try
+        {
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "最終更新時刻を更新できませんでした: {Path}", path);
+        }
     }
 
     public IStagedUpload BeginUpload()
@@ -177,9 +215,38 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         // (別ドライブを経由すると数百 MB のコピーになる)。
         var blobDirectory = StorageKey.ToLocalPath(_rootDirectory, BlobKeys.Prefix.TrimEnd('/'));
         Directory.CreateDirectory(blobDirectory);
+        PruneStaleStagingFiles(blobDirectory);
         // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
-        var stagingPath = Path.Combine(blobDirectory, ".building-" + Guid.NewGuid().ToString("N"));
+        var stagingPath = Path.Combine(blobDirectory, StagingPrefix + Guid.NewGuid().ToString("N"));
         return new StagedFile(stagingPath, this);
+    }
+
+    /// <summary>
+    /// 置き去りになった書き出し中のファイルを片付ける。ここには SQLite の完全な複製
+    /// (数百 MB) が置かれるうえ、同期フォルダの中なので放置すると同期クライアントが
+    /// 他の PC へ配ってしまう。進行中の Push を消さないよう、十分に古いものだけを対象にする。
+    /// </summary>
+    private void PruneStaleStagingFiles(string blobDirectory)
+    {
+        var threshold = DateTime.UtcNow - StagingRetention;
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(blobDirectory, StagingPrefix + "*"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) < threshold) File.Delete(path);
+                }
+                catch (IOException)
+                {
+                    // 別プロセスが書き込み中。次の機会に任せる。
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "書き出し中ファイルの掃除に失敗しました: {Directory}", blobDirectory);
+        }
     }
 
     public IEnumerable<StoredObject> List(string keyPrefix)
@@ -191,7 +258,7 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         {
             // 書き出し中の一時ファイルは回収の対象にしない。
             var name = Path.GetFileName(path);
-            if (name.StartsWith(".building-", StringComparison.Ordinal)) continue;
+            if (name.StartsWith(StagingPrefix, StringComparison.Ordinal)) continue;
 
             var info = new FileInfo(path);
             if (!info.Exists) continue;
@@ -217,12 +284,25 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
     public bool Exists(string key)
         => File.Exists(StorageKey.ToLocalPath(_rootDirectory, key));
 
+    /// <summary>
+    /// キーを削除する。
+    /// <para>
+    /// 同期クライアントがファイルを掴んでいる、権限が足りないといった理由で失敗しうる。
+    /// 呼び出し側 (回収) が 1 件の失敗として扱えるよう、同期先の種類によらない
+    /// <see cref="SyncStorageException"/> に揃えて投げる。
+    /// </para>
+    /// </summary>
     public void Delete(string key)
     {
         var path = StorageKey.ToLocalPath(_rootDirectory, key);
-        if (File.Exists(path))
+        if (!File.Exists(path)) return;
+        try
         {
             File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new SyncStorageException($"ファイルを削除できません: {path} ({ex.Message})", ex);
         }
     }
 
@@ -254,22 +334,43 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
             if (File.Exists(destination))
             {
                 // 内容から決まるキーなので、既にあるなら中身は同じ。置き換えずに済ませる。
-                File.Delete(LocalPath);
+                DiscardStaging();
             }
             else
             {
-                File.Move(LocalPath, destination);
+                try
+                {
+                    File.Move(LocalPath, destination);
+                }
+                catch (IOException) when (File.Exists(destination))
+                {
+                    // 上の Exists から Move までの間に、別の Push が同じ内容を置いた。
+                    // 内容から決まるキーなので相手が置いたものも中身は同じ。競合した側も
+                    // 成功として扱う。ここで失敗させると、同じデータを同時に送った
+                    // だけで Push 全体が落ちる。
+                    DiscardStaging();
+                }
             }
+            // 既にあった場合も刻み直す。参照が切れて猶予期間を過ぎた実体を、別の世代が
+            // 再び参照することがある。刻まないと、参照され直した直後に回収されうる。
+            _storage.StampWriteTime(destination);
             _committed = true;
         }
 
         public void Dispose()
         {
             if (_committed) return;
-            if (File.Exists(LocalPath))
-            {
-                try { File.Delete(LocalPath); } catch { /* best-effort cleanup */ }
-            }
+            DiscardStaging();
+        }
+
+        /// <summary>
+        /// 書き出しに使った一時ファイルを片付ける。消せなくても失敗にはしない。
+        /// 残った分は次回以降の <see cref="BeginUpload"/> が回収する。
+        /// </summary>
+        private void DiscardStaging()
+        {
+            if (!File.Exists(LocalPath)) return;
+            try { File.Delete(LocalPath); } catch { /* best-effort cleanup */ }
         }
     }
 }

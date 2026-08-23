@@ -141,6 +141,12 @@ public sealed class ManifestStore
             var nextVersion = currentVersion + 1;
             snapshot.Manifest.Tools[toolKey] = buildEntry(nextVersion);
 
+            // 読み込んだ manifest には、その manifest を書いた版の schemaVersion が
+            // 入っている。ここで書き出す内容は現行形式 (BlobKey を含む) なので、
+            // 宣言も現行値へ揃える。揃えないと、形式で分岐する読み手に 1 と伝えたまま
+            // 2 の内容を渡すことになる。
+            snapshot.Manifest.SchemaVersion = SyncManifest.CurrentSchemaVersion;
+
             if (_storage.TrySaveManifest(snapshot.Manifest, snapshot.VersionTag))
             {
                 return nextVersion;
