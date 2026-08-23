@@ -39,8 +39,14 @@ public sealed record BlobGarbageCollectionResult(
 /// <para>
 /// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直し、その状態を
 /// 条件にして <see cref="ISyncStorage.TryDelete"/> で消す。列挙は取った時点の写しなので、
-/// 走査に時間がかかるほど判断が古くなる。読み直しから削除までの隙間は同期先に判定させる
-/// (S3 互換モードは <c>If-Match</c> で不可分に、同期フォルダは削除の直前の読み直しで)。
+/// 走査に時間がかかるほど判断が古くなる。
+/// </para>
+/// <para>
+/// <b>読み直しから削除までの隙間は、どちらの同期先でも閉じられない。</b> S3 の条件付き
+/// 削除は ETag を条件に取るが、ETag は内容の関数なので、内容から決まるキーでは
+/// 送り直しを区別できない。Win32 にも更新時刻を条件にする不可分な削除は無い。
+/// 残る幅は 1 往復ぶんで猶予期間 (既定 7 日) に対しては無視でき、ここに入った場合も
+/// 次の Push が実体の欠落を見つけて送り直すため自然に回復する。
 /// </para>
 /// </summary>
 public sealed class BlobGarbageCollector

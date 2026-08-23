@@ -177,8 +177,13 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
         Assert.NotNull(seen);
 
         // 見た後に別の PC が置き直したことにする。
+        //
+        // DateTime.UtcNow を使わない。直前の Send が刻んだ時刻と同じ刻みに入ったり、
+        // TEMP が更新時刻を粗く丸めるボリューム (FAT/exFAT など) にあったりすると
+        // 同じ値になり、実装が壊れていなくてもテストが落ちる。
         File.SetLastWriteTimeUtc(
-            StorageKey.ToLocalPath(_root, file.BlobKey!), DateTime.UtcNow);
+            StorageKey.ToLocalPath(_root, file.BlobKey!),
+            seen!.LastModified.UtcDateTime.AddHours(1));
 
         Assert.False(storage.TryDelete(seen!));
         Assert.True(storage.Exists(file.BlobKey!));
