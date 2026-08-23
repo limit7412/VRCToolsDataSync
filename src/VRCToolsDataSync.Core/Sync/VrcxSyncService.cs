@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Paths;
+using VRCToolsDataSync.Core.Storage;
 
 namespace VRCToolsDataSync.Core.Sync;
 
@@ -8,9 +9,8 @@ public sealed class VrcxSyncService : ISyncService
 {
     public const string Key = "vrcx";
 
-    private const string SubFolder = "vrcx";
-    private const string SnapshotFileName = "latest.sqlite3";
-    private const string SettingsFileName = "latest.json";
+    private const string SnapshotKey = "vrcx/latest.sqlite3";
+    private const string SettingsKey = "vrcx/latest.json";
 
     private readonly VrcxPaths _paths;
     private readonly LocalBackup _backup;
@@ -38,11 +38,13 @@ public sealed class VrcxSyncService : ISyncService
             };
         }
 
-        var manifestStore = new ManifestStore(options.CloudFolderPath);
+        var storage = options.Storage;
+        var manifestStore = new ManifestStore(storage);
         var manifest = manifestStore.Load();
+        manifest.Tools.TryGetValue(Key, out var existing);
 
         if (!options.ForceOverwriteOnConflict
-            && manifest.Tools.TryGetValue(Key, out var existing)
+            && existing is not null
             && existing.Version > (options.LastPulledVersion ?? 0))
         {
             _logger.LogInformation(
@@ -57,65 +59,103 @@ public sealed class VrcxSyncService : ISyncService
             };
         }
 
-        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        Directory.CreateDirectory(toolFolder);
+        // 同期先に既にある内容は送り直さない。判断材料は前回の manifest エントリ。
+        var remoteFiles = existing?.Files ?? new List<ManifestFile>();
+        var files = new List<ManifestFile>();
+        var affected = new List<string>();
 
-        var snapshotDest = Path.Combine(toolFolder, SnapshotFileName);
-        // 別プロセスの Push と一時ファイル名が衝突しないよう GUID を含める。
-        var snapshotTmp = snapshotDest + ".building-" + Guid.NewGuid().ToString("N");
-        SqliteSnapshot.Create(_paths.SqliteFile, snapshotTmp);
-
-        try
+        // WAL を統合したスナップショットを作ってから送る。ローカルフォルダなら
+        // 同期先の一時ファイルへ直接 VACUUM し、S3 互換なら一時ファイル経由で
+        // アップロードする (どちらを使うかは同期先の実装が決める)。
+        using (var staged = storage.BeginUpload(SnapshotKey))
         {
-            if (File.Exists(snapshotDest))
+            SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
+            var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
+            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
-                File.Replace(snapshotTmp, snapshotDest, destinationBackupFileName: null);
+                _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
             }
             else
             {
-                File.Move(snapshotTmp, snapshotDest);
+                staged.Commit();
+                affected.Add(SnapshotKey);
             }
-        }
-        catch
-        {
-            if (File.Exists(snapshotTmp))
-            {
-                try { File.Delete(snapshotTmp); } catch { /* best-effort */ }
-            }
-            throw;
+            files.Add(snapshot);
         }
 
-        var affected = new List<string> { snapshotDest };
-
-        var settingsDest = Path.Combine(toolFolder, SettingsFileName);
         if (File.Exists(_paths.SettingsJsonFile))
         {
-            AtomicFile.Copy(_paths.SettingsJsonFile, settingsDest, overwrite: true);
-            affected.Add(settingsDest);
+            var settingsFile = SyncTransfer.Describe(_paths.SettingsJsonFile, SettingsKey);
+            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, settingsFile))
+            {
+                _logger.LogInformation("VRCX 設定ファイルの送信を省略 (内容が同じ)");
+            }
+            else
+            {
+                storage.Upload(_paths.SettingsJsonFile, SettingsKey);
+                affected.Add(SettingsKey);
+            }
+            files.Add(settingsFile);
         }
-        else if (File.Exists(settingsDest))
+        else
         {
-            // ローカルから消えた任意ファイルはクラウドからも削除する。
-            // ここで握りつぶすと Pull 側はリモートの実ファイル存在を見るため、
-            // 古い latest.json が他 PC へ復元され、削除した設定が復活する。
-            // 失敗した場合は Push 全体を失敗扱いにして上位に伝える。
-            File.Delete(settingsDest);
+            // ローカルから消えた任意ファイルは同期先からも削除する。
+            // ここで握りつぶすと Pull 側で古い latest.json が他 PC へ復元され、
+            // 削除した設定が復活する。失敗した場合は Push 全体を失敗扱いにする。
+            storage.Delete(SettingsKey);
         }
 
-        // 保存直前に manifest を再読込し、他 tool のエントリを失わないようにマージする。
-        // (別プロセス / 別 SyncService が同時に Push したケースを救済)
-        var finalManifest = manifestStore.Load();
-        var nextVersion = (finalManifest.Tools.TryGetValue(Key, out var prev) ? prev.Version : 0) + 1;
-        finalManifest.Tools[Key] = new ToolManifestEntry
+        if (SyncTransfer.IsUnchangedSet(existing, files))
         {
-            Version = nextVersion,
-            MachineName = options.MachineName,
-            UpdatedAt = DateTimeOffset.Now,
-            Files = BuildManifestFiles(affected, options.CloudFolderPath),
-        };
-        manifestStore.Save(finalManifest);
+            // 送るものが何も無いなら manifest も触らない。version を進めると
+            // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
+            // ダウンロードを誘発してしまう。
+            _logger.LogInformation("VRCX Push: 変更なし version={Version}", existing!.Version);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Success,
+                RemoteVersion = existing.Version,
+                Message = "前回の Push から変更がないため、同期先はそのままです",
+            };
+        }
 
-        _logger.LogInformation("VRCX Push 完了 version={Version} files={Count}", nextVersion, affected.Count);
+        long nextVersion;
+        try
+        {
+            nextVersion = manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, version => new ToolManifestEntry
+            {
+                Version = version,
+                MachineName = options.MachineName,
+                UpdatedAt = DateTimeOffset.Now,
+                Files = files,
+            });
+        }
+        catch (ToolEntryChangedException ex)
+        {
+            // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が
+            // 同じ tool を Push した。ここで押し切ると、相手が上書きしたオブジェクトに
+            // 対して「内容が同じだから送らない」と判断した記録を残すことになり、
+            // manifest と実データがずれる。
+            //
+            // なお、この時点で既にファイルは送信済みなので、同期先の実データと
+            // manifest の記録がずれた状態になりうる。その状態は Pull 側の
+            // ハッシュ検証で検出され、次に Push が通れば解消する (#27)。
+            _logger.LogInformation(
+                "VRCX Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
+                ex.ExpectedVersion, ex.ActualVersion);
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.ConflictDetected,
+                RemoteVersion = ex.ActualVersion,
+                LastPulledVersion = options.LastPulledVersion,
+                Message = "Push の途中で他の PC が同期先を更新しました。" +
+                          "同期先のファイルと manifest がずれている可能性があるため、" +
+                          "この PC のデータで上書きしてよければ強制 Push、" +
+                          "相手のデータを採用するなら Pull し直してから Push してください。",
+            };
+        }
+
+        _logger.LogInformation("VRCX Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
         {
             Outcome = SyncOutcome.Success,
@@ -128,8 +168,8 @@ public sealed class VrcxSyncService : ISyncService
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
 
-        var manifestStore = new ManifestStore(options.CloudFolderPath);
-        var manifest = manifestStore.Load();
+        var storage = options.Storage;
+        var manifest = new ManifestStore(storage).Load();
         if (!manifest.Tools.TryGetValue(Key, out var entry))
         {
             return new SyncResult
@@ -165,44 +205,94 @@ public sealed class VrcxSyncService : ISyncService
             };
         }
 
-        var toolFolder = Path.Combine(options.CloudFolderPath, SubFolder);
-        var remoteSnapshot = Path.Combine(toolFolder, SnapshotFileName);
-        var remoteSettings = Path.Combine(toolFolder, SettingsFileName);
-        if (!File.Exists(remoteSnapshot))
+        // manifest に載っているファイル集合を正としてローカルへ反映する。
+        // 同期先を実際に走査するのではなく manifest を基準にすることで、
+        // ローカルフォルダと S3 互換で同じ判断になる。
+        var remoteFiles = entry.Files.ToDictionary(f => f.RelativePath, StringComparer.Ordinal);
+        if (!remoteFiles.TryGetValue(SnapshotKey, out var remoteSnapshot))
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {remoteSnapshot}",
+                Message = $"クラウド側にスナップショットがありません: {SnapshotKey}",
             };
         }
 
         Directory.CreateDirectory(_paths.RootDirectory);
 
+        // (1) 同期先から取り出す。ここではローカルの既存ファイルに触れないので、
+        //     途中で失敗しても手元のデータは元のまま残る。
+        using var staging = new PullStaging(_logger);
+
+        if (!staging.Fetch(storage, remoteSnapshot, _paths.SqliteFile))
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にスナップショットがありません: {SnapshotKey}",
+            };
+        }
+
+        remoteFiles.TryGetValue(SettingsKey, out var remoteSettings);
+        if (remoteSettings is not null && !staging.Fetch(storage, remoteSettings, _paths.SettingsJsonFile))
+        {
+            // manifest が要求するファイルが同期先に無い。ここで成功にしてしまうと
+            // LastPulledVersion だけ進み、以後の起動時 Pull はこの version を
+            // 最新とみなして省略するため、欠けたまま固定される。
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"クラウド側にファイルがありません: {SettingsKey}",
+            };
+        }
+
+        // (2) 取り出した内容が manifest の記録と合っているか確かめる。
+        if (staging.FindMismatchedKey() is { } mismatched)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}。" +
+                          "同期先のファイルと manifest がずれています。" +
+                          "正しいデータを持つ PC から Push し直すと解消します。",
+            };
+        }
+
+        // (3) ここから先はローカルを書き換える。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
-            var filesToBackup = new List<string> { _paths.SqliteFile };
+            // WAL/SHM もバックアップに含める。この後で消すので、含めておかないと
+            // 本体へ未反映のローカル変更が復元できなくなる。
+            var filesToBackup = new List<string>
+            {
+                _paths.SqliteFile,
+                Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-wal"),
+                Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-shm"),
+            };
             if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
 
-        // WAL/SHM の掃除はバックアップ有無に関わらず必ず実行する。
-        // 残しておくと新しい本体 DB に対して古い WAL が適用されて
-        // データが破損するため、--no-backup でも飛ばさない。
-        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
-        DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
+        // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
+        // 古い WAL が新しい本体に対して再生されてデータが破損するため、
+        // --no-backup でも飛ばさない。
+        //
+        // 明示的な Pull はリモートの内容へ戻す操作なので、本体を差し替えない場合でも
+        // 消す (手元の未反映分は破棄される。バックアップには含めてある)。
+        // 起動時の自動 Pull (SkipIfNotNewer) では消さない。リモートで変わったのが
+        // latest.json だけだった場合に、差し替えるものが無いのに未反映のローカル変更を
+        // 捨てることになるため。
+        if (staging.IsStaged(_paths.SqliteFile) || !options.SkipIfNotNewer)
+        {
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
+        }
 
         var affected = new List<string>();
-        AtomicFile.Copy(remoteSnapshot, _paths.SqliteFile, overwrite: true);
-        affected.Add(_paths.SqliteFile);
+        staging.Apply(affected);
 
-        if (File.Exists(remoteSettings))
-        {
-            AtomicFile.Copy(remoteSettings, _paths.SettingsJsonFile, overwrite: true);
-            affected.Add(_paths.SettingsJsonFile);
-        }
-        else if (File.Exists(_paths.SettingsJsonFile))
+        if (remoteSettings is null && File.Exists(_paths.SettingsJsonFile))
         {
             // リモートに latest.json がなくなったときはローカルも削除して状態を
             // 揃える。握りつぶすと Push 側で削除済み判定との対称性が崩れて、
@@ -231,21 +321,5 @@ public sealed class VrcxSyncService : ISyncService
             // 破損する。失敗は呼び出し側 (Pull) に例外で伝え、Aborted にする。
             File.Delete(path);
         }
-    }
-
-    private static List<ManifestFile> BuildManifestFiles(IEnumerable<string> paths, string cloudFolder)
-    {
-        var list = new List<ManifestFile>();
-        foreach (var p in paths)
-        {
-            var info = new FileInfo(p);
-            list.Add(new ManifestFile
-            {
-                RelativePath = Path.GetRelativePath(cloudFolder, p).Replace('\\', '/'),
-                Size = info.Length,
-                Sha256 = FileHasher.Sha256(p),
-            });
-        }
-        return list;
     }
 }

@@ -5,9 +5,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
+using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 
@@ -15,6 +17,9 @@ namespace VRCToolsDataSync_App.ViewModels;
 
 public partial class MainPageViewModel : ObservableObject
 {
+    /// <summary>MainPage.xaml の保存先 ComboBox で S3 互換ストレージを指す位置。</summary>
+    private const int S3ModeIndex = 1;
+
     private readonly SyncRunner _runner;
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
@@ -37,9 +42,11 @@ public partial class MainPageViewModel : ObservableObject
         SyncVrcx = _settings.SyncVrcx;
         SyncFriendConnect = _settings.SyncFriendConnect;
         AutoSyncEnabled = _settings.AutoSyncEnabled;
+        LoadStorageSettingsToProperties();
         LoadLaunchConfigToProperties();
         RefreshStatusSummaries();
         RefreshStartupState();
+        AppendLog($"保存先: {SyncStorageFactory.DescribeTarget(_settings)}");
     }
 
     /// <summary>
@@ -154,6 +161,52 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial bool AutoSyncEnabled { get; set; }
 
+    // データの保存先。0 = 同期フォルダ、1 = S3 互換ストレージ。
+    // MainPage.xaml の ComboBox の並びと対応させる。
+    [ObservableProperty]
+    public partial int StorageModeIndex { get; set; }
+
+    [ObservableProperty]
+    public partial Visibility LocalFolderSettingsVisibility { get; set; } = Visibility.Visible;
+
+    [ObservableProperty]
+    public partial Visibility S3SettingsVisibility { get; set; } = Visibility.Collapsed;
+
+    [ObservableProperty]
+    public partial string S3ServiceUrl { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string S3Region { get; set; } = "auto";
+
+    [ObservableProperty]
+    public partial string S3BucketName { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string S3KeyPrefix { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string S3AccessKeyId { get; set; } = string.Empty;
+
+    // 入力欄には保存済みのキーを出さない。空のまま保存した場合は既存のキーを保つ。
+    [ObservableProperty]
+    public partial string S3SecretAccessKey { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string S3SecretStatus { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial bool S3UsePathStyle { get; set; } = true;
+
+    [ObservableProperty]
+    public partial bool S3UseConditionalWrites { get; set; } = true;
+
+    partial void OnStorageModeIndexChanged(int value)
+    {
+        var isS3 = value == S3ModeIndex;
+        LocalFolderSettingsVisibility = isS3 ? Visibility.Collapsed : Visibility.Visible;
+        S3SettingsVisibility = isS3 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     [ObservableProperty]
     public partial string VrcxStatus { get; set; } = string.Empty;
 
@@ -196,15 +249,124 @@ public partial class MainPageViewModel : ObservableObject
     [RelayCommand]
     private void SaveSettings()
     {
-        _settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
-        _settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
-        _settings.SyncVrcx = SyncVrcx;
-        _settings.SyncFriendConnect = SyncFriendConnect;
-        _settings.AutoSyncEnabled = AutoSyncEnabled;
-        ApplyLaunchPropertiesToSettings();
+        // 保存直前にディスクの現行値を読み直し、その上へ画面の値を載せる。
+        // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
+        // (同期履歴など) を起動時の古い値で巻き戻さないため。
+        var settings = _runner.LoadSettings();
+        settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
+        settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
+        settings.SyncVrcx = SyncVrcx;
+        settings.SyncFriendConnect = SyncFriendConnect;
+        settings.AutoSyncEnabled = AutoSyncEnabled;
+        ApplyStoragePropertiesToSettings(settings);
+        ApplyLaunchPropertiesToSettings(settings);
+
+        _settings = settings;
         _runner.SaveSettings(_settings);
         _coordinator?.UpdateSettings(_settings);
-        AppendLog($"設定を保存しました (auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
+
+        // 入力欄のシークレットキーは保存後に消す。画面に残し続ける必要はない。
+        S3SecretAccessKey = string.Empty;
+        RefreshSecretStatus();
+        RefreshStatusSummaries();
+        AppendLog($"設定を保存しました (保存先: {SyncStorageFactory.DescribeTarget(_settings)}, " +
+                  $"auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
+    }
+
+    /// <summary>保存先の設定を画面へ読み込む。</summary>
+    private void LoadStorageSettingsToProperties()
+    {
+        StorageModeIndex = _settings.StorageMode == SyncStorageMode.S3 ? S3ModeIndex : 0;
+
+        var s3 = _settings.S3;
+        S3ServiceUrl = s3?.ServiceUrl ?? string.Empty;
+        S3Region = string.IsNullOrWhiteSpace(s3?.Region) ? "auto" : s3!.Region;
+        S3BucketName = s3?.BucketName ?? string.Empty;
+        S3KeyPrefix = s3?.KeyPrefix ?? string.Empty;
+        S3AccessKeyId = s3?.AccessKeyId ?? string.Empty;
+        S3UsePathStyle = s3?.UsePathStyle ?? true;
+        S3UseConditionalWrites = s3?.UseConditionalWrites ?? true;
+        S3SecretAccessKey = string.Empty;
+        RefreshSecretStatus();
+    }
+
+    private void ApplyStoragePropertiesToSettings(SyncSettings settings)
+    {
+        settings.StorageMode = StorageModeIndex == S3ModeIndex
+            ? SyncStorageMode.S3
+            : SyncStorageMode.LocalFolder;
+
+        // S3 の欄は、保存先を切り替えても消さずに残す。切り替えて戻したときに
+        // 入力し直さずに済むほうが扱いやすい。
+        var existing = settings.S3;
+        settings.S3 = new S3Settings
+        {
+            ServiceUrl = S3ServiceUrl?.Trim() ?? string.Empty,
+            Region = string.IsNullOrWhiteSpace(S3Region) ? "auto" : S3Region.Trim(),
+            BucketName = S3BucketName?.Trim() ?? string.Empty,
+            KeyPrefix = S3KeyPrefix?.Trim().Trim('/') ?? string.Empty,
+            AccessKeyId = S3AccessKeyId?.Trim() ?? string.Empty,
+            // 入力が空なら、既に保存済みのキーをそのまま保つ。
+            ProtectedSecretAccessKey = string.IsNullOrEmpty(S3SecretAccessKey)
+                ? existing?.ProtectedSecretAccessKey
+                : SecretProtector.Protect(S3SecretAccessKey),
+            UsePathStyle = S3UsePathStyle,
+            UseConditionalWrites = S3UseConditionalWrites,
+            TimeoutSeconds = existing?.TimeoutSeconds ?? 1800,
+        };
+    }
+
+    private void RefreshSecretStatus()
+    {
+        S3SecretStatus = string.IsNullOrEmpty(_settings.S3?.ProtectedSecretAccessKey)
+            ? "未設定。API キー発行時に一度だけ表示される値を貼り付けてください。"
+            : "保存済み。変更する場合のみ入力してください (空欄なら現在のキーを保ちます)。";
+    }
+
+    /// <summary>保存先へ到達できるかを確かめる。画面の入力内容をそのまま使う。</summary>
+    [RelayCommand]
+    private async Task TestStorageAsync()
+    {
+        if (IsBusy) return;
+        IsBusy = true;
+        try
+        {
+            // 画面の入力を反映した一時的な設定で試す。ここでは保存しない。
+            var probe = _runner.LoadSettings();
+            ApplyStoragePropertiesToSettings(probe);
+            probe.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
+
+            var manifest = await Task.Run(() =>
+            {
+                var storage = _runner.CreateStorage(probe);
+                // 読み取りだけでなく書き込みと削除まで確認する。読み取り専用の
+                // 認証情報だと、保存した後の最初の Push で初めて失敗するため。
+                storage.VerifyAccess();
+                return storage.LoadManifest().Manifest;
+            });
+
+            AppendLog($"接続を確認しました (読み取り / 書き込み / 削除): {SyncStorageFactory.DescribeTarget(probe)}");
+            if (manifest.Tools.Count == 0)
+            {
+                AppendLog("  同期先にはまだデータがありません");
+            }
+            foreach (var (key, entry) in manifest.Tools)
+            {
+                AppendLog($"  [{key}] version={entry.Version} machine={entry.MachineName}");
+            }
+        }
+        catch (SyncStorageException ex)
+        {
+            AppendLog($"接続できませんでした: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"接続確認に失敗しました: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
     }
 
     private void LoadLaunchConfigToProperties()
@@ -218,21 +380,22 @@ public partial class MainPageViewModel : ObservableObject
         FriendConnectLaunchOnAppStart = fc.LaunchOnAppStart;
     }
 
-    private void ApplyLaunchPropertiesToSettings()
+    private void ApplyLaunchPropertiesToSettings(SyncSettings settings)
     {
         // 既存の Arguments は GUI で編集できないが、JSON を手編集して
         // 起動オプションを与えているユーザもいる。設定保存のたびに
         // 新規 ToolLaunchConfig を作ると Arguments が消えるので、
         // 既存 entry の値を引き継いでから上書きする。
-        var existingVrcx = _settings.Launch.GetValueOrDefault(VrcxSyncService.Key);
-        _settings.Launch[VrcxSyncService.Key] = new ToolLaunchConfig
+        settings.Launch ??= new Dictionary<string, ToolLaunchConfig>();
+        var existingVrcx = settings.Launch.GetValueOrDefault(VrcxSyncService.Key);
+        settings.Launch[VrcxSyncService.Key] = new ToolLaunchConfig
         {
             ExecutablePath = string.IsNullOrWhiteSpace(VrcxExecutablePath) ? null : VrcxExecutablePath.Trim(),
             Arguments = existingVrcx?.Arguments,
             LaunchOnAppStart = VrcxLaunchOnAppStart,
         };
-        var existingFc = _settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key);
-        _settings.Launch[FriendConnectSyncService.Key] = new ToolLaunchConfig
+        var existingFc = settings.Launch.GetValueOrDefault(FriendConnectSyncService.Key);
+        settings.Launch[FriendConnectSyncService.Key] = new ToolLaunchConfig
         {
             ExecutablePath = string.IsNullOrWhiteSpace(FriendConnectExecutablePath) ? null : FriendConnectExecutablePath.Trim(),
             Arguments = existingFc?.Arguments,
@@ -243,15 +406,15 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>
     /// トレイ「同期して起動」と MainPage の同名ボタンから呼ばれる。
     /// 同期 ON のツールを Pull → Launch する。既に動いていれば Launch は no-op。
-    /// 未保存の CloudFolderPath が UI にあれば実行前に反映する (TryGetCloud)。
+    /// 未保存の同期フォルダパスが UI にあれば実行前に反映する (TryCreateStorage)。
     /// </summary>
     [RelayCommand]
     private async Task SyncAndLaunchAsync()
     {
         if (IsBusy) return;
         // UI で編集中の CloudFolderPath を _settings へ反映してから走らせる。
-        // RunPushAsync/RunPullAsync が TryGetCloud で行っているのと同じ前処理。
-        if (!TryGetCloud(out _)) return;
+        // RunPushAsync/RunPullAsync が TryCreateStorage で行っているのと同じ前処理。
+        if (!TryCreateStorage(out _)) return;
         IsBusy = true;
         try
         {
@@ -375,12 +538,12 @@ public partial class MainPageViewModel : ObservableObject
 
     private async Task RunPushAsync(string displayName, ISyncService service)
     {
-        if (!TryGetCloud(out var cloud)) return;
+        if (!TryCreateStorage(out var storage)) return;
         IsBusy = true;
         try
         {
             AppendLog($"{displayName} Push 開始...");
-            var result = await Task.Run(() => _runner.Push(service, _settings, cloud, force: false));
+            var result = await Task.Run(() => _runner.Push(service, _settings, storage, force: false));
 
             if (result.Outcome == SyncOutcome.ConflictDetected && ConflictRequested is not null)
             {
@@ -394,12 +557,12 @@ public partial class MainPageViewModel : ObservableObject
                 {
                     case ConflictChoice.ForceOverwrite:
                         AppendLog($"{displayName} 強制 Push 実行");
-                        var forced = await Task.Run(() => _runner.Push(service, _settings, cloud, force: true));
+                        var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
                         ReportPushResult(displayName, forced);
                         break;
                     case ConflictChoice.PullFirst:
                         AppendLog($"{displayName} 先に Pull を実行");
-                        var pulled = await Task.Run(() => _runner.Pull(service, _settings, cloud, skipBackup: false));
+                        var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
                         ReportPullResult(displayName, pulled);
                         break;
                     default:
@@ -429,12 +592,12 @@ public partial class MainPageViewModel : ObservableObject
 
     private async Task RunPullAsync(string displayName, ISyncService service)
     {
-        if (!TryGetCloud(out var cloud)) return;
+        if (!TryCreateStorage(out var storage)) return;
         IsBusy = true;
         try
         {
             AppendLog($"{displayName} Pull 開始...");
-            var result = await Task.Run(() => _runner.Pull(service, _settings, cloud, skipBackup: false));
+            var result = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
             ReportPullResult(displayName, result);
         }
         catch (RunningProcessException ex)
@@ -516,18 +679,18 @@ public partial class MainPageViewModel : ObservableObject
                 LastPulledVersion = e.LastPulledVersion,
             });
 
-            if (!TryGetCloud(out var cloud)) return;
+            if (!TryCreateStorage(out var storage)) return;
 
             switch (choice)
             {
                 case ConflictChoice.ForceOverwrite:
                     AppendLog($"[auto] {e.DisplayName} 強制 Push 実行");
-                    var pushResult = await Task.Run(() => _runner.Push(e.ServiceFactory(), _settings, cloud, force: true));
+                    var pushResult = await Task.Run(() => _runner.Push(e.ServiceFactory(), _settings, storage, force: true));
                     ReportPushResult(e.DisplayName, pushResult);
                     break;
                 case ConflictChoice.PullFirst:
                     AppendLog($"[auto] {e.DisplayName} 先に Pull を実行");
-                    var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, cloud, skipBackup: false));
+                    var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
                     ReportPullResult(e.DisplayName, pullResult);
                     break;
                 default:
@@ -570,10 +733,10 @@ public partial class MainPageViewModel : ObservableObject
             });
 
             if (choice != RemoteUpdateChoice.PullNow) return;
-            if (!TryGetCloud(out var cloud)) return;
+            if (!TryCreateStorage(out var storage)) return;
 
             AppendLog($"[auto] {e.DisplayName} Pull 実行");
-            var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, cloud, skipBackup: false));
+            var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
             ReportPullResult(e.DisplayName, pullResult);
         }
         catch (Exception ex)
@@ -587,36 +750,62 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
-    private bool TryGetCloud(out string cloud)
+    /// <summary>
+    /// 同期を始める前に、設定から同期先を組み立てる。
+    /// ローカルフォルダモードでは、UI で編集中のパスを設定へ反映してから作る。
+    /// 組み立てられない場合は理由をログに出して false を返す。
+    /// </summary>
+    private bool TryCreateStorage(out ISyncStorage storage)
     {
-        cloud = CloudFolderPath?.Trim() ?? string.Empty;
-        if (string.IsNullOrEmpty(cloud))
+        storage = null!;
+
+        if (_settings.StorageMode == SyncStorageMode.LocalFolder)
         {
-            AppendLog("OneDrive フォルダパスを指定して「設定を保存」してください");
+            var cloud = CloudFolderPath?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(cloud))
+            {
+                AppendLog("同期フォルダのパスを指定して「設定を保存」してください");
+                return false;
+            }
+            // 設定が未保存だった場合のために、同期実行時にも保存を反映しておく。
+            // CloudFolderPath が変わった場合は常駐 Coordinator の監視も
+            // 旧パスを見たままになってしまうので、UpdateSettings で再起動して
+            // 新パスに張り替える (Watcher 再構築を伴う)。
+            if (_settings.CloudFolderPath != cloud && System.IO.Directory.Exists(cloud))
+            {
+                _settings.CloudFolderPath = cloud;
+                _runner.SaveSettings(_settings);
+                _coordinator?.UpdateSettings(_settings);
+            }
+        }
+
+        try
+        {
+            storage = _runner.CreateStorage(_settings, CloudFolderPath?.Trim());
+            return true;
+        }
+        catch (SyncStorageException ex)
+        {
+            AppendLog(ex.Message);
             return false;
         }
-        if (!System.IO.Directory.Exists(cloud))
-        {
-            AppendLog($"指定フォルダが存在しません: {cloud}");
-            return false;
-        }
-        // 設定が未保存だった場合のために、同期実行時にも保存を反映しておく。
-        // CloudFolderPath が変わった場合は常駐 Coordinator の CloudWatcher も
-        // 旧パスを監視したままになってしまうので、UpdateSettings で再起動して
-        // 新パスに張り替える (Watcher 再構築を伴う)。
-        if (_settings.CloudFolderPath != cloud)
-        {
-            _settings.CloudFolderPath = cloud;
-            _runner.SaveSettings(_settings);
-            _coordinator?.UpdateSettings(_settings);
-        }
-        return true;
     }
 
+    /// <summary>
+    /// 同期履歴の表示を更新する。同期履歴は保存先ごとに分かれているので、
+    /// 現在の保存先の分だけを拾う。保存先を組み立てられない (未設定など) 段階では
+    /// 未同期として表示する。
+    /// </summary>
     private void RefreshStatusSummaries()
     {
-        VrcxStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(VrcxSyncService.Key));
-        FriendConnectStatus = FormatStatus(_settings.ToolState.GetValueOrDefault(FriendConnectSyncService.Key));
+        if (!SyncStorageFactory.TryCreate(_settings, out var storage, out _, CloudFolderPath?.Trim()))
+        {
+            VrcxStatus = FormatStatus(null);
+            FriendConnectStatus = FormatStatus(null);
+            return;
+        }
+        VrcxStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, VrcxSyncService.Key));
+        FriendConnectStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, FriendConnectSyncService.Key));
     }
 
     private static string FormatStatus(ToolSyncState? state)

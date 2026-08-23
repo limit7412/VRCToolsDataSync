@@ -609,7 +609,7 @@ public partial class App : Application
             // 既に Coordinator.Stop() を呼んでいるため、このままだとプロセスは
             // 生き残るのに AutoSync 監視だけ止まった半死状態になる。Start() を
             // 呼び戻して監視を復活させる (Start は AutoSyncEnabled=false や
-            // CloudFolderPath 未設定なら no-op なので、安全に再呼び出し可能)。
+            // 保存先未設定なら no-op なので、安全に再呼び出し可能)。
             try { Coordinator?.Start(); LogLifecycle("ExitApplication.Coordinator.Start (resumed)"); }
             catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Start fail (resume): " + ex.Message); }
             // 終了フラグをクリアして次の終了要求を受け付けられるようにする
