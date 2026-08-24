@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Storage;
 
@@ -63,7 +62,7 @@ public sealed class StartupSyncOrchestrator
             return steps;
         }
 
-        foreach (var def in EnumerateTools(settings, _runner))
+        foreach (var def in ToolCatalog.All)
         {
             // (1) Pull
             TryPull(def, settings, storage, steps);
@@ -79,7 +78,7 @@ public sealed class StartupSyncOrchestrator
 
     private SyncResult? TryPull(ToolDefinition def, SyncSettings settings, ISyncStorage storage, List<StartupSyncStep> steps)
     {
-        if (!def.SyncEnabled)
+        if (!def.IsSyncEnabled(settings))
         {
             steps.Add(new StartupSyncStep
             {
@@ -103,7 +102,7 @@ public sealed class StartupSyncOrchestrator
             // Issue #19: 起動時自動 Pull はローカルが既に最新なら何もしない。
             // 手動 Pull や AutoPushConflict 経路の "先に Pull" は呼び出し側で
             // デフォルト false のまま使い、従来通り上書き Pull させる。
-            var result = _runner.Pull(def.ServiceFactory(), settings, storage, skipBackup: false, skipIfNotNewer: true);
+            var result = _runner.Pull(def.CreateService(_runner), settings, storage, skipBackup: false, skipIfNotNewer: true);
             // NothingToDo / SourceMissing は通常運用で起こり得る (クラウド未作成や
             // 初回セットアップ直後) ため、失敗ではなく Skip 扱い。それ以外の非成功
             // は予期しない異常なので PullFailed とする。
@@ -182,37 +181,5 @@ public sealed class StartupSyncOrchestrator
             LaunchResult = launchResult,
             Message = launchResult.Error,
         });
-    }
-
-    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings, SyncRunner runner)
-    {
-        yield return new ToolDefinition
-        {
-            Key = VrcxSyncService.Key,
-            DisplayName = "VRCX",
-            SyncEnabled = settings.SyncVrcx,
-            ServiceFactory = () => new VrcxSyncService(logger: runner.CreateLogger<VrcxSyncService>()),
-            ProcessNames = ProcessGuard.VrcxProcessNames,
-            FindExecutable = VrcxPaths.TryFindExecutable,
-        };
-        yield return new ToolDefinition
-        {
-            Key = FriendConnectSyncService.Key,
-            DisplayName = "VRC Friend Connect",
-            SyncEnabled = settings.SyncFriendConnect,
-            ServiceFactory = () => new FriendConnectSyncService(logger: runner.CreateLogger<FriendConnectSyncService>()),
-            ProcessNames = ProcessGuard.FriendConnectProcessNames,
-            FindExecutable = FriendConnectPaths.TryFindExecutable,
-        };
-    }
-
-    private sealed class ToolDefinition
-    {
-        public required string Key { get; init; }
-        public required string DisplayName { get; init; }
-        public required bool SyncEnabled { get; init; }
-        public required Func<ISyncService> ServiceFactory { get; init; }
-        public required IReadOnlyList<string> ProcessNames { get; init; }
-        public required Func<string?> FindExecutable { get; init; }
     }
 }

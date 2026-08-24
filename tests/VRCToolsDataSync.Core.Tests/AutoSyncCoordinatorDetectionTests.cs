@@ -37,9 +37,12 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
     private AutoSyncCoordinator Coordinator(SyncSettings settings)
         => new(new SyncRunner(new SettingsStore(_settingsPath)), settings);
 
-    /// <summary>並び順に依存しないよう、比較する側と揃えて並べておく。</summary>
-    private static readonly string[] BothTools =
-        new[] { VrcxSyncService.Key, FriendConnectSyncService.Key }.Order().ToArray();
+    /// <summary>
+    /// 一覧から導く。ツールを足したときにここを直し忘れると、監視が扱っていない
+    /// ことに気付けないまま通ってしまう。並び順に依存しないよう揃えておく。
+    /// </summary>
+    private static readonly string[] AllTools =
+        ToolCatalog.All.Select(t => t.Key).Order().ToArray();
 
     private static string[] ToolKeysOf(AutoSyncCoordinator coordinator)
         => coordinator.GetProcessDetections().Select(d => d.ToolKey).Order().ToArray();
@@ -54,7 +57,7 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
         coordinator.Start();
 
         var detections = coordinator.GetProcessDetections();
-        Assert.Equal(BothTools, detections.Select(d => d.ToolKey).Order().ToArray());
+        Assert.Equal(AllTools, detections.Select(d => d.ToolKey).Order().ToArray());
         Assert.All(detections, d => Assert.False(d.IsWatching));
     }
 
@@ -66,7 +69,7 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
 
         coordinator.Start();
 
-        Assert.Equal(BothTools, ToolKeysOf(coordinator));
+        Assert.Equal(AllTools, ToolKeysOf(coordinator));
         Assert.All(coordinator.GetProcessDetections(), d => Assert.False(d.IsWatching));
     }
 
@@ -136,7 +139,7 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
         coordinator.Stop();
 
         Assert.NotNull(readInsideHandler);
-        Assert.Equal(BothTools, readInsideHandler!.Select(d => d.ToolKey).Order().ToArray());
+        Assert.Equal(AllTools, readInsideHandler!.Select(d => d.ToolKey).Order().ToArray());
         Assert.All(readInsideHandler!, d => Assert.False(d.IsWatching));
     }
 
@@ -150,6 +153,6 @@ public sealed class AutoSyncCoordinatorDetectionTests : IDisposable
         coordinator.Start();
         coordinator.Start();
 
-        Assert.Equal(BothTools, ToolKeysOf(coordinator));
+        Assert.Equal(AllTools, ToolKeysOf(coordinator));
     }
 }

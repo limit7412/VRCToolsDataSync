@@ -64,21 +64,6 @@ public sealed class AutoSyncCoordinator : IDisposable
     /// </summary>
     public event Action? ProcessDetectionChanged;
 
-    /// <summary>
-    /// 監視しうるツール。設定で外されていて binding が作られなかったものにも
-    /// 状態を流す必要があるので、設定に依らない形で持つ。
-    /// <para>
-    /// 定義がここと <see cref="StartCore"/> に分かれているのは #18 で扱う。
-    /// </para>
-    /// </summary>
-    private static readonly IReadOnlyList<(string ToolKey, string DisplayName)> KnownTools = new[]
-    {
-        (VrcxSyncService.Key, "VRCX"),
-        (FriendConnectSyncService.Key, "VRC Friend Connect"),
-    };
-
-    private static string DisplayNameOf(string toolKey)
-        => KnownTools.First(t => t.ToolKey == toolKey).DisplayName;
 
     public AutoSyncCoordinator(SyncRunner runner, SyncSettings settings, ILogger<AutoSyncCoordinator>? logger = null)
     {
@@ -128,22 +113,10 @@ public sealed class AutoSyncCoordinator : IDisposable
             _recentlyCompletedAutoPushes.Clear();
         }
 
-        if (_settings.SyncVrcx)
+        foreach (var tool in ToolCatalog.All)
         {
-            _bindings.Add(CreateBinding(
-                VrcxSyncService.Key,
-                DisplayNameOf(VrcxSyncService.Key),
-                ProcessGuard.VrcxProcessNames,
-                () => new VrcxSyncService(logger: _runner.CreateLogger<VrcxSyncService>())));
-        }
-
-        if (_settings.SyncFriendConnect)
-        {
-            _bindings.Add(CreateBinding(
-                FriendConnectSyncService.Key,
-                DisplayNameOf(FriendConnectSyncService.Key),
-                ProcessGuard.FriendConnectProcessNames,
-                () => new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>())));
+            if (!tool.IsSyncEnabled(_settings)) continue;
+            _bindings.Add(CreateBinding(tool));
         }
 
         foreach (var binding in _bindings)
@@ -219,14 +192,11 @@ public sealed class AutoSyncCoordinator : IDisposable
         _settings = settings;
     }
 
-    private ToolBinding CreateBinding(
-        string toolKey,
-        string displayName,
-        IReadOnlyList<string> processNames,
-        Func<ISyncService> serviceFactory)
+    private ToolBinding CreateBinding(ToolDefinition tool)
     {
-        var watcher = new ProcessWatcher(processNames);
-        var binding = new ToolBinding(toolKey, displayName, watcher, serviceFactory);
+        var watcher = new ProcessWatcher(tool.ProcessNames);
+        var binding = new ToolBinding(
+            tool.Key, tool.DisplayName, watcher, () => tool.CreateService(_runner));
         // 検出状況の通知。どの候補が実際に当たっているかを GUI に出すために使う
         // (issue #11)。起動でも終了でも検出状況は変わるので、両方から流す。
         //
@@ -335,9 +305,9 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         var sources = _detectionSources;
         var detections = sources.Select(DetectionOf).ToList();
-        detections.AddRange(KnownTools
-            .Where(tool => !sources.Any(b => b.ToolKey == tool.ToolKey))
-            .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName)));
+        detections.AddRange(ToolCatalog.All
+            .Where(tool => !sources.Any(b => b.ToolKey == tool.Key))
+            .Select(tool => NotWatching(tool.Key, tool.DisplayName)));
         return detections;
     }
 
