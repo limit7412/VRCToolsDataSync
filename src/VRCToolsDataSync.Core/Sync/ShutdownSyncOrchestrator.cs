@@ -115,11 +115,11 @@ public sealed class ShutdownSyncOrchestrator
         //     全体タイムアウトに達して、同期 ON ツール (例: VRCX) の終了時 Push が
         //     キャンセルで巻き添えになる。同期 OFF ツールは exitChecks に乗せず、
         //     即時に PushSkipped("同期が無効化されています") として処理する。
-        var toolDefs = EnumerateTools(settings, _runner).ToArray();
+        var toolDefs = ToolCatalog.All;
         var exitChecks = new List<Task<(ToolDefinition def, bool exited)>>();
         foreach (var def in toolDefs)
         {
-            if (!def.SyncEnabled)
+            if (!def.IsSyncEnabled(settings))
             {
                 continue;
             }
@@ -178,7 +178,7 @@ public sealed class ShutdownSyncOrchestrator
                     ToolKey = def.Key,
                     DisplayName = def.DisplayName,
                     Kind = ShutdownSyncStepKind.PushSkipped,
-                    Message = def.SyncEnabled ? reason : "同期が無効化されています",
+                    Message = def.IsSyncEnabled(settings) ? reason : "同期が無効化されています",
                 });
             }
             return steps;
@@ -192,7 +192,7 @@ public sealed class ShutdownSyncOrchestrator
         // 通常 Push 処理に進む。
         foreach (var def in toolDefs)
         {
-            if (def.SyncEnabled) continue;
+            if (def.IsSyncEnabled(settings)) continue;
             steps.Add(new ShutdownSyncStep
             {
                 ToolKey = def.Key,
@@ -251,7 +251,7 @@ public sealed class ShutdownSyncOrchestrator
                 // Coordinator と終了フラグが長時間復旧しなくなる。
                 // 期限が来たら待つのをやめ、Push はそのまま走らせておく。
                 var pushTask = Task.Run(
-                    () => _runner.Push(def.ServiceFactory(), settings, pushStorage, force: false),
+                    () => _runner.Push(def.CreateService(_runner), settings, pushStorage, force: false),
                     CancellationToken.None);
                 var pushResult = await WaitForPushAsync(pushTask, ct).ConfigureAwait(false);
 
@@ -353,32 +353,4 @@ public sealed class ShutdownSyncOrchestrator
         return (def, exited);
     }
 
-    private static IEnumerable<ToolDefinition> EnumerateTools(SyncSettings settings, SyncRunner runner)
-    {
-        yield return new ToolDefinition
-        {
-            Key = VrcxSyncService.Key,
-            DisplayName = "VRCX",
-            SyncEnabled = settings.SyncVrcx,
-            ServiceFactory = () => new VrcxSyncService(logger: runner.CreateLogger<VrcxSyncService>()),
-            ProcessNames = ProcessGuard.VrcxProcessNames,
-        };
-        yield return new ToolDefinition
-        {
-            Key = FriendConnectSyncService.Key,
-            DisplayName = "VRC Friend Connect",
-            SyncEnabled = settings.SyncFriendConnect,
-            ServiceFactory = () => new FriendConnectSyncService(logger: runner.CreateLogger<FriendConnectSyncService>()),
-            ProcessNames = ProcessGuard.FriendConnectProcessNames,
-        };
-    }
-
-    private sealed class ToolDefinition
-    {
-        public required string Key { get; init; }
-        public required string DisplayName { get; init; }
-        public required bool SyncEnabled { get; init; }
-        public required Func<ISyncService> ServiceFactory { get; init; }
-        public required IReadOnlyList<string> ProcessNames { get; init; }
-    }
 }
