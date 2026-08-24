@@ -139,6 +139,9 @@
                     <TextBlock Text="VRCX" Style="{StaticResource SubtitleTextBlockStyle}" />
                     <TextBlock Text="{x:Bind ViewModel.VrcxStatus, Mode=OneWay}"
                                Style="{StaticResource BodyTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.VrcxProcessStatus, Mode=OneWay}"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button Content="Push"
                                 Command="{x:Bind ViewModel.PushVrcxCommand}"
@@ -174,6 +177,9 @@
                     <TextBlock Text="VRC Friend Connect" Style="{StaticResource SubtitleTextBlockStyle}" />
                     <TextBlock Text="{x:Bind ViewModel.FriendConnectStatus, Mode=OneWay}"
                                Style="{StaticResource BodyTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind ViewModel.FriendConnectProcessStatus, Mode=OneWay}"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button Content="Push"
                                 Command="{x:Bind ViewModel.PushFriendConnectCommand}"

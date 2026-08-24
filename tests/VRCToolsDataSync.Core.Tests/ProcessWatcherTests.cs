@@ -35,9 +35,10 @@ public sealed class ProcessWatcherTests
         => new(id, new DateTime(2026, 8, 23, startedAtHour, 0, 0, DateTimeKind.Local));
 
     /// <summary>監視を組み立て、通知を記録する一覧を返す。</summary>
-    private static (ProcessWatcher Watcher, List<string> Events) Watch(FakeProcesses processes)
+    private static (ProcessWatcher Watcher, List<string> Events) Watch(
+        FakeProcesses processes, params string[] names)
     {
-        var watcher = new ProcessWatcher(new[] { Name }, processes.Probe);
+        var watcher = new ProcessWatcher(names.Length == 0 ? new[] { Name } : names, processes.Probe);
         var events = new List<string>();
         watcher.ProcessExited += name => events.Add("exited:" + name);
         watcher.ProcessStarted += name => events.Add("started:" + name);
@@ -291,5 +292,127 @@ public sealed class ProcessWatcherTests
         watcher.Poll();
 
         Assert.Equal(new[] { "exited:" + Name }, events);
+    }
+
+    [Fact(DisplayName = "検出中の名前を読み出せる")]
+    public void DetectedProcessNamesReportsTheNamesThatMatched()
+    {
+        // 実行ファイル名は配布のされ方で変わりうるため候補を複数持っている。
+        // どれが実際に当たっているかを出せないと、利用者には「自動 Push が
+        // 動かない」ことしか見えない (issue #11)。
+        const string alternate = "VRCFriendConnect";
+        var processes = new FakeProcesses();
+        processes.Set(alternate, Instance(1000));
+        var (watcher, _) = Watch(processes, Name, alternate);
+
+        watcher.Poll();
+
+        Assert.Equal(new[] { alternate }, watcher.DetectedProcessNames);
+    }
+
+    [Fact(DisplayName = "どれも当たっていなければ検出中の名前は空になる")]
+    public void DetectedProcessNamesIsEmptyWhenNothingMatched()
+    {
+        var (watcher, _) = Watch(new FakeProcesses(), Name, "VRCFriendConnect");
+
+        watcher.Poll();
+
+        Assert.Empty(watcher.DetectedProcessNames);
+    }
+
+    [Fact(DisplayName = "検出中の名前は起動と終了に追従する")]
+    public void DetectedProcessNamesFollowsStartAndExit()
+    {
+        var processes = new FakeProcesses();
+        var (watcher, _) = Watch(processes);
+        watcher.Poll();
+        Assert.Empty(watcher.DetectedProcessNames);
+
+        processes.Set(Name, Instance(1000));
+        watcher.Poll();
+        Assert.Equal(new[] { Name }, watcher.DetectedProcessNames);
+
+        processes.Set(Name);
+        watcher.Poll();
+        Assert.Empty(watcher.DetectedProcessNames);
+    }
+
+    [Fact(DisplayName = "通知の処理中でも検出中の名前を読める")]
+    public void ANotificationHandlerDoesNotBlockReaders()
+    {
+        // 購読側が何をするかは監視からは分からない。通知を錠の中で出していると、
+        // 購読側が動いているあいだ読み出しが待たされる。
+        //
+        // 同一スレッドの読み返しでは確かめられない。lock は同じスレッドから再入できる
+        // ので、錠の中で通知を出していても素通りする。別のスレッドから読む。
+        var processes = new FakeProcesses();
+        var (watcher, _) = Watch(processes);
+        watcher.Poll();
+
+        using var handlerEntered = new ManualResetEventSlim();
+        using var readerDone = new ManualResetEventSlim();
+        var readerSucceeded = false;
+
+        var reader = new Thread(() =>
+        {
+            handlerEntered.Wait(TimeSpan.FromSeconds(10));
+            readerSucceeded = watcher.DetectedProcessNames.Count == 1;
+            readerDone.Set();
+        });
+        reader.Start();
+
+        // 通知の処理を、読み出しが済むまで抜けないようにする。
+        watcher.ProcessStarted += _ =>
+        {
+            handlerEntered.Set();
+            readerDone.Wait(TimeSpan.FromSeconds(10));
+        };
+
+        processes.Set(Name, Instance(1000));
+        watcher.Poll();
+
+        Assert.True(reader.Join(TimeSpan.FromSeconds(10)), "読み出しが終わらない");
+        Assert.True(readerSucceeded, "通知の処理中に読み出せていない");
+    }
+
+    [Fact(DisplayName = "走査と並行して検出中の名前を読める")]
+    public void DetectedProcessNamesCanBeReadWhilePolling()
+    {
+        // 走査は監視のスレッドが、読み出しは UI のスレッドが行う。
+        // 辞書を守らないまま両方から触ると、読み出し側が壊れた状態を見る。
+        var processes = new FakeProcesses();
+        processes.Set(Name, Instance(1000));
+        var (watcher, _) = Watch(processes);
+        watcher.Poll();
+
+        var stop = false;
+        Exception? failure = null;
+        var reader = new Thread(() =>
+        {
+            try
+            {
+                while (!Volatile.Read(ref stop)) _ = watcher.DetectedProcessNames;
+            }
+            catch (Exception ex) { failure = ex; }
+        });
+
+        reader.Start();
+        try
+        {
+            for (var i = 0; i < 200; i++)
+            {
+                processes.Set(Name, Instance(2000 + i, startedAtHour: 9));
+                watcher.Poll();
+                processes.Set(Name);
+                watcher.Poll();
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref stop, true);
+            Assert.True(reader.Join(TimeSpan.FromSeconds(30)), "読み出しが終わらない");
+        }
+
+        Assert.Null(failure);
     }
 }

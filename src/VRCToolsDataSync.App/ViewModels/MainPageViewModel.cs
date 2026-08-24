@@ -138,6 +138,12 @@ public partial class MainPageViewModel : ObservableObject
         });
         coordinator.AutoPushConflict += e => OnUi(() => _ = HandleAutoPushConflictAsync(e));
         coordinator.RemoteUpdateAvailable += e => OnUi(() => _ = HandleRemoteUpdateAsync(e));
+        coordinator.ProcessDetectionChanged += () => OnUi(RefreshProcessDetection);
+        // App は Coordinator.Start を背後で走らせてから画面を組み立てるため、ここへ来る
+        // 前に最初の通知が出ていることがある。既に起動していたプロセスは監視の開始時に
+        // 黙って取り込まれるので、ここで一度読まないとそのツールを閉じるまで表示が
+        // 変わらない。
+        RefreshProcessDetection();
     }
 
     private void OnUi(Action action)
@@ -212,6 +218,18 @@ public partial class MainPageViewModel : ObservableObject
 
     [ObservableProperty]
     public partial string FriendConnectStatus { get; set; } = string.Empty;
+
+    // プロセスの検出状況。同期履歴を出す VrcxStatus / FriendConnectStatus とは
+    // 別に持つ。片方は「いつ同期したか」、こちらは「いま動いているか」で、
+    // 更新の切っ掛けも違う (前者は同期のたび、後者は起動と終了のたび)。
+    [ObservableProperty]
+    public partial string VrcxProcessStatus { get; set; } = ProcessDetectionUnknown;
+
+    [ObservableProperty]
+    public partial string FriendConnectProcessStatus { get; set; } = ProcessDetectionUnknown;
+
+    /// <summary>監視が始まる前の表示。「動いていない」と書いてしまうと事実と違う。</summary>
+    private const string ProcessDetectionUnknown = "プロセス監視: 未開始";
 
     [ObservableProperty]
     public partial bool IsBusy { get; set; }
@@ -806,6 +824,46 @@ public partial class MainPageViewModel : ObservableObject
         }
         VrcxStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, VrcxSyncService.Key));
         FriendConnectStatus = FormatStatus(SyncRunner.FindToolState(_settings, storage!, FriendConnectSyncService.Key));
+    }
+
+    /// <summary>
+    /// プロセス検出状況の表示を更新する。
+    /// <para>
+    /// 通知は「変わった」ことしか伝えないので、そのたびに現在の状態を読み直す。
+    /// 通知に状態を載せると、遅れて届いた分が新しい表示を古い状態で上書きしうる。
+    /// </para>
+    /// </summary>
+    private void RefreshProcessDetection()
+    {
+        if (_coordinator is null) return;
+        foreach (var detection in _coordinator.GetProcessDetections())
+        {
+            ApplyProcessDetection(detection);
+        }
+    }
+
+    /// <summary>検出状況 1 件を宛先の表示へ振り分ける。</summary>
+    private void ApplyProcessDetection(ProcessDetectionEvent e)
+    {
+        var text = FormatProcessDetection(e);
+        if (e.ToolKey == VrcxSyncService.Key) VrcxProcessStatus = text;
+        else if (e.ToolKey == FriendConnectSyncService.Key) FriendConnectProcessStatus = text;
+    }
+
+    /// <summary>
+    /// 検出状況を 1 行にする。
+    /// <para>
+    /// 起動中は<b>当たった名前も出す</b>。実行ファイル名は配布のされ方で変わりうるため
+    /// 候補を複数持っており、どれも当たらない場合、利用者には「自動 Push が動かない」
+    /// ことしか見えない。当たった名前を出すことで、候補に無い名前で配布されていることに
+    /// 気付けるようにする (issue #11)。
+    /// </para>
+    /// </summary>
+    private static string FormatProcessDetection(ProcessDetectionEvent e)
+    {
+        if (!e.IsWatching) return "プロセス監視: 停止中";
+        if (!e.IsRunning) return "プロセス: 未検出";
+        return $"プロセス: 検出中 ({string.Join(", ", e.DetectedProcessNames)})";
     }
 
     private static string FormatStatus(ToolSyncState? state)

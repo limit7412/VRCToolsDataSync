@@ -45,11 +45,40 @@ public sealed class AutoSyncCoordinator : IDisposable
     // ProcessExited から切り離された HandleProcessExited タスクは、
     // この token を見て grace sleep / Push 直前で打ち切る。
     private CancellationTokenSource _generationCts = new();
+    // 検出状況を読むための、_bindings の写し。_lifecycleLock を取らずに読めるよう、
+    // 中身を変えずに丸ごと差し替える形で持つ。読み手は GUI のスレッドにいるため、
+    // 進行中の Start の裏で待たせたくない。
+    private volatile IReadOnlyList<ToolBinding> _detectionSources = Array.Empty<ToolBinding>();
 
     public event Action<AutoPushEvent>? AutoPushTriggered;
     public event Action<AutoPushEvent>? AutoPushCompleted;
     public event Action<AutoPushConflictEvent>? AutoPushConflict;
     public event Action<RemoteUpdateEvent>? RemoteUpdateAvailable;
+    /// <summary>
+    /// 検出状況が変わったことを知らせる。<b>中身は持たない。</b>
+    /// <para>
+    /// 状態そのものは <see cref="GetProcessDetections"/> から読む。通知に状態を載せると、
+    /// 錠を離してから届くまでの間に次の変化が起きた場合に古い方を届けうる。載せなければ、
+    /// 遅れて届いた通知は現在の状態を読み直させるだけになり、順序が問題にならない。
+    /// </para>
+    /// </summary>
+    public event Action? ProcessDetectionChanged;
+
+    /// <summary>
+    /// 監視しうるツール。設定で外されていて binding が作られなかったものにも
+    /// 状態を流す必要があるので、設定に依らない形で持つ。
+    /// <para>
+    /// 定義がここと <see cref="StartCore"/> に分かれているのは #18 で扱う。
+    /// </para>
+    /// </summary>
+    private static readonly IReadOnlyList<(string ToolKey, string DisplayName)> KnownTools = new[]
+    {
+        (VrcxSyncService.Key, "VRCX"),
+        (FriendConnectSyncService.Key, "VRC Friend Connect"),
+    };
+
+    private static string DisplayNameOf(string toolKey)
+        => KnownTools.First(t => t.ToolKey == toolKey).DisplayName;
 
     public AutoSyncCoordinator(SyncRunner runner, SyncSettings settings, ILogger<AutoSyncCoordinator>? logger = null)
     {
@@ -61,6 +90,9 @@ public sealed class AutoSyncCoordinator : IDisposable
     public void Start()
     {
         lock (_lifecycleLock) { StartCore(); }
+        // 通知は錠の外で出す。購読側が何をするかはここからは分からず、錠を持ったまま
+        // 呼ぶと、そのあいだ Stop や UpdateSettings が待たされる。
+        ProcessDetectionChanged?.Invoke();
     }
 
     private void StartCore()
@@ -100,7 +132,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _bindings.Add(CreateBinding(
                 VrcxSyncService.Key,
-                "VRCX",
+                DisplayNameOf(VrcxSyncService.Key),
                 ProcessGuard.VrcxProcessNames,
                 () => new VrcxSyncService(logger: _runner.CreateLogger<VrcxSyncService>())));
         }
@@ -109,7 +141,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             _bindings.Add(CreateBinding(
                 FriendConnectSyncService.Key,
-                "VRC Friend Connect",
+                DisplayNameOf(FriendConnectSyncService.Key),
                 ProcessGuard.FriendConnectProcessNames,
                 () => new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>())));
         }
@@ -118,6 +150,7 @@ public sealed class AutoSyncCoordinator : IDisposable
         {
             binding.Watcher.Start();
         }
+        RefreshDetectionSources();
 
         // 同期先が変更を知らせる仕組みを作る。ローカルフォルダはファイル監視、
         // S3 互換モードは manifest の定期確認になる。
@@ -133,6 +166,7 @@ public sealed class AutoSyncCoordinator : IDisposable
     public void Stop()
     {
         lock (_lifecycleLock) { StopCore(); }
+        ProcessDetectionChanged?.Invoke();
     }
 
     private void StopCore()
@@ -148,6 +182,7 @@ public sealed class AutoSyncCoordinator : IDisposable
             binding.Watcher.Dispose();
         }
         _bindings.Clear();
+        RefreshDetectionSources();
 
         if (_manifestWatcher is not null)
         {
@@ -169,6 +204,9 @@ public sealed class AutoSyncCoordinator : IDisposable
             StopCore();
             StartCore();
         }
+        // 通知は 1 回で足りる。読み直す側が見るのは Start を終えた後の状態なので、
+        // Stop と Start で 2 回流しても同じものを 2 度読むだけになる。
+        ProcessDetectionChanged?.Invoke();
     }
 
     /// <summary>
@@ -189,6 +227,14 @@ public sealed class AutoSyncCoordinator : IDisposable
     {
         var watcher = new ProcessWatcher(processNames);
         var binding = new ToolBinding(toolKey, displayName, watcher, serviceFactory);
+        // 検出状況の通知。どの候補が実際に当たっているかを GUI に出すために使う
+        // (issue #11)。起動でも終了でも検出状況は変わるので、両方から流す。
+        //
+        // Stop は監視の終了を 2 秒までしか待たないので、待ちきれなかった走査の通知が
+        // 停止後に届きうる。通知は状態を持たないため、その場合も読み直させるだけで
+        // 済み、停止中の表示を古い状態で上書きすることにはならない。
+        watcher.ProcessStarted += _ => ProcessDetectionChanged?.Invoke();
+        watcher.ProcessExited += _ => ProcessDetectionChanged?.Invoke();
         // 現世代の CancellationToken をキャプチャしてタスクに渡す。Stop / UpdateSettings
         // で世代が切り替わると、それより前にキューに入ったタスクはこの token で中断される。
         var token = _generationCts.Token;
@@ -272,6 +318,42 @@ public sealed class AutoSyncCoordinator : IDisposable
         public bool Pushed { get; set; }
         public InFlightPush(string toolKey) { ToolKey = toolKey; }
     }
+
+    /// <summary>
+    /// いまの検出状況。ツールごとに 1 件返す。
+    /// <para>
+    /// 通知は「変わった」ことしか伝えないので、購読側はここから読む。<b>読むたびに
+    /// 現在の状態が返る</b>ため、通知が遅れて届いても古い状態を表示することはない。
+    /// </para>
+    /// <para>
+    /// <see cref="_lifecycleLock"/> は取らない。読み手は GUI のスレッドにいるので、
+    /// 進行中の <see cref="Start"/> の裏で待たせたくない。代わりに
+    /// <see cref="_detectionSources"/> を丸ごと差し替える形で読ませる。
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<ProcessDetectionEvent> GetProcessDetections()
+    {
+        var sources = _detectionSources;
+        var detections = sources.Select(DetectionOf).ToList();
+        detections.AddRange(KnownTools
+            .Where(tool => !sources.Any(b => b.ToolKey == tool.ToolKey))
+            .Select(tool => NotWatching(tool.ToolKey, tool.DisplayName)));
+        return detections;
+    }
+
+    /// <summary>
+    /// 検出状況を読む先を、いまの <see cref="_bindings"/> に合わせる。
+    /// <see cref="_lifecycleLock"/> の中で呼ぶ。
+    /// </summary>
+    private void RefreshDetectionSources() => _detectionSources = _bindings.ToArray();
+
+    /// <summary>監視中のツール 1 つぶんの検出状況。</summary>
+    private static ProcessDetectionEvent DetectionOf(ToolBinding binding)
+        => new(binding.ToolKey, binding.DisplayName, IsWatching: true, binding.Watcher.DetectedProcessNames);
+
+    private static ProcessDetectionEvent NotWatching(string toolKey, string displayName)
+        => new(toolKey, displayName, IsWatching: false, Array.Empty<string>());
+
 
     /// <summary>
     /// プロセス終了検知後の AutoPush 本体。Push まで成功したら true を返す。
@@ -423,6 +505,33 @@ public sealed record AutoPushConflictEvent(
     long RemoteVersion,
     long LastPulledVersion,
     Func<ISyncService> ServiceFactory);
+
+/// <summary>
+/// ツール 1 つのプロセス検出状況。
+/// <para>
+/// 起動しているかどうかだけでなく、<b>どの名前で見つかったか</b>を載せる。
+/// 実行ファイル名は配布のされ方で変わりうるため候補を複数持っており
+/// (<see cref="Sync.ProcessGuard.FriendConnectProcessNames"/>)、どれも当たらない場合、
+/// 利用者には「自動 Push が動かない」ことしか見えない。当たった名前を出すことで、
+/// 候補に無い名前で配布されていることに気付けるようにする。
+/// </para>
+/// </summary>
+/// <param name="ToolKey">ツールの識別子。</param>
+/// <param name="DisplayName">表示名。</param>
+/// <param name="IsWatching">
+/// 監視しているかどうか。自動同期を切っている間や停止中は false になる。
+/// 「監視していない」と「動いていない」は別物なので、表示で混ぜないために分けて持つ。
+/// </param>
+/// <param name="DetectedProcessNames">実体が見つかった名前。</param>
+public sealed record ProcessDetectionEvent(
+    string ToolKey,
+    string DisplayName,
+    bool IsWatching,
+    IReadOnlyList<string> DetectedProcessNames)
+{
+    /// <summary>1 つでも見つかっていれば起動中と見なす。</summary>
+    public bool IsRunning => DetectedProcessNames.Count > 0;
+}
 
 public sealed record RemoteUpdateEvent(
     string ToolKey,
