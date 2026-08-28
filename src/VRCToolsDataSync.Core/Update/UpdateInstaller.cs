@@ -35,6 +35,12 @@ public class UpdateInstaller
     /// <summary>ZIP 直下に入るランチャーの名前。build-release.ps1 が作るものと一致させる。</summary>
     public const string LauncherName = "VRCToolsDataSync.cmd";
 
+    /// <summary>app ディレクトリに入る GUI の実行ファイルの名前。</summary>
+    public const string AppExecutableName = "VRCToolsDataSync.App.exe";
+
+    /// <summary>cli ディレクトリに入る CLI (更新ヘルパ) の実行ファイルの名前。</summary>
+    public const string CliExecutableName = "VRCToolsDataSync.Cli.exe";
+
     /// <summary>置き換えの対象になる、インストール先直下のディレクトリ。</summary>
     private static readonly string[] Parts = { "app", "cli" };
 
@@ -206,6 +212,22 @@ public class UpdateInstaller
         if (!File.Exists(Path.Combine(_sourceDirectory, LauncherName)))
         {
             throw new InvalidOperationException($"展開した一式に {LauncherName} が無い: {_sourceDirectory}");
+        }
+
+        // ディレクトリの存在だけでは足りない。digest が保証するのは ZIP が配布物
+        // そのものであることまでで、中身の形は保証しない。app の exe が欠けた
+        // 一式で進むと、現行を退避した後に起動できないディレクトリへ置き換えて
+        // しまう。ランチャーと再起動処理が参照する exe を必須として見る。
+        foreach (var required in new[]
+        {
+            Path.Combine("app", AppExecutableName),
+            Path.Combine("cli", CliExecutableName),
+        })
+        {
+            if (!File.Exists(Path.Combine(_sourceDirectory, required)))
+            {
+                throw new InvalidOperationException($"展開した一式に {required} が無い: {_sourceDirectory}");
+            }
         }
     }
 

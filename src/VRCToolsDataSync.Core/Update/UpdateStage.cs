@@ -106,11 +106,18 @@ public sealed class UpdateStage
     /// <summary>
     /// 取得済みで、今のチャンネルに合い、記録と照合の通る ZIP の記録。無ければ null を返す。
     /// <para>
-    /// 合わないものはその場で捨てる。残しておいても次の起動でまた同じ照合に
-    /// 落ちるだけであり、取り直しの機会を与えたほうがよい。
+    /// 合わないものは既定ではその場で捨てる。残しておいても次の起動でまた同じ
+    /// 照合に落ちるだけであり、取り直しの機会を与えたほうがよい。
+    /// </para>
+    /// <para>
+    /// <paramref name="discardMismatches"/> を偽にすると、合わないものを残したまま
+    /// null を返す。起動シーケンスの先頭 (置き換え直後の最初の起動) で使う。
+    /// そこで捨てると、置き換えた新しい版がこの後の初期化で失敗した場合に、
+    /// 退避した旧版と取得済みの ZIP の両方を失って復旧できなくなる。
+    /// 後始末は起動が成り立った後に、既定の破棄付きの呼び出しで行う。
     /// </para>
     /// </summary>
-    public StagedMetadata? TryLoadVerified(UpdateChannel channel, string runningVersion)
+    public StagedMetadata? TryLoadVerified(UpdateChannel channel, string runningVersion, bool discardMismatches = true)
     {
         StagedMetadata? metadata;
         try
@@ -120,13 +127,13 @@ public sealed class UpdateStage
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "取得しておいた配布物を確かめられないため捨てる");
-            Discard();
+            _logger.LogWarning(ex, "取得しておいた配布物を確かめられない");
+            if (discardMismatches) Discard();
             return null;
         }
         if (metadata is null)
         {
-            Discard();
+            if (discardMismatches) Discard();
             return null;
         }
 
@@ -135,8 +142,8 @@ public sealed class UpdateStage
         // stable へ変えられると、選び直した設定に反してプレリリースが入る。
         if (channel != UpdateChannel.Test && !metadata.Stable)
         {
-            _logger.LogInformation("取得しておいた {Tag} は今のチャンネルの対象ではないため捨てる", metadata.Tag);
-            Discard();
+            _logger.LogInformation("取得しておいた {Tag} は今のチャンネルの対象ではない", metadata.Tag);
+            if (discardMismatches) Discard();
             return null;
         }
 
@@ -148,15 +155,15 @@ public sealed class UpdateStage
         if (running is not null && staged is not null && staged <= running)
         {
             _logger.LogInformation(
-                "取得しておいた {Tag} は実行中の {Running} より新しくないため捨てる", metadata.Tag, runningVersion);
-            Discard();
+                "取得しておいた {Tag} は実行中の {Running} より新しくない", metadata.Tag, runningVersion);
+            if (discardMismatches) Discard();
             return null;
         }
 
         if (!Verify(metadata))
         {
-            _logger.LogWarning("取得しておいた配布物が記録と合わないため捨てる: {Path}", ZipPath);
-            Discard();
+            _logger.LogWarning("取得しておいた配布物が記録と合わない: {Path}", ZipPath);
+            if (discardMismatches) Discard();
             return null;
         }
 

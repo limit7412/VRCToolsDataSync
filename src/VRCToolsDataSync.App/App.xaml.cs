@@ -274,6 +274,16 @@ public partial class App : Application
             }
             catch (Exception ex) { LogStartupFailure("CacheWindowHandle", ex); }
 
+            // 更新の後始末 (退避した旧版と不要な取得の削除) はウィンドウを
+            // 立てられた後に行う (issue #45 第 3 段階)。起動の前に消すと、
+            // 置き換え直後の起動がここまで来られずに失敗した場合に、
+            // 復旧の材料を失う。
+            try
+            {
+                _ = System.Threading.Tasks.Task.Run(() => UpdateApplier.CleanUpAfterSuccessfulStart(LoggerFactory));
+            }
+            catch (Exception ex) { LogStartupFailure("UpdateCleanup", ex); }
+
             // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
             // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
             // 最大 15 秒だけシャットダウンを延長して Push を完了させる。

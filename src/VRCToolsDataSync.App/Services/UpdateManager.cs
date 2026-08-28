@@ -37,6 +37,15 @@ public sealed class UpdateManager : IDisposable
     // 取得は 1 本ずつ。同じ ZIP へ 2 本が書くと壊れる。
     private readonly SemaphoreSlim _downloadGate = new(1, 1);
 
+    // 取得の打ち切り。取得の本文の読み取りは HttpClient のタイムアウトの外に
+    // あるため、応答が止まったまま進まない取得を放置すると _downloadGate を
+    // 持ち続け、以後の確認からの取得がすべてスキップされる。
+    // 大きくても百数十 MB の ZIP であり、これで足りない回線では待っても仕方がない。
+    private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(30);
+
+    // 破棄と一緒に、走っている取得を打ち切るための元。
+    private readonly CancellationTokenSource _lifetime = new();
+
     /// <summary>
     /// 確認が終わるたびに上がる。定期の確認では通知済みの抑止を通した後の結果になる。
     /// ハンドラはバックグラウンドスレッドで呼ばれるので、UI 側でディスパッチする。
@@ -171,7 +180,9 @@ public sealed class UpdateManager : IDisposable
             if (staged is not null && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)) return;
 
             _logger.LogInformation("更新 {Tag} の取得を始める ({Size} バイト)", release.Tag, asset.Size);
-            await _repository.DownloadAsync(asset, _stage.ZipPath).ConfigureAwait(false);
+            using var cutoff = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            cutoff.CancelAfter(DownloadTimeout);
+            await _repository.DownloadAsync(asset, _stage.ZipPath, cutoff.Token).ConfigureAwait(false);
             _stage.SaveMetadata(release, asset);
             _logger.LogInformation("次の起動で置き換える更新を取得した: {Tag}", release.Tag);
 
@@ -243,6 +254,8 @@ public sealed class UpdateManager : IDisposable
     public void Dispose()
     {
         _timer.Dispose();
+        try { _lifetime.Cancel(); } catch { /* best-effort */ }
+        _lifetime.Dispose();
         _checkGate.Dispose();
         _downloadGate.Dispose();
         _repository.Dispose();

@@ -66,6 +66,18 @@ public sealed class UpdateStageTests : IDisposable
         Assert.False(File.Exists(stage.MetadataPath));
     }
 
+    [Fact(DisplayName = "破棄なしの照合は、合わないものを残したまま null を返す")]
+    public void NonDestructiveCheckKeepsMismatches()
+    {
+        // 起動シーケンスの先頭で使う形。置き換え直後の起動がこの後で失敗した
+        // 場合の復旧の材料になるため、ここでは捨てない。
+        var stage = StageWith("0.0.10");
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.10", discardMismatches: false));
+        Assert.True(File.Exists(stage.ZipPath));
+        Assert.True(File.Exists(stage.MetadataPath));
+    }
+
     [Fact(DisplayName = "実行中より新しくないものは捨てる")]
     public void DiscardsWhenNotNewerThanRunning()
     {

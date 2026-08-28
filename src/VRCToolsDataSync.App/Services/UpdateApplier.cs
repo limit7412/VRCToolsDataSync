@@ -36,26 +36,13 @@ public static class UpdateApplier
             var stage = new UpdateStage(logger: logger);
             var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
 
-            // 前回の置き換えが退避した .old は、次の起動、つまりここで消す。
-            if (root is not null)
-            {
-                UpdateInstaller.DiscardPrevious(root, logger);
-            }
-
+            // ここでは何も捨てない (discardMismatches: false)。この時点は置き換え
+            // 直後の最初の起動かもしれず、退避した .old と取得済みの ZIP は、
+            // この後の初期化が失敗した場合の復旧の材料になる。後始末は起動が
+            // 成り立った後に CleanUpAfterSuccessfulStart が行う。
             var channel = LoadChannel(logger);
-            var staged = stage.TryLoadVerified(channel, RunningVersion.Current());
-            if (staged is null)
-            {
-                // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
-                // ZIP と記録は TryLoadVerified が「実行中より新しくない」等で
-                // 消しているが、展開先だけが残る形はここで拾う。
-                stage.DiscardIncomplete();
-                if (!File.Exists(stage.ZipPath))
-                {
-                    DeleteDirectoryQuietly(stage.ExtractDirectory, logger);
-                }
-                return false;
-            }
+            var staged = stage.TryLoadVerified(channel, RunningVersion.Current(), discardMismatches: false);
+            if (staged is null) return false;
 
             if (root is null)
             {
@@ -79,13 +66,51 @@ public static class UpdateApplier
     }
 
     /// <summary>
+    /// 置き換えまわりの後始末。ウィンドウを立てられた後に呼ぶ。
+    /// <para>
+    /// 退避した .old と、置き換え済み・チャンネル外・壊れた取得をここで捨てる。
+    /// 起動シーケンスの先頭で捨てると、置き換えた新しい版が初期化の途中で
+    /// 失敗した場合に、旧版と取得済みの ZIP の両方を失って復旧できなくなる。
+    /// 起動が成り立った後なら、どちらも復旧の材料として残す必要が無い。
+    /// </para>
+    /// </summary>
+    public static void CleanUpAfterSuccessfulStart(ILoggerFactory loggerFactory)
+    {
+        var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
+        try
+        {
+            var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+            if (root is not null)
+            {
+                UpdateInstaller.DiscardPrevious(root, logger);
+            }
+
+            // まだ適用できる取得 (非配布形で適用しなかった等) は残り、
+            // 合わなくなった取得はここで捨てられる。
+            var stage = new UpdateStage(logger: logger);
+            _ = stage.TryLoadVerified(LoadChannel(logger), RunningVersion.Current());
+
+            // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
+            stage.DiscardIncomplete();
+            if (!File.Exists(stage.ZipPath))
+            {
+                DeleteDirectoryQuietly(stage.ExtractDirectory, logger);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "更新の後始末に失敗した");
+        }
+    }
+
+    /// <summary>
     /// ZIP を展開してヘルパを起動する。呼び出し側はこの後で App を終了させる。
     /// ヘルパは --wait-pid でこのプロセスの終了を待ってから置き換える。
     /// </summary>
     public static bool TrySpawnUpdater(UpdateStage stage, string installRoot, ILogger logger)
     {
         var extracted = stage.ExtractForApply();
-        var updater = Path.Combine(extracted, "cli", "VRCToolsDataSync.Cli.exe");
+        var updater = Path.Combine(extracted, "cli", UpdateInstaller.CliExecutableName);
         if (!File.Exists(updater))
         {
             // ZIP の形が想定と違う。展開し直しても同じなので取得ごと捨てる。

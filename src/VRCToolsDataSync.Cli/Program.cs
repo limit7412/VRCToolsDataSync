@@ -584,14 +584,19 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     // 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
     // その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
     // 失敗するだけである。待ちきれなければ、壊す前にここで止める。
+    //
+    // 終了時の同期は大きな DB や遅い保存先で数分かかりうるため、余裕を持って
+    // 10 分まで待つ。それでも待ちきれなかった場合は取得済みの更新を残したまま
+    // 引き下がる。App が生きていれば次の起動が、終了が遅れただけなら
+    // その次の起動が、同じ更新を適用し直す。
     if (waitPid is { } pid)
     {
         try
         {
             using var process = System.Diagnostics.Process.GetProcessById(pid);
-            if (!process.WaitForExit(120_000))
+            if (!process.WaitForExit(600_000))
             {
-                Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。");
+                Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
                 logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid);
                 return 6;
             }
@@ -610,7 +615,8 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     }
     catch (UpdateRollbackException ex)
     {
-        // 正規の位置に一式が無い状態。取得済みの ZIP は復旧の材料になるため消さない。
+        // 正規の位置に一式が無い状態。取得済みの ZIP は復旧の材料になるため消さず、
+        // 壊れた一式を起動し直そうともしない。
         Console.Error.WriteLine(ex.Message);
         Console.Error.WriteLine("インストール先が壊れた可能性があります。.old ディレクトリを手で戻すか、ZIP を展開し直してください。");
         logger.LogError(ex, "置き換えの巻き戻しに失敗した");
@@ -618,34 +624,56 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     }
     catch (Exception ex)
     {
-        // 巻き戻しは済んでいる。元の版のまま動かせる。
+        // 巻き戻しは済んでいて、現行版は無傷のまま動かせる。
         Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
         logger.LogError(ex, "置き換えに失敗した (巻き戻し済み)");
+
+        // 取得済みの更新をここで捨てる。残すと次の起動がまた同じ適用へ引き渡して
+        // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
+        // 開けなくなる。展開先はこのヘルパ自身が動いている場所なので消せないが、
+        // ZIP と記録が消えれば次の起動は適用へ入らず、展開先は後始末が拾う。
+        try
+        {
+            new UpdateStage(logger: logger).Discard();
+        }
+        catch (Exception discard)
+        {
+            logger.LogWarning(discard, "取得済みの更新を捨てられなかった");
+        }
+
+        // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。
+        if (relaunch) TryRelaunchApp(target, logger);
         return 1;
     }
 
-    if (relaunch)
+    if (relaunch && !TryRelaunchApp(target, logger))
     {
-        try
-        {
-            var appExe = Path.Combine(target, "app", "VRCToolsDataSync.App.exe");
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = appExe,
-                WorkingDirectory = Path.Combine(target, "app"),
-                UseShellExecute = true,
-            });
-        }
-        catch (Exception ex)
-        {
-            // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
-            Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
-            logger.LogWarning(ex, "置き換え後の起動に失敗した");
-            return 1;
-        }
+        // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
+        return 1;
     }
 
     return 0;
+}
+
+static bool TryRelaunchApp(string target, ILogger logger)
+{
+    try
+    {
+        var appDirectory = Path.Combine(target, "app");
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = Path.Combine(appDirectory, UpdateInstaller.AppExecutableName),
+            WorkingDirectory = appDirectory,
+            UseShellExecute = true,
+        });
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
+        logger.LogWarning(ex, "App の起動し直しに失敗した");
+        return false;
+    }
 }
 
 static string FormatBytes(long bytes)
