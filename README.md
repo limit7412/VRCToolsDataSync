@@ -225,19 +225,22 @@ powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Arch arm64
 
 出力先は `artifacts/win-<arch>/{app,cli}/` と `artifacts/VRCToolsDataSync-win-<arch>.zip`。`app/VRCToolsDataSync.App.exe` が GUI、`cli/VRCToolsDataSync.Cli.exe` が CLI。
 
-GitHub Actions の `release` ワークフロー (`.github/workflows/release.yml`) が x64 と arm64 をビルドし、GitHub Release に zip を添付する。
-トリガーによって作られるリリースの状態が変わる。
+リリースは **stable** (安定版) と **test** (プレリリース) の 2 チャンネルに分かれている (issue #45)。
+GitHub Actions がどちらも x64 と arm64 をビルドし、GitHub Release に zip を添付する。
 
-| トリガー | タグ | リリース |
-| --- | --- | --- |
-| master への push | 直近のタグの patch を一つ進めた番号を自動採番 | 公開 |
-| `0.0.4` 形式のタグの push | push したタグ | Draft |
-| Actions タブからの手動実行 | 入力したタグ名（空ならアーティファクトのみ） | Draft |
+| トリガー | ワークフロー | タグ | リリース |
+| --- | --- | --- | --- |
+| master への push | prerelease.yml | 直近の安定版タグの patch を一つ進めた `X.Y.(Z+1)-testN` を自動採番 | プレリリースとして公開 |
+| `0.0.4` 形式のタグの push | release.yml | push したタグ | Draft |
+| Actions タブからの手動実行 | release.yml | 入力したタグ名（空ならアーティファクトのみ） | Draft |
 
-master へのマージでリリースが公開されるため、PR を master へマージする操作がリリース操作にあたる。
-minor や major を上げたいときは、先に目的の番号のタグを push してリリースを作る。
+master へのマージは test チャンネルのプレリリースになる。ただし成果物の中身が変わらない push (tests やドキュメントのみ) では作られない。
+安定版は人が出す。`X.Y.Z` のタグを push して作られた Draft を確認して公開するか、リリース画面から手動で作成する。
+minor や major を上げたいときも、目的の番号のタグを push すればよい。
 
-master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、リリースは一本にまとまる。
+ビルドの前にタグを決め、`-p:Version` で成果物へ版を埋め込む。アプリはこの版を自動アップデートの「実行中の版」として使う。
+
+master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、プレリリースは一本にまとまる。
 番号は一つだけ進み、まとめられた変更はそのリリースのノートに含まれる (ノートは直前のタグからの差分で生成される)。
 
 ## 第三者プロダクトに関する免責
