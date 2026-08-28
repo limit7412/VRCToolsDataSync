@@ -27,11 +27,15 @@ public sealed class UpdateManager : IDisposable
     private readonly SyncRunner _runner;
     private readonly UpdateChecker _checker;
     private readonly GitHubReleaseRepository _repository;
+    private readonly UpdateStage _stage;
     private readonly ILogger _logger;
     private readonly Timer _timer;
 
     // 手動と定期の確認が重ならないように直列化する。
     private readonly SemaphoreSlim _checkGate = new(1, 1);
+
+    // 取得は 1 本ずつ。同じ ZIP へ 2 本が書くと壊れる。
+    private readonly SemaphoreSlim _downloadGate = new(1, 1);
 
     /// <summary>
     /// 確認が終わるたびに上がる。定期の確認では通知済みの抑止を通した後の結果になる。
@@ -39,12 +43,16 @@ public sealed class UpdateManager : IDisposable
     /// </summary>
     public event Action<UpdateCheckResult, bool>? CheckCompleted;
 
+    /// <summary>取得が済んで置き換え待ちになった (または捨てられた) ときに上がる。</summary>
+    public event Action? StagedChanged;
+
     public UpdateManager(SyncRunner runner, ILoggerFactory loggerFactory)
     {
         _runner = runner;
         _logger = loggerFactory.CreateLogger<UpdateManager>();
         _repository = new GitHubReleaseRepository(ReleaseAsset.NameForCurrentArchitecture());
         _checker = new UpdateChecker(_repository, loggerFactory.CreateLogger<UpdateChecker>());
+        _stage = new UpdateStage(logger: _logger);
 
         // 知らせ済みの版を復元してから最初の確認を行う。
         // 先に確認すると、前回知らせた版をもう一度知らせてしまう。
@@ -127,11 +135,95 @@ public sealed class UpdateManager : IDisposable
             {
                 _logger.LogWarning(ex, "更新確認の結果の通知に失敗した");
             }
+
+            // 見つけている版に配布物が付いていれば、常駐している間に取っておく
+            // (issue #45 第 3 段階)。置き換えは次の起動で行う。
+            // 通知を抑止した版も対象にする。抑えたのは繰り返しの通知であって、
+            // 取得まで止める理由は無い。
+            var available = _checker.Available(channel);
+            if (available?.Asset is not null)
+            {
+                _ = DownloadIfNeededAsync(available);
+            }
+
             return result;
         }
         finally
         {
             _checkGate.Release();
+        }
+    }
+
+    /// <summary>取得済みで置き換え待ちの記録。照合はせず、表示にだけ使う。</summary>
+    public StagedMetadata? Staged => _stage.TryLoadMetadata();
+
+    /// <summary>
+    /// まだ取っていない版なら取得して staged に置く。取得は 1 本に絞り、
+    /// 走っている間の呼び出しは黙って戻る (次の確認がまた呼ぶ)。
+    /// </summary>
+    private async Task DownloadIfNeededAsync(ReleaseInfo release)
+    {
+        if (release.Asset is not { } asset) return;
+        if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false)) return;
+        try
+        {
+            var staged = _stage.TryLoadMetadata();
+            if (staged is not null && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)) return;
+
+            _logger.LogInformation("更新 {Tag} の取得を始める ({Size} バイト)", release.Tag, asset.Size);
+            await _repository.DownloadAsync(asset, _stage.ZipPath).ConfigureAwait(false);
+            _stage.SaveMetadata(release, asset);
+            _logger.LogInformation("次の起動で置き換える更新を取得した: {Tag}", release.Tag);
+
+            try
+            {
+                StagedChanged?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "取得完了の通知に失敗した");
+            }
+        }
+        catch (Exception ex)
+        {
+            // 取得の失敗は次の確認でやり直せる。書きかけは取得の側が消している。
+            _logger.LogWarning(ex, "更新の取得に失敗した: {Tag}", release.Tag);
+        }
+        finally
+        {
+            _downloadGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 取得済みの更新を照合し直し、更新ヘルパを起動する。true が返ったら
+    /// 呼び出し側は App を終了させる (ヘルパがこのプロセスの終了を待っている)。
+    /// </summary>
+    public bool PrepareApplyAndSpawnUpdater()
+    {
+        try
+        {
+            var channel = _runner.LoadSettings().Update.Channel;
+            var staged = _stage.TryLoadVerified(channel, CurrentVersion);
+            if (staged is null)
+            {
+                try { StagedChanged?.Invoke(); } catch { /* best-effort */ }
+                return false;
+            }
+
+            var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+            if (root is null)
+            {
+                _logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag);
+                return false;
+            }
+
+            return UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "更新の適用に入れなかった");
+            return false;
         }
     }
 
@@ -152,6 +244,7 @@ public sealed class UpdateManager : IDisposable
     {
         _timer.Dispose();
         _checkGate.Dispose();
+        _downloadGate.Dispose();
         _repository.Dispose();
     }
 }

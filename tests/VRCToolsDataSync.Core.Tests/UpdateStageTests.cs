@@ -1,0 +1,114 @@
+using System.Security.Cryptography;
+using VRCToolsDataSync.Core.Update;
+using Xunit;
+
+namespace VRCToolsDataSync.Core.Tests;
+
+/// <summary>
+/// 取得しておいた更新の置き場所の判定を固定する (issue #45 第 3 段階)。
+/// 置き換えの直前の関門であり、チャンネル適合・版の前後・記録との照合の
+/// どれかで落ちたものはその場で捨てられることを確かめる。
+/// </summary>
+public sealed class UpdateStageTests : IDisposable
+{
+    private readonly string _directory =
+        Path.Combine(Path.GetTempPath(), "vrctoolsdatasync-tests-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_directory, recursive: true); } catch { /* best-effort */ }
+    }
+
+    private UpdateStage CreateStage() => new(_directory);
+
+    /// <summary>取得済みの状態 (ZIP と記録の対) を作る。</summary>
+    private UpdateStage StageWith(string tag, bool prerelease = false, byte[]? corruptedContent = null)
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        var content = new byte[1234];
+        Random.Shared.NextBytes(content);
+        File.WriteAllBytes(stage.ZipPath, corruptedContent ?? content);
+
+        var version = ReleaseVersion.Parse(tag)!;
+        var asset = new ReleaseAsset(
+            "VRCToolsDataSync-win-x64.zip",
+            "https://example.com/asset",
+            Convert.ToHexStringLower(SHA256.HashData(content)),
+            content.Length);
+        var release = new ReleaseInfo(version, tag, $"https://example.com/{tag}", prerelease, asset);
+        stage.SaveMetadata(release, asset);
+        return stage;
+    }
+
+    [Fact(DisplayName = "チャンネルと版と照合の通ったものだけを返す")]
+    public void ReturnsVerifiedStagedUpdate()
+    {
+        var stage = StageWith("0.0.10-test2", prerelease: true);
+
+        var staged = stage.TryLoadVerified(UpdateChannel.Test, "0.0.9");
+
+        Assert.NotNull(staged);
+        Assert.Equal("0.0.10-test2", staged!.Tag);
+        Assert.False(staged.Stable);
+        Assert.True(File.Exists(stage.ZipPath));
+    }
+
+    [Fact(DisplayName = "stable チャンネルではプレリリースの取得を捨てる")]
+    public void StableChannelDiscardsStagedPrerelease()
+    {
+        // test で取ったプレリリースを、stable へ変えて再起動したケース。
+        var stage = StageWith("0.0.10-test2", prerelease: true);
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+        Assert.False(File.Exists(stage.ZipPath));
+        Assert.False(File.Exists(stage.MetadataPath));
+    }
+
+    [Fact(DisplayName = "実行中より新しくないものは捨てる")]
+    public void DiscardsWhenNotNewerThanRunning()
+    {
+        // 取得後に手で新しい版へ入れ替えられていたケース。引き戻さない。
+        var stage = StageWith("0.0.10");
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.10"));
+        Assert.False(File.Exists(stage.ZipPath));
+    }
+
+    [Fact(DisplayName = "記録と合わない ZIP は捨てる")]
+    public void DiscardsCorruptedZip()
+    {
+        var stage = StageWith("0.0.10", corruptedContent: new byte[] { 1, 2, 3 });
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+        Assert.False(File.Exists(stage.ZipPath));
+    }
+
+    [Fact(DisplayName = "片方だけ残った取得は起動時の片付けで消える")]
+    public void DiscardIncompleteRemovesLonePieces()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+        File.WriteAllBytes(stage.ZipPath, new byte[] { 1 });
+
+        stage.DiscardIncomplete();
+
+        Assert.False(File.Exists(stage.ZipPath));
+
+        // そろっている対は消さない。
+        var complete = StageWith("0.0.10");
+        complete.DiscardIncomplete();
+        Assert.True(File.Exists(complete.ZipPath));
+    }
+
+    [Fact(DisplayName = "表示用の読み出しは対がそろっているときだけ返す")]
+    public void TryLoadMetadataRequiresBothPieces()
+    {
+        var stage = StageWith("0.0.10");
+        Assert.Equal("0.0.10", stage.TryLoadMetadata()!.Tag);
+
+        File.Delete(stage.ZipPath);
+        Assert.Null(stage.TryLoadMetadata());
+    }
+}

@@ -4,6 +4,7 @@ using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Update;
 
 var rootCommand = new RootCommand("VRCX / VRC Friend Connect データ同期ツール");
 
@@ -182,10 +183,52 @@ storageGcCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx
 });
 storageCommand.AddCommand(storageGcCommand);
 
+// --- self-update: 本体の更新の適用 (issue #45 第 3 段階) ---
+//
+// GUI (App) が展開しておいた新しい一式で、インストール先を置き換える更新ヘルパ。
+// 展開先の cli から起動されるため、置き換える対象 (app / cli) のどれも掴んでいない。
+// 人が直接叩く想定は無いので、ヘルプには出さない。
+
+var applySourceOption = new Option<string>(
+    aliases: new[] { "--source" },
+    description: "展開した新しい一式のディレクトリ")
+{ IsRequired = true };
+var applyTargetOption = new Option<string>(
+    aliases: new[] { "--target" },
+    description: "インストール先のルート")
+{ IsRequired = true };
+var applyWaitPidOption = new Option<int?>(
+    aliases: new[] { "--wait-pid" },
+    description: "このプロセスの終了を待ってから置き換える (呼び出し元の App)");
+var applyRelaunchOption = new Option<bool>(
+    aliases: new[] { "--relaunch" },
+    description: "置き換えた後に App を起動し直す");
+
+var selfUpdateApplyCommand = new Command("apply", "取得済みの更新でインストール先を置き換える");
+selfUpdateApplyCommand.AddOption(applySourceOption);
+selfUpdateApplyCommand.AddOption(applyTargetOption);
+selfUpdateApplyCommand.AddOption(applyWaitPidOption);
+selfUpdateApplyCommand.AddOption(applyRelaunchOption);
+selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
+{
+    ctx.ExitCode = ApplySelfUpdate(
+        source: ctx.ParseResult.GetValueForOption(applySourceOption)!,
+        target: ctx.ParseResult.GetValueForOption(applyTargetOption)!,
+        waitPid: ctx.ParseResult.GetValueForOption(applyWaitPidOption),
+        relaunch: ctx.ParseResult.GetValueForOption(applyRelaunchOption));
+});
+
+var selfUpdateCommand = new Command("self-update", "本体の更新を適用する (App が内部で使う)")
+{
+    IsHidden = true,
+};
+selfUpdateCommand.AddCommand(selfUpdateApplyCommand);
+
 rootCommand.AddCommand(pushCommand);
 rootCommand.AddCommand(pullCommand);
 rootCommand.AddCommand(statusCommand);
 rootCommand.AddCommand(storageCommand);
+rootCommand.AddCommand(selfUpdateCommand);
 
 return await rootCommand.InvokeAsync(args);
 
@@ -527,6 +570,82 @@ static int CollectGarbage(int graceDays, bool dryRun)
         Console.Error.WriteLine($"回収できませんでした: {ex.Message}");
         return 2;
     }
+}
+
+static int ApplySelfUpdate(string source, string target, int? waitPid, bool relaunch)
+{
+    using var loggerFactory = LoggerFactory.Create(builder =>
+    {
+        builder.SetMinimumLevel(LogLevel.Information);
+        builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
+    });
+    var logger = loggerFactory.CreateLogger("SelfUpdate");
+
+    // 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
+    // その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
+    // 失敗するだけである。待ちきれなければ、壊す前にここで止める。
+    if (waitPid is { } pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            if (!process.WaitForExit(120_000))
+            {
+                Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。");
+                logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid);
+                return 6;
+            }
+        }
+        catch (ArgumentException)
+        {
+            // 既に終了している。そのまま進む。
+        }
+    }
+
+    try
+    {
+        new UpdateInstaller(source, target, logger).Apply();
+        Console.WriteLine("本体を置き換えました。");
+        logger.LogInformation("本体を置き換えた: {Target}", target);
+    }
+    catch (UpdateRollbackException ex)
+    {
+        // 正規の位置に一式が無い状態。取得済みの ZIP は復旧の材料になるため消さない。
+        Console.Error.WriteLine(ex.Message);
+        Console.Error.WriteLine("インストール先が壊れた可能性があります。.old ディレクトリを手で戻すか、ZIP を展開し直してください。");
+        logger.LogError(ex, "置き換えの巻き戻しに失敗した");
+        return 7;
+    }
+    catch (Exception ex)
+    {
+        // 巻き戻しは済んでいる。元の版のまま動かせる。
+        Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
+        logger.LogError(ex, "置き換えに失敗した (巻き戻し済み)");
+        return 1;
+    }
+
+    if (relaunch)
+    {
+        try
+        {
+            var appExe = Path.Combine(target, "app", "VRCToolsDataSync.App.exe");
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = appExe,
+                WorkingDirectory = Path.Combine(target, "app"),
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
+            Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
+            logger.LogWarning(ex, "置き換え後の起動に失敗した");
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static string FormatBytes(long bytes)

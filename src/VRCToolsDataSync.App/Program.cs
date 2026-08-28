@@ -25,6 +25,15 @@ public static class Program
 
         try
         {
+            // 取得しておいた更新があれば、ここで置き換えを更新ヘルパへ渡して終了する
+            // (issue #45 第 3 段階)。多重起動の抑止より後に置くのは、既に常駐している
+            // プロセスがいる状態で置き換えないため。App を組み立てる前に置くのは、
+            // どうせ新しい exe で立ち上げ直すものを立ち上げないため。
+            if (Services.UpdateApplier.TryHandOverToStaged(App.LoggerFactory))
+            {
+                return;
+            }
+
             WinRT.ComWrappersSupport.InitializeComWrappers();
             Application.Start((p) =>
             {

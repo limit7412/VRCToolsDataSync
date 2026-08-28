@@ -58,8 +58,10 @@ public partial class MainPageViewModel : ObservableObject
 
         if (_updates is not null)
         {
-            // 確認はバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
+            // 確認も取得もバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
             _updates.CheckCompleted += (result, manual) => OnUi(() => HandleUpdateCheckCompleted(result, manual));
+            _updates.StagedChanged += () => OnUi(RefreshStagedRow);
+            RefreshStagedRow();
         }
     }
 
@@ -288,6 +290,13 @@ public partial class MainPageViewModel : ObservableObject
 
     // リリースページの URL。表示行と一緒に更新する。
     private string? _releasePageUrl;
+
+    // 取得済みで置き換え待ちの更新があるときだけ出す行 (issue #45 第 3 段階)。
+    [ObservableProperty]
+    public partial Visibility UpdateStagedVisibility { get; set; } = Visibility.Collapsed;
+
+    [ObservableProperty]
+    public partial string UpdateStagedText { get; set; } = string.Empty;
 
     public ObservableCollection<string> LogEntries { get; } = new();
 
@@ -576,6 +585,43 @@ public partial class MainPageViewModel : ObservableObject
             // 利用者が一度も見ないまま以後の確認で抑止される。
             _updates.MarkNotified(release);
         }
+    }
+
+    /// <summary>
+    /// 取得済みの行を staged の記録へ合わせる。記録はここでは照合しない。
+    /// 照合は適用の直前と次の起動が行い、通らなければそこで捨てられる。
+    /// </summary>
+    private void RefreshStagedRow()
+    {
+        var staged = _updates?.Staged;
+        if (staged is null)
+        {
+            UpdateStagedVisibility = Visibility.Collapsed;
+            UpdateStagedText = string.Empty;
+            return;
+        }
+        UpdateStagedText = $"{staged.Tag} を取得済み。次回起動時に適用されます";
+        UpdateStagedVisibility = Visibility.Visible;
+    }
+
+    /// <summary>
+    /// 「再起動して適用」ボタン。更新ヘルパを起動してから通常の終了シーケンスへ
+    /// 入る。ヘルパはこのプロセスの終了を待って置き換え、新しい版を立ち上げ直す。
+    /// </summary>
+    [RelayCommand]
+    private async Task ApplyStagedUpdateAsync()
+    {
+        if (_updates is null || IsBusy) return;
+        var ready = await Task.Run(() => _updates.PrepareApplyAndSpawnUpdater());
+        if (!ready)
+        {
+            AppendLog("更新を適用できませんでした。取得し直すか、ログを確認してください。");
+            RefreshStagedRow();
+            return;
+        }
+        AppendLog("更新を適用するため再起動します...");
+        // Tray「同期して終了」と同じ経路で閉じる。終了時 Push もそのまま流れる。
+        await App.ExitApplicationAsync(waitForToolsToExit: null);
     }
 
     /// <summary>

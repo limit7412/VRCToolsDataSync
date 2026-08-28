@@ -38,6 +38,16 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
     // 常駐アプリの片手間の確認であり、待たされてまで通す価値は無い。
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// 受け取る配布物の上限。実物は自己完結の WinUI アプリを含む ZIP で
+    /// 数十〜百数十 MB になる。宣言された大きさがこれを超えるものは、
+    /// 取りに行く前に断る。
+    /// </summary>
+    internal const long MaxAssetSize = 512L * 1024 * 1024;
+
+    /// <summary>読み出しの単位。</summary>
+    private const int BufferSize = 64 * 1024;
+
     private readonly HttpClient _httpClient;
     private readonly string _baseUrl;
     private readonly string _assetName;
@@ -114,6 +124,95 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
         if (!response.IsSuccessStatusCode)
         {
             throw new HttpRequestException($"GitHub API が {(int)response.StatusCode} を返した");
+        }
+    }
+
+    /// <summary>
+    /// 配布物を path へ取り、digest と照合してから残す (issue #45 第 3 段階)。
+    /// <para>
+    /// browser_download_url は署名付きの配布元へ 302 で渡す作りだが、
+    /// HttpClient が既定でリダイレクトを追う。認証ヘッダは付けていないため、
+    /// リダイレクト先へ漏れるものも無い。
+    /// </para>
+    /// <para>
+    /// 一覧の確認と同じ待ち時間では短すぎるので、応答ヘッダまでを既定の
+    /// タイムアウトで待ち、本体は打ち切りを cancellationToken に委ねて読む。
+    /// </para>
+    /// </summary>
+    public async Task DownloadAsync(ReleaseAsset asset, string path, CancellationToken cancellationToken = default)
+    {
+        if (asset.Size > MaxAssetSize)
+        {
+            throw new InvalidOperationException($"配布物が大きすぎる: {asset.Size} バイト");
+        }
+
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, asset.Url);
+        request.Headers.Accept.Clear();
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
+
+        using var response = await _httpClient.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"配布物の取得で {(int)response.StatusCode} が返った");
+        }
+
+        using var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await StoreAsync(body, asset, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 応答を読みながら digest を取り、通ったときだけ path へ残す。
+    /// <para>
+    /// 読みながら数えるのは、宣言より大きいものを最後まで受け取らないためである。
+    /// 通信から切り離してあり、テストではストリームを直に渡して確かめる。
+    /// </para>
+    /// </summary>
+    internal static async Task StoreAsync(
+        Stream source, ReleaseAsset asset, string path, CancellationToken cancellationToken = default)
+    {
+        using var digest = System.Security.Cryptography.SHA256.Create();
+        var written = 0L;
+        try
+        {
+            using (var file = File.Create(path))
+            {
+                var buffer = new byte[BufferSize];
+                int read;
+                while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)
+                           .ConfigureAwait(false)) > 0)
+                {
+                    written += read;
+                    if (written > asset.Size)
+                    {
+                        throw new InvalidOperationException($"配布物が宣言された大きさを超えた: {asset.Size} バイト");
+                    }
+
+                    digest.TransformBlock(buffer, 0, read, null, 0);
+                    await file.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            if (written != asset.Size)
+            {
+                throw new InvalidOperationException($"配布物の大きさが宣言と違う: {written} / {asset.Size} バイト");
+            }
+
+            digest.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            var actual = Convert.ToHexStringLower(digest.Hash!);
+            if (!string.Equals(actual, asset.DigestHex, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"配布物の digest が合わない: {actual} / {asset.DigestHex}");
+            }
+        }
+        catch
+        {
+            // 置き換えるのは実行ファイル一式であり、途中まで落ちたものを残す意味が無い。
+            try { File.Delete(path); } catch { /* best-effort */ }
+            throw;
         }
     }
 
