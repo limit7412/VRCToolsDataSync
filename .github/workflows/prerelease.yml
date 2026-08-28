@@ -138,8 +138,8 @@ jobs:
     # `cancel-in-progress: false` が守るのは実行中のものだけで、待機できる実行は 1 件に限られる。
     # 後から入った実行は待機中の実行を取り消すため、取り込みが続けて 3 件以上あると、
     # 中間のコミットを起点とする実行は取り消され、そのコミット単体のプレリリースは作られない。
-    # 取り消されたコミットの変更もその実行がチェックアウトする履歴に含まれるため、
-    # 最新の内容はプレリリースに入る。
+    # どの実行も、ロックを取った時点の master の先頭を対象にする (バージョンを決める
+    # ステップを参照) ため、どれが生き残っても最新の内容がプレリリースに入る。
     # 目的は取り込みごとに 1 つ作ることではなく、master の最新の内容を試せるようにすることなので、
     # 中間のコミット単体のプレリリースが飛ぶことは許容する。
     concurrency:
@@ -158,6 +158,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 対象を、ロックを取ったこの時点の master の先頭に合わせる。
+          # 起動時点のコミット (github.sha) を対象にすると、連続する push A、B で
+          # A の changes ジョブだけが遅れた場合に、B が先にプレリリースを作り、
+          # 後から回ってきた A がより大きい -testN を古いコミットへ作ってしまう。
+          # 版としてはそちらが最新に見えるため、B の変更が欠落する。
+          MASTER_SHA=$(git rev-parse origin/master)
+          git checkout --quiet --detach "$MASTER_SHA"
+
+          # その先頭が既にリリースタグを持つなら、同じ内容は公開済みである。
+          # 上の並びで、先へ進んだ実行が最新の内容を作り終えた後に
+          # 遅れた実行が回ってきた場合が、主にこれにあたる。
+          if git tag --points-at "$MASTER_SHA" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-test[0-9]+)?$'; then
+            echo "::notice::master の先頭は既にリリース済みのためプレリリースを作成しません"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "sha=$MASTER_SHA" >> "$GITHUB_OUTPUT"
+
           # 最新の安定版タグ (X.Y.Z 形式) を起点にする。
           # sort -V は環境によって使えないことがあるため、フィールドごとの数値順で並べる。
           LATEST=$(git tag --list \
@@ -166,10 +185,13 @@ jobs:
 
           # 安定版タグがまだ無ければ 0.0.1 を次期バージョンとする。
           # 旧 release.yml の自動採番と同じ初期値である。
+          #
+          # パッチは 10 進数として解釈する。タグは先頭ゼロを許すため、
+          # 0.0.09 のようなタグを 8 進数と見て失敗させない。
           if [ -z "$LATEST" ]; then
             NEXT="0.0.1"
           else
-            NEXT="${LATEST%.*}.$(( ${LATEST##*.} + 1 ))"
+            NEXT="${LATEST%.*}.$(( 10#${LATEST##*.} + 1 ))"
           fi
 
           # 既存の `-testN` の最大値から次の N を決める。
@@ -183,33 +205,38 @@ jobs:
           echo "バージョン: $VERSION"
 
       - name: Setup .NET 10
+        if: steps.version.outputs.skip != 'true'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
       - name: Restore
+        if: steps.version.outputs.skip != 'true'
         run: dotnet restore VRCToolsDataSync.slnx
 
       - name: Publish (App + Cli, x64)
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-release.ps1 -Arch x64 -Version $env:VERSION
 
       - name: Publish (App + Cli, arm64)
+        if: steps.version.outputs.skip != 'true'
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-release.ps1 -Arch arm64 -Version $env:VERSION
 
       - name: プレリリースを作る
+        if: steps.version.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
-          # 起動時点のコミットへタグを打つ。省略するとタグ作成時のデフォルトブランチの
-          # 先頭が使われ、実行が遅延した場合に後続のコミットを巻き込んでしまう
-          target_commitish: ${{ github.sha }}
+          # 版計算とビルドが対象にした master の先頭へタグを打つ。省略するとタグ作成
+          # 時点のデフォルトブランチの先頭が使われ、ビルドした内容と食い違いうる
+          target_commitish: ${{ steps.version.outputs.sha }}
           prerelease: true
           generate_release_notes: true
           files: artifacts/*.zip
