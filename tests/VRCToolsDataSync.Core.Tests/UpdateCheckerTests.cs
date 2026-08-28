@@ -21,6 +21,10 @@ public sealed class UpdateCheckerTests
             if (Failure is not null) throw Failure;
             return Task.FromResult(new ReleaseCatalog(Releases.ToList(), Complete));
         }
+
+        // 確認の判断だけを見るテストであり、取得へは到達しない。
+        public Task DownloadAsync(ReleaseAsset asset, string path, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
     }
 
     private static ReleaseInfo Release(string tag, bool prerelease = false)
