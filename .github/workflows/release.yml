@@ -1,9 +1,19 @@
 name: release
 
+# 安定版リリースの作成と、成果物の添付を担う。
+# master への push を契機とするプレリリースの自動作成は prerelease.yml が担う (issue #45)。
+# 以前は master への push ごとにパッチを自動採番した安定版を公開していたが、
+# チャンネル分岐により test チャンネルのプレリリースへ移した。
+#
+# タグ push と手動実行は Draft リリースを作り、リリースの手動作成 (release: created) は
+# そのリリースへ成果物を添付する。
+#
+# バージョンはビルドの前に決めて publish へ渡す。成果物が自分の版を知らないと、
+# 自動アップデートの「実行中の版と最新版の比較」が組めないためである。
+# どの契機でもタグは決まっているため、採番の直列化は要らない。
+
 on:
   push:
-    branches:
-      - master
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
   release:
@@ -15,18 +25,42 @@ on:
         required: false
 
 permissions:
-  contents: write
-
-# 自動採番する master への push だけを直列化する。番号が競合しうるのはこの経路だけで、
-# タグ push と手動実行とリリース作成は番号が決まっているため待機させる理由が無い。
-# 同じグループに入れると、待機中の実行が後続に置き換えられてリリースが作られなくなる。
-concurrency:
-  group: release-${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') && 'master' || github.run_id }}
-  cancel-in-progress: false
+  contents: read
 
 jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      # リリースとタグの操作にはタグ名をそのまま使う
+      name: ${{ steps.tag.outputs.name }}
+      # 成果物へ埋め込む版。タグに v を付ける運用へ変わっても読めるよう、先頭の v を落とす
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Determine tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            name="$RELEASE_TAG"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            name="$REF_NAME"
+          else
+            # 手動実行でタグを渡さなかった場合は空のままにする。
+            # リリースは作らず、版の埋め込みも行わないアーティファクトだけを残す。
+            name="$INPUT_TAG"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=${name#v}" >> "$GITHUB_OUTPUT"
+          echo "タグ: ${name:-(なし)}"
+
   build:
     name: Build (${{ matrix.arch }})
+    needs: version
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -47,7 +81,10 @@ jobs:
 
       - name: Publish (App + Cli, ${{ matrix.arch }})
         shell: pwsh
-        run: ./scripts/build-release.ps1 -Arch ${{ matrix.arch }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        # 版が空でもそのまま渡す。build-release.ps1 が空の版を「埋め込まない」と扱う
+        run: ./scripts/build-release.ps1 -Arch ${{ matrix.arch }} -Version $env:VERSION
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,20 +95,12 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: build
-    if: >-
-      startsWith(github.ref, 'refs/tags/')
-      || github.event.inputs.tag != ''
-      || github.event_name == 'release'
-      || (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    needs: [version, build]
+    if: needs.version.outputs.name != ''
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      # master への push では直近のタグから採番するため、タグを含めて取得する。
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -81,49 +110,12 @@ jobs:
       - name: List artifacts
         run: ls -lR artifacts
 
-      # master への push は patch を一つ進めた新しいタグで公開する。
-      # タグ push、リリース作成、手動実行は従来どおり Draft を作る。
-      - name: Determine tag
-        id: tag
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "release" ]; then
-            name="$RELEASE_TAG"
-            draft=true
-          elif [ -n "$INPUT_TAG" ]; then
-            name="$INPUT_TAG"
-            draft=true
-          elif [ "${{ github.ref }}" = "refs/heads/master" ]; then
-            latest=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
-            if [ -z "$latest" ]; then
-              name="0.0.1"
-            else
-              major="${latest%%.*}"
-              rest="${latest#*.}"
-              minor="${rest%%.*}"
-              patch="${rest#*.}"
-              # タグは先頭ゼロを許すため、10 進数として解釈する (09 を 8 進数と見て失敗させない)。
-              name="$major.$minor.$((10#$patch + 1))"
-            fi
-            draft=false
-          else
-            name="$REF_NAME"
-            draft=true
-          fi
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "draft=$draft" >> "$GITHUB_OUTPUT"
-          echo "タグ: $name (draft=$draft)"
-
       - name: Check if release exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ steps.tag.outputs.name }}
+          TAG_NAME: ${{ needs.version.outputs.name }}
         run: |
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -136,17 +128,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ steps.tag.outputs.name }}
+          TAG_NAME: ${{ needs.version.outputs.name }}
         run: gh release upload "$TAG_NAME" artifacts/*.zip --clobber
 
       # タグが無ければこのアクションが github.sha に対して作る。
+      # ここへ来るのはタグ push とタグ付きの手動実行だけであり、公開は人が行うため
+      # Draft で作る。
       - name: Create release
         if: steps.check.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.version.outputs.name }}
           target_commitish: ${{ github.sha }}
-          name: ${{ steps.tag.outputs.name }}
-          draft: ${{ steps.tag.outputs.draft }}
+          name: ${{ needs.version.outputs.name }}
+          draft: true
           generate_release_notes: true
           files: artifacts/*.zip
