@@ -11,9 +11,15 @@
 .PARAMETER OutputDir
   出力先のルート。既定は <repo>/artifacts。
 
+.PARAMETER Version
+  成果物へ埋め込むバージョン (例 0.1.0 / 0.1.0-test1)。
+  リリースのワークフローがタグから渡す。空ならソースの既定値のままビルドされ、
+  リリース版と見分けが付く。
+
 .EXAMPLE
   pwsh scripts/build-release.ps1
   pwsh scripts/build-release.ps1 -Arch arm64
+  pwsh scripts/build-release.ps1 -Version 0.1.0-test1
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +28,9 @@ param(
 
     [string]$Configuration = 'Release',
 
-    [string]$OutputDir
+    [string]$OutputDir,
+
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,6 +41,13 @@ if (-not $OutputDir) {
 }
 
 $rid = "win-$Arch"
+
+# アプリが実行中の自分の版を InformationalVersion から読めるよう、publish へ渡す。
+# 更新の確認 (issue #45) は実行中の版と最新版の比較が出発点になる。
+$versionArgs = @()
+if ($Version) {
+    $versionArgs += "-p:Version=$Version"
+}
 $appProject = Join-Path $repoRoot 'src/VRCToolsDataSync.App/VRCToolsDataSync.App.csproj'
 $cliProject = Join-Path $repoRoot 'src/VRCToolsDataSync.Cli/VRCToolsDataSync.Cli.csproj'
 
@@ -71,6 +86,7 @@ Write-Host "[3/6] Publishing App ($rid)"
     -p:PublishTrimmed=false `
     -p:PublishSingleFile=false `
     -p:WindowsAppSDKSelfContained=true `
+    @versionArgs `
     -o $appStagingDir
 if ($LASTEXITCODE -ne 0) { throw "App publish failed (exit $LASTEXITCODE)" }
 
@@ -82,6 +98,7 @@ Write-Host "[4/6] Publishing Cli ($rid)"
     -p:PublishReadyToRun=true `
     -p:PublishTrimmed=false `
     -p:PublishSingleFile=false `
+    @versionArgs `
     -o $cliStagingDir
 if ($LASTEXITCODE -ne 0) { throw "Cli publish failed (exit $LASTEXITCODE)" }
 
