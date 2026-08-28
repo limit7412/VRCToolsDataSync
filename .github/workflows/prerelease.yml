@@ -155,6 +155,9 @@ jobs:
       - name: バージョンを決める
         id: version
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -165,17 +168,51 @@ jobs:
           # 版としてはそちらが最新に見えるため、B の変更が欠落する。
           MASTER_SHA=$(git rev-parse origin/master)
           git checkout --quiet --detach "$MASTER_SHA"
+          echo "sha=$MASTER_SHA" >> "$GITHUB_OUTPUT"
 
-          # その先頭が既にリリースタグを持つなら、同じ内容は公開済みである。
-          # 上の並びで、先へ進んだ実行が最新の内容を作り終えた後に
-          # 遅れた実行が回ってきた場合が、主にこれにあたる。
-          if git tag --points-at "$MASTER_SHA" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-test[0-9]+)?$'; then
+          # その先頭が安定版タグを持つなら、同じ内容は安定版として出ている
+          # (または release.yml が公開の手続き中である)。プレリリースを重ねない。
+          if git tag --points-at "$MASTER_SHA" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::master の先頭は安定版として扱われているためプレリリースを作成しません"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # その先頭を指すプレリリースのタグが既にあるなら、タグの存在だけでは
+          # 済ませず、リリースと成果物 (両アーキテクチャの ZIP) が揃っているかまで
+          # 見る。タグだけで完了扱いすると、リリース作成後のアップロードで失敗した
+          # 実行を workflow_dispatch でやり直しても何もせず終わり、欠けた成果物を
+          # 直せない。揃っていないタグは、新しい番号を採らずそのタグとして作り直す
+          # (softprops のアクションは既存のリリースへ同名の成果物を上げ直し、
+          # リリースの無いタグにはリリースを作る)。
+          # 一覧を取れない場合も作り直す側へ倒す。上げ直しは重ねても壊れない。
+          REPAIR_TAG=""
+          FOUND_COMPLETE=false
+          while IFS= read -r TAG; do
+            [ -n "$TAG" ] || continue
+            ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)
+            if echo "$ASSETS" | grep -qx "VRCToolsDataSync-win-x64.zip" \
+              && echo "$ASSETS" | grep -qx "VRCToolsDataSync-win-arm64.zip"; then
+              FOUND_COMPLETE=true
+              continue
+            fi
+            REPAIR_TAG="$TAG"
+            break
+          done <<< "$(git tag --points-at "$MASTER_SHA" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-test[0-9]+$' || true)"
+
+          if [ -n "$REPAIR_TAG" ]; then
+            echo "::notice::${REPAIR_TAG} の成果物が揃っていないため作り直します"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "version=$REPAIR_TAG" >> "$GITHUB_OUTPUT"
+            echo "バージョン: $REPAIR_TAG (作り直し)"
+            exit 0
+          fi
+          if [ "$FOUND_COMPLETE" = "true" ]; then
             echo "::notice::master の先頭は既にリリース済みのためプレリリースを作成しません"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "sha=$MASTER_SHA" >> "$GITHUB_OUTPUT"
 
           # 最新の安定版タグ (X.Y.Z 形式) を起点にする。
           # sort -V は環境によって使えないことがあるため、フィールドごとの数値順で並べる。
