@@ -131,6 +131,34 @@
                                     IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
                         </StackPanel>
                     </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="本体の更新" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.UpdateStatus, Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <ComboBox SelectedIndex="{x:Bind ViewModel.UpdateChannelIndex, Mode=TwoWay}"
+                                      VerticalAlignment="Center">
+                                <ComboBoxItem Content="安定版 (stable)" />
+                                <ComboBoxItem Content="テスト版 (test)" />
+                            </ComboBox>
+                            <ToggleSwitch Header="自動で確認" IsOn="{x:Bind ViewModel.UpdateCheckEnabled, Mode=TwoWay}" />
+                            <Button Content="今すぐ確認"
+                                    VerticalAlignment="Center"
+                                    Command="{x:Bind ViewModel.CheckUpdateCommand}" />
+                        </StackPanel>
+                        <TextBlock Text="チャンネルと自動確認の変更は「設定を保存」で反映されます。テスト版は master の変更ごとに作られるプレリリースです。"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <StackPanel Orientation="Horizontal" Spacing="8"
+                                    Visibility="{x:Bind ViewModel.UpdateAvailableVisibility, Mode=OneWay}">
+                            <TextBlock Text="{x:Bind ViewModel.UpdateAvailableText, Mode=OneWay}"
+                                       VerticalAlignment="Center" />
+                            <Button Content="リリースページを開く"
+                                    Command="{x:Bind ViewModel.OpenReleasePageCommand}" />
+                        </StackPanel>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 

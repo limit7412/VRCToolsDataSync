@@ -9,6 +9,7 @@ using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
+using VRCToolsDataSync_App.Services;
 using VRCToolsDataSync_App.Tray;
 
 namespace VRCToolsDataSync_App;
@@ -101,6 +102,10 @@ public partial class App : Application
     }
 
     public static TrayIconManager Tray { get; } = new();
+
+    // 本体の更新確認 (issue #45)。OnLaunched で作る。MainPage の VM が
+    // 画面への反映のために参照する。
+    public static UpdateManager? Updates { get; private set; }
 
     // タスクトレイから「終了」を選んだとき、Window.Closed で
     // タスクトレイ最小化に切り替えないために立てるフラグ。
@@ -246,6 +251,14 @@ public partial class App : Application
                 });
             }
             catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+
+            // 更新確認は Window より先に作る。MainPage の VM が構築時に購読するため。
+            // 最初の確認は UpdateManager 側の遅延タイマーが起動同期の後に回す。
+            try
+            {
+                Updates = new UpdateManager(Runner, LoggerFactory);
+            }
+            catch (Exception ex) { LogStartupFailure("UpdateManager", ex); }
 
             Window = new MainWindow();
             Window.Closed += OnWindowClosed;
@@ -620,6 +633,8 @@ public partial class App : Application
         // (2) Coordinator を完全に Dispose してから Tray もきれいに片付ける。
         try { Coordinator?.Dispose(); LogLifecycle("ExitApplication.Coordinator.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Coordinator.Dispose fail: " + ex.Message); }
         Coordinator = null;
+        try { Updates?.Dispose(); } catch { /* best-effort */ }
+        Updates = null;
         try { Tray.Dispose(); LogLifecycle("ExitApplication.Tray.Dispose ok"); } catch (Exception ex) { LogLifecycle("ExitApplication.Tray.Dispose fail: " + ex.Message); }
 
         // 多重起動防止 Mutex を解放してから LoggerFactory を Dispose する。

@@ -204,6 +204,7 @@ public sealed class SettingsStore
                     settings.ToolStateSchema = merged.ToolStateSchema;
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
+                    settings.Update = merged.Update;
                 }
                 finally
                 {
@@ -271,6 +272,9 @@ public sealed class SettingsStore
             // Push/Pull 経由の Save がユーザの保存先変更を巻き戻さないようにする。
             StorageMode = topLevelSource.StorageMode,
             S3 = topLevelSource.S3?.Clone(),
+            // 更新確認の設定も Top-level と同じ扱い。Push/Pull の付随 Save が
+            // チャンネルや通知済みの記録を巻き戻さないようにする。
+            Update = (topLevelSource.Update ?? new UpdateSettings()).Clone(),
             // 読み込み時に移行済みなので、ディスク側も incoming 側も現行の版になっている。
             ToolStateSchema = CurrentToolStateSchema,
             ToolState = new Dictionary<string, ToolSyncState>(),
