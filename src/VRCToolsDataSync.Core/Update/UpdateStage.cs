@@ -196,8 +196,11 @@ public sealed class UpdateStage
             throw new IOException($"取得済みの記録を消せなかったため昇格しない: {MetadataPath}");
         }
 
-        File.Move(IncomingZipPath, ZipPath, overwrite: true);
-        File.Move(incomingMetadata, MetadataPath, overwrite: true);
+        // 残るのは同じディレクトリ内の名前の付け替えだけ。掴まれていて一瞬
+        // 失敗することがある (ウイルス対策ソフトなど) ので、短く待って
+        // やり直す。
+        MoveWithRetry(IncomingZipPath, ZipPath);
+        MoveWithRetry(incomingMetadata, MetadataPath);
 
         // 前の版を展開したものが残っていても、もう対応しない。
         DeleteDirectoryQuietly(ExtractDirectory);
@@ -238,6 +241,31 @@ public sealed class UpdateStage
             // 名前に区切りを許さないプラットフォーム)。そこではセッション内
             // だけの名前で妥協する。同じセッションの重なりは防げる。
             return new Mutex(initiallyOwned: false, name: name);
+        }
+    }
+
+    /// <summary>
+    /// 同じディレクトリ内で名前を付け替える。掴まれている間は短く待って
+    /// やり直し、それでも駄目なら投げる。
+    /// </summary>
+    private static void MoveWithRetry(string source, string destination)
+    {
+        const int attempts = 5;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.Move(source, destination, overwrite: true);
+                return;
+            }
+            catch (IOException) when (attempt < attempts)
+            {
+                Thread.Sleep(200);
+            }
+            catch (UnauthorizedAccessException) when (attempt < attempts)
+            {
+                Thread.Sleep(200);
+            }
         }
     }
 
