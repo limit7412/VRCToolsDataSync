@@ -200,6 +200,9 @@ var applyTargetOption = new Option<string>(
 var applyWaitPidOption = new Option<int?>(
     aliases: new[] { "--wait-pid" },
     description: "このプロセスの終了を待ってから置き換える (呼び出し元の App)");
+var applyWaitStartedOption = new Option<long?>(
+    aliases: new[] { "--wait-started" },
+    description: "--wait-pid のプロセスの開始時刻 (UTC の Ticks)。PID の使い回しを見分ける");
 var applyRelaunchOption = new Option<bool>(
     aliases: new[] { "--relaunch" },
     description: "置き換えた後に App を起動し直す");
@@ -208,6 +211,7 @@ var selfUpdateApplyCommand = new Command("apply", "取得済みの更新でイ�
 selfUpdateApplyCommand.AddOption(applySourceOption);
 selfUpdateApplyCommand.AddOption(applyTargetOption);
 selfUpdateApplyCommand.AddOption(applyWaitPidOption);
+selfUpdateApplyCommand.AddOption(applyWaitStartedOption);
 selfUpdateApplyCommand.AddOption(applyRelaunchOption);
 selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
@@ -215,6 +219,7 @@ selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationConte
         source: ctx.ParseResult.GetValueForOption(applySourceOption)!,
         target: ctx.ParseResult.GetValueForOption(applyTargetOption)!,
         waitPid: ctx.ParseResult.GetValueForOption(applyWaitPidOption),
+        waitStarted: ctx.ParseResult.GetValueForOption(applyWaitStartedOption),
         relaunch: ctx.ParseResult.GetValueForOption(applyRelaunchOption));
 });
 
@@ -584,7 +589,7 @@ static int CollectGarbage(int graceDays, bool dryRun)
     }
 }
 
-static int ApplySelfUpdate(string source, string target, int? waitPid, bool relaunch)
+static int ApplySelfUpdate(string source, string target, int? waitPid, long? waitStarted, bool relaunch)
 {
     using var loggerFactory = LoggerFactory.Create(builder =>
     {
@@ -633,7 +638,7 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
         // ロックを握ってから、呼び出し元が本当に終わったかを確かめる。普通は
         // ロックが渡った時点で終わっているが、放棄によらず (呼び出し元がロックを
         // 取れないまま起動を続けた場合など) 渡ってくることもある。
-        if (!WaitForCaller(waitPid, logger)) return 6;
+        if (!WaitForCaller(waitPid, waitStarted, logger)) return 6;
 
         return ApplySelfUpdateCore(source, target, relaunch, logger);
     }
@@ -657,7 +662,23 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 /// 適用し直す。
 /// </para>
 /// </summary>
-static bool WaitForCaller(int? waitPid, ILogger logger)
+/// <summary>
+/// 開始時刻が一致するか。読めない場合は、同じものとして扱って待つ側に倒す
+/// (待ちには上限があるが、待たずに進むと掴まれたファイルを入れ替えに行く)。
+/// </summary>
+static bool SameProcess(System.Diagnostics.Process process, long startedTicks)
+{
+    try
+    {
+        return process.StartTime.ToUniversalTime().Ticks == startedTicks;
+    }
+    catch (Exception)
+    {
+        return true;
+    }
+}
+
+static bool WaitForCaller(int? waitPid, long? waitStarted, ILogger logger)
 {
     // 終了時 Push の合計に上限は無い。S3Client の 30 分は操作ごとの上限で、
     // manifest の取得・オブジェクトの送信・manifest の保存が直列に続き、それが
@@ -674,6 +695,16 @@ static bool WaitForCaller(int? waitPid, ILogger logger)
     try
     {
         using var process = System.Diagnostics.Process.GetProcessById(pid);
+
+        // 番号だけでは足りない。呼び出し元が終わった後に OS が同じ番号を
+        // 別のプロセスへ回していると、無関係なプロセスを待ってしまう。相手が
+        // 長生きなら、こちらはロックを握ったまま上限まで待ち、置き換えも
+        // 起動し直しもせずに終わる。開始時刻まで見て同じものかを確かめる。
+        if (waitStarted is { } startedTicks && !SameProcess(process, startedTicks))
+        {
+            return true;
+        }
+
         if (process.WaitForExit(timeoutMilliseconds)) return true;
 
         Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");

@@ -243,12 +243,11 @@ public sealed class UpdateManager : IDisposable
                 // 後始末の間に来ていた取得の要求を拾う。取得の側は自分で要求を
                 // 置いてから枠を見るので、走り終えた者が次を拾えばよいが、
                 // ここは要求を置かない側なので、放っておくと誰も走らせない。
-                PendingDownload? pending;
-                lock (_pendingLock) { pending = _pending; }
-                if (pending is not null)
-                {
-                    _ = DownloadIfNeededAsync(pending.Release, pending.Channel);
-                }
+                //
+                // 読んだ値を渡し直さず、枠を取ってからその時点の要求を拾う。
+                // 渡し直すと、読んでから走らせるまでの間に置かれた新しい要求を
+                // 古い要求で上書きしうる。
+                _ = DrainPendingDownloadsAsync();
             }
         }
 
@@ -281,6 +280,19 @@ public sealed class UpdateManager : IDisposable
         if (release.Asset is null) return;
         lock (_pendingLock) { _pending = new PendingDownload(release, channel); }
 
+        await DrainPendingDownloadsAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 枠を取れる限り、置かれている要求を拾って走らせる。
+    /// <para>
+    /// 拾うのは「そのとき置かれている要求」であって、呼び出し側が見た値では
+    /// ない。値を持ち回すと、見てから走らせるまでの間に置かれた新しい要求を
+    /// 古い要求で上書きしうる。
+    /// </para>
+    /// </summary>
+    private async Task DrainPendingDownloadsAsync()
+    {
         while (await _downloadGate.WaitAsync(0).ConfigureAwait(false))
         {
             PendingDownload? next;

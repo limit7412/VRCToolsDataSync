@@ -31,7 +31,15 @@ public static class Program
             // どうせ新しい exe で立ち上げ直すものを立ち上げないため。
             if (Services.UpdateApplier.TryHandOverToStaged(App.LoggerFactory))
             {
-                return;
+                // 多重起動の抑止はここでは手放さない。手放してから実際に終わる
+                // までの隙に別の App が起動すると、その App が app\ 配下を掴んだ
+                // まま、待っているヘルパが入れ替えに入る。適用のロックと同じく、
+                // プロセスの終了で OS が手放すのに任せる。
+                //
+                // Environment.Exit は下の finally を通らないので、ログの
+                // 書き出しだけ先に済ませる。
+                try { App.LoggerFactory.Dispose(); } catch { /* best-effort */ }
+                Environment.Exit(0);
             }
 
             WinRT.ComWrappersSupport.InitializeComWrappers();

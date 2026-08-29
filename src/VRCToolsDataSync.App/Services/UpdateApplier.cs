@@ -418,6 +418,20 @@ public static class UpdateApplier
         startInfo.ArgumentList.Add(installRoot);
         startInfo.ArgumentList.Add("--wait-pid");
         startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
+
+        // 番号の使い回しを見分けられるよう、開始時刻も渡す。読めない場合は
+        // 渡さない (ヘルパは番号だけで待つ、これまでの動きになる)。
+        try
+        {
+            using var self = Process.GetCurrentProcess();
+            var started = self.StartTime.ToUniversalTime().Ticks;
+            startInfo.ArgumentList.Add("--wait-started");
+            startInfo.ArgumentList.Add(started.ToString());
+        }
+        catch (Exception ex)
+        {
+            LogQuietly(() => logger.LogWarning(ex, "自分の開始時刻を読めなかった"));
+        }
         startInfo.ArgumentList.Add("--relaunch");
 
         // 起こしたヘルパがすぐ落ちていないか見る。exe があっても、自己完結の
