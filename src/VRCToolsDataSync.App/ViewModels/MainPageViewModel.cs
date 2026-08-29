@@ -119,6 +119,15 @@ public partial class MainPageViewModel : ObservableObject
         RefreshStatusSummaries();
     }
 
+    /// <summary>
+    /// バックグラウンドからの通知を UI スレッドへ運ぶ手立てを渡す。
+    /// <para>
+    /// Coordinator とは切り離して受け取る。保存先が未設定などで Coordinator を
+    /// 作れない場合でも、更新確認 (issue #45) の結果は届くためである。
+    /// </para>
+    /// </summary>
+    public void SetUiDispatcher(Action<Action> uiDispatch) => _uiDispatch = uiDispatch;
+
     public void AttachCoordinator(AutoSyncCoordinator coordinator, Action<Action> uiDispatch)
     {
         _coordinator = coordinator;
@@ -355,7 +364,16 @@ public partial class MainPageViewModel : ObservableObject
             // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
             var reEnabled = !checkWasEnabled && update.CheckEnabled;
             var channelChanged = previousChannel != channel;
-            if (reEnabled || channelChanged)
+            var stale = reEnabled || channelChanged;
+
+            // 自動確認を止めている間は確認が走らない。「確認しています...」を
+            // 出すと、結果が来ないままその表示で固まる。未確認として見せ、
+            // 手動確認に委ねる。
+            if (stale && !update.CheckEnabled)
+            {
+                UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
+            }
+            else if (stale)
             {
                 UpdateStatus = "確認しています...";
                 _ = _updates.CheckAsync(manual: false);
