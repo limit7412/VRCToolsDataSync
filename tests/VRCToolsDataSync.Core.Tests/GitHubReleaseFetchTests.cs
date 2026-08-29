@@ -99,8 +99,8 @@ public sealed class GitHubReleaseFetchTests
         Assert.Equal(300, catalog.Releases.Count);
     }
 
-    [Fact(DisplayName = "一覧そのものを取れなければ例外を投げる")]
-    public async Task ThrowsWhenListingFails()
+    [Fact(DisplayName = "一覧の 1 ページ目を取れなければ例外を投げる")]
+    public async Task ThrowsWhenFirstPageFails()
     {
         var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Forbidden));
         using var repository = new GitHubReleaseRepository("asset.zip", BaseUrl, handler);
@@ -108,6 +108,24 @@ public sealed class GitHubReleaseFetchTests
         // 候補が 1 つも無い状態は「最新である」とは違う。呼び出し側が
         // Unreachable として扱えるよう、ここでは握らない。
         await Assert.ThrowsAsync<HttpRequestException>(() => repository.FetchReleasesAsync());
+    }
+
+    [Fact(DisplayName = "2 ページ目以降で切れても、取れた候補は返す")]
+    public async Task KeepsFirstPageWhenLaterPageFails()
+    {
+        var full = "[" + string.Join(",", Enumerable.Range(1, 100).Select(i => ReleaseJson($"1.0.{i}"))) + "]";
+        var handler = new StubHandler(url =>
+            url.Contains("page=1", StringComparison.Ordinal)
+                ? Json(full)
+                : new HttpResponseMessage(HttpStatusCode.Forbidden));
+        using var repository = new GitHubReleaseRepository("asset.zip", BaseUrl, handler);
+
+        var catalog = await repository.FetchReleasesAsync();
+
+        // 残りのレート枠が尽きただけで、1 ページ目に入っている新しい版まで
+        // 見落とすわけにはいかない。
+        Assert.Equal(100, catalog.Releases.Count);
+        Assert.False(catalog.Complete);
     }
 
     [Fact(DisplayName = "安定版がまだ無いリポジトリでも失敗にしない")]
