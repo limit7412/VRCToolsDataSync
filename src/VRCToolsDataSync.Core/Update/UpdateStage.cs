@@ -178,7 +178,12 @@ public sealed class UpdateStage
             InstallRoot = CurrentInstallRoot,
         };
 
-        // 記録を先に消す。ZIP を入れ替えた後で記録を書けなかった場合、
+        // 新しい記録は、対に触る前に横へ書いておく。書けない状況 (容量不足や
+        // ACL) はここで分かるので、その場合は前の対が無傷のまま残る。
+        var incomingMetadata = MetadataPath + ".new";
+        File.WriteAllText(incomingMetadata, JsonSerializer.Serialize(metadata, JsonOptions));
+
+        // 記録を先に消す。ZIP を入れ替えた後で記録を置けなかった場合、
         // 前の版の記録と新しい ZIP という食い違った対が残る。
         // 片方だけの状態なら DiscardIncomplete が起動時に片付ける。
         //
@@ -187,11 +192,12 @@ public sealed class UpdateStage
         // はずの前の版まで失う。書きかけは呼び出し側が片付け、次の確認でやり直す。
         if (!DeleteQuietly(MetadataPath))
         {
+            DeleteQuietly(incomingMetadata);
             throw new IOException($"取得済みの記録を消せなかったため昇格しない: {MetadataPath}");
         }
 
         File.Move(IncomingZipPath, ZipPath, overwrite: true);
-        File.WriteAllText(MetadataPath, JsonSerializer.Serialize(metadata, JsonOptions));
+        File.Move(incomingMetadata, MetadataPath, overwrite: true);
 
         // 前の版を展開したものが残っていても、もう対応しない。
         DeleteDirectoryQuietly(ExtractDirectory);
@@ -390,7 +396,17 @@ public sealed class UpdateStage
     public string ExtractForApply()
     {
         EnsureExtractable();
+
+        // 前の展開が残っていたら消す。消し切れないまま重ねて展開すると、
+        // 新しい版で消えたはずのファイルがそのまま残り、その混ざった一式を
+        // インストールしてしまう。消し切れない場合はここで止める (取得は残る
+        // ので、掴んでいたものが放されれば次の起動でやり直せる)。
         DeleteDirectoryQuietly(ExtractDirectory);
+        if (System.IO.Directory.Exists(ExtractDirectory))
+        {
+            throw new IOException($"前回の展開先を消せなかったため展開しない: {ExtractDirectory}");
+        }
+
         System.IO.Compression.ZipFile.ExtractToDirectory(ZipPath, ExtractDirectory);
         return ExtractDirectory;
     }

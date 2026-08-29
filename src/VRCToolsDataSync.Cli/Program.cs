@@ -726,20 +726,26 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
         // しているので、既定の置き場所を見ると自分の展開先を基にした空の場所を
         // 掴む。そこを消せても、本当の ZIP と記録は残ったままになる。
         var stageDirectory = UpdateStage.DirectoryFor(target);
-        var discarded = false;
+        var applicable = true;
         try
         {
-            discarded = new UpdateStage(stageDirectory, logger).Discard();
+            var stage = new UpdateStage(stageDirectory, logger);
+            stage.Discard();
+
+            // 開き直してよいのは「次の起動が同じ適用へ入らない」と言い切れる
+            // ときである。両方消せた場合だけでなく、片方だけ消せた場合もそう
+            // である。照合は対がそろっていなければ何も返さない。
+            applicable = stage.TryLoadMetadata() is not null;
         }
         catch (Exception discard)
         {
             Log(() => logger.LogWarning(discard, "取得済みの更新を捨てられなかった"));
         }
 
-        if (!discarded)
+        if (applicable)
         {
-            // 捨てられなかった。ここで開き直すと、次の起動がまた同じ適用へ
-            // 入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
+            // 対がそろったまま残っている。ここで開き直すと、次の起動がまた同じ
+            // 適用へ入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
             // 手で片付ける先を伝えて終える。
             Console.Error.WriteLine(
                 $"取得済みの更新を消せませんでした。{stageDirectory} を手で削除してから起動してください。");
