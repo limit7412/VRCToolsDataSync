@@ -181,7 +181,15 @@ public sealed class UpdateStage
         // 記録を先に消す。ZIP を入れ替えた後で記録を書けなかった場合、
         // 前の版の記録と新しい ZIP という食い違った対が残る。
         // 片方だけの状態なら DiscardIncomplete が起動時に片付ける。
-        DeleteQuietly(MetadataPath);
+        //
+        // 消せなかった場合はここで止める。古い記録を残したまま ZIP を入れ替えると、
+        // 食い違った対がそろった形で残り、次の照合で両方捨てられる。適用できた
+        // はずの前の版まで失う。書きかけは呼び出し側が片付け、次の確認でやり直す。
+        if (!DeleteQuietly(MetadataPath))
+        {
+            throw new IOException($"取得済みの記録を消せなかったため昇格しない: {MetadataPath}");
+        }
+
         File.Move(IncomingZipPath, ZipPath, overwrite: true);
         File.WriteAllText(MetadataPath, JsonSerializer.Serialize(metadata, JsonOptions));
 

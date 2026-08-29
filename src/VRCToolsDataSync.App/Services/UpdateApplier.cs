@@ -65,7 +65,7 @@ public static class UpdateApplier
                     return false;
                 }
 
-                if (!TrySpawnUpdater(stage, root, logger)) return false;
+                if (!TrySpawnUpdater(stage, root, staged.Tag, logger)) return false;
 
                 LogQuietly(() => logger.LogInformation("更新 {Tag} の適用をヘルパへ渡して終了する", staged.Tag));
                 handed = true;
@@ -324,6 +324,21 @@ public static class UpdateApplier
     /// </summary>
     public static void ReleaseHeldApplyLock()
     {
+        // 起こしたヘルパを先に止める。ロックだけ返すと、ヘルパがそれを取り、
+        // 生き残ったこちらの終了を 10 分待つ間ずっと握る。その間は取得の昇格も
+        // 次の適用も止まる。ヘルパはまだロックを待っているだけなので、ここで
+        // 止めても何も壊れない。
+        var updater = Interlocked.Exchange(ref _spawnedUpdater, null);
+        if (updater is not null)
+        {
+            try
+            {
+                if (!updater.HasExited) updater.Kill();
+            }
+            catch { /* best-effort */ }
+            updater.Dispose();
+        }
+
         var held = Interlocked.Exchange(ref _heldUntilExit, null);
         held?.Dispose();
     }
@@ -349,7 +364,7 @@ public static class UpdateApplier
     /// ヘルパと重なると足元を崩す。
     /// </para>
     /// </summary>
-    public static bool TrySpawnUpdater(UpdateStage stage, string installRoot, ILogger logger)
+    public static bool TrySpawnUpdater(UpdateStage stage, string installRoot, string expectedTag, ILogger logger)
     {
         var extracted = stage.ExtractForApply();
         var updater = Path.Combine(extracted, "cli", UpdateInstaller.CliExecutableName);
@@ -357,6 +372,12 @@ public static class UpdateApplier
         {
             // ZIP の形が想定と違う。展開し直しても同じなので取得ごと捨てる。
             LogQuietly(() => logger.LogWarning("展開した一式に更新ヘルパが無いため捨てる: {Path}", updater));
+            stage.Discard();
+            return false;
+        }
+
+        if (!ExtractedVersionMatches(extracted, expectedTag, logger))
+        {
             stage.Discard();
             return false;
         }
@@ -384,17 +405,63 @@ public static class UpdateApplier
         // されないまま画面が消え、次の起動も同じところで終わる。
         //
         // ヘルパは最初にこちらが握っているロックを待つので、無事なら生きたままである。
-        using var process = Process.Start(startInfo);
+        var process = Process.Start(startInfo);
         if (process is null || process.WaitForExit(StartupProbeMilliseconds))
         {
             LogQuietly(() => logger.LogWarning(
                 "更新ヘルパが起動直後に終了したため取得を捨てる (終了コード {Code})",
                 process?.ExitCode));
+            process?.Dispose();
             stage.Discard();
             return false;
         }
 
+        // 終了が取り消された場合に止められるよう持っておく。
+        _spawnedUpdater = process;
         return true;
+    }
+
+    /// <summary>
+    /// 起こした更新ヘルパ。終了が取り消された経路で止めるために持つ。
+    /// </summary>
+    private static Process? _spawnedUpdater;
+
+    /// <summary>
+    /// 展開した一式が、記録のタグどおりの版かを確かめる。
+    /// <para>
+    /// <c>-Version</c> を渡し忘れたビルドが添付されると、digest も実行ファイルの
+    /// 存在も通るのに、中身の版が上がらない。置き換えても起動した App の版が
+    /// 古いままなので、次の起動が同じ更新をまた適用しに行き、二周目で復旧の
+    /// 材料 (.old) まで失う。
+    /// </para>
+    /// <para>
+    /// 読めない・解釈できない場合は通す。ここで閉じる側に倒すと、版の埋め込み方が
+    /// 変わっただけで更新が止まる。断るのは、読めた上で違うと分かった場合だけ。
+    /// </para>
+    /// </summary>
+    private static bool ExtractedVersionMatches(string extracted, string expectedTag, ILogger logger)
+    {
+        var expected = ReleaseVersion.Parse(expectedTag);
+        if (expected is null) return true;
+
+        var appDirectory = Path.Combine(extracted, "app");
+        var embedded =
+            RunningVersion.OfFile(Path.Combine(appDirectory, "VRCToolsDataSync.App.dll"))
+            ?? RunningVersion.OfFile(Path.Combine(appDirectory, UpdateInstaller.AppExecutableName));
+
+        var actual = embedded is null ? null : ReleaseVersion.Parse(embedded);
+        if (actual is null)
+        {
+            LogQuietly(() => logger.LogWarning(
+                "展開した一式の版を読めなかったため、そのまま適用する: {Tag}", expectedTag));
+            return true;
+        }
+
+        if (actual.CompareTo(expected) == 0) return true;
+
+        LogQuietly(() => logger.LogWarning(
+            "展開した一式の版 ({Actual}) が記録のタグ ({Tag}) と違うため捨てる", embedded, expectedTag));
+        return false;
     }
 
     /// <summary>

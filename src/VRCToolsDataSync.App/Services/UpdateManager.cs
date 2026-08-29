@@ -367,7 +367,7 @@ public sealed class UpdateManager : IDisposable
                     return false;
                 }
 
-                spawned = UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
+                spawned = UpdateApplier.TrySpawnUpdater(_stage, root, staged.Tag, _logger);
 
                 // ヘルパを起こせたらロックは手放さない。ここで手放すと、終了
                 // シーケンス (終了時 Push で数分かかりうる) の間に裏の取得が

@@ -71,4 +71,18 @@ public sealed class ReleaseVersionTests
         // v 付きで読んだものも、記録には v 無しで残す。
         Assert.Equal("1.0.0", ReleaseVersion.Parse("v1.0.0")!.ToString());
     }
+
+    [Fact(DisplayName = "動いていない一式の版も読める")]
+    public void ReadsVersionFromFile()
+    {
+        // 展開した更新が、記録のタグどおりの版かを適用の前に確かめるために使う。
+        var self = typeof(ReleaseVersionTests).Assembly.Location;
+        Assert.False(string.IsNullOrEmpty(RunningVersion.OfFile(self)));
+
+        // コミット ID は落とす。版の比較には使わない。
+        Assert.DoesNotContain("+", RunningVersion.OfFile(self)!);
+
+        // 読めないものは分からないものとして扱う。捨てる判断はここではしない。
+        Assert.Null(RunningVersion.OfFile(Path.Combine(Path.GetTempPath(), "no-such-file-" + Guid.NewGuid().ToString("N"))));
+    }
 }
