@@ -453,6 +453,7 @@ public sealed class UpdateStage
     {
         using var archive = System.IO.Compression.ZipFile.OpenRead(ZipPath);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var total = 0L;
         foreach (var entry in archive.Entries)
         {
             // ディレクトリの項目は名前が空になる。重なっても害が無い。
@@ -461,8 +462,27 @@ public sealed class UpdateStage
             {
                 throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
             }
+
+            total += entry.Length;
+            if (total > MaxExtractedSize)
+            {
+                throw new InvalidDataException(
+                    $"展開後の大きさが桁違いの ZIP は展開しない: {total} バイトを超える");
+            }
         }
     }
+
+    /// <summary>
+    /// 展開後の大きさの上限。
+    /// <para>
+    /// 配布物は数百 MB を見込んでいる。圧縮率の高い誤った配布物をそのまま
+    /// 展開すると %AppData% のあるドライブを使い切り、しかも容量不足は配布物の
+    /// 問題ではないので捨てずに次の起動へ回す設計のため、起動のたびに同じことを
+    /// 繰り返す。桁が違うものはここで断る。正確な見積もりではなく、
+    /// 「あり得ない大きさ」の線として置いている。
+    /// </para>
+    /// </summary>
+    private const long MaxExtractedSize = 2L * 1024 * 1024 * 1024;
 
     /// <summary>
     /// 項目の名前を、実際に展開される先で見比べられる形へそろえる。
@@ -475,11 +495,21 @@ public sealed class UpdateStage
     /// </summary>
     private static string ExtractionKeyOf(string fullName)
     {
-        var segments = fullName
-            .Replace('\\', '/')
-            .Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Where(segment => segment != ".");
-        return string.Join('/', segments);
+        var resolved = new List<string>();
+        foreach (var segment in fullName.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == ".") continue;
+            if (segment == "..")
+            {
+                // 展開先を出るものは ExtractToDirectory の側が断る。ここでは
+                // 行き先を突き合わせたいだけなので、1 つ戻って続ける。
+                if (resolved.Count > 0) resolved.RemoveAt(resolved.Count - 1);
+                continue;
+            }
+            resolved.Add(segment);
+        }
+
+        return string.Join('/', resolved);
     }
 
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>

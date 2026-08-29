@@ -331,4 +331,21 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
+
+    [Fact(DisplayName = "上の階層を挟んだ書き方も同じ場所として断る")]
+    public void RefusesArchiveWithEntriesThatCollideThroughParentSegments()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // app/x/../foo.dll は app/foo.dll と同じ場所へ展開される。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/foo.dll");
+            archive.CreateEntry("app/x/../foo.dll");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
 }

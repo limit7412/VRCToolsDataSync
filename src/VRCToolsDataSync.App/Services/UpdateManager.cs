@@ -343,7 +343,27 @@ public sealed class UpdateManager : IDisposable
             // 昇格は適用と同じロックの下で行う。staged の ZIP を入れ替えて展開先を
             // 消すため、適用の側と重なると、起動前のヘルパを消したり、動いている
             // ヘルパの展開元を欠いたりする。
-            if (!UpdateApplier.TryWithApplyLock(_logger, () => { _stage.PromoteIncoming(release, asset); return false; }))
+            var promoted = false;
+            var lockHeld = UpdateApplier.TryWithApplyLock(_logger, () =>
+            {
+                // ロックを待っている間 (最大 11 分) にチャンネルを変えられて
+                // いないか、もう一度見る。待つ前の照合だけだと、その間の変更を
+                // 追い越して昇格し、適用できない版が画面に残る。
+                if (!MatchesSavedChannel(channel)) return false;
+
+                _stage.PromoteIncoming(release, asset);
+                promoted = true;
+                return false;
+            });
+
+            if (lockHeld && !promoted)
+            {
+                _logger.LogInformation("チャンネルが変わったため、取得した {Tag} は昇格しない", release.Tag);
+                _stage.DiscardIncoming();
+                return;
+            }
+
+            if (!lockHeld)
             {
                 // 適用が動いている。ロックを取れないまま昇格すると、動いている
                 // ヘルパの展開元を欠く。書きかけを片付けて見送り、次の確認で
