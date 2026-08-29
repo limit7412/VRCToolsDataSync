@@ -702,6 +702,15 @@ public partial class MainPageViewModel : ObservableObject
         bool ready;
         try
         {
+            // 起動時の同期がまだ走っていることがある。そのタスクは Coordinator の
+            // 追跡の外なので、待たずに進むと終了時 Push と並走した上で
+            // Environment.Exit に途中で切られる。
+            if (!App.StartupSyncFinished.IsCompleted)
+            {
+                AppendLog("起動時の同期の完了を待っています...");
+                await App.StartupSyncFinished;
+            }
+
             ready = await Task.Run(() => _updates.PrepareApplyAndSpawnUpdater());
         }
         catch

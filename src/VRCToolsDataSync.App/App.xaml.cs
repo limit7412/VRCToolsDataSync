@@ -180,6 +180,22 @@ public partial class App : Application
     }
 
     /// <summary>
+    /// 起動時の同期 (Pull → Launch) が終わったことを表す。
+    /// <para>
+    /// この同期は投げっぱなしで走っており、<c>Coordinator</c> の追跡の外にある。
+    /// 終わらないうちに更新の適用へ入ると、終了時 Push と並走した上で
+    /// <c>Environment.Exit</c> に途中で切られる。適用の側はこれを待つ。
+    /// 走らせられなかった場合も完了として扱う (待たせる相手が居ない)。
+    /// </para>
+    /// </summary>
+    internal static System.Threading.Tasks.Task StartupSyncFinished => _startupSyncFinished.Task;
+
+    private static readonly System.Threading.Tasks.TaskCompletionSource _startupSyncFinished =
+        new(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private static void MarkStartupSyncFinished() => _startupSyncFinished.TrySetResult();
+
+    /// <summary>
     /// 多重起動の抑止を、終了処理の途中で手放さないようにする。
     /// <para>
     /// 更新ヘルパを起こした後に使う。手放してから実際に終わるまでの隙に別の
@@ -261,10 +277,16 @@ public partial class App : Application
                     {
                         try { Coordinator?.Start(); LogLifecycle("Coordinator.Start ok (post-startup-sync)"); }
                         catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+                        MarkStartupSyncFinished();
                     }
                 });
             }
-            catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+            catch (Exception ex)
+            {
+                LogStartupFailure("Coordinator.Start", ex);
+                // 走らせられなかった。待たせる相手が居ないので、済んだものとして扱う。
+                MarkStartupSyncFinished();
+            }
 
             // 更新確認は Window より先に作る。MainPage の VM が構築時に購読するため。
             // 最初の確認は UpdateManager 側の遅延タイマーが起動同期の後に回す。

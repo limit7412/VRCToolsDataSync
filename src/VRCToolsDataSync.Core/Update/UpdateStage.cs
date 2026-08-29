@@ -367,10 +367,21 @@ public sealed class UpdateStage
             return null;
         }
 
-        if (!Verify(metadata))
+        try
         {
-            _logger.LogWarning("取得しておいた配布物が記録と合わない: {Path}", ZipPath);
-            if (discardMismatches) Discard();
+            if (!Verify(metadata))
+            {
+                _logger.LogWarning("取得しておいた配布物が記録と合わない: {Path}", ZipPath);
+                if (discardMismatches) Discard();
+                return null;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 読めなかっただけで、中身が合わないと分かったわけではない。掴まれて
+            // いる間 (ウイルス対策ソフトなど) に捨てると、正しい取得を失う。
+            // 適用はしないが、次の機会へ回す。
+            _logger.LogWarning(ex, "取得しておいた配布物を読めない: {Path}", ZipPath);
             return null;
         }
 
@@ -523,18 +534,14 @@ public sealed class UpdateStage
     }
 
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>
+    /// <remarks>
+    /// 読めなかった場合は投げる。「合わない」と同じ false で返すと、呼び出し側が
+    /// 中身の問題と取り違えて捨ててしまう。
+    /// </remarks>
     private bool Verify(StagedMetadata metadata)
     {
-        try
-        {
-            if (new FileInfo(ZipPath).Length != metadata.Size) return false;
-            return string.Equals(DigestOf(ZipPath), metadata.DigestHex, StringComparison.Ordinal);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _logger.LogWarning(ex, "取得しておいた配布物を読めない: {Path}", ZipPath);
-            return false;
-        }
+        if (new FileInfo(ZipPath).Length != metadata.Size) return false;
+        return string.Equals(DigestOf(ZipPath), metadata.DigestHex, StringComparison.Ordinal);
     }
 
     private static string DigestOf(string path)
