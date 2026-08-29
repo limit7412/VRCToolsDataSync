@@ -197,6 +197,27 @@ public sealed class UpdateManager : IDisposable
     public StagedMetadata? Staged => _stage.TryLoadMetadata();
 
     /// <summary>
+    /// 置き換えまわりの後始末を行い、済んだことを画面へ伝える (issue #45 第 3 段階)。
+    /// <para>
+    /// ウィンドウを立てられた後に呼ぶ。ここを通さずに後始末すると、適用の済んだ
+    /// 取得が消えたことが画面へ伝わらず、「次回起動時に適用されます」の行が
+    /// 押すまで残る。
+    /// </para>
+    /// </summary>
+    public void CleanUpAfterSuccessfulStart(ILoggerFactory loggerFactory)
+    {
+        UpdateApplier.CleanUpAfterSuccessfulStart(loggerFactory, _stage);
+        try
+        {
+            StagedChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "後始末の通知に失敗した");
+        }
+    }
+
+    /// <summary>
     /// まだ取っていない版なら取得して staged に置く。取得は 1 本に絞り、
     /// 走っている間の呼び出しは黙って戻る (次の確認がまた呼ぶ)。
     /// </summary>
@@ -206,14 +227,26 @@ public sealed class UpdateManager : IDisposable
         if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false)) return;
         try
         {
+            // タグだけでなく digest と大きさも見る。同じタグへ配布物を上げ直す
+            // 運用があり (release.yml の --clobber)、タグだけで済ませると
+            // 差し替え前のものを適用し続ける。
             var staged = _stage.TryLoadMetadata();
-            if (staged is not null && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)) return;
+            if (staged is not null
+                && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)
+                && string.Equals(staged.DigestHex, asset.DigestHex, StringComparison.Ordinal)
+                && staged.Size == asset.Size)
+            {
+                return;
+            }
 
             _logger.LogInformation("更新 {Tag} の取得を始める ({Size} バイト)", release.Tag, asset.Size);
             using var cutoff = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             cutoff.CancelAfter(DownloadTimeout);
-            await _repository.DownloadAsync(asset, _stage.ZipPath, cutoff.Token).ConfigureAwait(false);
-            _stage.SaveMetadata(release, asset);
+
+            // 正規の場所ではなく一時の場所へ取る。直接書くと、取得済みの版がある
+            // 状態で次の取得が途中で失敗したときに、適用できたはずの前の版まで失う。
+            await _repository.DownloadAsync(asset, _stage.IncomingZipPath, cutoff.Token).ConfigureAwait(false);
+            _stage.PromoteIncoming(release, asset);
             _logger.LogInformation("次の起動で置き換える更新を取得した: {Tag}", release.Tag);
 
             try
@@ -227,8 +260,10 @@ public sealed class UpdateManager : IDisposable
         }
         catch (Exception ex)
         {
-            // 取得の失敗は次の確認でやり直せる。書きかけは取得の側が消している。
+            // 取得の失敗は次の確認でやり直せる。書きかけは取得の側が消しているが、
+            // 打ち切られた場合に備えてここでも片付ける。取得済みの版は残る。
             _logger.LogWarning(ex, "更新の取得に失敗した: {Tag}", release.Tag);
+            _stage.DiscardIncoming();
         }
         finally
         {

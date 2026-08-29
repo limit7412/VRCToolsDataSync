@@ -139,9 +139,9 @@ public class UpdateInstaller
                 }
                 catch (Exception restore)
                 {
-                    _logger.LogError(restore,
+                    LogQuietly(() => _logger.LogError(restore,
                         "退避した {Part} を戻せなかった。{Backup} を {Current} へ戻す必要がある",
-                        part, backup, current);
+                        part, backup, current));
                     throw new UpdateRollbackException(
                         $"退避した {part} を戻せなかった: {backup} を {current} へ戻す必要がある", restore);
                 }
@@ -150,7 +150,7 @@ public class UpdateInstaller
             }
 
             swapped.Add(part);
-            _logger.LogInformation("{Part} を置き換えた", part);
+            LogQuietly(() => _logger.LogInformation("{Part} を置き換えた", part));
         }
 
         // (4) ランチャーは 1 ファイルの上書きで済ませる。ここで失敗しても
@@ -165,7 +165,7 @@ public class UpdateInstaller
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ランチャーを上書きできなかった: {Name}", LauncherName);
+            LogQuietly(() => _logger.LogWarning(ex, "ランチャーを上書きできなかった: {Name}", LauncherName));
         }
     }
 
@@ -183,11 +183,11 @@ public class UpdateInstaller
             {
                 if (!Directory.Exists(backup)) continue;
                 Directory.Delete(backup, recursive: true);
-                log.LogInformation("置き換え前の {Part} を消した", part);
+                LogQuietly(() => log.LogInformation("置き換え前の {Part} を消した", part));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                log.LogWarning(ex, "置き換え前の {Part} を消せなかった", part);
+                LogQuietly(() => log.LogWarning(ex, "置き換え前の {Part} を消せなかった", part));
             }
         }
     }
@@ -245,13 +245,26 @@ public class UpdateInstaller
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex,
+                LogQuietly(() => _logger.LogError(ex,
                     "退避した {Part} を戻せなかった。{Backup} を {Current} へ戻す必要がある",
-                    swapped[i], backup, current);
+                    swapped[i], backup, current));
                 throw new UpdateRollbackException(
                     $"退避した {swapped[i]} を戻せなかった: {backup} を {current} へ戻す必要がある", ex);
             }
         }
+    }
+
+    /// <summary>
+    /// 入れ替えの最中のログは、失敗しても流れを止めない。
+    /// <para>
+    /// ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
+    /// このリポジトリのロガーは例外を投げる。入れ替えの途中でそれが飛ぶと、
+    /// 巻き戻しを通らずに抜けてしまい、新しい app と古い cli が混ざった一式が残る。
+    /// </para>
+    /// </summary>
+    private static void LogQuietly(Action log)
+    {
+        try { log(); } catch { /* best-effort */ }
     }
 
     /// <summary>

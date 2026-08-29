@@ -74,7 +74,11 @@ public static class UpdateApplier
     /// 起動が成り立った後なら、どちらも復旧の材料として残す必要が無い。
     /// </para>
     /// </summary>
-    public static void CleanUpAfterSuccessfulStart(ILoggerFactory loggerFactory)
+    /// <param name="stage">
+    /// 常駐側が使っている置き場所。UpdateManager から渡す。省略すると既定の
+    /// 置き場所を見る。
+    /// </param>
+    public static void CleanUpAfterSuccessfulStart(ILoggerFactory loggerFactory, UpdateStage? stage = null)
     {
         var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
         try
@@ -87,11 +91,12 @@ public static class UpdateApplier
 
             // まだ適用できる取得 (非配布形で適用しなかった等) は残り、
             // 合わなくなった取得はここで捨てられる。
-            var stage = new UpdateStage(logger: logger);
+            stage ??= new UpdateStage(logger: logger);
             _ = stage.TryLoadVerified(LoadChannel(logger), RunningVersion.Current());
 
             // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
             stage.DiscardIncomplete();
+            stage.DiscardIncoming();
             if (!File.Exists(stage.ZipPath))
             {
                 DeleteDirectoryQuietly(stage.ExtractDirectory, logger);

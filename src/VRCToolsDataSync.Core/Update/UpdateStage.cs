@@ -64,6 +64,16 @@ public sealed class UpdateStage
     /// <summary>置き換えの直前に ZIP を展開する場所。</summary>
     public string ExtractDirectory => Path.Combine(Directory, "extracted");
 
+    /// <summary>
+    /// 取得中の ZIP を書く場所。
+    /// <para>
+    /// 取得は正規の場所ではなくここへ書き、照合まで通ってから入れ替える。
+    /// 直接書くと、既に取得済みの版がある状態で次の版の取得が途中で失敗した
+    /// ときに、適用できたはずの前の版まで失われる。
+    /// </para>
+    /// </summary>
+    public string IncomingZipPath => Path.Combine(Directory, "incoming.zip");
+
     public UpdateStage(string? directory = null, ILogger? logger = null)
     {
         Directory = directory ?? DefaultDirectory();
@@ -75,8 +85,15 @@ public sealed class UpdateStage
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "VRCToolsDataSync", "update");
 
-    /// <summary>取得が済んだ後に記録を書く。記録は取得の成功の印を兼ねる。</summary>
-    public void SaveMetadata(ReleaseInfo release, ReleaseAsset asset)
+    /// <summary>
+    /// 取得しておいた ZIP (<see cref="IncomingZipPath"/>) を、記録と一緒に
+    /// 置き換え待ちの対にする。
+    /// <para>
+    /// 呼ぶのは取得と照合が通った後だけである。ここまでは正規の場所に触らないので、
+    /// 途中で失敗しても前の版が適用できるまま残る。
+    /// </para>
+    /// </summary>
+    public void PromoteIncoming(ReleaseInfo release, ReleaseAsset asset)
     {
         System.IO.Directory.CreateDirectory(Directory);
         var metadata = new StagedMetadata
@@ -86,8 +103,20 @@ public sealed class UpdateStage
             Size = asset.Size,
             Stable = release.IsStable,
         };
+
+        // 記録を先に消す。ZIP を入れ替えた後で記録を書けなかった場合、
+        // 前の版の記録と新しい ZIP という食い違った対が残る。
+        // 片方だけの状態なら DiscardIncomplete が起動時に片付ける。
+        DeleteQuietly(MetadataPath);
+        File.Move(IncomingZipPath, ZipPath, overwrite: true);
         File.WriteAllText(MetadataPath, JsonSerializer.Serialize(metadata, JsonOptions));
+
+        // 前の版を展開したものが残っていても、もう対応しない。
+        DeleteDirectoryQuietly(ExtractDirectory);
     }
+
+    /// <summary>取得の途中で終わったものを消す。次の取得の前に呼ぶ。</summary>
+    public void DiscardIncoming() => DeleteQuietly(IncomingZipPath);
 
     /// <summary>記録だけを読む。照合はしない。画面の表示に使う。</summary>
     public StagedMetadata? TryLoadMetadata()
@@ -178,6 +207,7 @@ public sealed class UpdateStage
     {
         DeleteQuietly(ZipPath);
         DeleteQuietly(MetadataPath);
+        DeleteQuietly(IncomingZipPath);
         DeleteDirectoryQuietly(ExtractDirectory);
     }
 

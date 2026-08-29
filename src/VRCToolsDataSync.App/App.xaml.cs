@@ -280,7 +280,13 @@ public partial class App : Application
             // 復旧の材料を失う。
             try
             {
-                _ = System.Threading.Tasks.Task.Run(() => UpdateApplier.CleanUpAfterSuccessfulStart(LoggerFactory));
+                _ = System.Threading.Tasks.Task.Run(() =>
+                {
+                    // UpdateManager 経由で呼ぶ。後始末で取得が消えたことを
+                    // 画面へ伝えるため (直接呼ぶと表示が残る)。
+                    if (Updates is not null) Updates.CleanUpAfterSuccessfulStart(LoggerFactory);
+                    else UpdateApplier.CleanUpAfterSuccessfulStart(LoggerFactory);
+                });
             }
             catch (Exception ex) { LogStartupFailure("UpdateCleanup", ex); }
 

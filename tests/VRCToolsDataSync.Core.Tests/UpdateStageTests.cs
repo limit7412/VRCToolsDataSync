@@ -29,7 +29,8 @@ public sealed class UpdateStageTests : IDisposable
 
         var content = new byte[1234];
         Random.Shared.NextBytes(content);
-        File.WriteAllBytes(stage.ZipPath, corruptedContent ?? content);
+        // 取得と同じ経路を通す。一時の場所へ書いてから置き換え待ちへ昇格させる。
+        File.WriteAllBytes(stage.IncomingZipPath, corruptedContent ?? content);
 
         var version = ReleaseVersion.Parse(tag)!;
         var asset = new ReleaseAsset(
@@ -38,7 +39,7 @@ public sealed class UpdateStageTests : IDisposable
             Convert.ToHexStringLower(SHA256.HashData(content)),
             content.Length);
         var release = new ReleaseInfo(version, tag, $"https://example.com/{tag}", prerelease, asset);
-        stage.SaveMetadata(release, asset);
+        stage.PromoteIncoming(release, asset);
         return stage;
     }
 
@@ -112,6 +113,35 @@ public sealed class UpdateStageTests : IDisposable
         var complete = StageWith("0.0.10");
         complete.DiscardIncomplete();
         Assert.True(File.Exists(complete.ZipPath));
+    }
+
+    [Fact(DisplayName = "次の取得が途中で失敗しても、取得済みの版は残る")]
+    public void FailedIncomingDownloadKeepsPreviousStaged()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 次の版の取得が途中で落ちた状況。一時の場所にだけ書きかけが残る。
+        File.WriteAllBytes(stage.IncomingZipPath, new byte[] { 9, 9, 9 });
+        stage.DiscardIncoming();
+
+        // 適用できたはずの前の版は無傷のまま。
+        var staged = stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9");
+        Assert.NotNull(staged);
+        Assert.Equal("0.0.10", staged!.Tag);
+    }
+
+    [Fact(DisplayName = "昇格は前の版の ZIP と記録を置き換える")]
+    public void PromoteReplacesPreviousPair()
+    {
+        var stage = StageWith("0.0.10");
+        var first = File.ReadAllBytes(stage.ZipPath);
+
+        var second = StageWith("0.0.11");
+
+        Assert.Equal("0.0.11", second.TryLoadMetadata()!.Tag);
+        Assert.NotEqual(first, File.ReadAllBytes(second.ZipPath));
+        // 一時の場所は空にしておく。次の取得の書きかけと取り違えない。
+        Assert.False(File.Exists(second.IncomingZipPath));
     }
 
     [Fact(DisplayName = "表示用の読み出しは対がそろっているときだけ返す")]
