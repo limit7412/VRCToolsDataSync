@@ -22,6 +22,13 @@ public sealed partial class MainPage : Page
         ViewModel.ShowWindowRequested += () => App.ShowMainWindow();
         ViewModel.ToastRequested += (title, body) => App.Tray.ShowToast(title, body);
 
+        // UI スレッドへの運び先は Coordinator と切り離して先に渡す。
+        // 保存先が未設定などで Coordinator を作れなかった場合、以前は
+        // AttachCoordinator ごと呼ばれず、更新確認 (issue #45) の結果が
+        // バックグラウンドスレッドのまま画面へ触れていた。更新確認は
+        // 保存先の設定と関係なく動く。
+        ViewModel.SetUiDispatcher(action => App.DispatcherQueue.TryEnqueue(() => action()));
+
         if (App.Coordinator is not null)
         {
             ViewModel.AttachCoordinator(App.Coordinator, action =>
