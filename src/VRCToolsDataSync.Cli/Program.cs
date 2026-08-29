@@ -596,7 +596,9 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
     // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま
     // こちらのリネームとぶつかったりする。App は起動の先頭でこれを待つ。
-    using var applyMutex = new System.Threading.Mutex(initiallyOwned: false, name: UpdateStage.ApplyMutexName);
+    // 名前はインストール先ごとに分かれている。ヘルパ自身の居場所 (展開先) では
+    // なく、置き換える対象から引く。
+    using var applyMutex = UpdateStage.CreateApplyMutex(target);
     var applyMutexHeld = false;
     try
     {

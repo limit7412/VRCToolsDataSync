@@ -151,7 +151,7 @@ public static class UpdateApplier
         Mutex? mutex = null;
         try
         {
-            mutex = new Mutex(initiallyOwned: false, name: UpdateStage.ApplyMutexName);
+            mutex = UpdateStage.CreateApplyMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory));
             bool acquired;
             try
             {

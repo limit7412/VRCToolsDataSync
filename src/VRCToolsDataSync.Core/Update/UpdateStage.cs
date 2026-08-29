@@ -190,7 +190,7 @@ public sealed class UpdateStage
     }
 
     /// <summary>
-    /// 更新ヘルパが動いている間だけ握るクロスプロセスのロックの名前。
+    /// 更新ヘルパが動いている間だけ握るクロスプロセスのロックを作る。
     /// <para>
     /// ヘルパは展開先とインストール先を触る。その最中に App を起動されると、
     /// 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを
@@ -198,11 +198,34 @@ public sealed class UpdateStage
     /// 待ち、ヘルパは適用の全体で握る。
     /// </para>
     /// <para>
-    /// Global\ は付けない。置き場所が %AppData% 配下でユーザごとに分かれており、
-    /// competing するのは同じユーザのプロセスだけである。
+    /// 名前はインストール先ごとに分ける。置き場所を分けた以上、別の場所へ
+    /// 展開したコピーの適用を待つ理由が無い。
+    /// </para>
+    /// <para>
+    /// 名前空間は <c>Global\</c> を使う。接頭辞を付けないと、名前は対話
+    /// セッションごとの名前空間に作られる。同じ利用者がユーザーの切り替えや
+    /// リモートデスクトップで 2 つのセッションを持つと、置き場所と
+    /// インストール先は共有されるのに、ロックだけが互いに見えなくなる。
     /// </para>
     /// </summary>
-    public const string ApplyMutexName = "VRCToolsDataSync.Update.Apply";
+    /// <param name="installRoot">
+    /// インストール先。null は配布の形でない (dotnet run など) ことを表す。
+    /// </param>
+    public static Mutex CreateApplyMutex(string? installRoot)
+    {
+        var name = "VRCToolsDataSync.Update.Apply." + (installRoot is null ? "local" : ScopeKeyOf(installRoot));
+        try
+        {
+            return new Mutex(initiallyOwned: false, name: @"Global\" + name);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or NotSupportedException)
+        {
+            // Global\ の名前を作れない構成もある (権限を落とした環境や、
+            // 名前に区切りを許さないプラットフォーム)。そこではセッション内
+            // だけの名前で妥協する。同じセッションの重なりは防げる。
+            return new Mutex(initiallyOwned: false, name: name);
+        }
+    }
 
     /// <summary>取得の途中で終わったものを消す。次の取得の前に呼ぶ。</summary>
     public void DiscardIncoming() => _ = DeleteQuietly(IncomingZipPath);

@@ -250,4 +250,45 @@ public sealed class UpdateStageTests : IDisposable
         // 配布の形でない場合は 1 つにまとめる。
         Assert.Equal(Path.Combine(shared, "local"), UpdateStage.DirectoryFor(null));
     }
+
+    /// <summary>
+    /// 別のスレッドから同じ名前のロックを取ってみる。Mutex は取った本人には
+    /// 何度でも渡るので、分かれているかどうかは別のスレッドからしか見えない。
+    /// </summary>
+    private static bool CanHoldOnAnotherThread(string installRoot)
+    {
+        var acquired = false;
+        var thread = new Thread(() =>
+        {
+            using var mutex = UpdateStage.CreateApplyMutex(installRoot);
+            try { acquired = mutex.WaitOne(0); }
+            catch (AbandonedMutexException) { acquired = true; }
+            finally { if (acquired) mutex.ReleaseMutex(); }
+        });
+        thread.Start();
+        thread.Join();
+        return acquired;
+    }
+
+    [Fact(DisplayName = "適用のロックはインストール先ごとに分かれる")]
+    public void ApplyMutexIsScopedPerInstallRoot()
+    {
+        // 名前は実行ごとに変える。同時に走る別のテスト実行と取り合わない。
+        var mine = Path.Combine("C:", "apps", "vrctds-" + Guid.NewGuid().ToString("N"));
+        var other = Path.Combine("D:", "elsewhere", "vrctds-" + Guid.NewGuid().ToString("N"));
+
+        using var held = UpdateStage.CreateApplyMutex(mine);
+        Assert.True(held.WaitOne(0));
+        try
+        {
+            // 同じインストール先なら待たされる。
+            Assert.False(CanHoldOnAnotherThread(mine));
+            // 別のインストール先なら待つ理由が無い。置き場所も分かれている。
+            Assert.True(CanHoldOnAnotherThread(other));
+        }
+        finally
+        {
+            held.ReleaseMutex();
+        }
+    }
 }

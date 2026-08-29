@@ -43,6 +43,10 @@ public sealed class UpdateManager : IDisposable
     // 大きくても百数十 MB の ZIP であり、これで足りない回線では待っても仕方がない。
     private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(30);
 
+    // 後始末が取得の終わりを待つ上限。ここで待たされるのは手動の確認と
+    // ぶつかったときだけで、待ちきれなくても次の起動が同じ後始末をやり直す。
+    private static readonly TimeSpan CleanUpWait = TimeSpan.FromMinutes(5);
+
     // 破棄と一緒に、走っている取得を打ち切るための元。
     private readonly CancellationTokenSource _lifetime = new();
 
@@ -182,7 +186,7 @@ public sealed class UpdateManager : IDisposable
             var available = _checker.Available(channel);
             if (available?.Asset is not null)
             {
-                _ = DownloadIfNeededAsync(available);
+                _ = DownloadIfNeededAsync(available, channel);
             }
 
             return result;
@@ -206,7 +210,35 @@ public sealed class UpdateManager : IDisposable
     /// </summary>
     public void CleanUpAfterSuccessfulStart(ILoggerFactory loggerFactory)
     {
-        UpdateApplier.CleanUpAfterSuccessfulStart(loggerFactory, _stage);
+        // 後始末は書きかけ (incoming.zip) も消す。取得と重なると、取り終えて
+        // 昇格を待っているものを消してしまい、その確認の取得が空振りに終わる。
+        // 取得と同じ入り口で直列化する。取得と同じ順 (取得 → 適用ロック) で
+        // 取るので、詰まることはない。
+        //
+        // 最初の確認は起動から 30 秒後なので、普段この待ちは空振りする。
+        // 手動の確認とぶつかった場合も、待ちきれなければ次の起動へ回す。
+        var held = false;
+        try
+        {
+            held = _downloadGate.Wait(CleanUpWait);
+            if (!held)
+            {
+                _logger.LogInformation("取得中のため、更新の後始末は次の起動へ回す");
+                return;
+            }
+
+            UpdateApplier.CleanUpAfterSuccessfulStart(loggerFactory, _stage);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "更新の後始末に入れなかった");
+            return;
+        }
+        finally
+        {
+            if (held) _downloadGate.Release();
+        }
+
         try
         {
             StagedChanged?.Invoke();
@@ -221,20 +253,30 @@ public sealed class UpdateManager : IDisposable
     /// まだ取っていない版なら取得して staged に置く。取得は 1 本に絞り、
     /// 走っている間の呼び出しは黙って戻る (次の確認がまた呼ぶ)。
     /// </summary>
-    private async Task DownloadIfNeededAsync(ReleaseInfo release)
+    /// <param name="channel">この候補を見つけた確認のチャンネル。</param>
+    private async Task DownloadIfNeededAsync(ReleaseInfo release, UpdateChannel channel)
     {
         if (release.Asset is not { } asset) return;
         if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false)) return;
         try
         {
+            // 確認の最中にチャンネルを変えられていないか見る。確認は数秒かかり、
+            // その間の変更は珍しくない。古いチャンネルの候補を取りに行くと、
+            // 取得は 1 本ずつなので、後から来た今のチャンネルの取得が省かれる。
+            if (!MatchesSavedChannel(channel)) return;
+            if (!release.IsInChannel(channel)) return;
+
             // タグだけでなく digest と大きさも見る。同じタグへ配布物を上げ直す
             // 運用があり (release.yml の --clobber)、タグだけで済ませると
-            // 差し替え前のものを適用し続ける。
+            // 差し替え前のものを適用し続ける。stable の印も見る。プレリリース
+            // として取った後で印だけ外された場合、記録が prerelease のままだと
+            // stable のチャンネルで捨てられ、適用できないまま留まる。
             var staged = _stage.TryLoadMetadata();
             if (staged is not null
                 && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)
                 && string.Equals(staged.DigestHex, asset.DigestHex, StringComparison.Ordinal)
-                && staged.Size == asset.Size)
+                && staged.Size == asset.Size
+                && staged.Stable == release.IsStable)
             {
                 return;
             }
@@ -246,6 +288,16 @@ public sealed class UpdateManager : IDisposable
             // 正規の場所ではなく一時の場所へ取る。直接書くと、取得済みの版がある
             // 状態で次の取得が途中で失敗したときに、適用できたはずの前の版まで失う。
             await _repository.DownloadAsync(asset, _stage.IncomingZipPath, cutoff.Token).ConfigureAwait(false);
+
+            // 取得の間にチャンネルを変えられていたら昇格しない。画面へ出しても
+            // 適用の直前で捨てられるだけで、「取得済み」の表示が消えるのを
+            // 見せることになる。
+            if (!MatchesSavedChannel(channel))
+            {
+                _logger.LogInformation("チャンネルが変わったため、取得した {Tag} は昇格しない", release.Tag);
+                _stage.DiscardIncoming();
+                return;
+            }
 
             // 昇格は適用と同じロックの下で行う。staged の ZIP を入れ替えて展開先を
             // 消すため、適用の側と重なると、起動前のヘルパを消したり、動いている
@@ -335,6 +387,24 @@ public sealed class UpdateManager : IDisposable
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "更新の適用に入れなかった");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 保存されているチャンネルが <paramref name="channel"/> のままか。
+    /// 読めない場合は違うものとして扱う。分からないまま取りに行くよりは、
+    /// 次の確認へ回すほうが害が少ない。
+    /// </summary>
+    private bool MatchesSavedChannel(UpdateChannel channel)
+    {
+        try
+        {
+            return _runner.LoadSettings().Update.Channel == channel;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "更新チャンネルを読み直せなかった");
             return false;
         }
     }
