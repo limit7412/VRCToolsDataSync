@@ -1,3 +1,5 @@
+using VRCToolsDataSync.Core.Update;
+
 namespace VRCToolsDataSync.Core.Settings;
 
 /// <summary>データの保存先の種類。</summary>
@@ -39,6 +41,35 @@ public sealed class SyncSettings
     // Issue #6: ツールごとの自動起動設定。キーは ISyncService.ToolKey と一致させる
     // ("vrcx", "friend-connect")。
     public Dictionary<string, ToolLaunchConfig> Launch { get; set; } = new();
+
+    /// <summary>
+    /// 本体の更新確認の設定 (issue #45)。この項目が無い既存の settings.json も
+    /// 既定値 (stable チャンネル、確認あり) でそのまま動く。
+    /// </summary>
+    public UpdateSettings Update { get; set; } = new();
+}
+
+/// <summary>本体の更新確認の設定 (issue #45)。</summary>
+public sealed class UpdateSettings
+{
+    /// <summary>更新を拾うチャンネル。"stable" / "test" として読み書きされる。</summary>
+    public UpdateChannel Channel { get; set; } = UpdateChannel.Stable;
+
+    /// <summary>定期的な確認を行うか。手動の確認はこの値に関わらず行える。</summary>
+    public bool CheckEnabled { get; set; } = true;
+
+    /// <summary>
+    /// 知らせ済みの版のタグ。同じ版を起動のたびに知らせ直さないための記録で、
+    /// <see cref="UpdateChecker"/> が復元と書き戻しに使う。
+    /// </summary>
+    public string NotifiedVersion { get; set; } = string.Empty;
+
+    public UpdateSettings Clone() => new()
+    {
+        Channel = Channel,
+        CheckEnabled = CheckEnabled,
+        NotifiedVersion = NotifiedVersion,
+    };
 }
 
 /// <summary>S3 互換オブジェクトストレージの接続設定。</summary>

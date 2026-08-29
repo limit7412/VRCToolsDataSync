@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using VRCToolsDataSync.Core.Storage;
+using VRCToolsDataSync.Core.Update;
 
 namespace VRCToolsDataSync.Core.Settings;
 
@@ -59,6 +60,9 @@ public sealed class SettingsStore
         {
             settings = new SyncSettings();
         }
+        // JSON に明示的な null が書かれていると、既定値の代わりに null が入る。
+        // 読んだ側が毎回それを気にせずに済むよう、ここで既定へ落としておく。
+        settings.Update ??= new UpdateSettings();
         MigrateToolStateKeys(settings);
         return settings;
     }
@@ -130,6 +134,24 @@ public sealed class SettingsStore
     /// その古い値で上書きされて ON 設定が消えてしまう。
     /// </summary>
     public void SaveToolStateOnly(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: true);
+
+    /// <summary>
+    /// 通知済みの版の記録だけを書く (issue #45)。
+    /// <para>
+    /// 更新を知らせた時点でこれを呼ぶ。通常の <see cref="Save"/> を使うと、
+    /// 常駐している間に別プロセス (CLI の storage など) が変えた保存先を、
+    /// こちらが起動時に読んだ古い値で巻き戻す。読み書きはクロスプロセスの
+    /// 排他の下で行われるため、読んでから書くまでの間に割り込まれない。
+    /// </para>
+    /// </summary>
+    public void SaveNotifiedVersion(string tag)
+    {
+        // 中身はディスク側を全面的に採用し、通知済みの版だけを載せる。
+        // 実際にどちらの版が残るかは MergeForSave が版の新しさで決める。
+        var settings = new SyncSettings();
+        settings.Update.NotifiedVersion = tag;
+        SaveInternal(settings, mergeTopLevelFromDisk: true);
+    }
 
     private void SaveInternal(SyncSettings settings, bool mergeTopLevelFromDisk)
     {
@@ -204,6 +226,7 @@ public sealed class SettingsStore
                     settings.ToolStateSchema = merged.ToolStateSchema;
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
+                    settings.Update = merged.Update;
                 }
                 finally
                 {
@@ -271,6 +294,9 @@ public sealed class SettingsStore
             // Push/Pull 経由の Save がユーザの保存先変更を巻き戻さないようにする。
             StorageMode = topLevelSource.StorageMode,
             S3 = topLevelSource.S3?.Clone(),
+            // 更新確認の設定も Top-level と同じ扱い。Push/Pull の付随 Save が
+            // チャンネルや通知済みの記録を巻き戻さないようにする。
+            Update = (topLevelSource.Update ?? new UpdateSettings()).Clone(),
             // 読み込み時に移行済みなので、ディスク側も incoming 側も現行の版になっている。
             ToolStateSchema = CurrentToolStateSchema,
             ToolState = new Dictionary<string, ToolSyncState>(),
@@ -290,6 +316,22 @@ public sealed class SettingsStore
             if (inc is null) { result.ToolState[key] = dsk!; continue; }
             if (dsk is null) { result.ToolState[key] = inc; continue; }
             result.ToolState[key] = PickNewer(inc, dsk);
+        }
+
+        // 通知済みの版だけは、採用元に関わらずディスクと incoming の新しいほうを
+        // 採用する。通知の記録は常に前へ進む (UpdateChecker.MarkNotified が古い版で
+        // 上書きしない) ので、新旧は版の比較で決められる。これが無いと、起動時に
+        // 読んだ古い設定のまま保存する経路 (接続確認に時間のかかる CLI の storage
+        // など) が別プロセスの記録した版を巻き戻し、同じ版を知らせ直す。
+        var diskNotified = ReleaseVersion.Parse(disk.Update?.NotifiedVersion);
+        var incomingNotified = ReleaseVersion.Parse(incoming.Update?.NotifiedVersion);
+        if (diskNotified is not null && (incomingNotified is null || diskNotified > incomingNotified))
+        {
+            result.Update.NotifiedVersion = disk.Update!.NotifiedVersion;
+        }
+        else if (incomingNotified is not null)
+        {
+            result.Update.NotifiedVersion = incoming.Update!.NotifiedVersion;
         }
 
         // Launch は Top-level と同じ採用元から取る。理由:

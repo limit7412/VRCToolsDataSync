@@ -5,6 +5,13 @@
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>VRCToolsDataSync_App</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!--
+      手元ビルドの既定の版。ReleaseVersion.Parse が読めない綴りにしてあり、
+      更新確認 (issue #45) はこの版を Unknown として扱って比較しない。
+      リリースのワークフローは build-release.ps1 の -Version (-p:Version) で
+      タグの版に上書きする。
+    -->
+    <Version>0.0.0-dev</Version>
     <Platforms>x86;x64;ARM64</Platforms>
     <!--
       Platform を唯一の基準にして、そこから RID を導く。

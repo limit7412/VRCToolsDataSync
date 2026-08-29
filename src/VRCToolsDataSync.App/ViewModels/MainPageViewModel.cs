@@ -11,7 +11,9 @@ using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Update;
 using VRCToolsDataSync.Core.Watch;
+using VRCToolsDataSync_App.Services;
 
 namespace VRCToolsDataSync_App.ViewModels;
 
@@ -20,7 +22,11 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>MainPage.xaml の保存先 ComboBox で S3 互換ストレージを指す位置。</summary>
     private const int S3ModeIndex = 1;
 
+    /// <summary>MainPage.xaml の更新チャンネル ComboBox で test チャンネルを指す位置。</summary>
+    private const int TestChannelIndex = 1;
+
     private readonly SyncRunner _runner;
+    private readonly UpdateManager? _updates;
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
     private Action<Action>? _uiDispatch;
@@ -31,11 +37,12 @@ public partial class MainPageViewModel : ObservableObject
     // x:Bind 用の引数なしコンストラクタ。GUI ホストでは必ず App.Runner を共有して、
     // App 側で構成された FileLoggerProvider 経由でログが出るようにする。
     // (テスト等から MainPageViewModel 単体で生成したい場合は引数付きを使う)
-    public MainPageViewModel() : this(App.Runner) { }
+    public MainPageViewModel() : this(App.Runner, App.Updates) { }
 
-    public MainPageViewModel(SyncRunner runner)
+    public MainPageViewModel(SyncRunner runner, UpdateManager? updates = null)
     {
         _runner = runner;
+        _updates = updates;
         _settings = _runner.LoadSettings();
         MachineName = _settings.MachineName;
         CloudFolderPath = _settings.CloudFolderPath;
@@ -44,9 +51,17 @@ public partial class MainPageViewModel : ObservableObject
         AutoSyncEnabled = _settings.AutoSyncEnabled;
         LoadStorageSettingsToProperties();
         LoadLaunchConfigToProperties();
+        LoadUpdateSettingsToProperties();
         RefreshStatusSummaries();
         RefreshStartupState();
         AppendLog($"保存先: {SyncStorageFactory.DescribeTarget(_settings)}");
+
+        if (_updates is not null)
+        {
+            // 確認はバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
+            _updates.CheckCompleted += (result, channel, manual) =>
+                OnUi(() => HandleUpdateCheckCompleted(result, channel, manual));
+        }
     }
 
     /// <summary>
@@ -103,6 +118,15 @@ public partial class MainPageViewModel : ObservableObject
         _coordinator?.RefreshSettings(_settings);
         RefreshStatusSummaries();
     }
+
+    /// <summary>
+    /// バックグラウンドからの通知を UI スレッドへ運ぶ手立てを渡す。
+    /// <para>
+    /// Coordinator とは切り離して受け取る。保存先が未設定などで Coordinator を
+    /// 作れない場合でも、更新確認 (issue #45) の結果は届くためである。
+    /// </para>
+    /// </summary>
+    public void SetUiDispatcher(Action<Action> uiDispatch) => _uiDispatch = uiDispatch;
 
     public void AttachCoordinator(AutoSyncCoordinator coordinator, Action<Action> uiDispatch)
     {
@@ -254,6 +278,27 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial bool FriendConnectLaunchOnAppStart { get; set; }
 
+    // 本体の更新確認 (issue #45)。0 = 安定版、1 = テスト版。
+    // MainPage.xaml の ComboBox の並びと対応させる。
+    [ObservableProperty]
+    public partial int UpdateChannelIndex { get; set; }
+
+    [ObservableProperty]
+    public partial bool UpdateCheckEnabled { get; set; } = true;
+
+    [ObservableProperty]
+    public partial string UpdateStatus { get; set; } = string.Empty;
+
+    // 新しい版が見つかったときだけ出す行 (版の表示とリリースページへのボタン)。
+    [ObservableProperty]
+    public partial Visibility UpdateAvailableVisibility { get; set; } = Visibility.Collapsed;
+
+    [ObservableProperty]
+    public partial string UpdateAvailableText { get; set; } = string.Empty;
+
+    // リリースページの URL。表示行と一緒に更新する。
+    private string? _releasePageUrl;
+
     public ObservableCollection<string> LogEntries { get; } = new();
 
     public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
@@ -271,6 +316,11 @@ public partial class MainPageViewModel : ObservableObject
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
         var settings = _runner.LoadSettings();
+        // 更新確認の設定は、保存の前のディスク側の値を控えておく。
+        // 自動確認を戻したときと、チャンネルを変えたときに確認し直すために使う。
+        var previousUpdate = settings.Update ?? new UpdateSettings();
+        var checkWasEnabled = previousUpdate.CheckEnabled;
+        var previousChannel = previousUpdate.Channel;
         settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
@@ -278,6 +328,7 @@ public partial class MainPageViewModel : ObservableObject
         settings.AutoSyncEnabled = AutoSyncEnabled;
         ApplyStoragePropertiesToSettings(settings);
         ApplyLaunchPropertiesToSettings(settings);
+        ApplyUpdatePropertiesToSettings(settings);
 
         _settings = settings;
         _runner.SaveSettings(_settings);
@@ -289,6 +340,60 @@ public partial class MainPageViewModel : ObservableObject
         RefreshStatusSummaries();
         AppendLog($"設定を保存しました (保存先: {SyncStorageFactory.DescribeTarget(_settings)}, " +
                   $"auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
+
+        // チャンネルを変えた直後は、表示が前のチャンネルの結果のまま残る。
+        // 状態欄を新しいチャンネルの確認状態から作り直し、まだ確認できて
+        // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
+        // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
+        RefreshUpdateBanner();
+        // ApplyUpdatePropertiesToSettings が必ず入れているが、JSON から明示的な
+        // null が入りうる型なので、読む側では既定へ落として扱う。
+        var update = _settings.Update ?? new UpdateSettings();
+        var channel = update.Channel;
+        if (_updates is not null)
+        {
+            // 次のどちらかなら、確認済みでも確認し直す。
+            //
+            // 自動確認を戻したとき: 止めていた間は定期の確認が走っておらず、
+            // 残っている結果は古い。
+            //
+            // チャンネルを変えたとき: そのチャンネルの確認済みの印だけでは
+            // 足りない。stable の結果がある状態で test へ変え、その確認の途中で
+            // stable へ戻すと、印は残っているのに、遅れて届いた test の結果が
+            // 確認の状態を上書きしてしまう。どちらの場合も、次の定期確認まで
+            // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
+            var reEnabled = !checkWasEnabled && update.CheckEnabled;
+            var channelChanged = previousChannel != channel;
+            var stale = reEnabled || channelChanged;
+
+            // 自動確認を止めている間は確認が走らない。「確認しています...」を
+            // 出すと、結果が来ないままその表示で固まる。未確認として見せ、
+            // 手動確認に委ねる。
+            if (stale && !update.CheckEnabled)
+            {
+                UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
+            }
+            else if (stale)
+            {
+                UpdateStatus = "確認しています...";
+                _ = _updates.CheckAsync(manual: false);
+            }
+            else if (!_updates.HasChecked(channel))
+            {
+                UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
+                _ = _updates.CheckAsync(manual: false);
+            }
+            else if (_updates.Available(channel) is { } available)
+            {
+                UpdateStatus = $"新しい版 {available.Tag} が出ています (実行中: {_updates.CurrentVersion})";
+            }
+            else
+            {
+                UpdateStatus = _updates.IsComplete
+                    ? $"最新の版を利用中 ({_updates.CurrentVersion})"
+                    : "新しい版は見つかりませんでしたが、一覧を集めきれていないため最新とは言い切れません";
+            }
+        }
     }
 
     /// <summary>保存先の設定を画面へ読み込む。</summary>
@@ -419,6 +524,146 @@ public partial class MainPageViewModel : ObservableObject
             Arguments = existingFc?.Arguments,
             LaunchOnAppStart = FriendConnectLaunchOnAppStart,
         };
+    }
+
+    /// <summary>本体の更新確認の設定を画面へ読み込む (issue #45)。</summary>
+    private void LoadUpdateSettingsToProperties()
+    {
+        var update = _settings.Update ?? new UpdateSettings();
+        UpdateChannelIndex = update.Channel == UpdateChannel.Test ? TestChannelIndex : 0;
+        UpdateCheckEnabled = update.CheckEnabled;
+        UpdateStatus = _updates is null
+            ? "更新確認は利用できません"
+            : $"未確認 (実行中: {_updates.CurrentVersion})";
+    }
+
+    private void ApplyUpdatePropertiesToSettings(SyncSettings settings)
+    {
+        settings.Update ??= new UpdateSettings();
+        settings.Update.Channel = UpdateChannelIndex == TestChannelIndex
+            ? UpdateChannel.Test
+            : UpdateChannel.Stable;
+        settings.Update.CheckEnabled = UpdateCheckEnabled;
+        // NotifiedVersion は画面で編集しない。読み込んだ値をそのまま保つ。
+    }
+
+    /// <summary>
+    /// 「今すぐ確認」ボタン。定期確認と違い、設定で確認を止めていても走る。
+    /// 押した人が結果を待っているためで、結果の表示は CheckCompleted 経由で行う。
+    /// </summary>
+    [RelayCommand]
+    private async Task CheckUpdateAsync()
+    {
+        if (_updates is null) return;
+        UpdateStatus = "確認しています...";
+        try
+        {
+            var result = await _updates.CheckAsync(manual: true);
+            if (result is null)
+            {
+                UpdateStatus = "確認できませんでした (設定を読めません)";
+            }
+        }
+        catch (Exception ex)
+        {
+            UpdateStatus = $"確認できませんでした: {ex.Message}";
+        }
+    }
+
+    [RelayCommand]
+    private void OpenReleasePage()
+    {
+        var url = _releasePageUrl;
+        if (string.IsNullOrEmpty(url)) return;
+        try
+        {
+            // 既定のブラウザで開く。UseShellExecute が無いと URL を直接は開けない。
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = url,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"リリースページを開けませんでした: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 確認の結果を画面へ反映する。UI スレッドで呼ばれる。
+    /// <para>
+    /// 定期確認 (manual=false) では、知らせ済みの版が UpToDate に倒されて届く。
+    /// その場合も新しい版の行は出したままにする。通知を抑えるのは繰り返しの
+    /// バルーンであって、画面からの導線ではない。
+    /// </para>
+    /// </summary>
+    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel, bool manual)
+    {
+        if (_updates is null) return;
+
+        // 確認中にチャンネルを変えて保存すると、前のチャンネルの結果が遅れて届く。
+        // 保存済みの設定と食い違う結果を載せると、stable を選び直した直後に
+        // プレリリースを知らせ、その記録が以後の stable の通知まで抑えてしまう。
+        // 保存の側が新しいチャンネルでの確認を仕掛けており、結果は改めて届く。
+        var savedChannel = _settings.Update?.Channel ?? UpdateChannel.Stable;
+        if (channel != savedChannel) return;
+
+        var current = _updates.CurrentVersion;
+
+        UpdateStatus = result.Outcome switch
+        {
+            UpdateCheckOutcome.Available =>
+                $"新しい版 {result.Release!.Tag} が出ています (実行中: {current})",
+            UpdateCheckOutcome.UpToDate when result.Release is not null =>
+                $"新しい版 {result.Release.Tag} が出ています (通知済み)",
+            UpdateCheckOutcome.UpToDate =>
+                $"最新の版を利用中 ({current})",
+            UpdateCheckOutcome.Unreachable =>
+                "確認できませんでした。通信できないか、GitHub が応答しませんでした",
+            UpdateCheckOutcome.Incomplete =>
+                "新しい版は見つかりませんでしたが、一覧を集めきれていないため最新とは言い切れません",
+            UpdateCheckOutcome.Unknown =>
+                $"手元ビルド ({current}) のため確認しません",
+            _ => UpdateStatus,
+        };
+
+        RefreshUpdateBanner();
+
+        if (result.Outcome == UpdateCheckOutcome.Available && result.Release is { } release)
+        {
+            AppendLog($"新しい版 {release.Tag} が出ています (実行中: {current})");
+            if (!manual)
+            {
+                // 手動確認は画面を見ながらの操作なのでバルーンまでは出さない。
+                ToastRequested?.Invoke(
+                    "VRCToolsDataSync の更新",
+                    $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
+            }
+            // 画面と通知に出せた後で覚える。出せなかった版まで覚えると、
+            // 利用者が一度も見ないまま以後の確認で抑止される。
+            _updates.MarkNotified(release);
+        }
+    }
+
+    /// <summary>
+    /// 新しい版の行を、保存済みのチャンネルで見つけているものへ合わせる。
+    /// 別のチャンネルの結果は UpdateManager 側が返さないため、
+    /// チャンネルを切り替えた直後は行が消える (確認し直すと戻る)。
+    /// </summary>
+    private void RefreshUpdateBanner()
+    {
+        var available = _updates?.Available(_settings.Update?.Channel ?? UpdateChannel.Stable);
+        if (available is null)
+        {
+            UpdateAvailableVisibility = Visibility.Collapsed;
+            UpdateAvailableText = string.Empty;
+            _releasePageUrl = null;
+            return;
+        }
+        UpdateAvailableText = $"{available.Tag} を取得できます";
+        _releasePageUrl = available.HtmlUrl;
+        UpdateAvailableVisibility = Visibility.Visible;
     }
 
     /// <summary>

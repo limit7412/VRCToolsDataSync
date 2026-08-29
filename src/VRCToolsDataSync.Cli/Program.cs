@@ -393,7 +393,13 @@ static int ConfigureLocalStorage(string path)
         return 2;
     }
 
-    store.Save(settings);
+    // 接続確認には時間がかかりうる。その間に別プロセス (常駐の GUI など) が
+    // 変えた設定を巻き戻さないよう、保存の直前に読み直した設定へ
+    // 保存先の項目だけを載せて保存する。
+    var fresh = store.Load();
+    fresh.StorageMode = SyncStorageMode.LocalFolder;
+    fresh.CloudFolderPath = trimmed;
+    store.Save(fresh);
 
     Console.WriteLine($"保存先をローカル同期フォルダに設定しました: {trimmed}");
     return 0;
@@ -443,8 +449,14 @@ static int ConfigureS3Storage(
         return 2;
     }
 
-    store.Save(settings);
-    Console.WriteLine($"保存先を S3 互換ストレージに設定しました: {SyncStorageFactory.DescribeTarget(settings)}");
+    // 接続確認は実際に保存先まで往復するため数秒かかりうる。その間に
+    // 別プロセス (常駐の GUI など) が変えた設定を巻き戻さないよう、
+    // 保存の直前に読み直した設定へ保存先の項目だけを載せて保存する。
+    var fresh = store.Load();
+    fresh.StorageMode = SyncStorageMode.S3;
+    fresh.S3 = settings.S3;
+    store.Save(fresh);
+    Console.WriteLine($"保存先を S3 互換ストレージに設定しました: {SyncStorageFactory.DescribeTarget(fresh)}");
     Console.WriteLine("シークレットアクセスキーは、この Windows ユーザだけが復号できる形で保存しました。");
     return 0;
 }

@@ -191,9 +191,18 @@ public sealed class TrayIconManager : IDisposable
 
     public void ShowToast(string title, string body)
     {
-        // unpackaged では AppNotificationManager が必ず失敗するため no-op。
-        _ = title;
-        _ = body;
+        // AppNotificationManager (トースト) は unpackaged では必ず失敗するため使わない。
+        // 代わりにトレイアイコンのバルーン (Shell_NotifyIcon) を出す。こちらは
+        // パッケージングに依存しない。トレイを作れていない場合は黙って諦める。
+        // 通知が出なくても、同じ内容は GUI 上のログや状態表示に残っている。
+        try
+        {
+            _taskbarIcon?.ShowNotification(title: title, message: body);
+        }
+        catch (Exception ex)
+        {
+            LifecycleLog("Tray.ShowToast fail: " + ex.Message);
+        }
     }
 
     public void Dispose()
