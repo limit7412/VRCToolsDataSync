@@ -102,6 +102,23 @@ public sealed class UpdateChecker
     }
 
     /// <summary>
+    /// 直近の確認を無かったことにする。結果を使わずに捨てたときに呼ぶ。
+    /// <para>
+    /// 結果を捨てたのに確認済みのまま残すと、以後の「まだ確認していなければ
+    /// 確認する」判断が確認を省き、捨てた候補が画面にだけ出て通知されない
+    /// 状態が次の定期確認まで続く。
+    /// </para>
+    /// </summary>
+    public void InvalidateChecked()
+    {
+        lock (_gate)
+        {
+            _checkedChannel = null;
+            _available = null;
+        }
+    }
+
+    /// <summary>
     /// 既に知らせた版なら UpToDate へ倒す。自動の確認だけがこれを通す。
     /// <para>
     /// 手動で押したときの結末には使わない。抑止した結末をそのまま返すと、

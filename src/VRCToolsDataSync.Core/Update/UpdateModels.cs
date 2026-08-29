@@ -53,9 +53,15 @@ public sealed partial record ReleaseAsset(string Name, string Url, string Digest
     /// 実行中のプロセスのアーキテクチャに合う配布物の名前。
     /// リリースに添付しないアーキテクチャ (x86 など) では null を返す。
     /// 名前は release.yml / prerelease.yml が添付する ZIP の名前と一致させる。
+    /// <para>
+    /// OS ではなくプロセスのアーキテクチャで選ぶ。置き換えるのは実行中の
+    /// 一式であり、OS に合わせると ARM64 の Windows でエミュレーション実行して
+    /// いる x64 版へ arm64 の ZIP を渡すことになる。x64 の Windows で動く x86 版も、
+    /// 配布の無いアーキテクチャとして null に落ちる。
+    /// </para>
     /// </summary>
     public static string? NameForCurrentArchitecture()
-        => RuntimeInformation.OSArchitecture switch
+        => RuntimeInformation.ProcessArchitecture switch
         {
             Architecture.X64 => "VRCToolsDataSync-win-x64.zip",
             Architecture.Arm64 => "VRCToolsDataSync-win-arm64.zip",

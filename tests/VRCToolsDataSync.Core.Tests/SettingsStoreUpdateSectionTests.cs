@@ -99,6 +99,30 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         Assert.Equal("0.0.11", CreateStore().Load().Update.NotifiedVersion);
     }
 
+    [Fact(DisplayName = "通知済みの版の保存は、他の設定に触れない")]
+    public void SaveNotifiedVersionKeepsEverythingElseOnDisk()
+    {
+        // 常駐 GUI が起動時に読んだ設定。
+        var store = CreateStore();
+        var atStartup = store.Load();
+        atStartup.CloudFolderPath = @"C:\old";
+        store.Save(atStartup);
+
+        // その後、別プロセス (CLI の storage など) が保存先を変える。
+        var fromCli = CreateStore().Load();
+        fromCli.CloudFolderPath = @"D:\new";
+        fromCli.Update.Channel = UpdateChannel.Test;
+        CreateStore().Save(fromCli);
+
+        // GUI が更新を知らせて記録を書いても、保存先は巻き戻らない。
+        store.SaveNotifiedVersion("0.0.10-test1");
+
+        var loaded = CreateStore().Load();
+        Assert.Equal(@"D:\new", loaded.CloudFolderPath);
+        Assert.Equal(UpdateChannel.Test, loaded.Update.Channel);
+        Assert.Equal("0.0.10-test1", loaded.Update.NotifiedVersion);
+    }
+
     [Fact(DisplayName = "チャンネルは stable / test の文字列で書かれる")]
     public void ChannelIsSerializedAsString()
     {

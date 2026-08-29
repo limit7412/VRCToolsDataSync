@@ -27,6 +27,11 @@ public sealed class SyncRunner
     public void SaveSettings(SyncSettings settings) => _store.Save(settings);
 
     /// <summary>
+    /// 通知済みの版の記録だけを書く (issue #45)。他の設定には触れない。
+    /// </summary>
+    public void SaveNotifiedVersion(string tag) => _store.SaveNotifiedVersion(tag);
+
+    /// <summary>
     /// 設定から同期先を組み立てる。設定が足りない場合は
     /// <see cref="SyncStorageConfigurationException"/> を投げる。
     /// </summary>
