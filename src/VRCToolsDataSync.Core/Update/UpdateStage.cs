@@ -592,8 +592,16 @@ public sealed class UpdateStage
     /// </summary>
     private static string? ExtractionKeyOf(string fullName)
     {
+        var normalized = fullName.Replace('\\', '/');
+
+        // 先頭が区切りのもの (/payload.dll) と、ドライブの付いたもの
+        // (C:/payload.dll) は展開先の外を指す。段に分ける前に断る。区切りは
+        // 空の段として落ちてしまい、後の解決では相対のものと見分けられない。
+        if (normalized.StartsWith('/')) return null;
+        if (normalized.Length >= 2 && normalized[1] == ':') return null;
+
         var resolved = new List<string>();
-        foreach (var segment in fullName.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
             if (segment == ".") continue;
             if (segment == "..")

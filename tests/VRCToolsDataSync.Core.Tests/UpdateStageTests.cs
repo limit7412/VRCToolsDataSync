@@ -383,6 +383,26 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
 
+    [Theory(DisplayName = "根から始まる項目のある ZIP は断る")]
+    [InlineData("/payload.dll")]
+    [InlineData("\\payload.dll")]
+    [InlineData("C:/payload.dll")]
+    public void RefusesArchiveWithRootedEntries(string entryName)
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 展開先の外を指すが、段に分けると先頭の区切りが落ちて相対のものと
+        // 見分けられなくなる。分ける前に断る。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry(entryName);
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
     [Fact(DisplayName = "存在の判定は、無いと分かった場合だけ false にする")]
     public void PresenceIsUnknownWhenItCannotBeDetermined()
     {
