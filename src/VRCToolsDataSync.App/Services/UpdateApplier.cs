@@ -273,6 +273,21 @@ public static class UpdateApplier
     private static ApplyLock? _heldUntilExit;
 
     /// <summary>
+    /// 終了まで握るはずだったロックを手放す。終了が取り消された経路から呼ぶ。
+    /// <para>
+    /// 「再起動して適用」の終了シーケンスは、必ずプロセスの終了に至るとは
+    /// 限らない (ログオフの取り消しや、先に始まっていた終了処理との重なり)。
+    /// 生き残ったまま握り続けると、この後の昇格も、起こしたヘルパの適用も
+    /// 止まったままになる。
+    /// </para>
+    /// </summary>
+    public static void ReleaseHeldApplyLock()
+    {
+        var held = Interlocked.Exchange(ref _heldUntilExit, null);
+        held?.Dispose();
+    }
+
+    /// <summary>
     /// ログの失敗を流れから切り離す。
     /// <para>
     /// ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、

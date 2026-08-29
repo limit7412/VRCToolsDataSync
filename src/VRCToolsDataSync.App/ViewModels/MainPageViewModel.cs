@@ -690,6 +690,14 @@ public partial class MainPageViewModel : ObservableObject
         AppendLog("更新を適用するため再起動します...");
         // Tray「同期して終了」と同じ経路で閉じる。終了時 Push もそのまま流れる。
         await App.ExitApplicationAsync(waitForToolsToExit: null);
+
+        // ここへ戻ってきたのは、終了に至らなかった場合だけである (ログオフの
+        // 取り消しや、先に始まっていた終了処理との重なり)。適用のロックは
+        // プロセスの終了で手放す約束で握ったままなので、明示的に返す。
+        // 持ち続けると、この後の取得の昇格も、起こしたヘルパの適用も止まる。
+        UpdateApplier.ReleaseHeldApplyLock();
+        AppendLog("終了が取り消されたため、更新は次回起動時に適用されます。");
+        RefreshStagedRow();
     }
 
     /// <summary>
