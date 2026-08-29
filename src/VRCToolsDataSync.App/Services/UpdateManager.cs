@@ -120,7 +120,23 @@ public sealed class UpdateManager : IDisposable
         try
         {
             var result = await _checker.CheckAsync(CurrentVersion, channel, cancellationToken).ConfigureAwait(false);
-            if (!manual) result = _checker.SuppressNotified(result);
+            if (!manual)
+            {
+                result = _checker.SuppressNotified(result);
+
+                // 確認の最中に「自動で確認」を切られていたら、この結果は流さない。
+                // 開始前の判定だけだと、切った後にバルーンが出て、その版が
+                // 通知済みとして記録されてしまう。読めない場合も流さない側に倒す。
+                try
+                {
+                    if (!_runner.LoadSettings().Update.CheckEnabled) return null;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "更新確認の設定を読み直せなかった");
+                    return null;
+                }
+            }
 
             try
             {
