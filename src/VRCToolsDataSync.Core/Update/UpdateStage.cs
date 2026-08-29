@@ -442,13 +442,57 @@ public sealed class UpdateStage
     /// </summary>
     public void DiscardIncomplete()
     {
-        var zip = File.Exists(ZipPath);
-        var metadata = File.Exists(MetadataPath);
+        var zip = Present(ZipPath);
+        var metadata = Present(MetadataPath);
+
+        // 分からないもの (掴まれている等) がある間は触らない。片方が読めない
+        // だけの状態を「無い」と取り違えて、そろっている対を崩すことになる。
+        if (zip is null || metadata is null) return;
         if (zip == metadata) return;
 
         _logger.LogInformation("途中で終わった取得を片付ける: {Path}", ZipPath);
         Discard();
     }
+
+    /// <summary>
+    /// ファイルがあるか。分からない場合は null を返す。
+    /// <para>
+    /// <see cref="File.Exists(string)"/> は、権限や I/O の失敗も「無い」として
+    /// 返す。取得の対を扱う場面ではそれが困る。読めないだけのものを「無い」と
+    /// 見なすと、そろっている対を崩したり、残っている対を消せたことにしたり
+    /// する。開いてみて、無いと分かった場合だけ false にする。
+    /// </para>
+    /// </summary>
+    public static bool? Present(string path)
+    {
+        try
+        {
+            using var _ = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 置き換え待ちの対が残っているか。分からない場合は残っている側に倒す。
+    /// <para>
+    /// 破棄の後に「次の起動が同じ適用へ入らないか」を判断するために使う。
+    /// 読めないだけのものを「消えた」と取り違えると、開いては閉じるのを
+    /// 繰り返す経路へ戻ってしまう。
+    /// </para>
+    /// </summary>
+    public bool StagedPairRemains() => Present(ZipPath) != false || Present(MetadataPath) != false;
 
     /// <summary>
     /// ZIP を展開して、更新ヘルパが使う一式を作る。展開先は毎回作り直す。
@@ -489,9 +533,20 @@ public sealed class UpdateStage
         var total = 0L;
         foreach (var entry in archive.Entries)
         {
-            // ディレクトリの項目は名前が空になる。重なっても害が無い。
-            if (string.IsNullOrEmpty(entry.Name)) continue;
             var key = ExtractionKeyOf(entry.FullName);
+
+            // ディレクトリの項目は名前が空になる。同じ場所に重なっても害が
+            // 無いので、突き合わせの対象からは外す。ただし展開先の外を指す
+            // かどうかは、ディレクトリの項目でも見る。
+            if (string.IsNullOrEmpty(entry.Name))
+            {
+                if (key is null)
+                {
+                    throw new InvalidDataException($"展開先の外を指す項目のある ZIP は展開できない: {entry.FullName}");
+                }
+                continue;
+            }
+
             if (key is null)
             {
                 // 展開先の外を指す項目。ExtractToDirectory も断るが、そちらの

@@ -365,4 +365,36 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
+
+    [Fact(DisplayName = "展開先の外を指すディレクトリの項目も断る")]
+    public void RefusesArchiveWithDirectoryEntriesOutsideTheExtractionRoot()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // ディレクトリの項目は名前が空なので、突き合わせの対象からは外れる。
+        // それでも展開先の外を指すかどうかは見る必要がある。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("../elsewhere/");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
+    [Fact(DisplayName = "存在の判定は、無いと分かった場合だけ false にする")]
+    public void PresenceIsUnknownWhenItCannotBeDetermined()
+    {
+        var stage = StageWith("0.0.10");
+
+        Assert.True(UpdateStage.Present(stage.ZipPath));
+        Assert.True(stage.StagedPairRemains());
+
+        Assert.False(UpdateStage.Present(Path.Combine(_directory, "no-such-file")));
+
+        // 対が無くなって初めて「残っていない」になる。
+        stage.Discard();
+        Assert.False(stage.StagedPairRemains());
+    }
 }

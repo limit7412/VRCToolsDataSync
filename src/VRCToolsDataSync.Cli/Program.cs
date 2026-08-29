@@ -770,7 +770,11 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
             // 開き直してよいのは「次の起動が同じ適用へ入らない」と言い切れる
             // ときである。両方消せた場合だけでなく、片方だけ消せた場合もそう
             // である。照合は対がそろっていなければ何も返さない。
-            applicable = stage.TryLoadMetadata() is not null;
+            //
+            // 判定には記録の読み出しではなく、ファイルが残っているかを使う。
+            // 読めないだけのものを「消えた」と取り違えると、次の起動がまた
+            // 同じ適用へ入り、開いては閉じるのを繰り返す。
+            applicable = stage.StagedPairRemains();
         }
         catch (Exception discard)
         {
