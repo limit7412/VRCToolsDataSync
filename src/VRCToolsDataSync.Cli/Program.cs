@@ -604,13 +604,15 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     // ロックを別の待ち手が先に取る。取った相手が展開先を作り直せば、こちらの
     // 展開元 (--source) が壊れる。
     //
-    // 上限は呼び出し元の終了待ち (10 分) に合わせて広く取る。呼び出し元は
-    // 終了時に同期を流すことがあり、その間はロックを握ったままである。
+    // 上限は呼び出し元の終了待ちに合わせて広く取る。呼び出し元は終了時に
+    // 同期を流すことがあり、その間はロックを握ったままである。
     using var applyMutex = UpdateStage.CreateApplyMutex(target);
     var applyMutexHeld = false;
     try
     {
-        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(11));
+        // 上限は WaitForCaller と同じ長さにする。呼び出し元が終了時 Push を
+        // 流している間、ロックはそちらが握ったままである。
+        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(65));
     }
     catch (AbandonedMutexException)
     {
@@ -646,20 +648,29 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 /// その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
 /// 失敗するだけである。待ちきれなければ、壊す前にここで止める。
 /// <para>
-/// 終了時の同期は大きな DB や遅い保存先で数分かかりうるため、余裕を持って
-/// 10 分まで待つ。それでも待ちきれなかった場合は取得済みの更新を残したまま
-/// 引き下がる。App が生きていれば次の起動が、終了が遅れただけならその次の
-/// 起動が、同じ更新を適用し直す。
+/// 上限は終了時 Push の実際の上限に合わせる。保存先ごとの待ちは既定で 30 分
+/// (<c>S3StorageOptions.Timeout</c> / <c>TimeoutSeconds</c>) で、ツールの数だけ
+/// 直列に続く。短く切ると、Push を終えた App がそのまま終了する一方でヘルパは
+/// もう居らず、置き換えも起動し直しも行われないまま画面だけが閉じる。
+/// </para>
+/// <para>
+/// それでも待ちきれなかった場合は取得済みの更新を残したまま引き下がる。App が
+/// 生きていれば次の起動が、終了が遅れただけならその次の起動が、同じ更新を
+/// 適用し直す。
 /// </para>
 /// </summary>
 static bool WaitForCaller(int? waitPid, ILogger logger)
 {
+    // 終了時 Push は保存先ごとに既定 30 分で、同期しているツールの数だけ続く。
+    // 2 ツールぶんに少し余裕を足す。
+    const int timeoutMilliseconds = 65 * 60 * 1000;
+
     if (waitPid is not { } pid) return true;
 
     try
     {
         using var process = System.Diagnostics.Process.GetProcessById(pid);
-        if (process.WaitForExit(600_000)) return true;
+        if (process.WaitForExit(timeoutMilliseconds)) return true;
 
         Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
         try { logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid); } catch { /* best-effort */ }

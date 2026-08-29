@@ -155,8 +155,14 @@ public static class UpdateApplier
         => ApplyLock.TryAcquire(UpdaterWaitTimeout, logger);
 
     /// <summary>
-    /// ヘルパの完了を待つ上限。ヘルパは元の App の終了を最大 10 分待つため、
-    /// それを見込んだ長さにする。
+    /// ヘルパの完了を待つ上限。
+    /// <para>
+    /// ヘルパ側の待ち (呼び出し元の終了を待つ上限) より短くしてある。あちらは
+    /// 終了時 Push の実際の上限に合わせて 1 時間を越えるが、こちらで同じだけ
+    /// 待つと、ヘルパが固まったときに App を開けない時間がそのまま延びる。
+    /// 待ちきれない場合は更新に触らずに起動を続けるので、失うのは今回の適用の
+    /// 機会だけである。
+    /// </para>
     /// </summary>
     private static readonly TimeSpan UpdaterWaitTimeout = TimeSpan.FromMinutes(11);
 

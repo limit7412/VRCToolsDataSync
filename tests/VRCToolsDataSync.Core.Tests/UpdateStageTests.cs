@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Security.Cryptography;
 using VRCToolsDataSync.Core.Update;
 using Xunit;
@@ -290,5 +291,25 @@ public sealed class UpdateStageTests : IDisposable
         {
             held.ReleaseMutex();
         }
+    }
+
+
+    [Fact(DisplayName = "同じパスの項目を持つ ZIP は展開せずに断る")]
+    public void RefusesArchiveWithDuplicateEntries()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 書式としては正しく digest も通るが、上書きしない展開は 2 つ目で
+        // 落ちる。容量不足などと区別できるよう、配布物そのものの問題として
+        // 投げ分ける。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/VRCToolsDataSync.App.exe");
+            archive.CreateEntry("app/VRCToolsDataSync.App.exe");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
 }

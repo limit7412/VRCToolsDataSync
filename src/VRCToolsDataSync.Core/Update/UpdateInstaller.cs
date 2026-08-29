@@ -102,11 +102,28 @@ public class UpdateInstaller
 
         // (1) 重い複製を先に済ませる。ここまでは正規の位置に触らないので、
         //     何度失敗してもやり直せる。
-        foreach (var part in Parts)
+        //
+        //     途中で失敗したら、作りかけを消してから投げる。残すと、インストール
+        //     先に数百 MB の残骸が居座る。容量不足で失敗した場合は特に、その
+        //     残骸が次の取得まで妨げる。
+        try
         {
-            var fresh = Path.Combine(_targetDirectory, part + ".new");
-            DeleteDirectoryIfExists(fresh);
-            CopyDirectory(Path.Combine(_sourceDirectory, part), fresh);
+            foreach (var part in Parts)
+            {
+                var fresh = Path.Combine(_targetDirectory, part + ".new");
+                DeleteDirectoryIfExists(fresh);
+                CopyDirectory(Path.Combine(_sourceDirectory, part), fresh);
+            }
+        }
+        catch
+        {
+            foreach (var part in Parts)
+            {
+                LogQuietly(() => _logger.LogInformation("複製に失敗したため作りかけを消す: {Part}.new", part));
+                try { DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".new")); }
+                catch { /* best-effort */ }
+            }
+            throw;
         }
 
         // (2) 前回の置き換えが残した .old を先に除去する。残したまま進むと

@@ -389,9 +389,35 @@ public sealed class UpdateStage
     /// </summary>
     public string ExtractForApply()
     {
+        EnsureExtractable();
         DeleteDirectoryQuietly(ExtractDirectory);
         System.IO.Compression.ZipFile.ExtractToDirectory(ZipPath, ExtractDirectory);
         return ExtractDirectory;
+    }
+
+    /// <summary>
+    /// 展開が決まって失敗する形でないかを先に見る。
+    /// <para>
+    /// 同じパスの項目を 2 つ以上持つ ZIP は、書式としては正しく digest も通るが、
+    /// 上書きしない <c>ExtractToDirectory</c> は 2 つ目で <see cref="IOException"/> を
+    /// 投げる。展開の途中で落ちると、その例外が容量不足などと区別できない。
+    /// 配布物そのものの問題として <see cref="InvalidDataException"/> にそろえ、
+    /// 呼び出し側が取得ごと捨てられるようにする。
+    /// </para>
+    /// </summary>
+    private void EnsureExtractable()
+    {
+        using var archive = System.IO.Compression.ZipFile.OpenRead(ZipPath);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in archive.Entries)
+        {
+            // ディレクトリの項目は名前が空になる。重なっても害が無い。
+            if (string.IsNullOrEmpty(entry.Name)) continue;
+            if (!seen.Add(entry.FullName))
+            {
+                throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
+            }
+        }
     }
 
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>
