@@ -114,8 +114,10 @@ public sealed class GitHubReleaseFetchTests
     public async Task KeepsFirstPageWhenLaterPageFails()
     {
         var full = "[" + string.Join(",", Enumerable.Range(1, 100).Select(i => ReleaseJson($"1.0.{i}"))) + "]";
+        // 一覧の URL は per_page も持つため、末尾で見る (Contains だと
+        // "per_page=100" が "page=1" を含んでしまい、全ページが成功扱いになる)。
         var handler = new StubHandler(url =>
-            url.Contains("page=1", StringComparison.Ordinal)
+            url.EndsWith("&page=1", StringComparison.Ordinal)
                 ? Json(full)
                 : new HttpResponseMessage(HttpStatusCode.Forbidden));
         using var repository = new GitHubReleaseRepository("asset.zip", BaseUrl, handler);

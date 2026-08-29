@@ -344,13 +344,16 @@ public partial class MainPageViewModel : ObservableObject
         // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
         // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
         RefreshUpdateBanner();
-        var channel = _settings.Update.Channel;
+        // ApplyUpdatePropertiesToSettings が必ず入れているが、JSON から明示的な
+        // null が入りうる型なので、読む側では既定へ落として扱う。
+        var update = _settings.Update ?? new UpdateSettings();
+        var channel = update.Channel;
         if (_updates is not null)
         {
             // 自動確認を戻したときは、確認済みでも確認し直す。止めていた間は
             // 定期の確認が走っておらず、残っている結果は古い。次の定期確認まで
             // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
-            var reEnabled = !checkWasEnabled && _settings.Update.CheckEnabled;
+            var reEnabled = !checkWasEnabled && update.CheckEnabled;
             if (reEnabled)
             {
                 UpdateStatus = "確認しています...";
