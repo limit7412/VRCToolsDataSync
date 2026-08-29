@@ -467,24 +467,34 @@ public static class UpdateApplier
         var expected = ReleaseVersion.Parse(expectedTag);
         if (expected is null) return true;
 
-        var appDirectory = Path.Combine(extracted, "app");
-        var embedded =
-            RunningVersion.OfFile(Path.Combine(appDirectory, UpdateInstaller.AppAssemblyName))
-            ?? RunningVersion.OfFile(Path.Combine(appDirectory, UpdateInstaller.AppExecutableName));
+        // app と cli の両方を見る。片方だけ差し替わった一式が公開されると、
+        // 新しい App と古い CLI が組み合わさって入る。しかも App の版はタグに
+        // 追いついているので、後始末が取得と退避を片付けてしまい、取り直しでは
+        // 直せなくなる。
+        return PartMatches(Path.Combine(extracted, "app"), UpdateInstaller.AppAssemblyName, UpdateInstaller.AppExecutableName)
+            && PartMatches(Path.Combine(extracted, "cli"), UpdateInstaller.CliAssemblyName, UpdateInstaller.CliExecutableName);
 
-        if (embedded is null)
+        bool PartMatches(string directory, string assemblyName, string executableName)
         {
+            var embedded =
+                RunningVersion.OfFile(Path.Combine(directory, assemblyName))
+                ?? RunningVersion.OfFile(Path.Combine(directory, executableName));
+
+            if (embedded is null)
+            {
+                LogQuietly(() => logger.LogWarning(
+                    "展開した {Directory} の版を読めなかったため、そのまま適用する: {Tag}", directory, expectedTag));
+                return true;
+            }
+
+            var actual = ReleaseVersion.Parse(embedded);
+            if (actual is not null && actual.CompareTo(expected) == 0) return true;
+
             LogQuietly(() => logger.LogWarning(
-                "展開した一式の版を読めなかったため、そのまま適用する: {Tag}", expectedTag));
-            return true;
+                "展開した {Directory} の版 ({Actual}) が記録のタグ ({Tag}) と合わないため捨てる",
+                directory, embedded, expectedTag));
+            return false;
         }
-
-        var actual = ReleaseVersion.Parse(embedded);
-        if (actual is not null && actual.CompareTo(expected) == 0) return true;
-
-        LogQuietly(() => logger.LogWarning(
-            "展開した一式の版 ({Actual}) が記録のタグ ({Tag}) と合わないため捨てる", embedded, expectedTag));
-        return false;
     }
 
     /// <summary>

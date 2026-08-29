@@ -429,11 +429,29 @@ public sealed class UpdateStage
         {
             // ディレクトリの項目は名前が空になる。重なっても害が無い。
             if (string.IsNullOrEmpty(entry.Name)) continue;
-            if (!seen.Add(entry.FullName))
+            if (!seen.Add(ExtractionKeyOf(entry.FullName)))
             {
                 throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
             }
         }
+    }
+
+    /// <summary>
+    /// 項目の名前を、実際に展開される先で見比べられる形へそろえる。
+    /// <para>
+    /// ZIP の区切りは "/" と決まっているが、"\" で書かれたものも出回る。
+    /// Windows ではどちらも区切りとして扱われるため、<c>app/foo.dll</c> と
+    /// <c>app\foo.dll</c> は同じ場所へ展開される。名前をそのまま見比べると
+    /// 別物として通ってしまう。"." の区切りも同じ理由で落とす。
+    /// </para>
+    /// </summary>
+    private static string ExtractionKeyOf(string fullName)
+    {
+        var segments = fullName
+            .Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Where(segment => segment != ".");
+        return string.Join('/', segments);
     }
 
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>

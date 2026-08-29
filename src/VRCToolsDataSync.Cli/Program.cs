@@ -648,10 +648,8 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 /// その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
 /// 失敗するだけである。待ちきれなければ、壊す前にここで止める。
 /// <para>
-/// 上限は終了時 Push の実際の上限に合わせる。保存先ごとの待ちは既定で 30 分
-/// (<c>S3StorageOptions.Timeout</c> / <c>TimeoutSeconds</c>) で、ツールの数だけ
-/// 直列に続く。短く切ると、Push を終えた App がそのまま終了する一方でヘルパは
-/// もう居らず、置き換えも起動し直しも行われないまま画面だけが閉じる。
+/// 上限は長めに取る。短く切ると、Push を終えた App がそのまま終了する一方で
+/// ヘルパはもう居らず、置き換えも起動し直しも行われないまま画面だけが閉じる。
 /// </para>
 /// <para>
 /// それでも待ちきれなかった場合は取得済みの更新を残したまま引き下がる。App が
@@ -661,8 +659,14 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 /// </summary>
 static bool WaitForCaller(int? waitPid, ILogger logger)
 {
-    // 終了時 Push は保存先ごとに既定 30 分で、同期しているツールの数だけ続く。
-    // 2 ツールぶんに少し余裕を足す。
+    // 終了時 Push の合計に上限は無い。S3Client の 30 分は操作ごとの上限で、
+    // manifest の取得・オブジェクトの送信・manifest の保存が直列に続き、それが
+    // ツールの数だけ繰り返される。だからここは「Push の上限」ではなく、
+    // 「適用のロックを握ったまま待ち続けてよい長さ」として決めている。
+    //
+    // 待ちきれずに降りても失うものは少ない。取得は残るので、App が終わった後の
+    // 起動が適用し直す。逆に待ち続けると、固まった App の裏でヘルパがロックを
+    // 握ったままになり、以後の取得の昇格も適用も止まる。
     const int timeoutMilliseconds = 65 * 60 * 1000;
 
     if (waitPid is not { } pid) return true;

@@ -312,4 +312,23 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
+
+    [Fact(DisplayName = "区切りの書き方だけが違う項目も同じ場所として断る")]
+    public void RefusesArchiveWithEntriesThatCollideAfterNormalisation()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // ZIP の区切りは "/" と決まっているが "\" で書かれたものも出回る。
+        // Windows ではどちらも区切りなので、展開先は同じになる。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/VRCToolsDataSync.App.exe");
+            archive.CreateEntry("app\\VRCToolsDataSync.App.exe");
+            archive.CreateEntry("./cli/VRCToolsDataSync.Cli.exe");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
 }
