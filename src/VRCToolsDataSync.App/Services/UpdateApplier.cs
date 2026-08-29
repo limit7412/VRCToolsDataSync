@@ -327,7 +327,7 @@ public static class UpdateApplier
         // 終わる。それを見ずに App を終わらせると、置き換えも起動し直しも
         // されないまま画面が消え、次の起動も同じところで終わる。
         //
-        // ヘルパは最初に呼び出し元の終了を待つので、無事なら生きたままである。
+        // ヘルパは最初にこちらが握っているロックを待つので、無事なら生きたままである。
         using var process = Process.Start(startInfo);
         if (process is null || process.WaitForExit(StartupProbeMilliseconds))
         {
@@ -343,7 +343,7 @@ public static class UpdateApplier
 
     /// <summary>
     /// 起こしたヘルパが立ち上がったと見なすまでの猶予。ヘルパは最初に
-    /// 呼び出し元の終了を待つので、これを越えて生きていれば動いている。
+    /// こちらが握っているロックを待つので、これを越えて生きていれば動いている。
     /// </summary>
     private const int StartupProbeMilliseconds = 3000;
 

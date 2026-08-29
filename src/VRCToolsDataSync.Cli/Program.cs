@@ -593,27 +593,24 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     });
     var logger = loggerFactory.CreateLogger("SelfUpdate");
 
-    // 呼び出し元の終了を先に待ち、ロックはその後で取る。
-    //
-    // 呼び出し元はロックを握ったまま終わる。手放してから終わると、その隙に
-    // 別の待ち手 (裏で走っている取得の昇格) が先に握り、こちらの展開元
-    // (--source) を消しうる。握ったまま終われば所有権は OS がこちらへ渡す
-    // (放棄された mutex として受け取る)。先にロックを待つ順序では、こちらの
-    // 待ちが呼び出し元の終了より先に尽きてしまう。
-    if (!WaitForCaller(waitPid, logger)) return 6;
-
     // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
     // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま
     // こちらのリネームとぶつかったりする。App は起動の先頭でこれを待つ。
     // 名前はインストール先ごとに分かれている。ヘルパ自身の居場所 (展開先) では
     // なく、置き換える対象から引く。
+    //
+    // 待ちに入るのは、呼び出し元の終了を待つより先である。呼び出し元はロックを
+    // 握ったまま終わるので、その時点でこちらが待ち行列に居ないと、放棄された
+    // ロックを別の待ち手が先に取る。取った相手が展開先を作り直せば、こちらの
+    // 展開元 (--source) が壊れる。
+    //
+    // 上限は呼び出し元の終了待ち (10 分) に合わせて広く取る。呼び出し元は
+    // 終了時に同期を流すことがあり、その間はロックを握ったままである。
     using var applyMutex = UpdateStage.CreateApplyMutex(target);
     var applyMutexHeld = false;
     try
     {
-        // 呼び出し元は終わっているので、待つとしたら別のヘルパが動いている
-        // ときだけである。
-        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromSeconds(60));
+        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(11));
     }
     catch (AbandonedMutexException)
     {
@@ -631,6 +628,11 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 
     try
     {
+        // ロックを握ってから、呼び出し元が本当に終わったかを確かめる。普通は
+        // ロックが渡った時点で終わっているが、放棄によらず (呼び出し元がロックを
+        // 取れないまま起動を続けた場合など) 渡ってくることもある。
+        if (!WaitForCaller(waitPid, logger)) return 6;
+
         return ApplySelfUpdateCore(source, target, relaunch, logger);
     }
     finally
