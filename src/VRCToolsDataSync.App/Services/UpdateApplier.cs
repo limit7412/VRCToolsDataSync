@@ -33,53 +33,55 @@ public static class UpdateApplier
     {
         var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
 
-        // 適用に関わる間はクロスプロセスのロックを握る。ヘルパが動いている間は
-        // ここで待たされ、こちらが展開している間はヘルパの側が待つ。握ったまま
-        // 展開とヘルパの起動まで済ませるのは、その間に別の App が起動して同じ
-        // 展開先を作り直すと、動いているヘルパの足元を崩すためである。
-        using var applyLock = AcquireApplyLock(logger);
-
-        // 取れなかった場合は更新に触らない。触れば、ロックが防ぐはずの競合
-        // (動いているヘルパの展開元を作り直す等) がそのまま起きる。起動は続ける。
-        // 取得しておいたものは残るので、次の起動が適用し直す。
-        if (applyLock is null) return false;
-
         try
         {
-            var stage = new UpdateStage(logger: logger);
-            var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
-
-            // ここでは何も捨てない (discardMismatches: false)。この時点は置き換え
-            // 直後の最初の起動かもしれず、退避した .old と取得済みの ZIP は、
-            // この後の初期化が失敗した場合の復旧の材料になる。後始末は起動が
-            // 成り立った後に CleanUpAfterSuccessfulStart が行う。
-            var channel = LoadChannel(logger);
-            var staged = stage.TryLoadVerified(channel, RunningVersion.Current(), discardMismatches: false);
-            if (staged is null) return false;
-
-            if (root is null)
+            // 適用に関わる間はクロスプロセスのロックを握る。ヘルパが動いている
+            // 間はここで待たされ、こちらが展開している間はヘルパの側が待つ。
+            // 握ったまま展開とヘルパの起動まで済ませるのは、その間に別の App が
+            // 起動して同じ展開先を作り直すと、動いているヘルパの足元を崩すため。
+            //
+            // 取れなかった場合は更新に触らない。触れば、ロックが防ぐはずの競合が
+            // そのまま起きる。起動は続ける。取得しておいたものは残るので、次の
+            // 起動が適用し直す。
+            var handed = false;
+            _ = TryWithApplyLock(logger, () =>
             {
-                // dotnet run や bin\ 配下の手元ビルド。作業ツリーを置き換える
-                // わけにはいかないので、取得したものは残したまま適用しない。
-                LogQuietly(() => logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag));
-                return false;
-            }
+                var stage = new UpdateStage(logger: logger);
+                var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
 
-            if (!TrySpawnUpdater(stage, root, logger)) return false;
+                // ここでは何も捨てない (discardMismatches: false)。この時点は
+                // 置き換え直後の最初の起動かもしれず、退避した .old と取得済みの
+                // ZIP は、この後の初期化が失敗した場合の復旧の材料になる。
+                // 後始末は起動が成り立った後に CleanUpAfterSuccessfulStart が行う。
+                var channel = LoadChannel(logger);
+                var staged = stage.TryLoadVerified(channel, RunningVersion.Current(), discardMismatches: false);
+                if (staged is null) return false;
 
-            LogQuietly(() => logger.LogInformation("更新 {Tag} の適用をヘルパへ渡して終了する", staged.Tag));
-            return true;
+                if (root is null)
+                {
+                    // dotnet run や bin\ 配下の手元ビルド。作業ツリーを置き換える
+                    // わけにはいかないので、取得したものは残したまま適用しない。
+                    LogQuietly(() => logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag));
+                    return false;
+                }
+
+                if (!TrySpawnUpdater(stage, root, logger)) return false;
+
+                LogQuietly(() => logger.LogInformation("更新 {Tag} の適用をヘルパへ渡して終了する", staged.Tag));
+                handed = true;
+
+                // ロックは手放さない。このプロセスの終了で、待っているヘルパへ
+                // 渡る。
+                return true;
+            });
+
+            return handed;
         }
         catch (Exception ex)
         {
             // 適用に入れなくても、今の版のまま起動は続けられる。
             LogQuietly(() => logger.LogWarning(ex, "取得済みの更新の適用に入れなかった"));
             return false;
-        }
-        finally
-        {
-            // ヘルパは起動直後にこのロックを待つ。ここで手放して先へ進ませる。
-            applyLock.Release();
         }
     }
 
@@ -124,6 +126,9 @@ public static class UpdateApplier
                 {
                     DeleteDirectoryQuietly(stage.ExtractDirectory, logger);
                 }
+
+                // 後始末はここで終わり。ロックは手放す。
+                return false;
             });
 
             if (!done)
@@ -221,22 +226,51 @@ public static class UpdateApplier
     /// 取れないまま行っては、ロックを置いた意味が無い。見送っても行き詰まりは
     /// しない。昇格なら次の確認が取得からやり直し、後始末なら次の起動が拾う。
     /// </para>
+    /// <para>
+    /// <paramref name="action"/> が true を返した場合はロックを手放さない。
+    /// ヘルパを起こした後の話で、ここで手放すと、こちらが終わるまでの間に
+    /// 別の待ち手 (裏で走っている取得の昇格) が先に握りうる。昇格は展開先を
+    /// 消すため、起こしたばかりのヘルパの <c>--source</c> が欠ける。握ったまま
+    /// 終われば、所有権は OS がヘルパへ渡す (ヘルパは放棄された mutex を
+    /// 取得済みとして扱う)。
+    /// </para>
     /// </summary>
-    public static bool TryWithApplyLock(ILogger logger, Action action)
+    /// <param name="action">
+    /// ロックの下で行うこと。ロックをこのプロセスの終了まで握り続けるなら
+    /// true を返す。
+    /// </param>
+    /// <returns>ロックを取れて <paramref name="action"/> を行えたか。</returns>
+    public static bool TryWithApplyLock(ILogger logger, Func<bool> action)
     {
-        using var applyLock = AcquireApplyLock(logger);
+        var applyLock = AcquireApplyLock(logger);
         if (applyLock is null) return false;
 
+        var keep = false;
         try
         {
-            action();
+            keep = action();
             return true;
         }
         finally
         {
-            applyLock.Release();
+            if (keep)
+            {
+                // 掴んだままにする。参照を手放すと、GC が Mutex を片付けた
+                // 拍子に所有権まで落ちる。
+                _heldUntilExit = applyLock;
+            }
+            else
+            {
+                applyLock.Dispose();
+            }
         }
     }
+
+    /// <summary>
+    /// プロセスの終了まで握り続けるロック。ここで参照を持つのは、GC に
+    /// 片付けさせないためだけである。
+    /// </summary>
+    private static ApplyLock? _heldUntilExit;
 
     /// <summary>
     /// ログの失敗を流れから切り離す。
@@ -288,9 +322,30 @@ public static class UpdateApplier
         startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
         startInfo.ArgumentList.Add("--relaunch");
 
-        Process.Start(startInfo);
+        // 起こしたヘルパがすぐ落ちていないか見る。exe があっても、自己完結の
+        // ランタイムを欠いた一式なら、プロセスの生成だけ成功して引数を読む前に
+        // 終わる。それを見ずに App を終わらせると、置き換えも起動し直しも
+        // されないまま画面が消え、次の起動も同じところで終わる。
+        //
+        // ヘルパは最初に呼び出し元の終了を待つので、無事なら生きたままである。
+        using var process = Process.Start(startInfo);
+        if (process is null || process.WaitForExit(StartupProbeMilliseconds))
+        {
+            LogQuietly(() => logger.LogWarning(
+                "更新ヘルパが起動直後に終了したため取得を捨てる (終了コード {Code})",
+                process?.ExitCode));
+            stage.Discard();
+            return false;
+        }
+
         return true;
     }
+
+    /// <summary>
+    /// 起こしたヘルパが立ち上がったと見なすまでの猶予。ヘルパは最初に
+    /// 呼び出し元の終了を待つので、これを越えて生きていれば動いている。
+    /// </summary>
+    private const int StartupProbeMilliseconds = 3000;
 
     private static UpdateChannel LoadChannel(ILogger logger)
     {

@@ -593,6 +593,15 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     });
     var logger = loggerFactory.CreateLogger("SelfUpdate");
 
+    // 呼び出し元の終了を先に待ち、ロックはその後で取る。
+    //
+    // 呼び出し元はロックを握ったまま終わる。手放してから終わると、その隙に
+    // 別の待ち手 (裏で走っている取得の昇格) が先に握り、こちらの展開元
+    // (--source) を消しうる。握ったまま終われば所有権は OS がこちらへ渡す
+    // (放棄された mutex として受け取る)。先にロックを待つ順序では、こちらの
+    // 待ちが呼び出し元の終了より先に尽きてしまう。
+    if (!WaitForCaller(waitPid, logger)) return 6;
+
     // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
     // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま
     // こちらのリネームとぶつかったりする。App は起動の先頭でこれを待つ。
@@ -602,11 +611,14 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     var applyMutexHeld = false;
     try
     {
-        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromSeconds(30));
+        // 呼び出し元は終わっているので、待つとしたら別のヘルパが動いている
+        // ときだけである。
+        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromSeconds(60));
     }
     catch (AbandonedMutexException)
     {
-        // 前のヘルパが握ったまま落ちた。所有権はこちらに渡っている。
+        // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
+        // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
         applyMutexHeld = true;
     }
     if (!applyMutexHeld)
@@ -619,7 +631,7 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 
     try
     {
-        return ApplySelfUpdateCore(source, target, waitPid, relaunch, logger);
+        return ApplySelfUpdateCore(source, target, relaunch, logger);
     }
     finally
     {
@@ -627,7 +639,38 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     }
 }
 
-static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool relaunch, ILogger logger)
+/// <summary>
+/// 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
+/// その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
+/// 失敗するだけである。待ちきれなければ、壊す前にここで止める。
+/// <para>
+/// 終了時の同期は大きな DB や遅い保存先で数分かかりうるため、余裕を持って
+/// 10 分まで待つ。それでも待ちきれなかった場合は取得済みの更新を残したまま
+/// 引き下がる。App が生きていれば次の起動が、終了が遅れただけならその次の
+/// 起動が、同じ更新を適用し直す。
+/// </para>
+/// </summary>
+static bool WaitForCaller(int? waitPid, ILogger logger)
+{
+    if (waitPid is not { } pid) return true;
+
+    try
+    {
+        using var process = System.Diagnostics.Process.GetProcessById(pid);
+        if (process.WaitForExit(600_000)) return true;
+
+        Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
+        try { logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid); } catch { /* best-effort */ }
+        return false;
+    }
+    catch (ArgumentException)
+    {
+        // 既に終了している。そのまま進む。
+        return true;
+    }
+}
+
+static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILogger logger)
 {
     // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
     // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
@@ -637,32 +680,6 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
     void Log(Action write)
     {
         try { write(); } catch { /* best-effort */ }
-    }
-
-    // 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
-    // その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
-    // 失敗するだけである。待ちきれなければ、壊す前にここで止める。
-    //
-    // 終了時の同期は大きな DB や遅い保存先で数分かかりうるため、余裕を持って
-    // 10 分まで待つ。それでも待ちきれなかった場合は取得済みの更新を残したまま
-    // 引き下がる。App が生きていれば次の起動が、終了が遅れただけなら
-    // その次の起動が、同じ更新を適用し直す。
-    if (waitPid is { } pid)
-    {
-        try
-        {
-            using var process = System.Diagnostics.Process.GetProcessById(pid);
-            if (!process.WaitForExit(600_000))
-            {
-                Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
-                Log(() => logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid));
-                return 6;
-            }
-        }
-        catch (ArgumentException)
-        {
-            // 既に終了している。そのまま進む。
-        }
     }
 
     try

@@ -302,7 +302,7 @@ public sealed class UpdateManager : IDisposable
             // 昇格は適用と同じロックの下で行う。staged の ZIP を入れ替えて展開先を
             // 消すため、適用の側と重なると、起動前のヘルパを消したり、動いている
             // ヘルパの展開元を欠いたりする。
-            if (!UpdateApplier.TryWithApplyLock(_logger, () => _stage.PromoteIncoming(release, asset)))
+            if (!UpdateApplier.TryWithApplyLock(_logger, () => { _stage.PromoteIncoming(release, asset); return false; }))
             {
                 // 適用が動いている。ロックを取れないまま昇格すると、動いている
                 // ヘルパの展開元を欠く。書きかけを片付けて見送り、次の確認で
@@ -357,17 +357,22 @@ public sealed class UpdateManager : IDisposable
                 if (staged is null)
                 {
                     stagedMissing = true;
-                    return;
+                    return false;
                 }
 
                 var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
                 if (root is null)
                 {
                     _logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag);
-                    return;
+                    return false;
                 }
 
                 spawned = UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
+
+                // ヘルパを起こせたらロックは手放さない。ここで手放すと、終了
+                // シーケンス (終了時 Push で数分かかりうる) の間に裏の取得が
+                // 昇格し、起こしたヘルパの展開元を消しうる。
+                return spawned;
             });
 
             if (!locked)
