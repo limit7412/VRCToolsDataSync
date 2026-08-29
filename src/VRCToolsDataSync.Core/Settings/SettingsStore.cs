@@ -132,6 +132,24 @@ public sealed class SettingsStore
     /// </summary>
     public void SaveToolStateOnly(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: true);
 
+    /// <summary>
+    /// 通知済みの版の記録だけを書く (issue #45)。
+    /// <para>
+    /// 更新を知らせた時点でこれを呼ぶ。通常の <see cref="Save"/> を使うと、
+    /// 常駐している間に別プロセス (CLI の storage など) が変えた保存先を、
+    /// こちらが起動時に読んだ古い値で巻き戻す。読み書きはクロスプロセスの
+    /// 排他の下で行われるため、読んでから書くまでの間に割り込まれない。
+    /// </para>
+    /// </summary>
+    public void SaveNotifiedVersion(string tag)
+    {
+        // 中身はディスク側を全面的に採用し、通知済みの版だけを載せる。
+        // 実際にどちらの版が残るかは MergeForSave が版の新しさで決める。
+        var settings = new SyncSettings();
+        settings.Update.NotifiedVersion = tag;
+        SaveInternal(settings, mergeTopLevelFromDisk: true);
+    }
+
     private void SaveInternal(SyncSettings settings, bool mergeTopLevelFromDisk)
     {
         var dir = Path.GetDirectoryName(FilePath);

@@ -100,9 +100,9 @@ public sealed class UpdateManager : IDisposable
         _checker.MarkNotified(release);
         try
         {
-            var settings = _runner.LoadSettings();
-            settings.Update.NotifiedVersion = _checker.NotifiedTag;
-            _runner.SaveSettings(settings);
+            // 記録だけを書く専用の経路を使う。通常の保存だと、常駐している間に
+            // 別プロセスが変えた保存先を、こちらが読んだ古い値で巻き戻す。
+            _runner.SaveNotifiedVersion(_checker.NotifiedTag);
         }
         catch (Exception ex)
         {
@@ -144,13 +144,24 @@ public sealed class UpdateManager : IDisposable
                 // 確認の最中に「自動で確認」を切られていたら、この結果は流さない。
                 // 開始前の判定だけだと、切った後にバルーンが出て、その版が
                 // 通知済みとして記録されてしまう。読めない場合も流さない側に倒す。
+                //
+                // 捨てるときは確認そのものも無かったことにする。確認済みのまま
+                // 残すと、自動確認を戻したときに「確認済み」と見なされて確認を
+                // 省き、捨てた候補が画面にだけ出て通知されない状態が次の定期確認
+                // まで続く。
+                bool enabled;
                 try
                 {
-                    if (!_runner.LoadSettings().Update.CheckEnabled) return null;
+                    enabled = _runner.LoadSettings().Update.CheckEnabled;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "更新確認の設定を読み直せなかった");
+                    enabled = false;
+                }
+                if (!enabled)
+                {
+                    _checker.InvalidateChecked();
                     return null;
                 }
             }

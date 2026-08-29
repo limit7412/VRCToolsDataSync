@@ -173,6 +173,22 @@ public sealed class UpdateCheckerTests
         Assert.False(checker.HasChecked(UpdateChannel.Stable));
     }
 
+    [Fact(DisplayName = "結果を捨てたら、確認そのものも無かったことにする")]
+    public async Task InvalidateClearsCheckedStateAndCandidate()
+    {
+        var repository = new FakeReleaseRepository();
+        repository.Releases.AddRange(new[] { Release("0.0.9"), Release("0.0.10") });
+        var checker = new UpdateChecker(repository);
+        await checker.CheckAsync("0.0.9", UpdateChannel.Stable);
+
+        checker.InvalidateChecked();
+
+        // 捨てた候補が残っていると、次の「まだ確認していなければ確認する」で
+        // 確認が省かれ、通知されないまま画面にだけ出る。
+        Assert.False(checker.HasChecked(UpdateChannel.Stable));
+        Assert.Null(checker.Available(UpdateChannel.Stable));
+    }
+
     [Fact(DisplayName = "知らせ済みの版は UpToDate へ倒す")]
     public async Task SuppressesAlreadyNotifiedRelease()
     {

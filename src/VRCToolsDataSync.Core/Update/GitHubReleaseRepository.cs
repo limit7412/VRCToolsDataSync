@@ -3,6 +3,8 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace VRCToolsDataSync.Core.Update;
 
@@ -51,16 +53,22 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
     private readonly HttpClient _httpClient;
     private readonly string _baseUrl;
     private readonly string _assetName;
+    private readonly ILogger _logger;
 
     /// <param name="assetName">
     /// 置き換えに使う配布物の名前 (<see cref="ReleaseAsset.NameForCurrentArchitecture"/>)。
     /// null なら配布物を拾わず、確認だけを行う。
     /// </param>
     /// <param name="baseUrl">テストから差し替えるための API の起点。</param>
-    public GitHubReleaseRepository(string? assetName, string? baseUrl = null, HttpMessageHandler? handler = null)
+    public GitHubReleaseRepository(
+        string? assetName,
+        string? baseUrl = null,
+        HttpMessageHandler? handler = null,
+        ILogger? logger = null)
     {
         _assetName = assetName ?? string.Empty;
         _baseUrl = (baseUrl ?? DefaultBaseUrl).TrimEnd('/');
+        _logger = logger ?? NullLogger.Instance;
         _httpClient = handler is null ? new HttpClient() : new HttpClient(handler);
         _httpClient.Timeout = RequestTimeout;
         // GitHub API は User-Agent の無い要求を拒む。
@@ -75,8 +83,31 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
     public async Task<ReleaseCatalog> FetchReleasesAsync(CancellationToken cancellationToken = default)
     {
         var (listed, complete) = await FetchAllAsync(cancellationToken).ConfigureAwait(false);
-        var latest = await FetchLatestStableAsync(cancellationToken).ConfigureAwait(false);
-        return new ReleaseCatalog(Merge(listed, latest), complete);
+
+        // 一覧を最後までたどれたなら、そこに全てのリリースが入っている。
+        // latest はその部分集合であり、確かめに行く必要が無い。
+        if (complete) return new ReleaseCatalog(listed, true);
+
+        // 一覧が上限で切れた場合だけ latest を見る。押し出された安定版を拾うためである。
+        // ここでの失敗は握る。一覧は取れており、集めきれていないことは
+        // complete=false が伝える。残りのレート枠が尽きただけで、
+        // 手元にある候補ごと「届かなかった」ことにするのは行き過ぎである。
+        IReadOnlyList<ReleaseInfo> latest;
+        try
+        {
+            latest = await FetchLatestStableAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "最新の安定版を取れなかった。一覧の範囲だけで判断する");
+            latest = Array.Empty<ReleaseInfo>();
+        }
+
+        return new ReleaseCatalog(Merge(listed, latest), false);
     }
 
     /// <summary>集めた候補と、最後まで取れたかを返す。</summary>
