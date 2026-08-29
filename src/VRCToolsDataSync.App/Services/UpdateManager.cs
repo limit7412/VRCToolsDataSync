@@ -35,9 +35,12 @@ public sealed class UpdateManager : IDisposable
 
     /// <summary>
     /// 確認が終わるたびに上がる。定期の確認では通知済みの抑止を通した後の結果になる。
+    /// 第 2 引数は確認に使ったチャンネル。確認中にチャンネルを変えて保存すると
+    /// 前のチャンネルの結果が遅れて届くため、受け側は保存済みのチャンネルと
+    /// 突き合わせてから画面や通知に載せる。
     /// ハンドラはバックグラウンドスレッドで呼ばれるので、UI 側でディスパッチする。
     /// </summary>
-    public event Action<UpdateCheckResult, bool>? CheckCompleted;
+    public event Action<UpdateCheckResult, UpdateChannel, bool>? CheckCompleted;
 
     public UpdateManager(SyncRunner runner, ILoggerFactory loggerFactory)
     {
@@ -121,7 +124,7 @@ public sealed class UpdateManager : IDisposable
 
             try
             {
-                CheckCompleted?.Invoke(result, manual);
+                CheckCompleted?.Invoke(result, channel, manual);
             }
             catch (Exception ex)
             {

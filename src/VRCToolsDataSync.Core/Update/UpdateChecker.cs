@@ -157,8 +157,11 @@ public sealed class UpdateChecker
         {
             catalog = await _repository.FetchReleasesAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // 通すのは呼び出し側の中止だけにする。HttpClient のタイムアウトも
+            // OperationCanceledException で届くため、型だけで再送出すると、
+            // 遅い回線の確認が Unreachable にならず例外として漏れる。
             throw;
         }
         catch (Exception ex)
