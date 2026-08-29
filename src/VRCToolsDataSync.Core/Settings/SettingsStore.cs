@@ -60,6 +60,9 @@ public sealed class SettingsStore
         {
             settings = new SyncSettings();
         }
+        // JSON に明示的な null が書かれていると、既定値の代わりに null が入る。
+        // 読んだ側が毎回それを気にせずに済むよう、ここで既定へ落としておく。
+        settings.Update ??= new UpdateSettings();
         MigrateToolStateKeys(settings);
         return settings;
     }
