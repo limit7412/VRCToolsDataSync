@@ -485,14 +485,16 @@ public sealed class UpdateStage
     }
 
     /// <summary>
-    /// 置き換え待ちの対が残っているか。分からない場合は残っている側に倒す。
+    /// 置き換え待ちの対が残っているか。
     /// <para>
     /// 破棄の後に「次の起動が同じ適用へ入らないか」を判断するために使う。
-    /// 読めないだけのものを「消えた」と取り違えると、開いては閉じるのを
-    /// 繰り返す経路へ戻ってしまう。
+    /// 適用へ進むのは対がそろっているときだけなので、片方でも無いと分かれば
+    /// 「残っていない」でよい。逆に、読めないだけのものを「消えた」と
+    /// 取り違えると、開いては閉じるのを繰り返す経路へ戻ってしまうので、
+    /// 分からない側は残っているものとして数える。
     /// </para>
     /// </summary>
-    public bool StagedPairRemains() => Present(ZipPath) != false || Present(MetadataPath) != false;
+    public bool StagedPairRemains() => Present(ZipPath) != false && Present(MetadataPath) != false;
 
     /// <summary>
     /// ZIP を展開して、更新ヘルパが使う一式を作る。展開先は毎回作り直す。

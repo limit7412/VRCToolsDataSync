@@ -413,7 +413,11 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.False(UpdateStage.Present(Path.Combine(_directory, "no-such-file")));
 
-        // 対が無くなって初めて「残っていない」になる。
+        // 片方が無いと分かれば「残っていない」。適用へ進むのは対がそろって
+        // いるときだけなので、そこで開き直してよい。
+        File.Delete(stage.MetadataPath);
+        Assert.False(stage.StagedPairRemains());
+
         stage.Discard();
         Assert.False(stage.StagedPairRemains());
     }
