@@ -83,6 +83,31 @@ public sealed class UpdateCheckerTests
         Assert.False(checker.HasChecked(UpdateChannel.Stable));
     }
 
+    [Fact(DisplayName = "HTTP のタイムアウトも Unreachable として扱う")]
+    public async Task TreatsHttpTimeoutAsUnreachable()
+    {
+        // HttpClient のタイムアウトは OperationCanceledException で届くが、
+        // 呼び出し側は中止していない。例外として漏らさず、届かなかったと伝える。
+        var repository = new FakeReleaseRepository { Failure = new TaskCanceledException("timeout") };
+        var checker = new UpdateChecker(repository);
+
+        var result = await checker.CheckAsync("0.0.9", UpdateChannel.Stable);
+
+        Assert.Equal(UpdateCheckOutcome.Unreachable, result.Outcome);
+    }
+
+    [Fact(DisplayName = "呼び出し側の中止はそのまま伝える")]
+    public async Task PropagatesCallerCancellation()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var repository = new FakeReleaseRepository { Failure = new OperationCanceledException(cts.Token) };
+        var checker = new UpdateChecker(repository);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => checker.CheckAsync("0.0.9", UpdateChannel.Stable, cts.Token));
+    }
+
     [Fact(DisplayName = "集めきれなかった一覧では最新だと言い切らない")]
     public async Task ReportsIncompleteWhenCatalogIsTruncated()
     {

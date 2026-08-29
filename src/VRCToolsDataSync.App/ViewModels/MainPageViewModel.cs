@@ -59,7 +59,8 @@ public partial class MainPageViewModel : ObservableObject
         if (_updates is not null)
         {
             // 確認も取得もバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
-            _updates.CheckCompleted += (result, manual) => OnUi(() => HandleUpdateCheckCompleted(result, manual));
+            _updates.CheckCompleted += (result, channel, manual) =>
+                OnUi(() => HandleUpdateCheckCompleted(result, channel, manual));
             _updates.StagedChanged += () => OnUi(RefreshStagedRow);
             RefreshStagedRow();
         }
@@ -547,9 +548,17 @@ public partial class MainPageViewModel : ObservableObject
     /// バルーンであって、画面からの導線ではない。
     /// </para>
     /// </summary>
-    private void HandleUpdateCheckCompleted(UpdateCheckResult result, bool manual)
+    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel, bool manual)
     {
         if (_updates is null) return;
+
+        // 確認中にチャンネルを変えて保存すると、前のチャンネルの結果が遅れて届く。
+        // 保存済みの設定と食い違う結果を載せると、stable を選び直した直後に
+        // プレリリースを知らせ、その記録が以後の stable の通知まで抑えてしまう。
+        // 保存の側が新しいチャンネルでの確認を仕掛けており、結果は改めて届く。
+        var savedChannel = _settings.Update?.Channel ?? UpdateChannel.Stable;
+        if (channel != savedChannel) return;
+
         var current = _updates.CurrentVersion;
 
         UpdateStatus = result.Outcome switch

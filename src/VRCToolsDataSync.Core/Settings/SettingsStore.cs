@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using VRCToolsDataSync.Core.Storage;
+using VRCToolsDataSync.Core.Update;
 
 namespace VRCToolsDataSync.Core.Settings;
 
@@ -294,6 +295,22 @@ public sealed class SettingsStore
             if (inc is null) { result.ToolState[key] = dsk!; continue; }
             if (dsk is null) { result.ToolState[key] = inc; continue; }
             result.ToolState[key] = PickNewer(inc, dsk);
+        }
+
+        // 通知済みの版だけは、採用元に関わらずディスクと incoming の新しいほうを
+        // 採用する。通知の記録は常に前へ進む (UpdateChecker.MarkNotified が古い版で
+        // 上書きしない) ので、新旧は版の比較で決められる。これが無いと、起動時に
+        // 読んだ古い設定のまま保存する経路 (接続確認に時間のかかる CLI の storage
+        // など) が別プロセスの記録した版を巻き戻し、同じ版を知らせ直す。
+        var diskNotified = ReleaseVersion.Parse(disk.Update?.NotifiedVersion);
+        var incomingNotified = ReleaseVersion.Parse(incoming.Update?.NotifiedVersion);
+        if (diskNotified is not null && (incomingNotified is null || diskNotified > incomingNotified))
+        {
+            result.Update.NotifiedVersion = disk.Update!.NotifiedVersion;
+        }
+        else if (incomingNotified is not null)
+        {
+            result.Update.NotifiedVersion = incoming.Update!.NotifiedVersion;
         }
 
         // Launch は Top-level と同じ採用元から取る。理由:

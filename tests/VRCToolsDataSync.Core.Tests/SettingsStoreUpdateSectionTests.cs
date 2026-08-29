@@ -72,6 +72,33 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         Assert.Equal(UpdateChannel.Test, stale.Update.Channel);
     }
 
+    [Fact(DisplayName = "通知済みの版は、古い設定の保存で巻き戻らない")]
+    public void NotifiedVersionNeverMovesBackwardsOnStaleSave()
+    {
+        // 別プロセス (接続確認に時間のかかる CLI の storage など) が先に設定を読む。
+        var store = CreateStore();
+        var stale = store.Load();
+
+        // その間に GUI が通知済みの版を記録する。
+        var current = CreateStore().Load();
+        current.Update.NotifiedVersion = "0.0.10-test1";
+        CreateStore().Save(current);
+
+        // 古い設定 (未通知) のまま通常の Save をしても、記録は巻き戻らない。
+        stale.CloudFolderPath = @"C:\sync";
+        store.Save(stale);
+
+        var loaded = CreateStore().Load();
+        Assert.Equal("0.0.10-test1", loaded.Update.NotifiedVersion);
+        Assert.Equal(@"C:\sync", loaded.CloudFolderPath);
+
+        // 逆向き (incoming のほうが新しい記録を持つ) では incoming が勝つ。
+        var newer = CreateStore().Load();
+        newer.Update.NotifiedVersion = "0.0.11";
+        CreateStore().Save(newer);
+        Assert.Equal("0.0.11", CreateStore().Load().Update.NotifiedVersion);
+    }
+
     [Fact(DisplayName = "チャンネルは stable / test の文字列で書かれる")]
     public void ChannelIsSerializedAsString()
     {
