@@ -337,12 +337,28 @@ public partial class MainPageViewModel : ObservableObject
                   $"auto-sync={(_settings.AutoSyncEnabled ? "ON" : "OFF")})");
 
         // チャンネルを変えた直後は、表示が前のチャンネルの結果のまま残る。
-        // 新しいチャンネルでまだ確認できていなければ確認し直す。
+        // 状態欄を新しいチャンネルの確認状態から作り直し、まだ確認できて
+        // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
+        // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
         RefreshUpdateBanner();
         var channel = _settings.Update.Channel;
-        if (_updates is not null && !_updates.HasChecked(channel))
+        if (_updates is not null)
         {
-            _ = _updates.CheckAsync(manual: false);
+            if (!_updates.HasChecked(channel))
+            {
+                UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
+                _ = _updates.CheckAsync(manual: false);
+            }
+            else if (_updates.Available(channel) is { } available)
+            {
+                UpdateStatus = $"新しい版 {available.Tag} が出ています (実行中: {_updates.CurrentVersion})";
+            }
+            else
+            {
+                UpdateStatus = _updates.IsComplete
+                    ? $"最新の版を利用中 ({_updates.CurrentVersion})"
+                    : "新しい版は見つかりませんでしたが、一覧を集めきれていないため最新とは言い切れません";
+            }
         }
     }
 
