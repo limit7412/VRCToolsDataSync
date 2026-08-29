@@ -383,6 +383,23 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
 
+    [Fact(DisplayName = "末尾の点や空白だけが違う項目も同じ場所として断る")]
+    public void RefusesArchiveWithEntriesThatCollideAfterTrimmingTrailingDots()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // Win32 は段の末尾の点と空白を落とすので、展開先は同じになる。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/foo.dll");
+            archive.CreateEntry("app/foo.dll.");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
     [Theory(DisplayName = "根から始まる項目のある ZIP は断る")]
     [InlineData("/payload.dll")]
     [InlineData("\\payload.dll")]

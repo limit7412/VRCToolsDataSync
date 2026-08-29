@@ -614,7 +614,13 @@ public sealed class UpdateStage
                 resolved.RemoveAt(resolved.Count - 1);
                 continue;
             }
-            resolved.Add(segment);
+
+            // Win32 は段の末尾の点と空白を落とす。foo.dll と "foo.dll." は
+            // 同じ場所へ展開されるので、そろえてから見比べる。落とすと空に
+            // なる段 ("..." など) は Windows の名前として成り立たない。
+            var trimmed = segment.TrimEnd('.', ' ');
+            if (trimmed.Length == 0) return null;
+            resolved.Add(trimmed);
         }
 
         return string.Join('/', resolved);
