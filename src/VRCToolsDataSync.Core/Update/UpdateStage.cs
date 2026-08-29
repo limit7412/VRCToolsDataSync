@@ -458,7 +458,16 @@ public sealed class UpdateStage
         {
             // ディレクトリの項目は名前が空になる。重なっても害が無い。
             if (string.IsNullOrEmpty(entry.Name)) continue;
-            if (!seen.Add(ExtractionKeyOf(entry.FullName)))
+            var key = ExtractionKeyOf(entry.FullName);
+            if (key is null)
+            {
+                // 展開先の外を指す項目。ExtractToDirectory も断るが、そちらの
+                // IOException は容量不足などと区別できない。配布物そのものの
+                // 問題として投げ分け、取得ごと捨てられるようにする。
+                throw new InvalidDataException($"展開先の外を指す項目のある ZIP は展開できない: {entry.FullName}");
+            }
+
+            if (!seen.Add(key))
             {
                 throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
             }
@@ -493,7 +502,7 @@ public sealed class UpdateStage
     /// 別物として通ってしまう。"." の区切りも同じ理由で落とす。
     /// </para>
     /// </summary>
-    private static string ExtractionKeyOf(string fullName)
+    private static string? ExtractionKeyOf(string fullName)
     {
         var resolved = new List<string>();
         foreach (var segment in fullName.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
@@ -501,9 +510,10 @@ public sealed class UpdateStage
             if (segment == ".") continue;
             if (segment == "..")
             {
-                // 展開先を出るものは ExtractToDirectory の側が断る。ここでは
-                // 行き先を突き合わせたいだけなので、1 つ戻って続ける。
-                if (resolved.Count > 0) resolved.RemoveAt(resolved.Count - 1);
+                // 展開先より上へ戻る項目は、行き先を突き合わせようがない。
+                // 呼び出し側が配布物の問題として扱えるよう null を返す。
+                if (resolved.Count == 0) return null;
+                resolved.RemoveAt(resolved.Count - 1);
                 continue;
             }
             resolved.Add(segment);

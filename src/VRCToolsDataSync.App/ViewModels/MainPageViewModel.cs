@@ -693,9 +693,26 @@ public partial class MainPageViewModel : ObservableObject
     private async Task ApplyStagedUpdateAsync()
     {
         if (_updates is null || IsBusy) return;
-        var ready = await Task.Run(() => _updates.PrepareApplyAndSpawnUpdater());
+
+        // 準備の間 (ロックの待ちは最大 11 分、ヘルパの起動確認に 3 秒) も
+        // 塞いでおく。ここが空いていると、この後の終了時 Push と並走する手動の
+        // 同期を始められてしまい、その同期は Coordinator の追跡の外なので
+        // Environment.Exit で途中のまま切れる。
+        IsBusy = true;
+        bool ready;
+        try
+        {
+            ready = await Task.Run(() => _updates.PrepareApplyAndSpawnUpdater());
+        }
+        catch
+        {
+            IsBusy = false;
+            throw;
+        }
+
         if (!ready)
         {
+            IsBusy = false;
             AppendLog("更新を適用できませんでした。取得し直すか、ログを確認してください。");
             RefreshStagedRow();
             return;
@@ -714,6 +731,7 @@ public partial class MainPageViewModel : ObservableObject
         // プロセスの終了で手放す約束で握ったままなので、明示的に返す。
         // 持ち続けると、この後の取得の昇格も、起こしたヘルパの適用も止まる。
         UpdateApplier.ReleaseHeldApplyLock();
+        IsBusy = false;
         AppendLog("終了が取り消されたため、更新は次回起動時に適用されます。");
         RefreshStagedRow();
     }

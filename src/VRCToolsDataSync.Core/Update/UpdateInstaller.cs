@@ -100,30 +100,44 @@ public class UpdateInstaller
     {
         ValidateLayout();
 
-        // (1) 重い複製を先に済ませる。ここまでは正規の位置に触らないので、
-        //     何度失敗してもやり直せる。
-        //
-        //     途中で失敗したら、作りかけを消してから投げる。残すと、インストール
-        //     先に数百 MB の残骸が居座る。容量不足で失敗した場合は特に、その
-        //     残骸が次の取得まで妨げる。
+        // (1)-(3) のどこで失敗しても、用意した .new は残さない。数百 MB あり、
+        // 起動時の後始末も CLI 側の破棄も .new を見ないので、次の更新まで
+        // 居座る。容量不足で失敗した場合は特に、その残骸が次の取得まで妨げる。
         try
         {
-            foreach (var part in Parts)
-            {
-                var fresh = Path.Combine(_targetDirectory, part + ".new");
-                DeleteDirectoryIfExists(fresh);
-                CopyDirectory(Path.Combine(_sourceDirectory, part), fresh);
-            }
+            PrepareAndSwap();
+        }
+        catch (UpdateRollbackException)
+        {
+            // 正規の位置が欠けたまま。手で直す材料になりうるものは残す。
+            throw;
         }
         catch
         {
             foreach (var part in Parts)
             {
-                LogQuietly(() => _logger.LogInformation("複製に失敗したため作りかけを消す: {Part}.new", part));
+                LogQuietly(() => _logger.LogInformation("適用に失敗したため用意した一式を消す: {Part}.new", part));
                 try { DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".new")); }
                 catch { /* best-effort */ }
             }
             throw;
+        }
+
+        ReplaceLauncher();
+    }
+
+    /// <summary>
+    /// 用意 (複製) から入れ替えまで。失敗の後始末は呼び出し側が行う。
+    /// </summary>
+    private void PrepareAndSwap()
+    {
+        // (1) 重い複製を先に済ませる。ここまでは正規の位置に触らないので、
+        //     何度失敗してもやり直せる。
+        foreach (var part in Parts)
+        {
+            var fresh = Path.Combine(_targetDirectory, part + ".new");
+            DeleteDirectoryIfExists(fresh);
+            CopyDirectory(Path.Combine(_sourceDirectory, part), fresh);
         }
 
         // (2) 前回の置き換えが残した .old を先に除去する。残したまま進むと
@@ -181,12 +195,17 @@ public class UpdateInstaller
             swapped.Add(part);
             LogQuietly(() => _logger.LogInformation("{Part} を置き換えた", part));
         }
+    }
 
-        // (4) ランチャーを差し替える。同じディレクトリの一時ファイルへ書き切って
-        //     から置き換える。直接上書きすると、書いている途中で容量が尽きた場合に
-        //     欠けたランチャーが残り、通常の起動手段ごと壊れる。
-        //     ここで失敗しても app / cli の置き換えは成立しており、旧ランチャーは
-        //     無傷で、相対参照で新しい app を起動できるため、警告に留める。
+    /// <summary>
+    /// (4) ランチャーを差し替える。同じディレクトリの一時ファイルへ書き切って
+    /// から置き換える。直接上書きすると、書いている途中で容量が尽きた場合に
+    /// 欠けたランチャーが残り、通常の起動手段ごと壊れる。
+    /// ここで失敗しても app / cli の置き換えは成立しており、旧ランチャーは
+    /// 無傷で、相対参照で新しい app を起動できるため、警告に留める。
+    /// </summary>
+    private void ReplaceLauncher()
+    {
         var launcher = Path.Combine(_targetDirectory, LauncherName);
         var launcherTemp = launcher + ".new";
         try

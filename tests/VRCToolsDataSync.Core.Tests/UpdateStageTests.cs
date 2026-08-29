@@ -348,4 +348,21 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
+
+    [Fact(DisplayName = "展開先の外を指す項目のある ZIP は断る")]
+    public void RefusesArchiveWithEntriesOutsideTheExtractionRoot()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 展開の側も断るが、その例外は容量不足などと区別できない。配布物の
+        // 問題として投げ分け、取得ごと捨てられるようにする。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("../payload.dll");
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
 }
