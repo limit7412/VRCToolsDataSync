@@ -38,6 +38,12 @@ public static class UpdateApplier
         // 展開とヘルパの起動まで済ませるのは、その間に別の App が起動して同じ
         // 展開先を作り直すと、動いているヘルパの足元を崩すためである。
         using var applyLock = AcquireApplyLock(logger);
+
+        // 取れなかった場合は更新に触らない。触れば、ロックが防ぐはずの競合
+        // (動いているヘルパの展開元を作り直す等) がそのまま起きる。起動は続ける。
+        // 取得しておいたものは残るので、次の起動が適用し直す。
+        if (applyLock is null) return false;
+
         try
         {
             var stage = new UpdateStage(logger: logger);
@@ -55,25 +61,25 @@ public static class UpdateApplier
             {
                 // dotnet run や bin\ 配下の手元ビルド。作業ツリーを置き換える
                 // わけにはいかないので、取得したものは残したまま適用しない。
-                logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag);
+                LogQuietly(() => logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag));
                 return false;
             }
 
             if (!TrySpawnUpdater(stage, root, logger)) return false;
 
-            logger.LogInformation("更新 {Tag} の適用をヘルパへ渡して終了する", staged.Tag);
+            LogQuietly(() => logger.LogInformation("更新 {Tag} の適用をヘルパへ渡して終了する", staged.Tag));
             return true;
         }
         catch (Exception ex)
         {
             // 適用に入れなくても、今の版のまま起動は続けられる。
-            logger.LogWarning(ex, "取得済みの更新の適用に入れなかった");
+            LogQuietly(() => logger.LogWarning(ex, "取得済みの更新の適用に入れなかった"));
             return false;
         }
         finally
         {
             // ヘルパは起動直後にこのロックを待つ。ここで手放して先へ進ませる。
-            applyLock?.Release();
+            applyLock.Release();
         }
     }
 
@@ -95,38 +101,49 @@ public static class UpdateApplier
         var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
         try
         {
-            var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
-            if (root is not null)
+            // 後始末も適用と同じロックの下で行う。退避や展開先を消す操作なので、
+            // 動いているヘルパと重なれば足元を崩す。取れなければ何もしない
+            // (残ったものは次の起動の後始末が拾う)。
+            var done = TryWithApplyLock(logger, () =>
             {
-                UpdateInstaller.DiscardPrevious(root, logger);
-            }
+                var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+                if (root is not null)
+                {
+                    UpdateInstaller.DiscardPrevious(root, logger);
+                }
 
-            // まだ適用できる取得 (非配布形で適用しなかった等) は残り、
-            // 合わなくなった取得はここで捨てられる。
-            stage ??= new UpdateStage(logger: logger);
-            _ = stage.TryLoadVerified(LoadChannel(logger), RunningVersion.Current());
+                // まだ適用できる取得 (非配布形で適用しなかった等) は残り、
+                // 合わなくなった取得はここで捨てられる。
+                stage ??= new UpdateStage(logger: logger);
+                _ = stage.TryLoadVerified(LoadChannel(logger), RunningVersion.Current());
 
-            // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
-            stage.DiscardIncomplete();
-            stage.DiscardIncoming();
-            if (!File.Exists(stage.ZipPath))
+                // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
+                stage.DiscardIncomplete();
+                stage.DiscardIncoming();
+                if (!File.Exists(stage.ZipPath))
+                {
+                    DeleteDirectoryQuietly(stage.ExtractDirectory, logger);
+                }
+            });
+
+            if (!done)
             {
-                DeleteDirectoryQuietly(stage.ExtractDirectory, logger);
+                LogQuietly(() => logger.LogInformation("更新の適用中のため、後始末は次の起動へ回す"));
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "更新の後始末に失敗した");
+            LogQuietly(() => logger.LogWarning(ex, "更新の後始末に失敗した"));
         }
     }
 
     /// <summary>
     /// 更新の適用に関わる間だけ握るクロスプロセスのロック。
     /// <para>
-    /// 動いているヘルパがあれば、その完了まで待つ。待ちきれない場合も
-    /// null を返してそのまま進む。ここで起動を諦めると、ヘルパが固まったときに
-    /// App を開く手立てが無くなる。取得の照合は後段でやり直すので、途中の状態を
-    /// 掴んだとしても、適用できないものとして捨てられる。
+    /// 動いているヘルパがあれば、その完了まで待つ。待ちきれなければ null を
+    /// 返す。呼び出し側は更新に触らずに進むこと。ここで起動そのものを諦めると、
+    /// ヘルパが固まったときに App を開く手立てが無くなる。逆に、握れないまま
+    /// 展開や昇格へ進めば、ロックを置いた意味が無い。
     /// </para>
     /// </summary>
     private static ApplyLock? AcquireApplyLock(ILogger logger)
@@ -148,13 +165,13 @@ public static class UpdateApplier
 
             if (acquired) return new ApplyLock(mutex);
 
-            logger.LogWarning("更新ヘルパの完了を待ちきれなかった。そのまま起動を続ける");
+            LogQuietly(() => logger.LogWarning("更新ヘルパの完了を待ちきれなかった。更新には触らずに続ける"));
             mutex.Dispose();
             return null;
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "更新のロックを取れなかった");
+            LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
             mutex?.Dispose();
             return null;
         }
@@ -193,28 +210,45 @@ public static class UpdateApplier
     }
 
     /// <summary>
-    /// 更新のロックを取ってから <paramref name="action"/> を行う。
+    /// 更新のロックを取ってから <paramref name="action"/> を行う。取れなければ
+    /// 何もせず false を返す。
     /// <para>
-    /// 取得した ZIP を置き換え待ちへ昇格させる側から使う。昇格は staged の ZIP を
-    /// 入れ替えて展開先を消すため、適用の側と重なると、起動前のヘルパを消したり、
-    /// 動いているヘルパの展開元を欠いたりする。
+    /// 取得した ZIP を置き換え待ちへ昇格させる側と、後始末の側から使う。昇格は
+    /// staged の ZIP を入れ替えて展開先を消すため、適用の側と重なると、起動前の
+    /// ヘルパを消したり、動いているヘルパの展開元を欠いたりする。
     /// </para>
     /// <para>
-    /// ロックを取れなかった場合も action は行う。取得の側で諦めると、適用が
-    /// 長引いている間の取得がすべて落ちる。取得の照合は適用の直前にやり直す。
+    /// 取れないまま行っては、ロックを置いた意味が無い。見送っても行き詰まりは
+    /// しない。昇格なら次の確認が取得からやり直し、後始末なら次の起動が拾う。
     /// </para>
     /// </summary>
-    public static void WithApplyLock(ILogger logger, Action action)
+    public static bool TryWithApplyLock(ILogger logger, Action action)
     {
         using var applyLock = AcquireApplyLock(logger);
+        if (applyLock is null) return false;
+
         try
         {
             action();
+            return true;
         }
         finally
         {
-            applyLock?.Release();
+            applyLock.Release();
         }
+    }
+
+    /// <summary>
+    /// ログの失敗を流れから切り離す。
+    /// <para>
+    /// ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
+    /// このリポジトリのロガーは例外を投げる。ここでそれが飛ぶと、起動を続ける
+    /// ための catch から抜けて App が立ち上がらなくなる。
+    /// </para>
+    /// </summary>
+    private static void LogQuietly(Action write)
+    {
+        try { write(); } catch { /* best-effort */ }
     }
 
     /// <summary>
@@ -232,7 +266,7 @@ public static class UpdateApplier
         if (!File.Exists(updater))
         {
             // ZIP の形が想定と違う。展開し直しても同じなので取得ごと捨てる。
-            logger.LogWarning("展開した一式に更新ヘルパが無いため捨てる: {Path}", updater);
+            LogQuietly(() => logger.LogWarning("展開した一式に更新ヘルパが無いため捨てる: {Path}", updater));
             stage.Discard();
             return false;
         }
@@ -267,7 +301,7 @@ public static class UpdateApplier
         catch (Exception ex)
         {
             // 設定を読めない起動でも、安全側 (stable) の判定で先へ進める。
-            logger.LogWarning(ex, "更新チャンネルを読めなかったため stable として扱う");
+            LogQuietly(() => logger.LogWarning(ex, "更新チャンネルを読めなかったため stable として扱う"));
             return UpdateChannel.Stable;
         }
     }
@@ -280,7 +314,7 @@ public static class UpdateApplier
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            logger.LogWarning(ex, "消せなかった: {Path}", path);
+            LogQuietly(() => logger.LogWarning(ex, "消せなかった: {Path}", path));
         }
     }
 }

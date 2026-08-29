@@ -250,7 +250,16 @@ public sealed class UpdateManager : IDisposable
             // 昇格は適用と同じロックの下で行う。staged の ZIP を入れ替えて展開先を
             // 消すため、適用の側と重なると、起動前のヘルパを消したり、動いている
             // ヘルパの展開元を欠いたりする。
-            UpdateApplier.WithApplyLock(_logger, () => _stage.PromoteIncoming(release, asset));
+            if (!UpdateApplier.TryWithApplyLock(_logger, () => _stage.PromoteIncoming(release, asset)))
+            {
+                // 適用が動いている。ロックを取れないまま昇格すると、動いている
+                // ヘルパの展開元を欠く。書きかけを片付けて見送り、次の確認で
+                // 取得からやり直す。
+                _logger.LogInformation("更新の適用中のため、取得した {Tag} の昇格を見送る", release.Tag);
+                _stage.DiscardIncoming();
+                return;
+            }
+
             _logger.LogInformation("次の起動で置き換える更新を取得した: {Tag}", release.Tag);
 
             try
@@ -290,7 +299,7 @@ public sealed class UpdateManager : IDisposable
             // 照合から展開・ヘルパ起動までを一つのロック区間にする。照合の後に
             // ロックを取り直すと、その隙に裏の取得が別の ZIP を昇格させ、
             // 確かめたものとは違う版が展開されうる。
-            UpdateApplier.WithApplyLock(_logger, () =>
+            var locked = UpdateApplier.TryWithApplyLock(_logger, () =>
             {
                 var staged = _stage.TryLoadVerified(channel, CurrentVersion);
                 if (staged is null)
@@ -308,6 +317,14 @@ public sealed class UpdateManager : IDisposable
 
                 spawned = UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
             });
+
+            if (!locked)
+            {
+                // 既に別の適用が動いている。取得しておいたものはそのまま残るので、
+                // その適用が済んだ後の起動、または次の操作でやり直せる。
+                _logger.LogInformation("更新の適用中のため、いまは適用に入れない");
+                return false;
+            }
 
             if (stagedMissing)
             {
