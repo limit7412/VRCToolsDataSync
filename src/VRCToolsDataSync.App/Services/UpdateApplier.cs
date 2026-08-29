@@ -193,6 +193,31 @@ public static class UpdateApplier
     }
 
     /// <summary>
+    /// 更新のロックを取ってから <paramref name="action"/> を行う。
+    /// <para>
+    /// 取得した ZIP を置き換え待ちへ昇格させる側から使う。昇格は staged の ZIP を
+    /// 入れ替えて展開先を消すため、適用の側と重なると、起動前のヘルパを消したり、
+    /// 動いているヘルパの展開元を欠いたりする。
+    /// </para>
+    /// <para>
+    /// ロックを取れなかった場合も action は行う。取得の側で諦めると、適用が
+    /// 長引いている間の取得がすべて落ちる。取得の照合は適用の直前にやり直す。
+    /// </para>
+    /// </summary>
+    public static void WithApplyLock(ILogger logger, Action action)
+    {
+        using var applyLock = AcquireApplyLock(logger);
+        try
+        {
+            action();
+        }
+        finally
+        {
+            applyLock?.Release();
+        }
+    }
+
+    /// <summary>
     /// 更新のロックを取ってから展開とヘルパの起動を行う。
     /// 常駐中の「再起動して適用」から使う (起動時の経路は既にロックを握っている)。
     /// </summary>

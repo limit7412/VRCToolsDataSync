@@ -33,6 +33,17 @@ public sealed class StagedMetadata
     public string AssetName { get; init; } = string.Empty;
 
     /// <summary>
+    /// 取得した時点のインストール先。
+    /// <para>
+    /// 同じ利用者が配布 ZIP を複数の場所へ展開していると、どのコピーも同じ
+    /// 置き場所を共有する。ここを見ないと、コピー A が取った更新をコピー B が
+    /// 自分のインストール先へ適用し、A は更新されないまま取得を失う。
+    /// 配布の形でない場合 (dotnet run など) は空になる。
+    /// </para>
+    /// </summary>
+    public string InstallRoot { get; init; } = string.Empty;
+
+    /// <summary>
     /// 安定版のチャンネルで拾う対象か。取得したときの <see cref="ReleaseInfo.IsStable"/> を残す。
     /// <para>
     /// タグの綴りだけでは足りない。手で作ったリリースにプレリリースの印だけが
@@ -92,6 +103,13 @@ public sealed class UpdateStage
         _logger = logger ?? NullLogger.Instance;
     }
 
+    /// <summary>
+    /// 実行中のインストール先。配布の形でなければ空文字を返す。
+    /// 記録との突き合わせに使うため、判定を 1 か所に寄せてある。
+    /// </summary>
+    private static string CurrentInstallRoot =>
+        UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory) ?? string.Empty;
+
     public static string DefaultDirectory()
         => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -115,6 +133,7 @@ public sealed class UpdateStage
             Size = asset.Size,
             Stable = release.IsStable,
             AssetName = asset.Name,
+            InstallRoot = CurrentInstallRoot,
         };
 
         // 記録を先に消す。ZIP を入れ替えた後で記録を書けなかった場合、
@@ -204,6 +223,17 @@ public sealed class UpdateStage
                 "取得しておいた {Tag} は実行中のアーキテクチャ向けではない ({Actual} / {Expected})",
                 metadata.Tag, metadata.AssetName, expectedAsset ?? "(配布なし)");
             if (discardMismatches) Discard();
+            return null;
+        }
+
+        // 取得したときと同じインストール先かを見る。配布 ZIP を複数の場所へ
+        // 展開している場合、どのコピーもこの置き場所を共有する。
+        if (!string.Equals(metadata.InstallRoot, CurrentInstallRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogInformation(
+                "取得しておいた {Tag} は別のインストール先のものである ({Actual})",
+                metadata.Tag, string.IsNullOrEmpty(metadata.InstallRoot) ? "(配布の形でない)" : metadata.InstallRoot);
+            // 相手のコピーが適用できるよう、ここでは捨てない。
             return null;
         }
 

@@ -182,6 +182,25 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
     }
 
+    [Fact(DisplayName = "別のインストール先の取得は適用も破棄もしない")]
+    public void KeepsStagedFromAnotherInstallRoot()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 別の場所へ展開したコピーが取った記録に見せかける。
+        // テストを走らせているプロセスは配布の形ではないので、記録の
+        // installRoot は空で書かれている。
+        var json = File.ReadAllText(stage.MetadataPath);
+        var altered = json.Replace("\"installRoot\": \"\"", "\"installRoot\": \"D:\\\\elsewhere\"");
+        Assert.NotEqual(json, altered);
+        File.WriteAllText(stage.MetadataPath, altered);
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+        // 相手のコピーが適用できるよう、こちらでは捨てない。
+        Assert.True(File.Exists(stage.ZipPath));
+        Assert.True(File.Exists(stage.MetadataPath));
+    }
+
     [Fact(DisplayName = "破棄は消せたかどうかを返す")]
     public void DiscardReportsWhetherItRemovedThePair()
     {

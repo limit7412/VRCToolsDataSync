@@ -246,7 +246,11 @@ public sealed class UpdateManager : IDisposable
             // 正規の場所ではなく一時の場所へ取る。直接書くと、取得済みの版がある
             // 状態で次の取得が途中で失敗したときに、適用できたはずの前の版まで失う。
             await _repository.DownloadAsync(asset, _stage.IncomingZipPath, cutoff.Token).ConfigureAwait(false);
-            _stage.PromoteIncoming(release, asset);
+
+            // 昇格は適用と同じロックの下で行う。staged の ZIP を入れ替えて展開先を
+            // 消すため、適用の側と重なると、起動前のヘルパを消したり、動いている
+            // ヘルパの展開元を欠いたりする。
+            UpdateApplier.WithApplyLock(_logger, () => _stage.PromoteIncoming(release, asset));
             _logger.LogInformation("次の起動で置き換える更新を取得した: {Tag}", release.Tag);
 
             try

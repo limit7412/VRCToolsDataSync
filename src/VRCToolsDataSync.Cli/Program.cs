@@ -611,7 +611,7 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     {
         // 別のヘルパが動いている。二重に適用しない。
         Console.Error.WriteLine("別の更新処理が実行中のため、置き換えを中止しました。");
-        logger.LogWarning("更新のロックを取れなかったため適用しない");
+        try { logger.LogWarning("更新のロックを取れなかったため適用しない"); } catch { /* best-effort */ }
         return 6;
     }
 
@@ -627,6 +627,16 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
 
 static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool relaunch, ILogger logger)
 {
+    // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
+    // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
+    // このリポジトリのロガーは例外を投げる。入れ替えの後にそれが飛ぶと、
+    // staged の破棄にも App の起動し直しにも辿り着かず、利用者から見れば
+    // 「再起動して適用」でアプリが閉じただけになる。
+    void Log(Action write)
+    {
+        try { write(); } catch { /* best-effort */ }
+    }
+
     // 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
     // その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
     // 失敗するだけである。待ちきれなければ、壊す前にここで止める。
@@ -643,7 +653,7 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
             if (!process.WaitForExit(600_000))
             {
                 Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
-                logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid);
+                Log(() => logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid));
                 return 6;
             }
         }
@@ -657,7 +667,7 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
     {
         new UpdateInstaller(source, target, logger).Apply();
         Console.WriteLine("本体を置き換えました。");
-        logger.LogInformation("本体を置き換えた: {Target}", target);
+        Log(() => logger.LogInformation("本体を置き換えた: {Target}", target));
     }
     catch (UpdateRollbackException ex)
     {
@@ -665,14 +675,14 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
         // 壊れた一式を起動し直そうともしない。
         Console.Error.WriteLine(ex.Message);
         Console.Error.WriteLine("インストール先が壊れた可能性があります。.old ディレクトリを手で戻すか、ZIP を展開し直してください。");
-        logger.LogError(ex, "置き換えの巻き戻しに失敗した");
+        Log(() => logger.LogError(ex, "置き換えの巻き戻しに失敗した"));
         return 7;
     }
     catch (Exception ex)
     {
         // 巻き戻しは済んでいて、現行版は無傷のまま動かせる。
         Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
-        logger.LogError(ex, "置き換えに失敗した (巻き戻し済み)");
+        Log(() => logger.LogError(ex, "置き換えに失敗した (巻き戻し済み)"));
 
         // 取得済みの更新をここで捨てる。残すと次の起動がまた同じ適用へ引き渡して
         // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
@@ -685,7 +695,7 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
         }
         catch (Exception discard)
         {
-            logger.LogWarning(discard, "取得済みの更新を捨てられなかった");
+            Log(() => logger.LogWarning(discard, "取得済みの更新を捨てられなかった"));
         }
 
         if (!discarded)
@@ -695,7 +705,7 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
             // 手で片付ける先を伝えて終える。
             Console.Error.WriteLine(
                 $"取得済みの更新を消せませんでした。{new UpdateStage().Directory} を手で削除してから起動してください。");
-            logger.LogError("取得済みの更新を消せないため、App を起動し直さない");
+            Log(() => logger.LogError("取得済みの更新を消せないため、App を起動し直さない"));
             return 8;
         }
 
@@ -729,7 +739,7 @@ static bool TryRelaunchApp(string target, ILogger logger)
     catch (Exception ex)
     {
         Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
-        logger.LogWarning(ex, "App の起動し直しに失敗した");
+        try { logger.LogWarning(ex, "App の起動し直しに失敗した"); } catch { /* best-effort */ }
         return false;
     }
 }
