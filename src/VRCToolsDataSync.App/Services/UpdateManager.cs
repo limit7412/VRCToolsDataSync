@@ -236,7 +236,20 @@ public sealed class UpdateManager : IDisposable
         }
         finally
         {
-            if (held) _downloadGate.Release();
+            if (held)
+            {
+                _downloadGate.Release();
+
+                // 後始末の間に来ていた取得の要求を拾う。取得の側は自分で要求を
+                // 置いてから枠を見るので、走り終えた者が次を拾えばよいが、
+                // ここは要求を置かない側なので、放っておくと誰も走らせない。
+                PendingDownload? pending;
+                lock (_pendingLock) { pending = _pending; }
+                if (pending is not null)
+                {
+                    _ = DownloadIfNeededAsync(pending.Release, pending.Channel);
+                }
+            }
         }
 
         try
