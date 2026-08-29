@@ -364,12 +364,24 @@ public sealed class UpdateStage
             return null;
         }
 
+        // 記録のタグが版として読めなければ適用しない。読めないままだと、この後の
+        // 前後の判定も、展開した一式との突き合わせも素通りになり、古い版へ
+        // 引き戻す経路が空く。正規の経路で書いた記録は必ず読める (確認の側が
+        // 読めたタグしか渡さない) ので、読めないのは壊れているか触られている。
+        var staged = ReleaseVersion.Parse(metadata.Tag);
+        if (staged is null)
+        {
+            _logger.LogWarning("取得しておいた記録のタグを版として読めない: {Tag}", metadata.Tag);
+            if (discardMismatches) Discard();
+            return null;
+        }
+
         // 実行中より新しいものだけを通す。取得してから起動しないまま日が経ち、
         // その間に手で新しい版へ入れ替えられていると、取っておいた古いほうへ
-        // 引き戻すことになる。どちらかが版として読めなければ新しいものとして扱う。
+        // 引き戻すことになる。実行中の版が読めない場合 (手元ビルドの 0.0.0-dev)
+        // だけは、比べようがないので通す。
         var running = ReleaseVersion.Parse(runningVersion);
-        var staged = ReleaseVersion.Parse(metadata.Tag);
-        if (running is not null && staged is not null && staged <= running)
+        if (running is not null && staged <= running)
         {
             _logger.LogInformation(
                 "取得しておいた {Tag} は実行中の {Running} より新しくない", metadata.Tag, runningVersion);

@@ -104,6 +104,24 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.False(Directory.Exists(TargetFile("app.old")));
     }
 
+    [Fact(DisplayName = "置き換えの途中の形は完了と見なさない")]
+    public void LooksCompleteRejectsHalfSwappedLayouts()
+    {
+        // 巻き戻しにも失敗すると、入れ替え済みの側だけで起動できることがある。
+        // その形で後始末へ進むと、復旧の材料まで消してしまう。
+        Assert.True(UpdateInstaller.LooksComplete(TargetDir));
+
+        // 途中で終わった跡が残っている。
+        Directory.CreateDirectory(TargetFile("cli.new"));
+        Assert.False(UpdateInstaller.LooksComplete(TargetDir));
+        Directory.Delete(TargetFile("cli.new"));
+        Assert.True(UpdateInstaller.LooksComplete(TargetDir));
+
+        // 正規の位置が欠けている。
+        Directory.Delete(TargetFile("cli"), recursive: true);
+        Assert.False(UpdateInstaller.LooksComplete(TargetDir));
+    }
+
     /// <summary>指定の移動だけを失敗させて、失敗時の経路を作る。</summary>
     private sealed class FailingInstaller : UpdateInstaller
     {

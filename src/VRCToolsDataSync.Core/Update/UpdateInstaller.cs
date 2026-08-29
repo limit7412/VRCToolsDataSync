@@ -221,6 +221,37 @@ public class UpdateInstaller
     }
 
     /// <summary>
+    /// インストール先が置き換えを終えた形になっているか。
+    /// <para>
+    /// 巻き戻しにも失敗した場合 (<see cref="UpdateRollbackException"/>)、正規の
+    /// 位置が欠けたまま、入れ替え済みの側だけで起動できてしまうことがある。その
+    /// まま後始末へ進むと、復旧の材料 (.old と取得しておいた ZIP) を消してしまう。
+    /// 途中で終わった跡 (.new の残り) と、必要な一式の欠けを見る。
+    /// </para>
+    /// </summary>
+    public static bool LooksComplete(string targetDirectory)
+    {
+        foreach (var part in Parts)
+        {
+            if (Directory.Exists(Path.Combine(targetDirectory, part + ".new"))) return false;
+            if (!Directory.Exists(Path.Combine(targetDirectory, part))) return false;
+        }
+
+        foreach (var required in new[]
+        {
+            Path.Combine("app", AppExecutableName),
+            Path.Combine("app", AppAssemblyName),
+            Path.Combine("cli", CliExecutableName),
+            Path.Combine("cli", CliAssemblyName),
+        })
+        {
+            if (!File.Exists(Path.Combine(targetDirectory, required))) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// 置き換えの後始末。次の起動 (新しい版) から呼び、退避した .old を消す。
     /// 消せなくても常駐は続ける。次の機会にまた試す。
     /// </summary>

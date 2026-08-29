@@ -109,6 +109,18 @@ public static class UpdateApplier
             var done = TryWithApplyLock(logger, () =>
             {
                 var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+
+                // 置き換えが途中で終わった形なら、何も捨てない。巻き戻しにも
+                // 失敗した場合、入れ替え済みの側だけで起動できてしまうことが
+                // あり、そこで後始末を通すと復旧の材料 (.old と取得しておいた
+                // ZIP) を消してしまう。
+                if (root is not null && !UpdateInstaller.LooksComplete(root))
+                {
+                    LogQuietly(() => logger.LogWarning(
+                        "インストール先が置き換えの途中の形をしているため、後始末をしない: {Root}", root));
+                    return false;
+                }
+
                 if (root is not null)
                 {
                     UpdateInstaller.DiscardPrevious(root, logger);
