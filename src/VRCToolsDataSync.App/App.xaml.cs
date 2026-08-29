@@ -179,8 +179,22 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
+    /// 多重起動の抑止を、終了処理の途中で手放さないようにする。
+    /// <para>
+    /// 更新ヘルパを起こした後に使う。手放してから実際に終わるまでの隙に別の
+    /// App が起動すると、待っているヘルパと入れ替えがぶつかる。プロセスの
+    /// 終了で OS が手放すのに任せれば、その隙が無くなる。
+    /// </para>
+    /// </summary>
+    internal static void KeepSingleInstanceUntilExit() => _keepSingleInstanceUntilExit = true;
+
+    private static bool _keepSingleInstanceUntilExit;
+
     internal static void ReleaseSingleInstance()
     {
+        if (_keepSingleInstanceUntilExit) return;
+
         try
         {
             _singleInstanceMutex?.ReleaseMutex();

@@ -355,6 +355,9 @@ public partial class MainPageViewModel : ObservableObject
         // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
         // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
         RefreshUpdateBanner();
+        // 取得済みの行も作り直す。stable へ切り替えると、test で取ったものは
+        // 出さなくなる (押しても捨てられるだけなので、出したままにしない)。
+        RefreshStagedRow();
         // ApplyUpdatePropertiesToSettings が必ず入れているが、JSON から明示的な
         // null が入りうる型なので、読む側では既定へ落として扱う。
         var update = _settings.Update ?? new UpdateSettings();
@@ -662,6 +665,16 @@ public partial class MainPageViewModel : ObservableObject
     private void RefreshStagedRow()
     {
         var staged = _updates?.Staged;
+
+        // 保存されているチャンネルで拾わないものは出さない。test で取った後に
+        // stable へ切り替えると、その取得は次の起動でもボタンでも捨てられる。
+        // 出したままだと、押して初めて消える食い違いになる。
+        var channel = _settings.Update?.Channel ?? UpdateChannel.Stable;
+        if (staged is not null && channel != UpdateChannel.Test && !staged.Stable)
+        {
+            staged = null;
+        }
+
         if (staged is null)
         {
             UpdateStagedVisibility = Visibility.Collapsed;
@@ -688,6 +701,11 @@ public partial class MainPageViewModel : ObservableObject
             return;
         }
         AppendLog("更新を適用するため再起動します...");
+
+        // 終了処理の途中で多重起動の抑止を手放さない。手放してから実際に終わる
+        // までの隙に別の App が起動すると、待っているヘルパと入れ替えがぶつかる。
+        App.KeepSingleInstanceUntilExit();
+
         // Tray「同期して終了」と同じ経路で閉じる。終了時 Push もそのまま流れる。
         await App.ExitApplicationAsync(waitForToolsToExit: null);
 

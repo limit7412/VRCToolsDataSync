@@ -437,15 +437,19 @@ public sealed class UpdateManager : IDisposable
     {
         try
         {
-            var channel = _runner.LoadSettings().Update.Channel;
             var spawned = false;
             var stagedMissing = false;
 
             // 照合から展開・ヘルパ起動までを一つのロック区間にする。照合の後に
             // ロックを取り直すと、その隙に裏の取得が別の ZIP を昇格させ、
             // 確かめたものとは違う版が展開されうる。
+            //
+            // チャンネルもこの中で読む。ロックを待つ間 (最大 11 分) に切り替え
+            // られることがあり、待つ前に読んだ値で照合すると、保存された設定に
+            // 反する版を適用してしまう。
             var locked = UpdateApplier.TryWithApplyLock(_logger, () =>
             {
+                var channel = _runner.LoadSettings().Update.Channel;
                 var staged = _stage.TryLoadVerified(channel, CurrentVersion);
                 if (staged is null)
                 {
