@@ -688,10 +688,16 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
         // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
         // 開けなくなる。展開先はこのヘルパ自身が動いている場所なので消せないが、
         // ZIP と記録が消えれば次の起動は適用へ入らず、展開先は後始末が拾う。
+        //
+        // 置き場所はインストール先ごとに分かれているため、対象 (--target) から
+        // 引く。ヘルパ自身は展開先から動いており、そこも配布 ZIP と同じ形を
+        // しているので、既定の置き場所を見ると自分の展開先を基にした空の場所を
+        // 掴む。そこを消せても、本当の ZIP と記録は残ったままになる。
+        var stageDirectory = UpdateStage.DirectoryFor(target);
         var discarded = false;
         try
         {
-            discarded = new UpdateStage(logger: logger).Discard();
+            discarded = new UpdateStage(stageDirectory, logger).Discard();
         }
         catch (Exception discard)
         {
@@ -704,7 +710,7 @@ static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool 
             // 入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
             // 手で片付ける先を伝えて終える。
             Console.Error.WriteLine(
-                $"取得済みの更新を消せませんでした。{new UpdateStage().Directory} を手で削除してから起動してください。");
+                $"取得済みの更新を消せませんでした。{stageDirectory} を手で削除してから起動してください。");
             Log(() => logger.LogError("取得済みの更新を消せないため、App を起動し直さない"));
             return 8;
         }

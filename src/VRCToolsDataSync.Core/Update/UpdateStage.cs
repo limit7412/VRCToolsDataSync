@@ -121,14 +121,28 @@ public sealed class UpdateStage
     /// </para>
     /// </summary>
     public static string DefaultDirectory()
+        => DirectoryFor(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory));
+
+    /// <summary>
+    /// 指定したインストール先の置き場所。
+    /// <para>
+    /// 自分の居場所と対象のインストール先が違う側から使う。更新ヘルパは
+    /// 展開先 (<see cref="ExtractDirectory"/> の下) から動いており、そこも
+    /// 配布 ZIP と同じ形をしているため、既定の置き場所を引くと自分の展開先を
+    /// 基にした別の場所を掴む。ヘルパは <c>--target</c> からここを引くこと。
+    /// </para>
+    /// </summary>
+    /// <param name="installRoot">
+    /// インストール先。null は配布の形でない (dotnet run など) ことを表す。
+    /// </param>
+    public static string DirectoryFor(string? installRoot)
     {
         var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "VRCToolsDataSync", "update");
 
-        var installRoot = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
-        // 配布の形でない (dotnet run など) 場合は適用まで進まないので、
-        // 名前を分ける意味も無い。1 つにまとめる。
+        // 配布の形でない場合は適用まで進まないので、名前を分ける意味も無い。
+        // 1 つにまとめる。
         return installRoot is null ? Path.Combine(root, "local") : Path.Combine(root, ScopeKeyOf(installRoot));
     }
 

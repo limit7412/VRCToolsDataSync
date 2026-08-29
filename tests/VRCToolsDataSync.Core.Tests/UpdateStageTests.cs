@@ -239,5 +239,15 @@ public sealed class UpdateStageTests : IDisposable
         var actual = UpdateStage.DefaultDirectory();
         Assert.NotEqual(shared, Path.TrimEndingDirectorySeparator(actual));
         Assert.Equal(shared, Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(actual)));
+
+        // インストール先が違えば置き場所も違う。末尾の区切りと大文字小文字は
+        // 同じ場所として畳む (Windows のファイルシステムに合わせる)。
+        var a = UpdateStage.DirectoryFor(Path.Combine("C:", "apps", "vrctds"));
+        var b = UpdateStage.DirectoryFor(Path.Combine("D:", "elsewhere", "vrctds"));
+        Assert.NotEqual(a, b);
+        Assert.Equal(a, UpdateStage.DirectoryFor(Path.Combine("C:", "Apps", "VRCTDS") + Path.DirectorySeparatorChar));
+
+        // 配布の形でない場合は 1 つにまとめる。
+        Assert.Equal(Path.Combine(shared, "local"), UpdateStage.DirectoryFor(null));
     }
 }
