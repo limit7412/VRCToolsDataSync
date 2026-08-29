@@ -284,23 +284,36 @@ public sealed class UpdateManager : IDisposable
         try
         {
             var channel = _runner.LoadSettings().Update.Channel;
-            var staged = _stage.TryLoadVerified(channel, CurrentVersion);
-            if (staged is null)
+            var spawned = false;
+            var stagedMissing = false;
+
+            // 照合から展開・ヘルパ起動までを一つのロック区間にする。照合の後に
+            // ロックを取り直すと、その隙に裏の取得が別の ZIP を昇格させ、
+            // 確かめたものとは違う版が展開されうる。
+            UpdateApplier.WithApplyLock(_logger, () =>
+            {
+                var staged = _stage.TryLoadVerified(channel, CurrentVersion);
+                if (staged is null)
+                {
+                    stagedMissing = true;
+                    return;
+                }
+
+                var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+                if (root is null)
+                {
+                    _logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag);
+                    return;
+                }
+
+                spawned = UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
+            });
+
+            if (stagedMissing)
             {
                 try { StagedChanged?.Invoke(); } catch { /* best-effort */ }
-                return false;
             }
-
-            var root = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
-            if (root is null)
-            {
-                _logger.LogInformation("配布の形ではないため、取得済みの {Tag} は適用しない", staged.Tag);
-                return false;
-            }
-
-            // ロックを取ってから展開する。起動中の別プロセスが同じ展開先を
-            // 触っている場合に、その足元を崩さないため。
-            return UpdateApplier.TrySpawnUpdaterWithLock(_stage, root, _logger);
+            return spawned;
         }
         catch (Exception ex)
         {

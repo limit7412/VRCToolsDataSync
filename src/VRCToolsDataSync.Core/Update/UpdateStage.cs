@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
@@ -110,10 +111,37 @@ public sealed class UpdateStage
     private static string CurrentInstallRoot =>
         UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory) ?? string.Empty;
 
+    /// <summary>
+    /// 置き場所。インストール先ごとに分ける。
+    /// <para>
+    /// 同じ利用者が配布 ZIP を複数の場所へ展開していると、共有した場合に
+    /// 行き止まりが生まれる。一方が取った更新を、もう一方は「取得済み」と見て
+    /// 取得を省く一方、インストール先が違うので適用はできない。
+    /// 分けておけば、どのコピーも自分の取得を持てる。
+    /// </para>
+    /// </summary>
     public static string DefaultDirectory()
-        => Path.Combine(
+    {
+        var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "VRCToolsDataSync", "update");
+
+        var installRoot = UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory);
+        // 配布の形でない (dotnet run など) 場合は適用まで進まないので、
+        // 名前を分ける意味も無い。1 つにまとめる。
+        return installRoot is null ? Path.Combine(root, "local") : Path.Combine(root, ScopeKeyOf(installRoot));
+    }
+
+    /// <summary>
+    /// インストール先をディレクトリ名にする。パスはそのまま使えないので縮める。
+    /// 大文字小文字は Windows のファイルシステムに合わせて畳む。
+    /// </summary>
+    private static string ScopeKeyOf(string installRoot)
+    {
+        var normalized = Path.TrimEndingDirectorySeparator(installRoot).ToLowerInvariant();
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
+        return Convert.ToHexStringLower(hash)[..16];
+    }
 
     /// <summary>
     /// 取得しておいた ZIP (<see cref="IncomingZipPath"/>) を、記録と一緒に

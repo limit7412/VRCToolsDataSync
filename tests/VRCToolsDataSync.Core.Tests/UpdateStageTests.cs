@@ -225,4 +225,19 @@ public sealed class UpdateStageTests : IDisposable
         File.Delete(stage.ZipPath);
         Assert.Null(stage.TryLoadMetadata());
     }
+
+    [Fact(DisplayName = "既定の置き場所はインストール先ごとに分かれる")]
+    public void DefaultDirectoryIsScopedPerInstallRoot()
+    {
+        var shared = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "VRCToolsDataSync", "update");
+
+        // 共有の update\ をそのまま使うと、複数の場所へ展開したコピーが
+        // 互いの取得を「取得済み」と見て取得を省き、しかし適用はできない
+        // 行き止まりに入る。1 段掘って分ける。
+        var actual = UpdateStage.DefaultDirectory();
+        Assert.NotEqual(shared, Path.TrimEndingDirectorySeparator(actual));
+        Assert.Equal(shared, Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(actual)));
+    }
 }

@@ -218,24 +218,6 @@ public static class UpdateApplier
     }
 
     /// <summary>
-    /// 更新のロックを取ってから展開とヘルパの起動を行う。
-    /// 常駐中の「再起動して適用」から使う (起動時の経路は既にロックを握っている)。
-    /// </summary>
-    public static bool TrySpawnUpdaterWithLock(UpdateStage stage, string installRoot, ILogger logger)
-    {
-        using var applyLock = AcquireApplyLock(logger);
-        try
-        {
-            return TrySpawnUpdater(stage, installRoot, logger);
-        }
-        finally
-        {
-            // ヘルパは起動直後にこのロックを待つ。ここで手放して先へ進ませる。
-            applyLock?.Release();
-        }
-    }
-
-    /// <summary>
     /// ZIP を展開してヘルパを起動する。呼び出し側はこの後で App を終了させる。
     /// ヘルパは --wait-pid でこのプロセスの終了を待ってから置き換える。
     /// <para>
