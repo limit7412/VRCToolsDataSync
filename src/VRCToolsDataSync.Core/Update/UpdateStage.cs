@@ -308,10 +308,20 @@ public sealed class UpdateStage
             if (!File.Exists(MetadataPath) || !File.Exists(ZipPath)) return null;
             metadata = JsonSerializer.Deserialize<StagedMetadata>(File.ReadAllText(MetadataPath), JsonOptions);
         }
-        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "取得しておいた配布物を確かめられない");
+            // 記録として読めない。中身が壊れていると分かったので捨ててよい。
+            _logger.LogWarning(ex, "取得しておいた記録を読めない: {Path}", MetadataPath);
             if (discardMismatches) Discard();
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 読めなかっただけで、中身が壊れていると分かったわけではない。
+            // 掴まれている間 (ウイルス対策ソフトなど) に捨てると、正しい取得を
+            // 失う。しかも同じ理由で片方だけ消せて対が崩れることもある。
+            // 適用はしないが、次の機会へ回す。
+            _logger.LogWarning(ex, "取得しておいた記録を読めない: {Path}", MetadataPath);
             return null;
         }
         if (metadata is null)
