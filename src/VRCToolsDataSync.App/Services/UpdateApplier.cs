@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Update;
@@ -31,6 +32,12 @@ public static class UpdateApplier
     public static bool TryHandOverToStaged(ILoggerFactory loggerFactory)
     {
         var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
+
+        // 適用に関わる間はクロスプロセスのロックを握る。ヘルパが動いている間は
+        // ここで待たされ、こちらが展開している間はヘルパの側が待つ。握ったまま
+        // 展開とヘルパの起動まで済ませるのは、その間に別の App が起動して同じ
+        // 展開先を作り直すと、動いているヘルパの足元を崩すためである。
+        using var applyLock = AcquireApplyLock(logger);
         try
         {
             var stage = new UpdateStage(logger: logger);
@@ -62,6 +69,11 @@ public static class UpdateApplier
             // 適用に入れなくても、今の版のまま起動は続けられる。
             logger.LogWarning(ex, "取得済みの更新の適用に入れなかった");
             return false;
+        }
+        finally
+        {
+            // ヘルパは起動直後にこのロックを待つ。ここで手放して先へ進ませる。
+            applyLock?.Release();
         }
     }
 
@@ -109,8 +121,102 @@ public static class UpdateApplier
     }
 
     /// <summary>
+    /// 更新の適用に関わる間だけ握るクロスプロセスのロック。
+    /// <para>
+    /// 動いているヘルパがあれば、その完了まで待つ。待ちきれない場合も
+    /// null を返してそのまま進む。ここで起動を諦めると、ヘルパが固まったときに
+    /// App を開く手立てが無くなる。取得の照合は後段でやり直すので、途中の状態を
+    /// 掴んだとしても、適用できないものとして捨てられる。
+    /// </para>
+    /// </summary>
+    private static ApplyLock? AcquireApplyLock(ILogger logger)
+    {
+        Mutex? mutex = null;
+        try
+        {
+            mutex = new Mutex(initiallyOwned: false, name: UpdateStage.ApplyMutexName);
+            bool acquired;
+            try
+            {
+                acquired = mutex.WaitOne(UpdaterWaitTimeout);
+            }
+            catch (AbandonedMutexException)
+            {
+                // ヘルパが握ったまま落ちた。所有権はこちらに渡っている。
+                acquired = true;
+            }
+
+            if (acquired) return new ApplyLock(mutex);
+
+            logger.LogWarning("更新ヘルパの完了を待ちきれなかった。そのまま起動を続ける");
+            mutex.Dispose();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "更新のロックを取れなかった");
+            mutex?.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// ヘルパの完了を待つ上限。ヘルパは元の App の終了を最大 10 分待つため、
+    /// それを見込んだ長さにする。
+    /// </summary>
+    private static readonly TimeSpan UpdaterWaitTimeout = TimeSpan.FromMinutes(11);
+
+    /// <summary>
+    /// 握った <see cref="Mutex"/> の後始末をまとめる。
+    /// 解放は所有したスレッドから行う必要があるため、明示的な
+    /// <see cref="Release"/> と <see cref="Dispose"/> を分けてある。
+    /// </summary>
+    private sealed class ApplyLock : IDisposable
+    {
+        private readonly Mutex _mutex;
+        private bool _released;
+
+        public ApplyLock(Mutex mutex) => _mutex = mutex;
+
+        public void Release()
+        {
+            if (_released) return;
+            _released = true;
+            try { _mutex.ReleaseMutex(); } catch { /* best-effort */ }
+        }
+
+        public void Dispose()
+        {
+            Release();
+            _mutex.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 更新のロックを取ってから展開とヘルパの起動を行う。
+    /// 常駐中の「再起動して適用」から使う (起動時の経路は既にロックを握っている)。
+    /// </summary>
+    public static bool TrySpawnUpdaterWithLock(UpdateStage stage, string installRoot, ILogger logger)
+    {
+        using var applyLock = AcquireApplyLock(logger);
+        try
+        {
+            return TrySpawnUpdater(stage, installRoot, logger);
+        }
+        finally
+        {
+            // ヘルパは起動直後にこのロックを待つ。ここで手放して先へ進ませる。
+            applyLock?.Release();
+        }
+    }
+
+    /// <summary>
     /// ZIP を展開してヘルパを起動する。呼び出し側はこの後で App を終了させる。
     /// ヘルパは --wait-pid でこのプロセスの終了を待ってから置き換える。
+    /// <para>
+    /// 更新のロックを握った状態で呼ぶこと。展開先を作り直すため、動いている
+    /// ヘルパと重なると足元を崩す。
+    /// </para>
     /// </summary>
     public static bool TrySpawnUpdater(UpdateStage stage, string installRoot, ILogger logger)
     {

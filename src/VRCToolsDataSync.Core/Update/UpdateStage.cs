@@ -21,6 +21,18 @@ public sealed class StagedMetadata
     public required long Size { get; init; }
 
     /// <summary>
+    /// 取得した配布物の名前。アーキテクチャがここに表れる
+    /// (VRCToolsDataSync-win-x64.zip / -arm64.zip)。
+    /// <para>
+    /// ARM64 の Windows では、ネイティブの版とエミュレーションの x64 版が
+    /// 同じ置き場所を共有しうる。名前を残さないと、片方が取った ZIP を
+    /// もう片方が自分のインストール先へ適用できてしまう。
+    /// 古い記録には無いため既定は空とし、その場合は適用しない。
+    /// </para>
+    /// </summary>
+    public string AssetName { get; init; } = string.Empty;
+
+    /// <summary>
     /// 安定版のチャンネルで拾う対象か。取得したときの <see cref="ReleaseInfo.IsStable"/> を残す。
     /// <para>
     /// タグの綴りだけでは足りない。手で作ったリリースにプレリリースの印だけが
@@ -102,6 +114,7 @@ public sealed class UpdateStage
             DigestHex = asset.DigestHex,
             Size = asset.Size,
             Stable = release.IsStable,
+            AssetName = asset.Name,
         };
 
         // 記録を先に消す。ZIP を入れ替えた後で記録を書けなかった場合、
@@ -115,8 +128,23 @@ public sealed class UpdateStage
         DeleteDirectoryQuietly(ExtractDirectory);
     }
 
+    /// <summary>
+    /// 更新ヘルパが動いている間だけ握るクロスプロセスのロックの名前。
+    /// <para>
+    /// ヘルパは展開先とインストール先を触る。その最中に App を起動されると、
+    /// 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを
+    /// 掴んだままヘルパのリネームとぶつかったりする。App は起動の先頭でこれを
+    /// 待ち、ヘルパは適用の全体で握る。
+    /// </para>
+    /// <para>
+    /// Global\ は付けない。置き場所が %AppData% 配下でユーザごとに分かれており、
+    /// competing するのは同じユーザのプロセスだけである。
+    /// </para>
+    /// </summary>
+    public const string ApplyMutexName = "VRCToolsDataSync.Update.Apply";
+
     /// <summary>取得の途中で終わったものを消す。次の取得の前に呼ぶ。</summary>
-    public void DiscardIncoming() => DeleteQuietly(IncomingZipPath);
+    public void DiscardIncoming() => _ = DeleteQuietly(IncomingZipPath);
 
     /// <summary>記録だけを読む。照合はしない。画面の表示に使う。</summary>
     public StagedMetadata? TryLoadMetadata()
@@ -166,6 +194,19 @@ public sealed class UpdateStage
             return null;
         }
 
+        // 実行中のプロセスに合う配布物かを見る。ARM64 の Windows では
+        // ネイティブの版とエミュレーションの x64 版が同じ置き場所を共有しうる。
+        // 名前が合わないもの (と、名前を持たない古い記録) は適用しない。
+        var expectedAsset = ReleaseAsset.NameForCurrentArchitecture();
+        if (expectedAsset is null || !string.Equals(metadata.AssetName, expectedAsset, StringComparison.Ordinal))
+        {
+            _logger.LogInformation(
+                "取得しておいた {Tag} は実行中のアーキテクチャ向けではない ({Actual} / {Expected})",
+                metadata.Tag, metadata.AssetName, expectedAsset ?? "(配布なし)");
+            if (discardMismatches) Discard();
+            return null;
+        }
+
         // 今のチャンネルが拾う版かを見る。取得と置き換えの間には、設定を変えて
         // 再起動するだけの間がある。test で取ったプレリリースを取得済みのまま
         // stable へ変えられると、選び直した設定に反してプレリリースが入る。
@@ -203,12 +244,22 @@ public sealed class UpdateStage
     /// 取得しておいたものを消す。片方ずつ消す。まとめて括ると、先の 1 つが
     /// 消せなかったときにもう片方を試さないまま抜ける。
     /// </summary>
-    public void Discard()
+    /// <summary>
+    /// 取得しておいたものを消す。片方ずつ消す。まとめて括ると、先の 1 つが
+    /// 消せなかったときにもう片方を試さないまま抜ける。
+    /// <para>
+    /// ZIP と記録の両方を消せたときだけ true を返す。呼び出し側が
+    /// 「次の起動でまた同じものを適用しに行かないか」を判断できるようにするため。
+    /// 展開先は消せなくても適用の判断に影響しないので、成否には含めない。
+    /// </para>
+    /// </summary>
+    public bool Discard()
     {
-        DeleteQuietly(ZipPath);
-        DeleteQuietly(MetadataPath);
+        var zip = DeleteQuietly(ZipPath);
+        var metadata = DeleteQuietly(MetadataPath);
         DeleteQuietly(IncomingZipPath);
         DeleteDirectoryQuietly(ExtractDirectory);
+        return zip && metadata;
     }
 
     /// <summary>
@@ -269,15 +320,18 @@ public sealed class UpdateStage
         return Convert.ToHexStringLower(sha.Hash!);
     }
 
-    private void DeleteQuietly(string path)
+    /// <summary>消せたか (もともと無かった場合も true) を返す。</summary>
+    private bool DeleteQuietly(string path)
     {
         try
         {
             File.Delete(path);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogWarning(ex, "消せなかった: {Path}", path);
+            return false;
         }
     }
 

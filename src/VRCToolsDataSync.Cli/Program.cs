@@ -593,6 +593,40 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
     });
     var logger = loggerFactory.CreateLogger("SelfUpdate");
 
+    // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
+    // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま
+    // こちらのリネームとぶつかったりする。App は起動の先頭でこれを待つ。
+    using var applyMutex = new System.Threading.Mutex(initiallyOwned: false, name: UpdateStage.ApplyMutexName);
+    var applyMutexHeld = false;
+    try
+    {
+        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromSeconds(30));
+    }
+    catch (AbandonedMutexException)
+    {
+        // 前のヘルパが握ったまま落ちた。所有権はこちらに渡っている。
+        applyMutexHeld = true;
+    }
+    if (!applyMutexHeld)
+    {
+        // 別のヘルパが動いている。二重に適用しない。
+        Console.Error.WriteLine("別の更新処理が実行中のため、置き換えを中止しました。");
+        logger.LogWarning("更新のロックを取れなかったため適用しない");
+        return 6;
+    }
+
+    try
+    {
+        return ApplySelfUpdateCore(source, target, waitPid, relaunch, logger);
+    }
+    finally
+    {
+        try { applyMutex.ReleaseMutex(); } catch { /* best-effort */ }
+    }
+}
+
+static int ApplySelfUpdateCore(string source, string target, int? waitPid, bool relaunch, ILogger logger)
+{
     // 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
     // その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
     // 失敗するだけである。待ちきれなければ、壊す前にここで止める。
@@ -644,13 +678,25 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, bool rela
         // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
         // 開けなくなる。展開先はこのヘルパ自身が動いている場所なので消せないが、
         // ZIP と記録が消えれば次の起動は適用へ入らず、展開先は後始末が拾う。
+        var discarded = false;
         try
         {
-            new UpdateStage(logger: logger).Discard();
+            discarded = new UpdateStage(logger: logger).Discard();
         }
         catch (Exception discard)
         {
             logger.LogWarning(discard, "取得済みの更新を捨てられなかった");
+        }
+
+        if (!discarded)
+        {
+            // 捨てられなかった。ここで開き直すと、次の起動がまた同じ適用へ
+            // 入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
+            // 手で片付ける先を伝えて終える。
+            Console.Error.WriteLine(
+                $"取得済みの更新を消せませんでした。{new UpdateStage().Directory} を手で削除してから起動してください。");
+            logger.LogError("取得済みの更新を消せないため、App を起動し直さない");
+            return 8;
         }
 
         // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。

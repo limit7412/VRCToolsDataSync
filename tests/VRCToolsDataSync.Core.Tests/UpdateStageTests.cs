@@ -22,7 +22,13 @@ public sealed class UpdateStageTests : IDisposable
     private UpdateStage CreateStage() => new(_directory);
 
     /// <summary>取得済みの状態 (ZIP と記録の対) を作る。</summary>
-    private UpdateStage StageWith(string tag, bool prerelease = false, byte[]? corruptedContent = null)
+    /// <summary>テストを走らせているプロセスに合う配布物の名前。</summary>
+    private static string CurrentAssetName =>
+        ReleaseAsset.NameForCurrentArchitecture()
+        ?? throw new InvalidOperationException("配布のあるアーキテクチャで実行すること");
+
+    private UpdateStage StageWith(
+        string tag, bool prerelease = false, byte[]? corruptedContent = null, string? assetName = null)
     {
         var stage = CreateStage();
         Directory.CreateDirectory(_directory);
@@ -34,7 +40,7 @@ public sealed class UpdateStageTests : IDisposable
 
         var version = ReleaseVersion.Parse(tag)!;
         var asset = new ReleaseAsset(
-            "VRCToolsDataSync-win-x64.zip",
+            assetName ?? CurrentAssetName,
             "https://example.com/asset",
             Convert.ToHexStringLower(SHA256.HashData(content)),
             content.Length);
@@ -142,6 +148,53 @@ public sealed class UpdateStageTests : IDisposable
         Assert.NotEqual(first, File.ReadAllBytes(second.ZipPath));
         // 一時の場所は空にしておく。次の取得の書きかけと取り違えない。
         Assert.False(File.Exists(second.IncomingZipPath));
+    }
+
+    [Fact(DisplayName = "別のアーキテクチャ向けの取得は適用しない")]
+    public void DiscardsStagedForAnotherArchitecture()
+    {
+        // ARM64 の Windows では、ネイティブの版とエミュレーションの x64 版が
+        // 同じ置き場所を共有しうる。片方の取得をもう片方が適用してはいけない。
+        var stage = StageWith("0.0.10", assetName: "VRCToolsDataSync-win-somethingelse.zip");
+
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+        Assert.False(File.Exists(stage.ZipPath));
+    }
+
+    [Fact(DisplayName = "配布物の名前を持たない古い記録は適用しない")]
+    public void DiscardsStagedWithoutAssetName()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 名前の項目が無い、この変更より前に書かれた記録へ差し替える。
+        var size = new FileInfo(stage.ZipPath).Length;
+        var digest = Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(stage.ZipPath)));
+        File.WriteAllText(stage.MetadataPath, $$"""
+            {
+              "tag": "0.0.10",
+              "digestHex": "{{digest}}",
+              "size": {{size}},
+              "stable": true
+            }
+            """);
+
+        // 分からないものを適用するわけにはいかない。
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+    }
+
+    [Fact(DisplayName = "破棄は消せたかどうかを返す")]
+    public void DiscardReportsWhetherItRemovedThePair()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 消せたときだけ true。呼び出し側はこれを見て、次の起動が同じものを
+        // 適用しに行かないことを確かめる。
+        Assert.True(stage.Discard());
+        Assert.False(File.Exists(stage.ZipPath));
+        Assert.False(File.Exists(stage.MetadataPath));
+
+        // もともと無い場合も消せたものとして扱う。
+        Assert.True(stage.Discard());
     }
 
     [Fact(DisplayName = "表示用の読み出しは対がそろっているときだけ返す")]

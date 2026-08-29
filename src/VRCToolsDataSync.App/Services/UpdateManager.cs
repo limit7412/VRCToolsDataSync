@@ -294,7 +294,9 @@ public sealed class UpdateManager : IDisposable
                 return false;
             }
 
-            return UpdateApplier.TrySpawnUpdater(_stage, root, _logger);
+            // ロックを取ってから展開する。起動中の別プロセスが同じ展開先を
+            // 触っている場合に、その足元を崩さないため。
+            return UpdateApplier.TrySpawnUpdaterWithLock(_stage, root, _logger);
         }
         catch (Exception ex)
         {

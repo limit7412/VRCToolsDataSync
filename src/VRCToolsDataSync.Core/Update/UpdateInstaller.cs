@@ -153,19 +153,22 @@ public class UpdateInstaller
             LogQuietly(() => _logger.LogInformation("{Part} を置き換えた", part));
         }
 
-        // (4) ランチャーは 1 ファイルの上書きで済ませる。ここで失敗しても
-        //     app / cli の置き換えは成立しており、旧ランチャーでも相対参照で
-        //     新しい app を起動できるため、警告に留める。
+        // (4) ランチャーを差し替える。同じディレクトリの一時ファイルへ書き切って
+        //     から置き換える。直接上書きすると、書いている途中で容量が尽きた場合に
+        //     欠けたランチャーが残り、通常の起動手段ごと壊れる。
+        //     ここで失敗しても app / cli の置き換えは成立しており、旧ランチャーは
+        //     無傷で、相対参照で新しい app を起動できるため、警告に留める。
+        var launcher = Path.Combine(_targetDirectory, LauncherName);
+        var launcherTemp = launcher + ".new";
         try
         {
-            File.Copy(
-                Path.Combine(_sourceDirectory, LauncherName),
-                Path.Combine(_targetDirectory, LauncherName),
-                overwrite: true);
+            File.Copy(Path.Combine(_sourceDirectory, LauncherName), launcherTemp, overwrite: true);
+            File.Move(launcherTemp, launcher, overwrite: true);
         }
         catch (Exception ex)
         {
-            LogQuietly(() => _logger.LogWarning(ex, "ランチャーを上書きできなかった: {Name}", LauncherName));
+            LogQuietly(() => _logger.LogWarning(ex, "ランチャーを差し替えられなかった: {Name}", LauncherName));
+            try { File.Delete(launcherTemp); } catch { /* best-effort */ }
         }
     }
 
