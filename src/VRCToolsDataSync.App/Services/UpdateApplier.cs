@@ -435,8 +435,10 @@ public static class UpdateApplier
     /// 材料 (.old) まで失う。
     /// </para>
     /// <para>
-    /// 読めない・解釈できない場合は通す。ここで閉じる側に倒すと、版の埋め込み方が
-    /// 変わっただけで更新が止まる。断るのは、読めた上で違うと分かった場合だけ。
+    /// 版そのものを読み出せなかった場合 (版の資源が無い等) は通す。ここまで
+    /// 閉じる側に倒すと、埋め込み方が変わっただけで更新が止まる。読めた値が
+    /// 解釈できない場合は断る。<c>-Version</c> を渡し忘れたビルドの既定値
+    /// (0.0.0-dev) がここに来るためで、通せば上の繰り返しにそのまま入る。
     /// </para>
     /// </summary>
     private static bool ExtractedVersionMatches(string extracted, string expectedTag, ILogger logger)
@@ -446,21 +448,21 @@ public static class UpdateApplier
 
         var appDirectory = Path.Combine(extracted, "app");
         var embedded =
-            RunningVersion.OfFile(Path.Combine(appDirectory, "VRCToolsDataSync.App.dll"))
+            RunningVersion.OfFile(Path.Combine(appDirectory, UpdateInstaller.AppAssemblyName))
             ?? RunningVersion.OfFile(Path.Combine(appDirectory, UpdateInstaller.AppExecutableName));
 
-        var actual = embedded is null ? null : ReleaseVersion.Parse(embedded);
-        if (actual is null)
+        if (embedded is null)
         {
             LogQuietly(() => logger.LogWarning(
                 "展開した一式の版を読めなかったため、そのまま適用する: {Tag}", expectedTag));
             return true;
         }
 
-        if (actual.CompareTo(expected) == 0) return true;
+        var actual = ReleaseVersion.Parse(embedded);
+        if (actual is not null && actual.CompareTo(expected) == 0) return true;
 
         LogQuietly(() => logger.LogWarning(
-            "展開した一式の版 ({Actual}) が記録のタグ ({Tag}) と違うため捨てる", embedded, expectedTag));
+            "展開した一式の版 ({Actual}) が記録のタグ ({Tag}) と合わないため捨てる", embedded, expectedTag));
         return false;
     }
 

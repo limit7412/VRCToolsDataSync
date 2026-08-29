@@ -41,6 +41,18 @@ public class UpdateInstaller
     /// <summary>cli ディレクトリに入る CLI (更新ヘルパ) の実行ファイルの名前。</summary>
     public const string CliExecutableName = "VRCToolsDataSync.Cli.exe";
 
+    /// <summary>
+    /// app ディレクトリに入る GUI の本体 (マネージドアセンブリ) の名前。
+    /// <para>
+    /// 配布は単一ファイルにまとめていないため、exe は起動の入り口 (apphost) で
+    /// しかない。これが欠けると exe があっても起動できない。
+    /// </para>
+    /// </summary>
+    public const string AppAssemblyName = "VRCToolsDataSync.App.dll";
+
+    /// <summary>cli ディレクトリに入る CLI の本体 (マネージドアセンブリ) の名前。</summary>
+    public const string CliAssemblyName = "VRCToolsDataSync.Cli.dll";
+
     /// <summary>置き換えの対象になる、インストール先直下のディレクトリ。</summary>
     private static readonly string[] Parts = { "app", "cli" };
 
@@ -221,10 +233,16 @@ public class UpdateInstaller
         // そのものであることまでで、中身の形は保証しない。app の exe が欠けた
         // 一式で進むと、現行を退避した後に起動できないディレクトリへ置き換えて
         // しまう。ランチャーと再起動処理が参照する exe を必須として見る。
+        //
+        // 本体のアセンブリも見る。配布は単一ファイルにまとめていないので、exe は
+        // 起動の入り口でしかない。exe だけそろっていても、隣の dll が欠けていれば
+        // 起動できず、置き換えだけが成功して App を開けなくなる。
         foreach (var required in new[]
         {
             Path.Combine("app", AppExecutableName),
+            Path.Combine("app", AppAssemblyName),
             Path.Combine("cli", CliExecutableName),
+            Path.Combine("cli", CliAssemblyName),
         })
         {
             if (!File.Exists(Path.Combine(_sourceDirectory, required)))

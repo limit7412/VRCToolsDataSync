@@ -35,8 +35,10 @@ public sealed class UpdateInstallerTests : IDisposable
         File.WriteAllText(Path.Combine(directory, "app", "marker.txt"), marker + "-app");
         File.WriteAllText(Path.Combine(directory, "app", "nested", "marker.txt"), marker + "-nested");
         File.WriteAllText(Path.Combine(directory, "app", UpdateInstaller.AppExecutableName), marker + "-app-exe");
+        File.WriteAllText(Path.Combine(directory, "app", UpdateInstaller.AppAssemblyName), marker + "-app-dll");
         File.WriteAllText(Path.Combine(directory, "cli", "marker.txt"), marker + "-cli");
         File.WriteAllText(Path.Combine(directory, "cli", UpdateInstaller.CliExecutableName), marker + "-cli-exe");
+        File.WriteAllText(Path.Combine(directory, "cli", UpdateInstaller.CliAssemblyName), marker + "-cli-dll");
         File.WriteAllText(Path.Combine(directory, UpdateInstaller.LauncherName), marker + "-cmd");
     }
 
@@ -82,6 +84,19 @@ public sealed class UpdateInstallerTests : IDisposable
         // digest は ZIP が配布物そのものであることまでしか保証しない。
         // ディレクトリがそろっていても、起動できない一式で置き換えない。
         File.Delete(Path.Combine(SourceDir, "app", UpdateInstaller.AppExecutableName));
+
+        Assert.Throws<InvalidOperationException>(() => new UpdateInstaller(SourceDir, TargetDir).Apply());
+
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.False(Directory.Exists(TargetFile("app.old")));
+    }
+
+    [Fact(DisplayName = "app の本体 dll が欠けた一式も、正規の位置に触る前に断る")]
+    public void RefusesSourceWithoutAppAssembly()
+    {
+        // 配布は単一ファイルにまとめていないので、exe は起動の入り口でしかない。
+        // 隣の dll が欠けていれば、exe がそろっていても起動できない。
+        File.Delete(Path.Combine(SourceDir, "app", UpdateInstaller.AppAssemblyName));
 
         Assert.Throws<InvalidOperationException>(() => new UpdateInstaller(SourceDir, TargetDir).Apply());
 

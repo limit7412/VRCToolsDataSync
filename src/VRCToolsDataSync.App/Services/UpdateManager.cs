@@ -257,7 +257,16 @@ public sealed class UpdateManager : IDisposable
     private async Task DownloadIfNeededAsync(ReleaseInfo release, UpdateChannel channel)
     {
         if (release.Asset is not { } asset) return;
-        if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false)) return;
+        if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false))
+        {
+            // 走っている取得の裏で、別の確認が新しい候補を見つけた。ここで
+            // 落とすと、その候補は次の確認 (定期なら 24 時間後) まで取りに
+            // 行かれない。チャンネルを切り替えた直後がこれに当たる。覚えて
+            // おいて、走っている取得が終わったらやり直す。
+            _pending = new PendingDownload(release, channel);
+            return;
+        }
+
         try
         {
             // 確認の最中にチャンネルを変えられていないか見る。確認は数秒かかり、
@@ -333,8 +342,22 @@ public sealed class UpdateManager : IDisposable
         finally
         {
             _downloadGate.Release();
+
+            // 待たせていた要求があればやり直す。取得の枠は今空いたところなので、
+            // 次はここを通れる。要求は 1 つだけ覚える (同じ確認から何度も来ても
+            // 最後のものだけ追えばよい)。
+            var pending = Interlocked.Exchange(ref _pending, null);
+            if (pending is not null)
+            {
+                _ = DownloadIfNeededAsync(pending.Release, pending.Channel);
+            }
         }
     }
+
+    /// <summary>取得が走っている間に来た、次に追うべき候補。</summary>
+    private sealed record PendingDownload(ReleaseInfo Release, UpdateChannel Channel);
+
+    private PendingDownload? _pending;
 
     /// <summary>
     /// 取得済みの更新を照合し直し、更新ヘルパを起動する。true が返ったら
