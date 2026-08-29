@@ -307,9 +307,11 @@ public partial class MainPageViewModel : ObservableObject
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
         var settings = _runner.LoadSettings();
-        // 自動確認を止めていた間は確認が走らず、残っている結果は古くなっている。
-        // 戻したときに確認し直すため、保存の前にディスク側の値を控える。
-        var checkWasEnabled = settings.Update?.CheckEnabled ?? true;
+        // 更新確認の設定は、保存の前のディスク側の値を控えておく。
+        // 自動確認を戻したときと、チャンネルを変えたときに確認し直すために使う。
+        var previousUpdate = settings.Update ?? new UpdateSettings();
+        var checkWasEnabled = previousUpdate.CheckEnabled;
+        var previousChannel = previousUpdate.Channel;
         settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
@@ -341,11 +343,19 @@ public partial class MainPageViewModel : ObservableObject
         var channel = update.Channel;
         if (_updates is not null)
         {
-            // 自動確認を戻したときは、確認済みでも確認し直す。止めていた間は
-            // 定期の確認が走っておらず、残っている結果は古い。次の定期確認まで
+            // 次のどちらかなら、確認済みでも確認し直す。
+            //
+            // 自動確認を戻したとき: 止めていた間は定期の確認が走っておらず、
+            // 残っている結果は古い。
+            //
+            // チャンネルを変えたとき: そのチャンネルの確認済みの印だけでは
+            // 足りない。stable の結果がある状態で test へ変え、その確認の途中で
+            // stable へ戻すと、印は残っているのに、遅れて届いた test の結果が
+            // 確認の状態を上書きしてしまう。どちらの場合も、次の定期確認まで
             // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
             var reEnabled = !checkWasEnabled && update.CheckEnabled;
-            if (reEnabled)
+            var channelChanged = previousChannel != channel;
+            if (reEnabled || channelChanged)
             {
                 UpdateStatus = "確認しています...";
                 _ = _updates.CheckAsync(manual: false);

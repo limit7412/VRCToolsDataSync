@@ -51,6 +51,21 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         Assert.Equal(string.Empty, loaded.Update.NotifiedVersion);
     }
 
+    [Fact(DisplayName = "明示的な null が書かれていても既定値で読める")]
+    public void DefaultsApplyWhenSectionIsExplicitlyNull()
+    {
+        // 手で編集された settings.json には null が書かれうる。読んだ側が
+        // 毎回それを気にせずに済むよう、読み込みの時点で既定へ落とす。
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(Path.Combine(_directory, "settings.json"), """{ "update": null }""");
+
+        var loaded = CreateStore().Load();
+
+        Assert.NotNull(loaded.Update);
+        Assert.Equal(UpdateChannel.Stable, loaded.Update.Channel);
+        Assert.True(loaded.Update.CheckEnabled);
+    }
+
     [Fact(DisplayName = "ToolState 専用の保存は update セクションを巻き戻さない")]
     public void SaveToolStateOnlyKeepsUpdateSectionOnDisk()
     {
