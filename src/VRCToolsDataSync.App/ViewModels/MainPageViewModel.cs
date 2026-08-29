@@ -316,6 +316,9 @@ public partial class MainPageViewModel : ObservableObject
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
         var settings = _runner.LoadSettings();
+        // 自動確認を止めていた間は確認が走らず、残っている結果は古くなっている。
+        // 戻したときに確認し直すため、保存の前にディスク側の値を控える。
+        var checkWasEnabled = settings.Update?.CheckEnabled ?? true;
         settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
@@ -344,7 +347,16 @@ public partial class MainPageViewModel : ObservableObject
         var channel = _settings.Update.Channel;
         if (_updates is not null)
         {
-            if (!_updates.HasChecked(channel))
+            // 自動確認を戻したときは、確認済みでも確認し直す。止めていた間は
+            // 定期の確認が走っておらず、残っている結果は古い。次の定期確認まで
+            // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
+            var reEnabled = !checkWasEnabled && _settings.Update.CheckEnabled;
+            if (reEnabled)
+            {
+                UpdateStatus = "確認しています...";
+                _ = _updates.CheckAsync(manual: false);
+            }
+            else if (!_updates.HasChecked(channel))
             {
                 UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
                 _ = _updates.CheckAsync(manual: false);

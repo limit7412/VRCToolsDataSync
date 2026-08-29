@@ -110,16 +110,43 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
         return new ReleaseCatalog(Merge(listed, latest), false);
     }
 
-    /// <summary>集めた候補と、最後まで取れたかを返す。</summary>
+    /// <summary>
+    /// 集めた候補と、最後まで取れたかを返す。
+    /// <para>
+    /// 2 ページ目以降で失敗しても、そこまでに取れた候補は返す。
+    /// 手元には既に候補があり、その中に新しい版がいるかもしれない。
+    /// 集めきれていないことは Complete=false が伝えるので、
+    /// 「最新である」と言い切ることにはならない。
+    /// 1 ページも取れなかった場合だけ投げる。候補が空なのは、
+    /// 「新しい版が無い」ではなく「届かなかった」である。
+    /// </para>
+    /// </summary>
     private async Task<(List<ReleaseInfo> Releases, bool Complete)> FetchAllAsync(CancellationToken cancellationToken)
     {
         var releases = new List<ReleaseInfo>();
         for (var page = 1; page <= MaxPages; page++)
         {
-            var body = await GetStringAsync(
-                $"{_baseUrl}/releases?per_page={PerPage}&page={page}", cancellationToken).ConfigureAwait(false);
-            var payloads = JsonSerializer.Deserialize<List<ReleasePayload>>(body)
-                ?? throw new HttpRequestException("GitHub API の応答を読めなかった");
+            List<ReleasePayload> payloads;
+            try
+            {
+                var body = await GetStringAsync(
+                    $"{_baseUrl}/releases?per_page={PerPage}&page={page}", cancellationToken).ConfigureAwait(false);
+                payloads = JsonSerializer.Deserialize<List<ReleasePayload>>(body)
+                    ?? throw new HttpRequestException("GitHub API の応答を読めなかった");
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            // 1 ページ目を取れているかで分ける。取れた候補の数では分けない。
+            // 1 ページ分すべてが読めないタグ (下書きなど) の場合に、届いている
+            // のに「届かなかった」と扱うことになる。
+            catch (Exception ex) when (page > 1)
+            {
+                _logger.LogWarning(ex, "リリースの一覧を {Page} ページ目で取れなかった。そこまでの範囲で判断する", page);
+                return (releases, false);
+            }
+
             releases.AddRange(BuildAll(payloads, _assetName));
 
             // 上限に満たない件数で返ってきたら最後のページである。
