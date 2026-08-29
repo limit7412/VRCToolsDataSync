@@ -250,22 +250,54 @@ public sealed class UpdateManager : IDisposable
     }
 
     /// <summary>
-    /// まだ取っていない版なら取得して staged に置く。取得は 1 本に絞り、
-    /// 走っている間の呼び出しは黙って戻る (次の確認がまた呼ぶ)。
+    /// まだ取っていない版なら取得して staged に置く。取得は 1 本に絞る。
+    /// <para>
+    /// 走っている取得があれば、要求を置いて戻る。置いた要求は、走っている
+    /// 取得が終わりに拾う。落とすと、その候補は次の確認 (定期なら 24 時間後)
+    /// まで取りに行かれない。チャンネルを切り替えた直後がこれに当たる。
+    /// </para>
+    /// <para>
+    /// 要求を置くのは枠を見るより先である。逆にすると、枠が空いていないと
+    /// 見た直後に走っていた取得が終わり、その取得が拾うより後に要求を置く、
+    /// という順序が成り立つ。置いた要求を誰も拾わない。
+    /// </para>
     /// </summary>
     /// <param name="channel">この候補を見つけた確認のチャンネル。</param>
     private async Task DownloadIfNeededAsync(ReleaseInfo release, UpdateChannel channel)
     {
-        if (release.Asset is not { } asset) return;
-        if (!await _downloadGate.WaitAsync(0).ConfigureAwait(false))
+        if (release.Asset is null) return;
+        lock (_pendingLock) { _pending = new PendingDownload(release, channel); }
+
+        while (await _downloadGate.WaitAsync(0).ConfigureAwait(false))
         {
-            // 走っている取得の裏で、別の確認が新しい候補を見つけた。ここで
-            // 落とすと、その候補は次の確認 (定期なら 24 時間後) まで取りに
-            // 行かれない。チャンネルを切り替えた直後がこれに当たる。覚えて
-            // おいて、走っている取得が終わったらやり直す。
-            _pending = new PendingDownload(release, channel);
-            return;
+            PendingDownload? next;
+            lock (_pendingLock) { (next, _pending) = (_pending, null); }
+
+            if (next is null)
+            {
+                // 別の呼び出しが先に拾っていった。
+                _downloadGate.Release();
+                return;
+            }
+
+            try
+            {
+                await RunDownloadAsync(next.Release, next.Channel).ConfigureAwait(false);
+            }
+            finally
+            {
+                _downloadGate.Release();
+            }
+
+            // 走らせている間に来た要求があれば、続けて拾う。
+            lock (_pendingLock) { if (_pending is null) return; }
         }
+    }
+
+    /// <summary>取得の本体。枠を取った状態で呼ぶ。</summary>
+    private async Task RunDownloadAsync(ReleaseInfo release, UpdateChannel channel)
+    {
+        if (release.Asset is not { } asset) return;
 
         try
         {
@@ -339,25 +371,18 @@ public sealed class UpdateManager : IDisposable
             _logger.LogWarning(ex, "更新の取得に失敗した: {Tag}", release.Tag);
             _stage.DiscardIncoming();
         }
-        finally
-        {
-            _downloadGate.Release();
-
-            // 待たせていた要求があればやり直す。取得の枠は今空いたところなので、
-            // 次はここを通れる。要求は 1 つだけ覚える (同じ確認から何度も来ても
-            // 最後のものだけ追えばよい)。
-            var pending = Interlocked.Exchange(ref _pending, null);
-            if (pending is not null)
-            {
-                _ = DownloadIfNeededAsync(pending.Release, pending.Channel);
-            }
-        }
     }
 
     /// <summary>取得が走っている間に来た、次に追うべき候補。</summary>
     private sealed record PendingDownload(ReleaseInfo Release, UpdateChannel Channel);
 
+    /// <summary>
+    /// 次に追うべき候補。1 つだけ覚える (同じ確認から何度来ても最後のものだけ
+    /// 追えばよい)。置くのと拾うのを同じ錠の下で行う。
+    /// </summary>
     private PendingDownload? _pending;
+
+    private readonly object _pendingLock = new();
 
     /// <summary>
     /// 取得済みの更新を照合し直し、更新ヘルパを起動する。true が返ったら

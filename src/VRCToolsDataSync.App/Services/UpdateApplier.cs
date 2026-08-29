@@ -366,7 +366,22 @@ public static class UpdateApplier
     /// </summary>
     public static bool TrySpawnUpdater(UpdateStage stage, string installRoot, string expectedTag, ILogger logger)
     {
-        var extracted = stage.ExtractForApply();
+        string extracted;
+        try
+        {
+            extracted = stage.ExtractForApply();
+        }
+        catch (InvalidDataException ex)
+        {
+            // ZIP として読めない。digest が保証するのは、公開されている配布物
+            // そのものを取れたことまでで、それが壊れていないことではない。
+            // 残すと、起動のたびに同じところで失敗し、取得の側も digest が
+            // 合っているので取り直さない。取得ごと捨てて抜け出す。
+            LogQuietly(() => logger.LogWarning(ex, "取得した ZIP を展開できないため捨てる: {Path}", stage.ZipPath));
+            stage.Discard();
+            return false;
+        }
+
         var updater = Path.Combine(extracted, "cli", UpdateInstaller.CliExecutableName);
         if (!File.Exists(updater))
         {
