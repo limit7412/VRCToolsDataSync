@@ -152,35 +152,7 @@ public static class UpdateApplier
     /// </para>
     /// </summary>
     private static ApplyLock? AcquireApplyLock(ILogger logger)
-    {
-        Mutex? mutex = null;
-        try
-        {
-            mutex = UpdateStage.CreateApplyMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory));
-            bool acquired;
-            try
-            {
-                acquired = mutex.WaitOne(UpdaterWaitTimeout);
-            }
-            catch (AbandonedMutexException)
-            {
-                // ヘルパが握ったまま落ちた。所有権はこちらに渡っている。
-                acquired = true;
-            }
-
-            if (acquired) return new ApplyLock(mutex);
-
-            LogQuietly(() => logger.LogWarning("更新ヘルパの完了を待ちきれなかった。更新には触らずに続ける"));
-            mutex.Dispose();
-            return null;
-        }
-        catch (Exception ex)
-        {
-            LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
-            mutex?.Dispose();
-            return null;
-        }
-    }
+        => ApplyLock.TryAcquire(UpdaterWaitTimeout, logger);
 
     /// <summary>
     /// ヘルパの完了を待つ上限。ヘルパは元の App の終了を最大 10 分待つため、
@@ -189,29 +161,98 @@ public static class UpdateApplier
     private static readonly TimeSpan UpdaterWaitTimeout = TimeSpan.FromMinutes(11);
 
     /// <summary>
-    /// 握った <see cref="Mutex"/> の後始末をまとめる。
-    /// 解放は所有したスレッドから行う必要があるため、明示的な
-    /// <see cref="Release"/> と <see cref="Dispose"/> を分けてある。
+    /// 握った <see cref="Mutex"/> と、それを所有するスレッドの組。
+    /// <para>
+    /// <see cref="Mutex"/> の所有権はスレッドに紐づき、取ったスレッドからしか
+    /// 手放せない。ここでは、取得から解放までを専用のスレッドに閉じ込め、
+    /// 外からは <see cref="Dispose"/> の合図だけで手放せるようにする。
+    /// そうしないと、取得が <c>Task.Run</c> の中で、解放が UI スレッドから、
+    /// というような組み合わせで解放が黙って失敗する。
+    /// </para>
+    /// <para>
+    /// スレッドは背景スレッドなので、合図が来ないまま残ってもプロセスの終了を
+    /// 妨げない。所有権はそのときに OS が手放し、待っているヘルパへ渡る。
+    /// </para>
     /// </summary>
     private sealed class ApplyLock : IDisposable
     {
-        private readonly Mutex _mutex;
-        private bool _released;
+        private readonly ManualResetEventSlim _acquired = new(false);
+        private readonly ManualResetEventSlim _release = new(false);
+        private bool _held;
 
-        public ApplyLock(Mutex mutex) => _mutex = mutex;
+        private ApplyLock() { }
 
-        public void Release()
+        /// <summary>取れなければ null を返す。</summary>
+        public static ApplyLock? TryAcquire(TimeSpan timeout, ILogger logger)
         {
-            if (_released) return;
-            _released = true;
-            try { _mutex.ReleaseMutex(); } catch { /* best-effort */ }
+            var owner = new ApplyLock();
+            try
+            {
+                var thread = new Thread(() => owner.Own(timeout, logger))
+                {
+                    IsBackground = true,
+                    Name = "VRCToolsDataSync.UpdateApplyLock",
+                };
+                thread.Start();
+            }
+            catch (Exception ex)
+            {
+                LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
+                return null;
+            }
+
+            owner._acquired.Wait();
+            if (owner._held) return owner;
+
+            owner.Dispose();
+            return null;
         }
 
-        public void Dispose()
+        /// <summary>専用スレッドの中身。取得を伝えた後、解放の合図まで持ち続ける。</summary>
+        private void Own(TimeSpan timeout, ILogger logger)
         {
-            Release();
-            _mutex.Dispose();
+            Mutex? mutex = null;
+            try
+            {
+                mutex = UpdateStage.CreateApplyMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory));
+                try
+                {
+                    _held = mutex.WaitOne(timeout);
+                }
+                catch (AbandonedMutexException)
+                {
+                    // ヘルパが握ったまま落ちた。所有権はこちらに渡っている。
+                    _held = true;
+                }
+
+                if (!_held)
+                {
+                    LogQuietly(() => logger.LogWarning("更新ヘルパの完了を待ちきれなかった。更新には触らずに続ける"));
+                }
+            }
+            catch (Exception ex)
+            {
+                LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
+                _held = false;
+            }
+            finally
+            {
+                _acquired.Set();
+            }
+
+            if (!_held)
+            {
+                mutex?.Dispose();
+                return;
+            }
+
+            _release.Wait();
+            try { mutex!.ReleaseMutex(); } catch { /* best-effort */ }
+            mutex!.Dispose();
         }
+
+        /// <summary>手放す合図を送る。どのスレッドから呼んでもよい。</summary>
+        public void Dispose() => _release.Set();
     }
 
     /// <summary>
