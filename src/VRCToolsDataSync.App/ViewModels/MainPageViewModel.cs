@@ -319,11 +319,12 @@ public partial class MainPageViewModel : ObservableObject
     public event Action<string, string>? ToastRequested;
 
     /// <summary>
-    /// 適用のためにヘルパへ渡した後か。渡した時点で立て、終了まで下ろさない。
+    /// 適用の準備に入った後か。準備を始める時点で立て、終了まで下ろさない
+    /// (準備に失敗した場合だけ下ろす)。
     /// <para>
     /// ヘルパは渡した時点のチャンネルで照合を済ませている。その後で設定を
-    /// 保存されると、保存済みの設定と実際に適用される版が食い違う。終了時
-    /// Push を待っている間もウィンドウは操作できるので、その窓を塞ぐ。
+    /// 保存されると、保存済みの設定と実際に適用される版が食い違う。準備の間も
+    /// 終了時 Push を待っている間もウィンドウは操作できるので、その窓を塞ぐ。
     /// </para>
     /// </summary>
     private bool _handedOverToUpdater;
@@ -717,6 +718,11 @@ public partial class MainPageViewModel : ObservableObject
         // 同期を始められてしまい、その同期は Coordinator の追跡の外なので
         // Environment.Exit で途中のまま切れる。
         IsBusy = true;
+
+        // 設定の保存はここから止める。準備の中でヘルパを起こし、その生存を
+        // 3 秒見る間も画面は操作できる。渡した後に stable へ変えて保存されると、
+        // 保存済みの設定と適用される版が食い違う。準備に失敗したら下ろす。
+        _handedOverToUpdater = true;
         bool ready;
         try
         {
@@ -733,23 +739,20 @@ public partial class MainPageViewModel : ObservableObject
         }
         catch
         {
+            _handedOverToUpdater = false;
             IsBusy = false;
             throw;
         }
 
         if (!ready)
         {
+            _handedOverToUpdater = false;
             IsBusy = false;
             AppendLog("更新を適用できませんでした。取得し直すか、ログを確認してください。");
             RefreshStagedRow();
             return;
         }
         AppendLog("更新を適用するため再起動します...");
-
-        // ここから先、設定の保存は受け付けない。ヘルパは渡した時点のチャンネルで
-        // 照合を済ませており、終了時 Push を待つ間に stable へ変えて保存されると、
-        // 保存済みの設定と適用される版が食い違う。
-        _handedOverToUpdater = true;
 
         // 終了処理の途中で多重起動の抑止を手放さない。手放してから実際に終わる
         // までの隙に別の App が起動すると、待っているヘルパと入れ替えがぶつかる。

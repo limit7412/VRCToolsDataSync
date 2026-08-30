@@ -761,15 +761,15 @@ static int ApplySelfUpdateCore(
         Console.WriteLine("本体を置き換えました。");
         Log(() => logger.LogInformation("本体を置き換えた: {Target}", target));
     }
-    catch (UpdateCapacityException ex)
+    catch (UpdateDeferredException ex)
     {
-        // 空きが足りないだけで、正規の位置には触っていない。取得済みの ZIP を
-        // 捨てると、利用者は空きを作った後に数百 MB を取り直すことになる。
-        // 残したまま引き下がり、現行版を開き直す。空きができれば次の起動が
-        // そのまま適用する。
-        Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
-        Console.Error.WriteLine("空き容量を作ってから起動し直すと、取得済みの更新がそのまま適用されます。");
-        Log(() => logger.LogError(ex, "空き容量が足りないため置き換えを見送った"));
+        // 正規の位置には触っていない (空き不足、前回の残骸を消せない等)。
+        // 取得済みの ZIP を捨てると、利用者は妨げが退いた後に数百 MB を
+        // 取り直すことになる。残したまま引き下がり、現行版を開き直す。
+        // 妨げが退けば次の起動がそのまま適用する。
+        Console.Error.WriteLine($"置き換えを見送りました: {ex.Message}");
+        Console.Error.WriteLine("原因を取り除いてから起動し直すと、取得済みの更新がそのまま適用されます。");
+        Log(() => logger.LogError(ex, "正規の位置に触る前に断ったため置き換えを見送った"));
 
         // 見送りの指定つきで開き直す。付けずに開き直すと、その App が同じ
         // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、

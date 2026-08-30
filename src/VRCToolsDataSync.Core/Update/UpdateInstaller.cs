@@ -17,14 +17,20 @@ public sealed class UpdateRollbackException : Exception
 }
 
 /// <summary>
-/// インストール先に、新しい一式を置くだけの空きが無い。
+/// 正規の位置に触る前に断った。今回は置き換えず、次の機会へ回す。
 /// <para>
-/// 配布物の問題ではないので、取得しておいたものを捨ててはならない。空きを
-/// 作れば同じ ZIP でやり直せる。数百 MB の取り直しを利用者に強いないための
-/// 区別である。
+/// 配布物の問題ではないので、取得しておいたものを捨ててはならない。妨げが
+/// 退けば同じ ZIP でやり直せる。数百 MB の取り直しを利用者に強いないための
+/// 区別である。現行版は無傷なので、そのまま起動し直してよい。
 /// </para>
 /// </summary>
-public sealed class UpdateCapacityException : Exception
+public class UpdateDeferredException : Exception
+{
+    public UpdateDeferredException(string message, Exception? inner = null) : base(message, inner) { }
+}
+
+/// <summary>インストール先に、新しい一式を置くだけの空きが無い。</summary>
+public sealed class UpdateCapacityException : UpdateDeferredException
 {
     public UpdateCapacityException(string message, Exception? inner = null) : base(message, inner) { }
 }
@@ -148,10 +154,14 @@ public class UpdateInstaller
         // を確かめており、複製に失敗しても現行版は無傷のまま残るためである。
         // .old は 1 つ前の版の退避であって、いま動いている版の復旧の材料では
         // ない (PrepareAndSwap も入れ替えの前に消している)。
+        //
+        // 消せない場合も、正規の位置には触っていないので取得は残す。掴まれて
+        // いるだけのことがあり (ウイルス対策ソフトなど)、そこで取得を捨てると
+        // 妨げが退いた後に数百 MB の取り直しになる。
         foreach (var part in Parts)
         {
-            DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".new"));
-            DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".old"));
+            ClearLeftover(Path.Combine(_targetDirectory, part + ".new"));
+            ClearLeftover(Path.Combine(_targetDirectory, part + ".old"));
         }
 
         EnsureSpaceForCopy();
@@ -180,6 +190,21 @@ public class UpdateInstaller
         }
 
         ReplaceLauncher();
+    }
+
+    /// <summary>
+    /// 前回が残したものを消す。消せない場合は、今回の置き換えを見送る。
+    /// </summary>
+    private void ClearLeftover(string path)
+    {
+        try
+        {
+            DeleteDirectoryIfExists(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new UpdateDeferredException($"前回の残骸を消せないため置き換えない: {path}", ex);
+        }
     }
 
     /// <summary>
@@ -244,7 +269,7 @@ public class UpdateInstaller
         //     正規の位置にはまだ触っていないため、失敗しても壊れない。
         foreach (var part in Parts)
         {
-            DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".old"));
+            ClearLeftover(Path.Combine(_targetDirectory, part + ".old"));
         }
 
         // (3) 正規の位置に触るのはここからの短いリネームだけ。

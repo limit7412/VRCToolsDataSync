@@ -1052,6 +1052,27 @@ public sealed class UpdateStage
         "LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
     };
 
+    /// <summary>
+    /// 取得しておいた ZIP が記録どおりかを見る。取得を省いてよいかの判断に使う。
+    /// <para>
+    /// 読めなかった場合は true を返す。掴まれているだけのことがあり、そこで
+    /// 「合っていない」と答えると数百 MB を取り直させることになる。壊れていれば
+    /// 適用の直前の照合が捨てるので、取りこぼしても次の確認で拾える。
+    /// </para>
+    /// </summary>
+    public bool MatchesStagedZip(StagedMetadata metadata)
+    {
+        try
+        {
+            return Verify(metadata);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogDebug(ex, "取得しておいた ZIP を照合できなかった: {Path}", ZipPath);
+            return true;
+        }
+    }
+
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>
     /// <remarks>
     /// 読めなかった場合は投げる。「合わない」と同じ false で返すと、呼び出し側が

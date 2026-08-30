@@ -337,12 +337,18 @@ public sealed class UpdateManager : IDisposable
             // 差し替え前のものを適用し続ける。stable の印も見る。プレリリース
             // として取った後で印だけ外された場合、記録が prerelease のままだと
             // stable のチャンネルで捨てられ、適用できないまま留まる。
+            //
+            // 記録が合っていても、ZIP そのものが記録どおりかを見る。記録だけで
+            // 省くと、壊れた ZIP を「取得済み」と扱ったまま次の起動を迎え、
+            // そこで捨てられて、適用にはもう一度の再起動が要る。確認は 24 時間に
+            // 1 度なので、ここで数百 MB を読む負担は許容する。
             var staged = _stage.TryLoadMetadata();
             if (staged is not null
                 && string.Equals(staged.Tag, release.Tag, StringComparison.Ordinal)
                 && string.Equals(staged.DigestHex, asset.DigestHex, StringComparison.Ordinal)
                 && staged.Size == asset.Size
-                && staged.Stable == release.IsStable)
+                && staged.Stable == release.IsStable
+                && _stage.MatchesStagedZip(staged))
             {
                 return;
             }

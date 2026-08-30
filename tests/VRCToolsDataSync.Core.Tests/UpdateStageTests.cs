@@ -96,6 +96,20 @@ public sealed class UpdateStageTests : IDisposable
         Assert.False(File.Exists(stage.ZipPath));
     }
 
+    [Fact(DisplayName = "取得を省いてよいかは、記録ではなく ZIP との照合で決める")]
+    public void MatchesStagedZipLooksAtTheZipNotJustTheMetadata()
+    {
+        var stage = StageWith("0.0.10");
+        var metadata = stage.TryLoadMetadata();
+        Assert.NotNull(metadata);
+        Assert.True(stage.MatchesStagedZip(metadata!));
+
+        // 記録は残したまま ZIP だけを壊す。記録だけを見て取得を省くと、壊れた
+        // ものを「取得済み」として次の起動まで持ち越すことになる。
+        File.WriteAllBytes(stage.ZipPath, new byte[] { 1, 2, 3 });
+        Assert.False(stage.MatchesStagedZip(metadata!));
+    }
+
     [Fact(DisplayName = "記録と合わない ZIP は捨てる")]
     public void DiscardsCorruptedZip()
     {
