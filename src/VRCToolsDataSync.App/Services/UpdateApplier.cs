@@ -152,8 +152,21 @@ public static class UpdateApplier
 
                 // まだ適用できる取得 (非配布形で適用しなかった等) は残り、
                 // 合わなくなった取得はここで捨てられる。
+                //
+                // チャンネルを読めない場合は突き合わせ自体を見送る。stable として
+                // 見ると、test で取得しておいたものをチャンネル外として捨てる。
+                // 後始末を 1 回飛ばすだけなら、次の起動が拾う。
                 stage ??= new UpdateStage(logger: logger);
-                _ = stage.TryLoadVerified(LoadChannel(logger), RunningVersion.Current());
+                var channel = TryLoadChannel(logger);
+                if (channel is not null)
+                {
+                    _ = stage.TryLoadVerified(channel.Value, RunningVersion.Current());
+                }
+                else
+                {
+                    LogQuietly(() => logger.LogWarning(
+                        "更新チャンネルを読めないため、取得しておいたものの突き合わせは見送る"));
+                }
 
                 // 途中で終わった取得と、適用が済んだ後に残る展開先を片付ける。
                 stage.DiscardIncomplete();
@@ -364,6 +377,75 @@ public static class UpdateApplier
     /// 止まったままになる。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// 起こしたヘルパが、こちらの終了を待たずに既に終わっているか。
+    /// <para>
+    /// ヘルパの待ちには上限がある。終了時 Push がそれを越えると、ヘルパは
+    /// 置き換えも起動し直しもせずに降りる。こちらはそのまま終わるので、
+    /// 利用者から見ると「再起動して適用」を押したのに画面が閉じたきりになる。
+    /// 終了の直前にこれを見て、居なければ呼び出し側が開き直す。
+    /// </para>
+    /// <para>
+    /// true を返した時点で、ヘルパへの参照は手放している。以後
+    /// <see cref="ReleaseHeldApplyLock"/> はロックを返すだけになる。
+    /// </para>
+    /// </summary>
+    public static bool SpawnedUpdaterDied(ILogger logger)
+    {
+        var updater = Volatile.Read(ref _spawnedUpdater);
+        if (updater is null) return false;
+
+        bool exited;
+        int code;
+        try
+        {
+            exited = updater.HasExited;
+            code = exited ? updater.ExitCode : 0;
+        }
+        catch (Exception ex)
+        {
+            LogQuietly(() => logger.LogWarning(ex, "起こしたヘルパの状態を見られなかった"));
+            return false;
+        }
+
+        if (!exited) return false;
+
+        LogQuietly(() => logger.LogWarning(
+            "起こしたヘルパが待ちきれずに終わっていた (終了コード {Code})", code));
+        Interlocked.Exchange(ref _spawnedUpdater, null)?.Dispose();
+        return true;
+    }
+
+    /// <summary>
+    /// 現行版の App を開き直す。
+    /// <para>
+    /// 見送りの指定は付けない。取得しておいたものはそのまま残っているので、
+    /// 開き直した App が改めてヘルパへ渡す。そちらは起動したばかりで流す Push が
+    /// 無く、ヘルパの待ちが尽きることもない。
+    /// </para>
+    /// <para>
+    /// 呼ぶ前に、多重起動の抑止と適用のロックを手放しておくこと。掴んだまま
+    /// 起動すると、起動した App がそこで止まる。
+    /// </para>
+    /// </summary>
+    public static void RelaunchApp(ILogger logger)
+    {
+        try
+        {
+            var appDirectory = AppContext.BaseDirectory;
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = Path.Combine(appDirectory, UpdateInstaller.AppExecutableName),
+                WorkingDirectory = appDirectory,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            LogQuietly(() => logger.LogWarning(ex, "App を開き直せなかった"));
+        }
+    }
+
     public static void ReleaseHeldApplyLock()
     {
         // 起こしたヘルパを先に止める。ロックだけ返すと、ヘルパがそれを取り、
@@ -553,7 +635,15 @@ public static class UpdateApplier
     /// </summary>
     private const int StartupProbeMilliseconds = 3000;
 
-    private static UpdateChannel LoadChannel(ILogger logger)
+    /// <summary>
+    /// 保存済みの更新チャンネル。読めなければ null を返す。
+    /// <para>
+    /// 読めなかったことを stable と同じ値で返してはいけない。捨てる判断を伴う
+    /// 突き合わせに渡すと、test で取得しておいたものがチャンネル外と見なされ、
+    /// 正しい取得を消してしまう。判断の側で「分からない」を扱えるようにする。
+    /// </para>
+    /// </summary>
+    private static UpdateChannel? TryLoadChannel(ILogger logger)
     {
         try
         {
@@ -561,11 +651,20 @@ public static class UpdateApplier
         }
         catch (Exception ex)
         {
-            // 設定を読めない起動でも、安全側 (stable) の判定で先へ進める。
-            LogQuietly(() => logger.LogWarning(ex, "更新チャンネルを読めなかったため stable として扱う"));
-            return UpdateChannel.Stable;
+            LogQuietly(() => logger.LogWarning(ex, "更新チャンネルを読めなかった"));
+            return null;
         }
     }
+
+    /// <summary>
+    /// 保存済みの更新チャンネル。読めなければ安全側 (stable) を返す。
+    /// <para>
+    /// 捨てる判断を伴わない場面でだけ使う。stable として見た結果は「適用しない」
+    /// に倒れるだけで、取得したものは残る。
+    /// </para>
+    /// </summary>
+    private static UpdateChannel LoadChannel(ILogger logger)
+        => TryLoadChannel(logger) ?? UpdateChannel.Stable;
 
     private static void DeleteDirectoryQuietly(string path, ILogger logger)
     {

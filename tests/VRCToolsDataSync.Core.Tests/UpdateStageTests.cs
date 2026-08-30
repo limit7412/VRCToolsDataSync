@@ -559,6 +559,30 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Equal("0.0.10", staged!.Tag);
     }
 
+    [Fact(DisplayName = "横に新旧の記録が並んだら、ZIP と合うほうを置き直す")]
+    public void FinishesPromoteWithTheMetadataThatMatchesTheZip()
+    {
+        // 古い記録を退避した後、ZIP を入れ替える前に電源が落ちた形を作る。
+        // 正規の ZIP は前のもの、横には新旧 2 つの記録が並ぶ。
+        var stage = StageWith("0.0.10");
+        File.Move(stage.MetadataPath, stage.MetadataPath + ".old");
+        File.WriteAllText(
+            stage.MetadataPath + ".new",
+            """
+            {"tag":"0.0.11","digestHex":"0000000000000000000000000000000000000000000000000000000000000000","size":1,"stable":true,"assetName":"x.zip","installRoot":""}
+            """);
+
+        stage.DiscardIncomplete();
+
+        // 名前で新しいほうを選ぶと、合わない対になって両方捨てられる。
+        // ZIP と照合して古いほうを戻すので、前の版はそのまま適用できる。
+        var staged = stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9");
+        Assert.NotNull(staged);
+        Assert.Equal("0.0.10", staged!.Tag);
+        Assert.False(File.Exists(stage.MetadataPath + ".new"));
+        Assert.False(File.Exists(stage.MetadataPath + ".old"));
+    }
+
     [Theory(DisplayName = "同じ場所がファイルとディレクトリの両方になる ZIP は断る")]
     [InlineData("app/foo", "app/foo/bar.dll")]
     [InlineData("app/foo/bar.dll", "app/foo")]

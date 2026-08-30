@@ -695,11 +695,26 @@ public partial class App : Application
         // など内部リソースが解放され、未 flush のログが確実に書き出される。
         // Environment.Exit(0) は finally を呼ばないため、ここで明示的に
         // Dispose しないとログの末尾が欠ける可能性がある。
+        // 起こしたヘルパが待ちきれずに終わっていたら、こちらで開き直す。
+        // このまま終わると、利用者から見て「再起動して適用」を押したのに画面が
+        // 閉じたきりになる。ヘルパが居ない以上、抑止もロックも持ち続ける理由は
+        // 無いので、先に両方を手放してから起動する。掴んだままだと、起動した
+        // App がそこで止まる。
+        if (UpdateApplier.SpawnedUpdaterDied(UpdateLogger()))
+        {
+            _keepSingleInstanceUntilExit = false;
+            ReleaseSingleInstance();
+            UpdateApplier.ReleaseHeldApplyLock();
+            UpdateApplier.RelaunchApp(UpdateLogger());
+        }
+
         ReleaseSingleInstance();
         LogLifecycle("ExitApplication.Environment.Exit(0)");
         try { LoggerFactory.Dispose(); } catch { /* best-effort */ }
         Environment.Exit(0);
     }
+
+    private static ILogger UpdateLogger() => LoggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
 
     private static void LogLifecycle(string message)
     {

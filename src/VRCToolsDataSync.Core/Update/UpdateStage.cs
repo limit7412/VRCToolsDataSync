@@ -515,26 +515,57 @@ public sealed class UpdateStage
         if (Present(ZipPath) != true) return;
         if (Present(MetadataPath) != false) return;
 
-        if (Present(IncomingMetadataPath) == true)
+        var candidates = new[] { IncomingMetadataPath, PreviousMetadataPath }
+            .Where(path => Present(path) == true)
+            .ToArray();
+        if (candidates.Length == 0) return;
+
+        // どちらを置くかは、名前ではなく ZIP との照合で決める。昇格は「古い記録を
+        // 退避する → ZIP を入れ替える」の順なので、その 2 つの間で電源が落ちれば
+        // ZIP は前のもののまま、横には新旧 2 つの記録が並ぶ。新しいほうを名前だけで
+        // 選ぶと、合わない対を作って両方捨てることになる。
+        long size;
+        string digest;
+        try
         {
-            // ZIP は新しいものに入れ替わっている。新しい記録を置けば対がそろう。
+            size = new FileInfo(ZipPath).Length;
+            digest = DigestOf(ZipPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "昇格の途中で止まった ZIP を読めなかった: {Path}", ZipPath);
+            return;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            var metadata = TryReadMetadata(candidate);
+            if (metadata is null) continue;
+            if (metadata.Size != size) continue;
+            if (!string.Equals(metadata.DigestHex, digest, StringComparison.Ordinal)) continue;
+
             try
             {
-                _logger.LogInformation("昇格の途中で止まった記録を置き直す: {Path}", MetadataPath);
-                MoveWithRetry(IncomingMetadataPath, MetadataPath);
-                _ = DeleteQuietly(PreviousMetadataPath, quiet: true);
+                _logger.LogInformation("昇格の途中で止まった記録を置き直す: {From}", candidate);
+                MoveWithRetry(candidate, MetadataPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(ex, "昇格の途中で止まった記録を置き直せなかった: {Path}", MetadataPath);
+                return;
+            }
+
+            foreach (var other in candidates)
+            {
+                if (!string.Equals(other, candidate, StringComparison.Ordinal))
+                {
+                    _ = DeleteQuietly(other, quiet: true);
+                }
             }
             return;
         }
 
-        // 新しい記録が無く、退避した古い記録だけがある。ZIP の入れ替えに失敗し、
-        // その場での戻しも失敗した後である。正規の ZIP は前のものなので、
-        // 退避した記録を戻せば前の対が使える。
-        if (Present(PreviousMetadataPath) == true) RestorePreviousMetadata();
+        _logger.LogWarning("横に残った記録はどれも ZIP と合わないため、置き直さない: {Path}", ZipPath);
     }
 
     /// <summary>退避しておいた古い記録を正規の名前へ戻す。</summary>
@@ -548,6 +579,20 @@ public sealed class UpdateStage
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogWarning(ex, "退避した記録を戻せなかった: {Path}", MetadataPath);
+        }
+    }
+
+    /// <summary>指定の場所の記録を読む。読めない・壊れている場合は null。</summary>
+    private StagedMetadata? TryReadMetadata(string path)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<StagedMetadata>(File.ReadAllText(path), JsonOptions);
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "記録を読めなかった: {Path}", path);
+            return null;
         }
     }
 
@@ -718,9 +763,25 @@ public sealed class UpdateStage
         using var archive = System.IO.Compression.ZipFile.OpenRead(ZipPath);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (archive.Entries.Count > MaxEntries)
+        {
+            throw new InvalidDataException(
+                $"項目数が桁違いの ZIP は展開しない: {archive.Entries.Count} 個 (上限 {MaxEntries} 個)");
+        }
+
         var total = 0L;
+        var pathVolume = 0L;
         foreach (var entry in archive.Entries)
         {
+            // 名前の総量にも上限を置く。空の項目ばかりなら中身の大きさは 0 の
+            // ままなので、集合に溜める名前のほうが先にメモリを食い潰す。
+            pathVolume += entry.FullName.Length;
+            if (pathVolume > MaxPathVolume)
+            {
+                throw new InvalidDataException(
+                    $"項目名の総量が桁違いの ZIP は展開しない: {MaxPathVolume} 文字を超える");
+            }
+
             var key = ExtractionKeyOf(entry.FullName);
 
             // ディレクトリの項目は名前が空になる。同じ場所に重なっても害が
@@ -838,6 +899,21 @@ public sealed class UpdateStage
     /// </para>
     /// </summary>
     private const long MaxExtractedSize = 2L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// 項目数の上限。
+    /// <para>
+    /// 中身が空の項目は展開後の大きさに現れないので、<see cref="MaxExtractedSize"/>
+    /// だけでは数で押し切られる。突き合わせのために名前を集合へ溜め、展開では
+    /// 同じ数のファイルを作るため、メモリとファイルシステムの両方を使い切りうる。
+    /// 自動適用は画面を出す前に走るので、そうなると App が開かなくなる。
+    /// 配布物は数百ファイルなので、桁違いのところに線を置く。
+    /// </para>
+    /// </summary>
+    private const int MaxEntries = 100_000;
+
+    /// <summary>項目名の総量の上限。空の項目を並べられた場合に効く。</summary>
+    private const long MaxPathVolume = 16L * 1024 * 1024;
 
     /// <summary>
     /// 項目の名前を、実際に展開される先で見比べられる形へそろえる。
