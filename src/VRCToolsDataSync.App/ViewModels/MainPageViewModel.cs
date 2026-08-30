@@ -1007,6 +1007,38 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 手動でのストレージの回収 (issue #55)。自動回収と違って間引かず今すぐ実行し、
+    /// 結果も失敗もログに出す。実行後は自動回収の記録が更新されるので、
+    /// 直後の Push で回収が重ねて走ることはない。
+    /// </summary>
+    [RelayCommand]
+    private async Task CollectGarbageAsync()
+    {
+        if (!TryCreateStorage(out var storage)) return;
+        IsBusy = true;
+        try
+        {
+            AppendLog("ストレージの回収を開始...");
+            var result = await Task.Run(() => _runner.CollectGarbageNow(storage));
+            AppendLog(
+                $"ストレージの回収 完了: {result.Deleted} 件 ({result.DescribeDeletedBytes()}) を削除 " +
+                $"/ 参照あり {result.Live} 件 / 猶予期間内 {result.Young} 件");
+            if (result.Failed > 0)
+            {
+                AppendLog($"  {result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります");
+            }
+        }
+        catch (SyncStorageException ex)
+        {
+            AppendLog($"ストレージの回収 失敗: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
     private void ReportPushResult(string displayName, SyncResult result, ISyncStorage storage)
     {
         switch (result.Outcome)

@@ -121,6 +121,38 @@ public sealed class AutoGcTests : IDisposable
         Assert.True(CreateStore().Load().LastGcAt.ContainsKey(storage.StateKeyPrefix));
     }
 
+    [Fact(DisplayName = "手動実行は間隔に関わらず回収し、直後の自動実行を省かせる")]
+    public void ManualRunIgnoresInterval()
+    {
+        var store = CreateStore();
+        var storage = StorageWithOrphan();
+        var runner = new SyncRunner(store);
+        Assert.NotNull(runner.CollectGarbageIfDue(storage));
+
+        // 自動実行の直後でも、手動はそのまま走る。
+        storage.Seed(BlobKeys.Prefix + "ccc", "orphan2", LongAgo);
+        var manual = runner.CollectGarbageNow(storage);
+
+        Assert.Equal(1, manual.Deleted);
+        Assert.False(storage.Has(BlobKeys.Prefix + "ccc"));
+        // 手動実行も記録を更新するので、続く自動実行は間引かれる。
+        Assert.Null(runner.CollectGarbageIfDue(storage));
+    }
+
+    [Fact(DisplayName = "手動実行の失敗は呼び出し側へ伝える")]
+    public void ManualRunPropagatesFailure()
+    {
+        // manifest がまだ無い保存先では、回収は安全側の中止 (例外) になる。
+        // 手動実行では結果を待っている利用者がいるので、自動実行と違って
+        // 握りつぶさず伝える。
+        var storage = new FakeSyncStorage { Now = LongAgo };
+        storage.Seed(BlobKeys.Prefix + "bbb", "orphan", LongAgo);
+
+        Assert.Throws<SyncStorageException>(
+            () => new SyncRunner(CreateStore()).CollectGarbageNow(storage));
+        Assert.True(storage.Has(BlobKeys.Prefix + "bbb"));
+    }
+
     [Fact(DisplayName = "実行時刻の記録は、古い設定の保存で巻き戻らない")]
     public void LastGcAtNeverMovesBackwardsOnStaleSave()
     {

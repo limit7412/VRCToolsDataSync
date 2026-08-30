@@ -168,6 +168,27 @@ public sealed class SyncRunner
     }
 
     /// <summary>
+    /// 間引きをせず、今すぐ回収する。GUI の手動実行用。
+    /// <para>
+    /// 実行時刻は自動回収と同じ記録に残し、直後の自動回収を省かせる。
+    /// 失敗は自動回収と違って握りつぶさない。手動実行では結果を待っている
+    /// 利用者がいるので、失敗を伝えて対処 (権限の見直しなど) につなげる。
+    /// </para>
+    /// </summary>
+    public BlobGarbageCollectionResult CollectGarbageNow(ISyncStorage storage)
+    {
+        // 自動回収と同時に走った場合は待つ。飛ばすと「押したのに何も起きない」
+        // ように見えるため、自動側と違って TryEnter にしない。
+        lock (AutoGcLock)
+        {
+            _store.SaveLastGcAt(storage.StateKeyPrefix, DateTimeOffset.Now);
+            var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
+            logger.LogInformation("手動回収を開始します: {Target}", storage.DisplayName);
+            return new BlobGarbageCollector(storage, logger).Collect();
+        }
+    }
+
+    /// <summary>
     /// <see cref="CollectGarbageIfDue"/> をバックグラウンドで実行する。
     /// <para>
     /// 常駐アプリの経路 (自動 Push・GUI の Push) から使う。回収は初回や

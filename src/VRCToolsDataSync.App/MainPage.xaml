@@ -119,6 +119,18 @@
                     </StackPanel>
 
                     <StackPanel Spacing="4">
+                        <TextBlock Text="ストレージの回収" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="今すぐ回収"
+                                    Command="{x:Bind ViewModel.CollectGarbageCommand}"
+                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        </StackPanel>
+                        <TextBlock Text="どの PC からも参照されなくなって 7 日以上経ったデータを保存先から削除します。Push の後始末として 1 日 1 回自動でも実行されます。"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
                         <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}" />

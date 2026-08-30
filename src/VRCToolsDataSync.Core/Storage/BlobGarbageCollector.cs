@@ -17,7 +17,17 @@ public sealed record BlobGarbageCollectionResult(
     int Young,
     int Deleted,
     long DeletedBytes,
-    int Failed);
+    int Failed)
+{
+    /// <summary>削除した合計サイズの表示用文字列 (例: "1.2 GB")。CLI と GUI で共用する。</summary>
+    public string DescribeDeletedBytes()
+    {
+        if (DeletedBytes < 1024) return $"{DeletedBytes} B";
+        if (DeletedBytes < 1024L * 1024) return $"{DeletedBytes / 1024.0:0.#} KB";
+        if (DeletedBytes < 1024L * 1024 * 1024) return $"{DeletedBytes / (1024.0 * 1024):0.#} MB";
+        return $"{DeletedBytes / (1024.0 * 1024 * 1024):0.##} GB";
+    }
+}
 
 /// <summary>
 /// どの manifest からも参照されていないオブジェクトを回収する。

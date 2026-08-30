@@ -294,7 +294,7 @@ static int RunPush(
                 if (gc is not null)
                 {
                     Console.WriteLine(
-                        $"  ストレージの回収: {gc.Deleted} 件 ({FormatBytes(gc.DeletedBytes)}) を削除");
+                        $"  ストレージの回収: {gc.Deleted} 件 ({gc.DescribeDeletedBytes()}) を削除");
                 }
                 return 0;
             case SyncOutcome.ConflictDetected:
@@ -583,8 +583,8 @@ static int CollectGarbage(int graceDays, bool dryRun)
         var result = collector.Collect(TimeSpan.FromDays(graceDays), dryRun);
 
         Console.WriteLine(dryRun
-            ? $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収対象 {result.Deleted} 件 ({FormatBytes(result.DeletedBytes)})"
-            : $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収 {result.Deleted} 件 ({FormatBytes(result.DeletedBytes)})");
+            ? $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収対象 {result.Deleted} 件 ({result.DescribeDeletedBytes()})"
+            : $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収 {result.Deleted} 件 ({result.DescribeDeletedBytes()})");
         if (result.Failed > 0)
         {
             Console.Error.WriteLine($"{result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります。");
@@ -899,14 +899,6 @@ static bool TryRelaunchApp(string target, ILogger logger, bool skipUpdateApply =
         try { logger.LogWarning(ex, "App の起動し直しに失敗した"); } catch { /* best-effort */ }
         return false;
     }
-}
-
-static string FormatBytes(long bytes)
-{
-    if (bytes < 1024) return $"{bytes} B";
-    if (bytes < 1024L * 1024) return $"{bytes / 1024.0:0.#} KB";
-    if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):0.#} MB";
-    return $"{bytes / (1024.0 * 1024 * 1024):0.##} GB";
 }
 
 /// <summary>
