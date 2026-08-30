@@ -10,7 +10,7 @@ namespace VRCToolsDataSync.Core.Domain;
 /// 構造へ、S3 互換実装はオブジェクトキーへ写す。
 /// </para>
 /// <para>
-/// 実装はスレッドセーフでなければならない。<see cref="Watch.AutoSyncCoordinator"/>
+/// 実装はスレッドセーフでなければならない。<c>AutoSyncCoordinator</c>
 /// が同じインスタンスを複数のスレッドから使う。
 /// </para>
 /// </summary>
@@ -20,7 +20,7 @@ public interface ISyncStorage
     string DisplayName { get; }
 
     /// <summary>
-    /// <see cref="Settings.SyncSettings.ToolState"/> のキーに付ける接頭辞。
+    /// <see cref="SyncSettings.ToolState"/> のキーに付ける接頭辞。
     /// <para>
     /// LastPulledVersion は「その同期先の manifest の version」に対する状態なので、
     /// 同期先を切り替えると意味を失う。同期先ごとに別のキーで持つことで、切り替え直後に
@@ -63,7 +63,7 @@ public interface ISyncStorage
     /// 送りたいものが既にファイルとしてある場合も、直接書き込む口は用意せずここを通す。
     /// 別の口があると、ハッシュを取ったファイルと送るファイルが別の実体になりうる。
     /// 置き場所を内容から決めている以上、それは同じキーに別の内容が入ることを意味する
-    /// (<see cref="Sync.SyncTransfer.Send"/>)。
+    /// (<c>SyncTransfer.Send</c>)。
     /// </para>
     /// </summary>
     IStagedUpload BeginUpload();

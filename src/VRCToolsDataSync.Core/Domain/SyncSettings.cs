@@ -43,7 +43,7 @@ public sealed class SyncSettings
 
     /// <summary>
     /// 自動回収 (issue #55) を最後に試みた時刻。キーは
-    /// <see cref="Storage.ISyncStorage.StateKeyPrefix"/> で、保存先ごとに分けて持つ。
+    /// <see cref="ISyncStorage.StateKeyPrefix"/> で、保存先ごとに分けて持つ。
     /// 保存先を切り替えた直後に、別の保存先での実行を「済んだばかり」と
     /// 取り違えないようにするため。
     /// </summary>
