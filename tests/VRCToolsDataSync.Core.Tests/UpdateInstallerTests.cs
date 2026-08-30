@@ -66,6 +66,24 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.False(Directory.Exists(TargetFile("cli.old")));
     }
 
+    [Fact(DisplayName = "前回の失敗が残した .new は、空きを測る前に片付ける")]
+    public void ClearsLeftoverNewDirectoriesBeforeMeasuringSpace()
+    {
+        // 前回のヘルパが複製の途中で落ちた状況。残骸を数に入れたまま空きを測ると、
+        // 消せば足りる場合でも断り続けることになる。
+        Directory.CreateDirectory(TargetFile("app.new", "nested"));
+        File.WriteAllText(TargetFile("app.new", "stale.txt"), "stale");
+        Directory.CreateDirectory(TargetFile("cli.new"));
+        File.WriteAllText(TargetFile("cli.new", "stale.txt"), "stale");
+
+        new UpdateInstaller(SourceDir, TargetDir).Apply();
+
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.False(File.Exists(TargetFile("app", "stale.txt")));
+        Assert.False(Directory.Exists(TargetFile("app.new")));
+        Assert.False(Directory.Exists(TargetFile("cli.new")));
+    }
+
     [Fact(DisplayName = "一式が欠けていれば、正規の位置に触る前に断る")]
     public void RefusesIncompleteSource()
     {

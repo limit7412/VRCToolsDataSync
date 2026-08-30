@@ -138,6 +138,15 @@ public class UpdateInstaller
     public void Apply()
     {
         ValidateLayout();
+
+        // 前回の失敗が残した .new を先に消す。PrepareAndSwap も複製の前に消すが、
+        // 空きを測る前に消しておかないと、これから空く分を「足りない」と数えて
+        // しまう。残骸を消せば足りる状況で断り続けることになる。
+        foreach (var part in Parts)
+        {
+            DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".new"));
+        }
+
         EnsureSpaceForCopy();
 
         // (1)-(3) のどこで失敗しても、用意した .new は残さない。数百 MB あり、

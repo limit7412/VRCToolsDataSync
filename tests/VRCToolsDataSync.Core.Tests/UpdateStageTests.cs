@@ -535,6 +535,30 @@ public sealed class UpdateStageTests : IDisposable
         Assert.NotNull(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
     }
 
+    [Fact(DisplayName = "ZIP の入れ替えに失敗しても、取得済みの前の版は残る")]
+    public void FailedZipSwapKeepsThePreviousPair()
+    {
+        var stage = StageWith("0.0.10");
+        var zipBefore = File.ReadAllBytes(stage.ZipPath);
+
+        // 取得の実体が無い状態で昇格を試みる。古い記録を外した後、ZIP の
+        // 入れ替えで失敗する経路を通る。
+        Assert.False(File.Exists(stage.IncomingZipPath));
+        var asset = new ReleaseAsset(
+            CurrentAssetName, "https://example.com/asset", new string('0', 64), 1);
+        var release = new ReleaseInfo(
+            ReleaseVersion.Parse("0.0.11")!, "0.0.11", "https://example.com/0.0.11", false, asset);
+        Assert.ThrowsAny<IOException>(() => stage.PromoteIncoming(release, asset));
+
+        // 正規の ZIP は前のまま。外した記録が戻っているので、前の版はそのまま
+        // 適用できる。
+        Assert.Equal(zipBefore, File.ReadAllBytes(stage.ZipPath));
+        Assert.True(File.Exists(stage.MetadataPath));
+        var staged = stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9");
+        Assert.NotNull(staged);
+        Assert.Equal("0.0.10", staged!.Tag);
+    }
+
     [Theory(DisplayName = "同じ場所がファイルとディレクトリの両方になる ZIP は断る")]
     [InlineData("app/foo", "app/foo/bar.dll")]
     [InlineData("app/foo/bar.dll", "app/foo")]

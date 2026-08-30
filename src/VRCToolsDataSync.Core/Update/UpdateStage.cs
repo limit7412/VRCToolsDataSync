@@ -89,6 +89,9 @@ public sealed class UpdateStage
     /// <summary>昇格の途中で横へ書く記録。付け替えに失敗した場合はここに残る。</summary>
     private string IncomingMetadataPath => MetadataPath + ".new";
 
+    /// <summary>昇格の間だけ古い記録を退避しておく場所。</summary>
+    private string PreviousMetadataPath => MetadataPath + ".old";
+
     /// <summary>置き換えの直前に ZIP を展開する場所。</summary>
     public string ExtractDirectory => Path.Combine(Directory, "extracted");
 
@@ -187,24 +190,50 @@ public sealed class UpdateStage
         var incomingMetadata = IncomingMetadataPath;
         File.WriteAllText(incomingMetadata, JsonSerializer.Serialize(metadata, JsonOptions));
 
-        // 記録を先に消す。ZIP を入れ替えた後で記録を置けなかった場合、
-        // 前の版の記録と新しい ZIP という食い違った対が残る。
-        // 片方だけの状態なら DiscardIncomplete が起動時に片付ける。
+        // 古い記録は正規の名前から外す。残したまま ZIP を入れ替えると、前の版の
+        // 記録と新しい ZIP という食い違った対がそろった形で残り、次の照合で
+        // 両方捨てられる。適用できたはずの前の版まで失う。
         //
-        // 消せなかった場合はここで止める。古い記録を残したまま ZIP を入れ替えると、
-        // 食い違った対がそろった形で残り、次の照合で両方捨てられる。適用できた
-        // はずの前の版まで失う。書きかけは呼び出し側が片付け、次の確認でやり直す。
-        if (!DeleteQuietly(MetadataPath))
+        // ただし消さずに横へ退避する。この後の ZIP の入れ替えに失敗した場合、
+        // 正規の場所に残るのは前の ZIP なので、退避した記録を戻せば前の対が
+        // そのまま使える。消してしまうと、そちらも道連れになる。
+        //
+        // 外せなかった場合はここで止める。書きかけは呼び出し側が片付け、
+        // 次の確認でやり直す。
+        var previousMetadata = PreviousMetadataPath;
+        _ = DeleteQuietly(previousMetadata, quiet: true);
+        var previousKept = false;
+        if (Present(MetadataPath) != false)
         {
-            DeleteQuietly(incomingMetadata);
-            throw new IOException($"取得済みの記録を消せなかったため昇格しない: {MetadataPath}");
+            try
+            {
+                MoveWithRetry(MetadataPath, previousMetadata);
+                previousKept = true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                DeleteQuietly(incomingMetadata, quiet: true);
+                throw new IOException($"取得済みの記録を退避できなかったため昇格しない: {MetadataPath}", ex);
+            }
         }
 
         // 残るのは同じディレクトリ内の名前の付け替えだけ。掴まれていて一瞬
         // 失敗することがある (ウイルス対策ソフトなど) ので、短く待って
         // やり直す。
-        MoveWithRetry(IncomingZipPath, ZipPath);
+        try
+        {
+            MoveWithRetry(IncomingZipPath, ZipPath);
+        }
+        catch
+        {
+            // 正規の ZIP はまだ前のもの。退避した記録を戻せば、前の対が無傷で残る。
+            if (previousKept) RestorePreviousMetadata();
+            DeleteQuietly(incomingMetadata, quiet: true);
+            throw;
+        }
+
         MoveWithRetry(incomingMetadata, MetadataPath);
+        _ = DeleteQuietly(previousMetadata, quiet: true);
 
         // 前の版を展開したものが残っていても、もう対応しない。
         DeleteDirectoryQuietly(ExtractDirectory);
@@ -436,6 +465,7 @@ public sealed class UpdateStage
         var metadata = DeleteQuietly(MetadataPath);
         DeleteQuietly(IncomingZipPath);
         DeleteQuietly(IncomingMetadataPath, quiet: true);
+        DeleteQuietly(PreviousMetadataPath, quiet: true);
         DeleteDirectoryQuietly(ExtractDirectory);
         ForgetExtractFailures();
         return zip && metadata;
@@ -484,16 +514,40 @@ public sealed class UpdateStage
     {
         if (Present(ZipPath) != true) return;
         if (Present(MetadataPath) != false) return;
-        if (Present(IncomingMetadataPath) != true) return;
 
+        if (Present(IncomingMetadataPath) == true)
+        {
+            // ZIP は新しいものに入れ替わっている。新しい記録を置けば対がそろう。
+            try
+            {
+                _logger.LogInformation("昇格の途中で止まった記録を置き直す: {Path}", MetadataPath);
+                MoveWithRetry(IncomingMetadataPath, MetadataPath);
+                _ = DeleteQuietly(PreviousMetadataPath, quiet: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogWarning(ex, "昇格の途中で止まった記録を置き直せなかった: {Path}", MetadataPath);
+            }
+            return;
+        }
+
+        // 新しい記録が無く、退避した古い記録だけがある。ZIP の入れ替えに失敗し、
+        // その場での戻しも失敗した後である。正規の ZIP は前のものなので、
+        // 退避した記録を戻せば前の対が使える。
+        if (Present(PreviousMetadataPath) == true) RestorePreviousMetadata();
+    }
+
+    /// <summary>退避しておいた古い記録を正規の名前へ戻す。</summary>
+    private void RestorePreviousMetadata()
+    {
         try
         {
-            _logger.LogInformation("昇格の途中で止まった記録を置き直す: {Path}", MetadataPath);
-            MoveWithRetry(IncomingMetadataPath, MetadataPath);
+            _logger.LogInformation("退避した記録を戻す: {Path}", MetadataPath);
+            MoveWithRetry(PreviousMetadataPath, MetadataPath);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "昇格の途中で止まった記録を置き直せなかった: {Path}", MetadataPath);
+            _logger.LogWarning(ex, "退避した記録を戻せなかった: {Path}", MetadataPath);
         }
     }
 
