@@ -66,15 +66,20 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.False(Directory.Exists(TargetFile("cli.old")));
     }
 
-    [Fact(DisplayName = "前回の失敗が残した .new は、空きを測る前に片付ける")]
-    public void ClearsLeftoverNewDirectoriesBeforeMeasuringSpace()
+    [Fact(DisplayName = "前回が残した .new と .old は、空きを測る前に片付ける")]
+    public void ClearsLeftoverDirectoriesBeforeMeasuringSpace()
     {
-        // 前回のヘルパが複製の途中で落ちた状況。残骸を数に入れたまま空きを測ると、
-        // 消せば足りる場合でも断り続けることになる。
+        // 前回のヘルパが複製の途中で落ち、さらに前回の退避も残っている状況。
+        // どちらも次に消す対象なので、数に入れたまま空きを測ると、消せば足りる
+        // 場合でも断り続けることになる。
         Directory.CreateDirectory(TargetFile("app.new", "nested"));
         File.WriteAllText(TargetFile("app.new", "stale.txt"), "stale");
         Directory.CreateDirectory(TargetFile("cli.new"));
         File.WriteAllText(TargetFile("cli.new", "stale.txt"), "stale");
+        Directory.CreateDirectory(TargetFile("app.old"));
+        File.WriteAllText(TargetFile("app.old", "older.txt"), "older");
+        Directory.CreateDirectory(TargetFile("cli.old"));
+        File.WriteAllText(TargetFile("cli.old", "older.txt"), "older");
 
         new UpdateInstaller(SourceDir, TargetDir).Apply();
 
@@ -82,6 +87,10 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.False(File.Exists(TargetFile("app", "stale.txt")));
         Assert.False(Directory.Exists(TargetFile("app.new")));
         Assert.False(Directory.Exists(TargetFile("cli.new")));
+
+        // 今回の退避に入れ替わっている (1 つ前の版のものは残らない)。
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
+        Assert.False(File.Exists(TargetFile("app.old", "older.txt")));
     }
 
     [Fact(DisplayName = "一式が欠けていれば、正規の位置に触る前に断る")]

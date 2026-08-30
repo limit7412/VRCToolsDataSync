@@ -139,12 +139,19 @@ public class UpdateInstaller
     {
         ValidateLayout();
 
-        // 前回の失敗が残した .new を先に消す。PrepareAndSwap も複製の前に消すが、
-        // 空きを測る前に消しておかないと、これから空く分を「足りない」と数えて
-        // しまう。残骸を消せば足りる状況で断り続けることになる。
+        // 前回の失敗が残した .new と、前回の置き換えが残した .old を先に消す。
+        // PrepareAndSwap もどちらも消すが、空きを測る前に消しておかないと、
+        // これから空く分を「足りない」と数えてしまう。残骸を消せば足りる状況で
+        // 断り続けることになる。
+        //
+        // .old を先に消してよいのは、ここまでで ValidateLayout が現行版のそろい
+        // を確かめており、複製に失敗しても現行版は無傷のまま残るためである。
+        // .old は 1 つ前の版の退避であって、いま動いている版の復旧の材料では
+        // ない (PrepareAndSwap も入れ替えの前に消している)。
         foreach (var part in Parts)
         {
             DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".new"));
+            DeleteDirectoryIfExists(Path.Combine(_targetDirectory, part + ".old"));
         }
 
         EnsureSpaceForCopy();

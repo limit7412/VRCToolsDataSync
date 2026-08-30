@@ -481,7 +481,14 @@ public sealed class UpdateStage
     /// </summary>
     public void DiscardIncomplete()
     {
-        TryFinishInterruptedPromote();
+        // 仕上げが「分からない」で終わった場合は、この回は何も捨てない。横に
+        // 正しい記録が残っているのに、読めなかっただけで照合済みの ZIP を
+        // 捨てることになる。次の起動でやり直せる。
+        if (TryFinishInterruptedPromote() == PromoteRecovery.Unknown)
+        {
+            _logger.LogInformation("昇格の仕上げを判断できないため、この回は片付けない: {Path}", ZipPath);
+            return;
+        }
 
         var zip = Present(ZipPath);
         var metadata = Present(MetadataPath);
@@ -510,15 +517,25 @@ public sealed class UpdateStage
     /// 必要は無い。
     /// </para>
     /// </summary>
-    private void TryFinishInterruptedPromote()
+    private PromoteRecovery TryFinishInterruptedPromote()
     {
-        if (Present(ZipPath) != true) return;
-        if (Present(MetadataPath) != false) return;
+        // 「無いと分かった」以外は触らない。読めないだけのものを相手に判断すると、
+        // そろっている対を崩す。
+        if (Present(ZipPath) == false) return PromoteRecovery.NotNeeded;
+        if (Present(ZipPath) is null) return PromoteRecovery.Unknown;
+        if (Present(MetadataPath) is null) return PromoteRecovery.Unknown;
+        if (Present(MetadataPath) == true) return PromoteRecovery.NotNeeded;
 
-        var candidates = new[] { IncomingMetadataPath, PreviousMetadataPath }
-            .Where(path => Present(path) == true)
-            .ToArray();
-        if (candidates.Length == 0) return;
+        var candidates = new List<string>();
+        foreach (var path in new[] { IncomingMetadataPath, PreviousMetadataPath })
+        {
+            switch (Present(path))
+            {
+                case true: candidates.Add(path); break;
+                case null: return PromoteRecovery.Unknown;
+            }
+        }
+        if (candidates.Count == 0) return PromoteRecovery.NotNeeded;
 
         // どちらを置くかは、名前ではなく ZIP との照合で決める。昇格は「古い記録を
         // 退避する → ZIP を入れ替える」の順なので、その 2 つの間で電源が落ちれば
@@ -534,12 +551,25 @@ public sealed class UpdateStage
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogWarning(ex, "昇格の途中で止まった ZIP を読めなかった: {Path}", ZipPath);
-            return;
+            return PromoteRecovery.Unknown;
         }
 
         foreach (var candidate in candidates)
         {
-            var metadata = TryReadMetadata(candidate);
+            StagedMetadata? metadata;
+            try
+            {
+                metadata = TryReadMetadata(candidate);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 読めないだけかもしれない。合わないものとして扱うと、この後の
+                // 片付けが照合済みの ZIP を捨てる。判断を次の起動へ回す。
+                _logger.LogWarning(ex, "横に残った記録を読めなかった: {Path}", candidate);
+                return PromoteRecovery.Unknown;
+            }
+
+            // 読めたが中身が壊れているものは、合わないものとして次を見る。
             if (metadata is null) continue;
             if (metadata.Size != size) continue;
             if (!string.Equals(metadata.DigestHex, digest, StringComparison.Ordinal)) continue;
@@ -552,7 +582,7 @@ public sealed class UpdateStage
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 _logger.LogWarning(ex, "昇格の途中で止まった記録を置き直せなかった: {Path}", MetadataPath);
-                return;
+                return PromoteRecovery.Unknown;
             }
 
             foreach (var other in candidates)
@@ -562,10 +592,24 @@ public sealed class UpdateStage
                     _ = DeleteQuietly(other, quiet: true);
                 }
             }
-            return;
+            return PromoteRecovery.Completed;
         }
 
         _logger.LogWarning("横に残った記録はどれも ZIP と合わないため、置き直さない: {Path}", ZipPath);
+        return PromoteRecovery.NotNeeded;
+    }
+
+    /// <summary>昇格の仕上げの結果。</summary>
+    private enum PromoteRecovery
+    {
+        /// <summary>仕上げるものが無い、または横の記録がどれも ZIP と合わない。</summary>
+        NotNeeded,
+
+        /// <summary>記録を置き直して対がそろった。</summary>
+        Completed,
+
+        /// <summary>読めない・動かせないものがあり、判断できない。捨てる側へ進んではいけない。</summary>
+        Unknown,
     }
 
     /// <summary>退避しておいた古い記録を正規の名前へ戻す。</summary>
@@ -582,16 +626,22 @@ public sealed class UpdateStage
         }
     }
 
-    /// <summary>指定の場所の記録を読む。読めない・壊れている場合は null。</summary>
+    /// <summary>
+    /// 指定の場所の記録を読む。中身が壊れている場合は null を返す。
+    /// <para>
+    /// 読めなかった場合は投げる。「壊れている」と同じ null で返すと、呼び出し側が
+    /// 「合わない記録」と取り違えて先へ進んでしまう。
+    /// </para>
+    /// </summary>
     private StagedMetadata? TryReadMetadata(string path)
     {
         try
         {
             return JsonSerializer.Deserialize<StagedMetadata>(File.ReadAllText(path), JsonOptions);
         }
-        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "記録を読めなかった: {Path}", path);
+            _logger.LogWarning(ex, "記録が壊れている: {Path}", path);
             return null;
         }
     }

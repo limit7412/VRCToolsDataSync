@@ -583,6 +583,28 @@ public sealed class UpdateStageTests : IDisposable
         Assert.False(File.Exists(stage.MetadataPath + ".old"));
     }
 
+    [Fact(DisplayName = "仕上げを判断できない間は、片方だけの状態でも捨てない")]
+    public void KeepsTheZipWhileThePromoteRecoveryCannotBeDecided()
+    {
+        var stage = StageWith("0.0.10");
+        File.Move(stage.MetadataPath, stage.MetadataPath + ".old");
+
+        // 横の記録を読めない状況を作る。同じ名前のディレクトリは、ファイルとして
+        // 開こうとすると弾かれるので「無いのか読めないのか分からない」に落ちる。
+        Directory.CreateDirectory(stage.MetadataPath + ".new");
+
+        stage.DiscardIncomplete();
+
+        // 読めなかっただけで、照合済みの ZIP を捨ててはいけない。
+        Assert.True(File.Exists(stage.ZipPath));
+        Assert.True(File.Exists(stage.MetadataPath + ".old"));
+
+        // 読めるようになれば、次の回で仕上がる。
+        Directory.Delete(stage.MetadataPath + ".new");
+        stage.DiscardIncomplete();
+        Assert.NotNull(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+    }
+
     [Theory(DisplayName = "同じ場所がファイルとディレクトリの両方になる ZIP は断る")]
     [InlineData("app/foo", "app/foo/bar.dll")]
     [InlineData("app/foo/bar.dll", "app/foo")]

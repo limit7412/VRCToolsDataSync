@@ -318,9 +318,27 @@ public partial class MainPageViewModel : ObservableObject
 
     public event Action<string, string>? ToastRequested;
 
+    /// <summary>
+    /// 適用のためにヘルパへ渡した後か。渡した時点で立て、終了まで下ろさない。
+    /// <para>
+    /// ヘルパは渡した時点のチャンネルで照合を済ませている。その後で設定を
+    /// 保存されると、保存済みの設定と実際に適用される版が食い違う。終了時
+    /// Push を待っている間もウィンドウは操作できるので、その窓を塞ぐ。
+    /// </para>
+    /// </summary>
+    private bool _handedOverToUpdater;
+
     [RelayCommand]
     private void SaveSettings()
     {
+        if (_handedOverToUpdater)
+        {
+            // 適用はもう動き出している。ここで設定を書き換えても反映されず、
+            // 保存済みの設定と適用される版が食い違うだけになる。
+            AppendLog("更新の適用中です。設定の保存は再起動後に行ってください。");
+            return;
+        }
+
         // 保存直前にディスクの現行値を読み直し、その上へ画面の値を載せる。
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
@@ -728,6 +746,11 @@ public partial class MainPageViewModel : ObservableObject
         }
         AppendLog("更新を適用するため再起動します...");
 
+        // ここから先、設定の保存は受け付けない。ヘルパは渡した時点のチャンネルで
+        // 照合を済ませており、終了時 Push を待つ間に stable へ変えて保存されると、
+        // 保存済みの設定と適用される版が食い違う。
+        _handedOverToUpdater = true;
+
         // 終了処理の途中で多重起動の抑止を手放さない。手放してから実際に終わる
         // までの隙に別の App が起動すると、待っているヘルパと入れ替えがぶつかる。
         App.KeepSingleInstanceUntilExit();
@@ -740,6 +763,10 @@ public partial class MainPageViewModel : ObservableObject
         // プロセスの終了で手放す約束で握ったままなので、明示的に返す。
         // 持ち続けると、この後の取得の昇格も、起こしたヘルパの適用も止まる。
         UpdateApplier.ReleaseHeldApplyLock();
+
+        // 起こしたヘルパはロックと一緒に止めた。適用は動いていないので、
+        // 設定の保存も受け付け直す。
+        _handedOverToUpdater = false;
         IsBusy = false;
         AppendLog("終了が取り消されたため、更新は次回起動時に適用されます。");
         RefreshStagedRow();
