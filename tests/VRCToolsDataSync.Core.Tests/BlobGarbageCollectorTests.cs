@@ -250,4 +250,111 @@ public sealed class BlobGarbageCollectorTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new BlobGarbageCollector(storage).Collect(TimeSpan.FromSeconds(-1)));
     }
+    [Fact(DisplayName = "猶予期間を過ぎた未完了のアップロードは中断する")]
+    public void AbortsStaleIncompleteUploads()
+    {
+        // 送信済みのパートは List に現れないが、保存容量としては課金される (#59)。
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "bbb", "upload-1", LongAgo));
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace);
+
+        Assert.Equal(1, result.AbortedUploads);
+        Assert.Empty(storage.IncompleteUploads);
+    }
+
+    [Fact(DisplayName = "猶予期間内の未完了のアップロードは残す")]
+    public void KeepsIncompleteUploadsWithinGrace()
+    {
+        // 他の PC が今まさに送っている最中のものは、まさしく未完了として現れる。
+        // 中断すると、その Push をこちらから壊すことになる。
+        var storage = StorageAt(DateTimeOffset.UtcNow);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", DateTimeOffset.UtcNow);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "bbb", "upload-1", DateTimeOffset.UtcNow));
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace);
+
+        Assert.Equal(0, result.AbortedUploads);
+        Assert.Single(storage.IncompleteUploads);
+    }
+
+    [Fact(DisplayName = "dry-run では未完了のアップロードを数えるだけにする")]
+    public void DryRunCountsIncompleteUploadsWithoutAborting()
+    {
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "bbb", "upload-1", LongAgo));
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace, dryRun: true);
+
+        Assert.Equal(1, result.AbortedUploads);
+        Assert.Single(storage.IncompleteUploads);
+    }
+
+    [Fact(DisplayName = "中断の失敗は 1 件として数え、実体の回収は続ける")]
+    public void CountsAbortFailureWithoutStoppingCollection()
+    {
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
+        storage.Seed(BlobKeys.Prefix + "bbb", "orphan", LongAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "ccc", "upload-1", LongAgo));
+        storage.AbortFailures.Add("upload-1");
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace);
+
+        // 実体の回収は済んでいる。
+        Assert.Equal(1, result.Deleted);
+        Assert.False(storage.Has(BlobKeys.Prefix + "bbb"));
+        Assert.Equal(0, result.AbortedUploads);
+
+        // 中断の失敗は削除の失敗と分けて数える。要る権限が違うため、
+        // 混ぜると原因を切り分けられない。
+        Assert.Equal(1, result.FailedUploads);
+        Assert.Equal(0, result.Failed);
+    }
+
+    [Fact(DisplayName = "manifest の参照が無くても、未完了のアップロードは中断する")]
+    public void AbortsIncompleteUploadsEvenWithoutLiveReferences()
+    {
+        // 最初の Push がマルチパートの途中で切れると、断片だけが残って manifest は
+        // 無い。実体の削除はここで止めるが、断片の片付けまで止めると課金され続ける
+        // ものを消す手立てが無くなる (#59)。
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "would be deleted", LongAgo);
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "bbb", "upload-1", LongAgo));
+
+        Assert.Throws<SyncStorageException>(() => new BlobGarbageCollector(storage).Collect(Grace));
+
+        // 断片は消えている。実体には触っていない。
+        Assert.Empty(storage.IncompleteUploads);
+        Assert.True(storage.Has(BlobKeys.Prefix + "aaa"));
+    }
+
+    [Fact(DisplayName = "未完了のアップロードを一覧できなくても、実体の回収は成立させる")]
+    public void KeepsCollectionResultWhenIncompleteUploadsCannotBeListed()
+    {
+        // 一覧の権限が無い認証情報や、その操作を持たない同期先がありうる。
+        // そこで実体の回収まで失敗にすると、消せるものまで残る。
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
+        storage.Seed(BlobKeys.Prefix + "bbb", "orphan", LongAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+        storage.ListIncompleteUploadsFailure = new SyncStorageException("一覧できません (テスト)");
+
+        var result = new BlobGarbageCollector(storage).Collect(Grace);
+
+        Assert.Equal(1, result.Deleted);
+        Assert.Equal(0, result.AbortedUploads);
+        Assert.Equal(0, result.Failed);
+    }
 }

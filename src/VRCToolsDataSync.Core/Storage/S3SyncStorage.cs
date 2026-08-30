@@ -117,6 +117,23 @@ public sealed class S3SyncStorage : ISyncStorage
         return new StagedObject(this, stagingPath);
     }
 
+    public IEnumerable<IncompleteUpload> ListIncompleteUploads()
+    {
+        // 実データと同じ接頭辞に絞る。manifest は 1 回の PUT で送るため、
+        // 未完了のまま残るのは blobs/ の下だけである。
+        var prefix = ToObjectKey(BlobKeys.Prefix);
+        foreach (var (key, uploadId, initiated) in _client.ListMultipartUploads(prefix))
+        {
+            // キー接頭辞を設定している場合、呼び出し側にはそれを除いた形で返す。
+            var scoped = _keyPrefix.Length > 0 ? _keyPrefix + "/" : string.Empty;
+            if (scoped.Length > 0 && !key.StartsWith(scoped, StringComparison.Ordinal)) continue;
+            yield return new IncompleteUpload(key[scoped.Length..], uploadId, initiated);
+        }
+    }
+
+    public void AbortIncompleteUpload(IncompleteUpload upload)
+        => _client.AbortMultipartUpload(ToObjectKey(upload.Key), upload.UploadId);
+
     public IEnumerable<StoredObject> List(string keyPrefix)
     {
         var prefix = ToObjectKey(keyPrefix);

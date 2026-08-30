@@ -11,13 +11,21 @@ namespace VRCToolsDataSync.Core.Storage;
 /// <param name="Deleted">削除したもの。</param>
 /// <param name="DeletedBytes">削除したものの合計サイズ (分かる場合)。</param>
 /// <param name="Failed">削除に失敗したもの。</param>
+/// <param name="AbortedUploads">中断した、未完了のアップロード (#59)。</param>
+/// <param name="FailedUploads">
+/// 中断に失敗した、未完了のアップロード (#59)。
+/// 削除の失敗とは分けて数える。要る権限が違うため (s3:DeleteObject と
+/// s3:AbortMultipartUpload)、混ぜると原因の切り分けができない。
+/// </param>
 public sealed record BlobGarbageCollectionResult(
     int Scanned,
     int Live,
     int Young,
     int Deleted,
     long DeletedBytes,
-    int Failed)
+    int Failed,
+    int AbortedUploads = 0,
+    int FailedUploads = 0)
 {
     /// <summary>削除した合計サイズの表示用文字列 (例: "1.2 GB")。CLI と GUI で共用する。</summary>
     public string DescribeDeletedBytes()
@@ -45,6 +53,10 @@ public sealed record BlobGarbageCollectionResult(
 /// <para>
 /// 参照が 1 件も集まらなかった場合は回収そのものを中止する。manifest を読めない
 /// 一瞬に当たっただけかもしれず、その判断のまま走らせると全部消すことになる。
+/// 中止するのは実体の削除だけである。未完了のアップロードの片付け (#59) は
+/// manifest の参照と無関係なので、その前に済ませる。最初の Push がマルチパートの
+/// 途中で切れた保存先には manifest がまだ無く、後に回すと課金され続ける断片を
+/// 消す手立てが無くなる。
 /// </para>
 /// <para>
 /// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直し、その状態を
@@ -93,7 +105,15 @@ public sealed class BlobGarbageCollector
             throw new ArgumentOutOfRangeException(nameof(gracePeriod), "猶予期間に負の値は指定できません");
         }
 
-        // 生きている参照を先に集める。manifest を読んでから列挙する順にすることで、
+        var threshold = DateTimeOffset.UtcNow - grace;
+
+        // 未完了のアップロードは manifest から参照されない。実体の削除を止める
+        // 判断とは無関係なので、その手前で片付ける。最初の Push がマルチパートの
+        // 途中で切れた保存先には manifest がまだ無く、下の中止に巻き込むと、
+        // 課金され続ける断片を消す手立てが無くなる (#59)。
+        var (aborted, abortFailures) = AbortStaleUploads(threshold, dryRun);
+
+        // 生きている参照を集める。manifest を読んでから列挙する順にすることで、
         // 「読んだ後に公開された manifest が参照するオブジェクト」は列挙側に現れても
         // 新しいので猶予期間に守られる。逆順にすると、列挙してから manifest を読むまでの
         // 間に公開されたものを取りこぼす。
@@ -113,9 +133,9 @@ public sealed class BlobGarbageCollector
             throw new SyncStorageException(
                 "manifest から参照されている実体が 1 件もありません。" +
                 "manifest がまだ無いか、読めない状態だった可能性があります。" +
-                "この状態で回収すると生きている実体まで消すため、中止しました。");
+                "この状態で回収すると生きている実体まで消すため、中止しました。" +
+                (aborted > 0 ? $" (未完了のアップロード {aborted} 件は中断しました)" : string.Empty));
         }
-        var threshold = DateTimeOffset.UtcNow - grace;
 
         var scanned = 0;
         var liveCount = 0;
@@ -188,11 +208,69 @@ public sealed class BlobGarbageCollector
             }
         }
 
-        var result = new BlobGarbageCollectionResult(scanned, liveCount, young, deleted, deletedBytes, failed);
+        var result = new BlobGarbageCollectionResult(
+            scanned, liveCount, young, deleted, deletedBytes, failed, aborted, abortFailures);
         _logger.LogInformation(
-            "回収完了 scanned={Scanned} live={Live} young={Young} deleted={Deleted} failed={Failed}",
-            result.Scanned, result.Live, result.Young, result.Deleted, result.Failed);
+            "回収完了 scanned={Scanned} live={Live} young={Young} deleted={Deleted} " +
+            "failed={Failed} aborted={Aborted} abortFailed={AbortFailed}",
+            result.Scanned, result.Live, result.Young, result.Deleted, result.Failed,
+            result.AbortedUploads, result.FailedUploads);
         return result;
+    }
+
+    /// <summary>
+    /// 猶予期間を過ぎた、未完了のアップロードを中断する (#59)。
+    /// <para>
+    /// 実体の回収と同じ猶予期間を使う。他の PC が今まさに送っている最中の
+    /// アップロードは、まさしく未完了として現れるためである。中断すると、
+    /// 送信中の Push がその時点で失敗する。
+    /// </para>
+    /// <para>
+    /// 一覧を取れない同期先や、権限の足りない認証情報では何もしない。実体の
+    /// 回収はここまでで済んでおり、そちらの結果まで巻き添えにする理由が無い。
+    /// </para>
+    /// </summary>
+    private (int Aborted, int Failed) AbortStaleUploads(DateTimeOffset threshold, bool dryRun)
+    {
+        List<IncompleteUpload> stale;
+        try
+        {
+            stale = _storage.ListIncompleteUploads()
+                .Where(upload => upload.InitiatedAt <= threshold)
+                .ToList();
+        }
+        catch (SyncStorageException ex)
+        {
+            _logger.LogWarning(ex, "未完了のアップロードを一覧できませんでした");
+            return (0, 0);
+        }
+
+        var aborted = 0;
+        var failed = 0;
+        foreach (var upload in stale)
+        {
+            if (dryRun)
+            {
+                aborted++;
+                _logger.LogInformation(
+                    "中断の対象 (実行はしない): {Key} ({UploadId})", upload.Key, upload.UploadId);
+                continue;
+            }
+
+            try
+            {
+                _storage.AbortIncompleteUpload(upload);
+                aborted++;
+                _logger.LogInformation("未完了のアップロードを中断しました: {Key}", upload.Key);
+            }
+            catch (SyncStorageException ex)
+            {
+                // 1 件の失敗で全体を止めない。残りは次回に回る。
+                failed++;
+                _logger.LogWarning(ex, "未完了のアップロードを中断できませんでした: {Key}", upload.Key);
+            }
+        }
+        return (aborted, failed);
     }
 
     /// <summary>

@@ -187,6 +187,35 @@ internal sealed class FakeSyncStorage : ISyncStorage
         }
     }
 
+    /// <summary>未完了のまま残っているアップロード。テストの前提として置く。</summary>
+    public List<IncompleteUpload> IncompleteUploads { get; } = new();
+
+    /// <summary>ここに載せた uploadId の中断は失敗する。1 件の失敗を作るために使う。</summary>
+    public HashSet<string> AbortFailures { get; } = new(StringComparer.Ordinal);
+
+    /// <summary><see cref="ListIncompleteUploads"/> が投げる例外。一覧を取れない同期先を作る。</summary>
+    public SyncStorageException? ListIncompleteUploadsFailure { get; set; }
+
+    public IEnumerable<IncompleteUpload> ListIncompleteUploads()
+    {
+        Calls.Add("ListIncompleteUploads");
+        if (ListIncompleteUploadsFailure is not null) throw ListIncompleteUploadsFailure;
+        // 列挙中に中断されても壊れないよう、写しを返す。実装 (ページング) も
+        // 一度に全部は返さない。
+        return IncompleteUploads.ToList();
+    }
+
+    public void AbortIncompleteUpload(IncompleteUpload upload)
+    {
+        Calls.Add("AbortIncompleteUpload:" + upload.UploadId);
+        if (AbortFailures.Contains(upload.UploadId))
+        {
+            throw new SyncStorageException($"中断できません (テスト): {upload.Key}");
+        }
+        // 既に無いものの中断も成功として扱う。実装も 404 をそう扱う。
+        IncompleteUploads.RemoveAll(u => u.UploadId == upload.UploadId);
+    }
+
     public IManifestWatcher CreateManifestWatcher() => throw new NotSupportedException();
 
     /// <summary>

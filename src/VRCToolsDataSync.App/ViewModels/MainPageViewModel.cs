@@ -1022,9 +1022,21 @@ public partial class MainPageViewModel : ObservableObject
             AppendLog(
                 $"ストレージ容量の解放 完了: {result.Deleted} 件 ({result.DescribeDeletedBytes()}) を削除 " +
                 $"/ 参照あり {result.Live} 件 / 猶予期間内 {result.Young} 件");
+            if (result.AbortedUploads > 0)
+            {
+                // 送信が途中で切れた断片は一覧に現れないまま課金される。
+                AppendLog($"  未完了のアップロード {result.AbortedUploads} 件を中断しました");
+            }
             if (result.Failed > 0)
             {
                 AppendLog($"  {result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります");
+            }
+            if (result.FailedUploads > 0)
+            {
+                // 削除の失敗と分けて出す。要る権限が違うので、混ぜると原因を切り分けられない。
+                AppendLog(
+                    $"  {result.FailedUploads} 件の未完了のアップロードを中断できませんでした " +
+                    "(API キーの権限を確認してください)");
             }
         }
         catch (Exception ex)

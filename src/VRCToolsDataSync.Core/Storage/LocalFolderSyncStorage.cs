@@ -266,6 +266,17 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
         }
     }
 
+    /// <summary>
+    /// 同期フォルダには分割して送る仕組みが無い。未完了のアップロードは
+    /// 原理的に生じないため、常に空を返す (#59)。書き出し中の一時ファイルは
+    /// 実体の側 (<see cref="List"/>) で見分けており、こちらの話ではない。
+    /// </summary>
+    public IEnumerable<IncompleteUpload> ListIncompleteUploads() => Array.Empty<IncompleteUpload>();
+
+    /// <summary>呼ばれることは無い。列挙が常に空だからである。</summary>
+    public void AbortIncompleteUpload(IncompleteUpload upload)
+        => throw new SyncStorageException("同期フォルダには未完了のアップロードがありません");
+
     public IEnumerable<StoredObject> List(string keyPrefix)
     {
         var root = StorageKey.ToLocalPath(_rootDirectory, keyPrefix.TrimEnd('/'));
