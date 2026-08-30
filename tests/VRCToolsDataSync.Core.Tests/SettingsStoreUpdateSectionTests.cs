@@ -27,14 +27,12 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         var store = CreateStore();
         var settings = store.Load();
         settings.Update.Channel = UpdateChannel.Test;
-        settings.Update.CheckEnabled = false;
         settings.Update.NotifiedVersion = "0.0.10-test1";
 
         store.Save(settings);
         var loaded = CreateStore().Load();
 
         Assert.Equal(UpdateChannel.Test, loaded.Update.Channel);
-        Assert.False(loaded.Update.CheckEnabled);
         Assert.Equal("0.0.10-test1", loaded.Update.NotifiedVersion);
     }
 
@@ -47,7 +45,6 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         var loaded = CreateStore().Load();
 
         Assert.Equal(UpdateChannel.Stable, loaded.Update.Channel);
-        Assert.True(loaded.Update.CheckEnabled);
         Assert.Equal(string.Empty, loaded.Update.NotifiedVersion);
     }
 
@@ -63,7 +60,21 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
 
         Assert.NotNull(loaded.Update);
         Assert.Equal(UpdateChannel.Stable, loaded.Update.Channel);
-        Assert.True(loaded.Update.CheckEnabled);
+    }
+
+    [Fact(DisplayName = "以前の checkEnabled が残った settings.json も、そのまま読める")]
+    public void IgnoresRemovedCheckEnabledField()
+    {
+        // 確認を止める設定は無くした。読み込みは未知の項目を無視するので、
+        // 以前の値が残っていても読み込み自体が失敗してはいけない。
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(
+            Path.Combine(_directory, "settings.json"),
+            """{ "update": { "channel": "test", "checkEnabled": false } }""");
+
+        var loaded = CreateStore().Load();
+
+        Assert.Equal(UpdateChannel.Test, loaded.Update.Channel);
     }
 
     [Fact(DisplayName = "ToolState 専用の保存は update セクションを巻き戻さない")]

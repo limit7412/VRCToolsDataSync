@@ -106,8 +106,8 @@ public sealed record ReleaseCatalog(IReadOnlyList<ReleaseInfo> Releases, bool Co
 /// 確認の結末。
 /// <para>
 /// 「新しい版が無い」と「確かめられなかった」を呼び出し側が書き分けられるよう、
-/// null ではなく結末そのものを返す。自動の確認はどちらも黙るが、手動で押した
-/// ときに黙るのは無反応と区別が付かない。
+/// null ではなく結末そのものを返す。バルーンはどちらでも黙るが、画面の状態欄は
+/// 「最新の版を利用中」と「確認できませんでした」を書き分ける。
 /// </para>
 /// </summary>
 public enum UpdateCheckOutcome
