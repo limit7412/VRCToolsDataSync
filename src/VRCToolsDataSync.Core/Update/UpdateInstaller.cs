@@ -17,6 +17,19 @@ public sealed class UpdateRollbackException : Exception
 }
 
 /// <summary>
+/// インストール先に、新しい一式を置くだけの空きが無い。
+/// <para>
+/// 配布物の問題ではないので、取得しておいたものを捨ててはならない。空きを
+/// 作れば同じ ZIP でやり直せる。数百 MB の取り直しを利用者に強いないための
+/// 区別である。
+/// </para>
+/// </summary>
+public sealed class UpdateCapacityException : Exception
+{
+    public UpdateCapacityException(string message, Exception? inner = null) : base(message, inner) { }
+}
+
+/// <summary>
 /// 展開しておいた新しい一式で、インストール先を置き換える (issue #45 第 3 段階)。
 /// <para>
 /// 実行中のアプリは <c>app\</c> 配下の DLL を掴んでいるため、ディレクトリの
@@ -99,6 +112,7 @@ public class UpdateInstaller
     public void Apply()
     {
         ValidateLayout();
+        EnsureSpaceForCopy();
 
         // (1)-(3) のどこで失敗しても、用意した .new は残さない。数百 MB あり、
         // 起動時の後始末も CLI 側の破棄も .new を見ないので、次の更新まで
@@ -125,6 +139,49 @@ public class UpdateInstaller
 
         ReplaceLauncher();
     }
+
+    /// <summary>
+    /// インストール先に、新しい一式をもう 1 つ置くだけの空きがあるかを先に見る。
+    /// <para>
+    /// 複製の途中で空きが尽きると、呼び出し側 (更新ヘルパ) はそれを置き換えの
+    /// 失敗として扱い、取得しておいた ZIP まで捨ててしまう。利用者は空きを
+    /// 作った後、数百 MB を取り直すことになる。触る前に見て
+    /// <see cref="UpdateCapacityException"/> で分けておけば、取得を残したまま
+    /// 引き下がれる。
+    /// </para>
+    /// <para>
+    /// 見るのはインストール先のドライブである。展開先とは別のドライブに
+    /// 置かれている場合があり、そちらの空きは <c>UpdateStage</c> が展開の前に
+    /// 確かめている。空きを読めない置き場所 (ネットワーク越しなど) では
+    /// 見送る。読めないことを不足の証拠にはできない。
+    /// </para>
+    /// </summary>
+    private void EnsureSpaceForCopy()
+    {
+        long required;
+        long available;
+        try
+        {
+            required = Parts.Sum(part => DirectorySize(Path.Combine(_sourceDirectory, part)));
+
+            var root = Path.GetPathRoot(Path.GetFullPath(_targetDirectory));
+            if (string.IsNullOrEmpty(root)) return;
+            available = new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            LogQuietly(() => _logger.LogDebug(ex, "空き容量を読めなかったため確認を見送る: {Target}", _targetDirectory));
+            return;
+        }
+
+        if (available >= required) return;
+
+        throw new UpdateCapacityException(
+            $"インストール先に空きが足りないため置き換えない: {required} バイト必要だが {available} バイトしかない");
+    }
+
+    private static long DirectorySize(string path) =>
+        new DirectoryInfo(path).EnumerateFiles("*", SearchOption.AllDirectories).Sum(file => file.Length);
 
     /// <summary>
     /// 用意 (複製) から入れ替えまで。失敗の後始末は呼び出し側が行う。

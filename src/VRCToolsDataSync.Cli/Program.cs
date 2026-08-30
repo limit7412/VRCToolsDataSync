@@ -736,6 +736,18 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
         Console.WriteLine("本体を置き換えました。");
         Log(() => logger.LogInformation("本体を置き換えた: {Target}", target));
     }
+    catch (UpdateCapacityException ex)
+    {
+        // 空きが足りないだけで、正規の位置には触っていない。取得済みの ZIP を
+        // 捨てると、利用者は空きを作った後に数百 MB を取り直すことになる。
+        // 残したまま引き下がり、現行版を開き直す。空きができれば次の起動が
+        // そのまま適用する。
+        Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
+        Console.Error.WriteLine("空き容量を作ってから起動し直すと、取得済みの更新がそのまま適用されます。");
+        Log(() => logger.LogError(ex, "空き容量が足りないため置き換えを見送った"));
+        if (relaunch) TryRelaunchApp(target, logger);
+        return 9;
+    }
     catch (UpdateRollbackException ex)
     {
         // 正規の位置に一式が無い状態。取得済みの ZIP は復旧の材料になるため消さず、

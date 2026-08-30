@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -204,6 +205,9 @@ public sealed class UpdateStage
 
         // 前の版を展開したものが残っていても、もう対応しない。
         DeleteDirectoryQuietly(ExtractDirectory);
+
+        // 展開の失敗の数は前の ZIP のもの。新しい ZIP は 1 回目から数え直す。
+        ForgetExtractFailures();
     }
 
     /// <summary>
@@ -429,6 +433,7 @@ public sealed class UpdateStage
         var metadata = DeleteQuietly(MetadataPath);
         DeleteQuietly(IncomingZipPath);
         DeleteDirectoryQuietly(ExtractDirectory);
+        ForgetExtractFailures();
         return zip && metadata;
     }
 
@@ -521,16 +526,86 @@ public sealed class UpdateStage
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
                                        or NotSupportedException or ArgumentException)
         {
-            // ここへ来る失敗は、空きを確かめた後に残るもの、つまり Windows では
-            // 作れない項目名 (予約された装置名・使えない文字・長すぎる経路など)
-            // である。名前の規則を 1 つずつ数え上げても塞ぎ切れないため、
-            // 「展開できない配布物」としてまとめて断る。呼び出し側はこれを見て
-            // 取得ごと捨てるので、同じ ZIP で失敗を繰り返さない。
-            throw new InvalidDataException($"展開できない ZIP: {ZipPath}", ex);
+            throw ClassifyExtractFailure(ex);
         }
 
+        ForgetExtractFailures();
         return ExtractDirectory;
     }
+
+    /// <summary>
+    /// 展開の失敗を、取得を残して待つものと、取得ごと捨てるものに分ける。
+    /// <para>
+    /// 一時的に掴まれている (ウイルス対策ソフトなど)、確認の後に空きが尽きた、
+    /// といった失敗は配布物の問題ではないので、そのまま投げ直して取得を残す。
+    /// 次の起動でやり直せる。
+    /// </para>
+    /// <para>
+    /// ただし残すだけでは、Windows で作れない項目名のように何度やっても
+    /// 失敗する配布物で、起動のたびに同じことを繰り返す。例外の種類では
+    /// 一時的なものと見分けられないため、同じ ZIP で何回失敗したかを数え、
+    /// <see cref="MaxExtractAttempts"/> 回に達したところで配布物の問題として
+    /// <see cref="InvalidDataException"/> にそろえる。呼び出し側はこれを見て
+    /// 取得ごと捨てる。数は昇格 (新しい ZIP) と展開の成功で 0 に戻す。
+    /// </para>
+    /// </summary>
+    private Exception ClassifyExtractFailure(Exception ex)
+    {
+        var failures = RecordExtractFailure();
+        if (failures < MaxExtractAttempts)
+        {
+            _logger.LogWarning(ex, "展開に失敗した ({Failures} 回目)。取得は残して次の機会にやり直す", failures);
+            return ex;
+        }
+
+        return new InvalidDataException(
+            $"{failures} 回続けて展開できなかったため配布物の問題として扱う: {ZipPath}", ex);
+    }
+
+    /// <summary>同じ ZIP の展開をあきらめるまでの回数。</summary>
+    private const int MaxExtractAttempts = 3;
+
+    private string ExtractFailureCountPath => Path.Combine(Directory, "extract-failures");
+
+    /// <summary>
+    /// 展開の失敗を 1 つ数えて、数えた後の回数を返す。
+    /// <para>
+    /// 記録 (<see cref="MetadataPath"/>) とは別のファイルに置く。書きかけで
+    /// 落ちても、照合に使う対には触らない形にするためである。読めない場合は
+    /// 0 から数え直す。数えられない状況 (容量不足など) は、そもそも取得を
+    /// 残したい側なので、数が進まないことが困る形にはならない。
+    /// </para>
+    /// </summary>
+    private int RecordExtractFailure()
+    {
+        var failures = 1;
+        try
+        {
+            if (int.TryParse(File.ReadAllText(ExtractFailureCountPath), out var previous) && previous > 0)
+            {
+                failures = previous + 1;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 読めなければ 1 回目として扱う。
+        }
+
+        try
+        {
+            System.IO.Directory.CreateDirectory(Directory);
+            File.WriteAllText(ExtractFailureCountPath, failures.ToString(CultureInfo.InvariantCulture));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogDebug(ex, "展開の失敗を数えられなかった: {Path}", ExtractFailureCountPath);
+        }
+
+        return failures;
+    }
+
+    /// <summary>展開の失敗の数を捨てる。新しい ZIP を置いたときと、展開が通ったときに呼ぶ。</summary>
+    private void ForgetExtractFailures() => _ = DeleteQuietly(ExtractFailureCountPath, quiet: true);
 
     /// <summary>
     /// 展開が決まって失敗する形でないかを先に見る。
@@ -576,12 +651,16 @@ public sealed class UpdateStage
                 throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
             }
 
-            total += entry.Length;
-            if (total > MaxExtractedSize)
+            // 足す前に見る。項目の大きさは ZIP の目録に書かれた値をそのまま
+            // 受け取るので、桁を偽られると足し算が折り返し、負の合計として
+            // 上限も空き容量の確認もすり抜ける。
+            if (entry.Length < 0 || entry.Length > MaxExtractedSize - total)
             {
                 throw new InvalidDataException(
-                    $"展開後の大きさが桁違いの ZIP は展開しない: {total} バイトを超える");
+                    $"展開後の大きさが桁違いの ZIP は展開しない: {MaxExtractedSize} バイトを超える");
             }
+
+            total += entry.Length;
         }
 
         EnsureSpaceFor(total);
@@ -743,7 +822,8 @@ public sealed class UpdateStage
     }
 
     /// <summary>消せたか (もともと無かった場合も true) を返す。</summary>
-    private bool DeleteQuietly(string path)
+    /// <param name="quiet">消せなくても支障の無いものを消すとき。警告を残さない。</param>
+    private bool DeleteQuietly(string path, bool quiet = false)
     {
         try
         {
@@ -752,7 +832,8 @@ public sealed class UpdateStage
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "消せなかった: {Path}", path);
+            if (quiet) _logger.LogDebug(ex, "消せなかった: {Path}", path);
+            else _logger.LogWarning(ex, "消せなかった: {Path}", path);
             return false;
         }
     }

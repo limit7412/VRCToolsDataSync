@@ -466,6 +466,56 @@ public sealed class UpdateStageTests : IDisposable
         Assert.True(File.Exists(Path.Combine(extracted, "app", "CONFIG.json")));
     }
 
+    [Fact(DisplayName = "展開の失敗は、続いた場合だけ配布物の問題として扱う")]
+    public void KeepsStagedUntilExtractionFailsRepeatedly()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/foo.dll");
+        }
+
+        // 展開先と同じ名前のファイルを置いて、展開を必ず失敗させる。
+        // 一時的に掴まれている状況の代わりとして使う。
+        File.WriteAllText(stage.ExtractDirectory, "");
+
+        // 続くかどうかが分かるまでは、取得を残して投げ直す。
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+
+        // 3 回目で配布物の問題として扱う。呼び出し側はこれを見て取得ごと捨てる。
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
+    [Fact(DisplayName = "展開が通れば、それまでの失敗の数は忘れる")]
+    public void ForgetsExtractionFailuresAfterASuccess()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/foo.dll");
+        }
+
+        File.WriteAllText(stage.ExtractDirectory, "");
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+
+        // 邪魔が退いて展開が通った後は、数え直しになる。通らなければ、
+        // 一時的な失敗を跨いだだけで次の 1 回目に捨てられてしまう。
+        File.Delete(stage.ExtractDirectory);
+        stage.ExtractForApply();
+
+        Directory.Delete(stage.ExtractDirectory, recursive: true);
+        File.WriteAllText(stage.ExtractDirectory, "");
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+    }
+
     [Fact(DisplayName = "存在の判定は、無いと分かった場合だけ false にする")]
     public void PresenceIsUnknownWhenItCannotBeDetermined()
     {
