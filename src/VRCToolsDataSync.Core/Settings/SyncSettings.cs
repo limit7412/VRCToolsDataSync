@@ -43,6 +43,14 @@ public sealed class SyncSettings
     public Dictionary<string, ToolLaunchConfig> Launch { get; set; } = new();
 
     /// <summary>
+    /// 自動回収 (issue #55) を最後に試みた時刻。キーは
+    /// <see cref="Storage.ISyncStorage.StateKeyPrefix"/> で、保存先ごとに分けて持つ。
+    /// 保存先を切り替えた直後に、別の保存先での実行を「済んだばかり」と
+    /// 取り違えないようにするため。
+    /// </summary>
+    public Dictionary<string, DateTimeOffset> LastGcAt { get; set; } = new();
+
+    /// <summary>
     /// 本体の更新確認の設定 (issue #45)。この項目が無い既存の settings.json も
     /// 既定値 (stable チャンネル、確認あり) でそのまま動く。
     /// </summary>

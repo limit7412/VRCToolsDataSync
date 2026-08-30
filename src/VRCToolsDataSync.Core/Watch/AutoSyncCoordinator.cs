@@ -362,6 +362,7 @@ public sealed class AutoSyncCoordinator : IDisposable
             // 並行発火する可能性があるため、同一プロセス内では直列化して
             // manifest.json の read-modify-write 競合を回避する。
             SyncResult result;
+            ISyncStorage storage;
             lock (_autoPushLock)
             {
                 // ロック取得後にも世代失効を確認 (長時間待ち後の二重Push防止)。
@@ -372,18 +373,26 @@ public sealed class AutoSyncCoordinator : IDisposable
                 }
                 // Start 時に作った同期先を使う。Stop と競合して null になっていたら
                 // 世代が切れているので Push しない。
-                var storage = _storage;
-                if (storage is null)
+                var current = _storage;
+                if (current is null)
                 {
                     _logger.LogInformation("AutoPush キャンセル (同期先が解放済み) tool={Tool}", binding.ToolKey);
                     return false;
                 }
+                storage = current;
                 result = _runner.Push(service, _settings, storage, force: false);
             }
             switch (result.Outcome)
             {
                 case SyncOutcome.Success:
                     _logger.LogInformation("AutoPush 完了 tool={Tool} version={Version}", binding.ToolKey, result.RemoteVersion);
+                    // Push の後始末として、参照が切れた実体の回収を試みる (issue #55)。
+                    // この AutoPush タスクは Shutdown シーケンスが完了を待つので、
+                    // ここで同期実行すると回収の長さがそのまま終了を遅らせる。
+                    // バックグラウンドに切り離し、途中打ち切りは次回に任せる。
+                    // (Stop 後に _storage が捨てられても、掴んだ参照はそのまま使える。
+                    //  ISyncStorage はスレッドセーフで、破棄の手続きも持たない。)
+                    _runner.CollectGarbageInBackground(storage);
                     AutoPushCompleted?.Invoke(pushEvent with { Result = result });
                     return true;
                 case SyncOutcome.ConflictDetected:

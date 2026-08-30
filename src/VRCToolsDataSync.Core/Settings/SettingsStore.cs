@@ -63,6 +63,7 @@ public sealed class SettingsStore
         // JSON に明示的な null が書かれていると、既定値の代わりに null が入る。
         // 読んだ側が毎回それを気にせずに済むよう、ここで既定へ落としておく。
         settings.Update ??= new UpdateSettings();
+        settings.LastGcAt ??= new Dictionary<string, DateTimeOffset>();
         MigrateToolStateKeys(settings);
         return settings;
     }
@@ -134,6 +135,47 @@ public sealed class SettingsStore
     /// その古い値で上書きされて ON 設定が消えてしまう。
     /// </summary>
     public void SaveToolStateOnly(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: true);
+
+    /// <summary>
+    /// 回収の記録 (<see cref="SyncSettings.LastGcAt"/>) として受け入れる、
+    /// 未来方向の時刻のずれの上限。
+    /// <para>
+    /// これより先の未来を指す記録は無かったものとして扱う。時計が進んだ状態で
+    /// 書かれた記録は、時計を直した後も「新しい方」としてマージに勝ち続け、
+    /// 正しい時刻の記録で置き換えられないためである。プロセス間のわずかな
+    /// 時計差まで無効にしないよう、少しだけ許す。
+    /// </para>
+    /// </summary>
+    public static readonly TimeSpan LastGcAtFutureTolerance = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// 自動回収を試みた時刻の記録だけを書く (issue #55)。
+    /// <para>
+    /// 通知済みの版 (<see cref="SaveNotifiedVersion"/>) と同じ理由で、通常の
+    /// <see cref="Save"/> は使わない。回収は Push の後始末として常駐中に走るので、
+    /// 起動時に読んだ古い settings で保存すると、その後に別プロセスが変えた
+    /// 設定を巻き戻す。
+    /// </para>
+    /// <para>
+    /// settings.json が読めない場合は書かずに例外を伝える。マージは読めない
+    /// ディスクを「無い」扱いにして incoming を採用するので、ここで渡す既定値
+    /// だらけの settings が、破損しただけのファイルを正常な形で上書きし、
+    /// 保存先や自動同期の設定が無言で消えるためである。
+    /// </para>
+    /// </summary>
+    public void SaveLastGcAt(string storageStateKey, DateTimeOffset at)
+    {
+        // 読めることを先に確かめる。ファイルがまだ無い場合は Load が既定値を
+        // 返すので、初回の保存はそのまま通る。確かめてから保存するまでの間に
+        // 壊れる可能性は残るが、その幅は保存の一瞬しかない。
+        _ = Load();
+
+        // 中身はディスク側を全面的に採用し、この記録だけを載せる。
+        // どちらが残るかは MergeForSave がキーごとの新しさで決める。
+        var settings = new SyncSettings();
+        settings.LastGcAt[storageStateKey] = at;
+        SaveInternal(settings, mergeTopLevelFromDisk: true);
+    }
 
     /// <summary>
     /// 通知済みの版の記録だけを書く (issue #45)。
@@ -227,6 +269,7 @@ public sealed class SettingsStore
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
                     settings.Update = merged.Update;
+                    settings.LastGcAt = merged.LastGcAt;
                 }
                 finally
                 {
@@ -301,6 +344,7 @@ public sealed class SettingsStore
             ToolStateSchema = CurrentToolStateSchema,
             ToolState = new Dictionary<string, ToolSyncState>(),
             Launch = new Dictionary<string, ToolLaunchConfig>(),
+            LastGcAt = new Dictionary<string, DateTimeOffset>(),
         };
 
         // 両方に存在する tool キーは新しい方を採用、片方だけにあるものはそのまま追加。
@@ -332,6 +376,31 @@ public sealed class SettingsStore
         else if (incomingNotified is not null)
         {
             result.Update.NotifiedVersion = incoming.Update!.NotifiedVersion;
+        }
+
+        // 自動回収の記録は、採用元に関わらずキーごとにディスクと incoming の
+        // 新しいほうを採用する。時刻は常に前へ進むので、新旧は比較で決められる。
+        // 通知済みの版と同じく、古い settings を持つ経路の保存が別プロセスの
+        // 記録を巻き戻して、回収を余分に走らせないため。
+        //
+        // ただし、未来を指す記録は捨てる (LastGcAtFutureTolerance)。時計が進んだ
+        // 状態で書かれた記録は「新しい方」として勝ち続け、時計を直した後の正しい
+        // 記録で置き換えられないためである。捨てれば次の保存が正しい時刻で作り直す。
+        var latestAcceptableGcAt = DateTimeOffset.Now + LastGcAtFutureTolerance;
+        var diskGcAt = disk.LastGcAt ?? new Dictionary<string, DateTimeOffset>();
+        var incomingGcAt = incoming.LastGcAt ?? new Dictionary<string, DateTimeOffset>();
+        foreach (var kv in diskGcAt)
+        {
+            if (kv.Value > latestAcceptableGcAt) continue;
+            result.LastGcAt[kv.Key] = kv.Value;
+        }
+        foreach (var kv in incomingGcAt)
+        {
+            if (kv.Value > latestAcceptableGcAt) continue;
+            if (!result.LastGcAt.TryGetValue(kv.Key, out var existing) || kv.Value > existing)
+            {
+                result.LastGcAt[kv.Key] = kv.Value;
+            }
         }
 
         // Launch は Top-level と同じ採用元から取る。理由:

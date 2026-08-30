@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
@@ -104,6 +106,172 @@ public sealed class SyncRunner
         }
         return result;
     }
+
+    /// <summary>
+    /// 自動回収 (issue #55) の実行間隔。狙いは 1 日 1 回。丸 1 日にすると、
+    /// 毎日ほぼ同じ時刻に Push するユーザで前回からの経過がわずかに届かず、
+    /// 実行が 1 日おきになりがちなので、少し短く取る。
+    /// </summary>
+    public static readonly TimeSpan AutoGcInterval = TimeSpan.FromHours(20);
+
+    /// <summary>
+    /// 回収の排他に使う Mutex を作る。
+    /// <para>
+    /// プロセス内のロックではなく名前付き Mutex にするのは、GUI と CLI が
+    /// 別プロセスで同じ保存先へ Push しうるため。プロセス内の排他では期限の判定と
+    /// 時刻の記録が不可分にならず、双方が同じ古い記録を読んで、課金対象の走査
+    /// (S3 の List) を二重に行う。
+    /// </para>
+    /// <para>
+    /// 名前は保存先ごとに分ける。全体で 1 つにすると、ある保存先の回収が進行して
+    /// いる間に別の保存先への回収が弾かれ、実行時刻も記録されないまま取り残される。
+    /// <see cref="ISyncStorage.StateKeyPrefix"/> はパスなど Mutex 名に使えない文字を
+    /// 含むため、ハッシュにして使う。Global\ は付けずユーザセッション内のみの排他に
+    /// する (settings.json と保存先の認証情報はユーザ毎のため)。
+    /// </para>
+    /// </summary>
+    private static Mutex CreateGcMutex(ISyncStorage storage)
+    {
+        var name = "VRCToolsDataSync.BlobGc." + Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(storage.StateKeyPrefix)));
+        return new Mutex(initiallyOwned: false, name);
+    }
+
+    private static bool TryAcquire(Mutex mutex, TimeSpan timeout)
+    {
+        try
+        {
+            return mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 保持したまま死んだプロセスから所有権が渡ってきた。取れてはいるので続行。
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 前回の自動回収から <see cref="AutoGcInterval"/> が空いていれば、参照が
+    /// 切れた実体の回収 (<see cref="BlobGarbageCollector"/>) を実行する。
+    /// Push の後始末として呼ぶ。実行しなかった場合は null を返す。
+    /// <para>
+    /// 前回の実行時刻は settings.json のディスク上の値で判定する。GUI と CLI は
+    /// 別プロセスで同じ保存先へ Push しうるので、手元の settings インスタンス
+    /// では互いの実行を知れない。判定から記録までは保存先ごとの Mutex の中で行い、
+    /// 並走した相手が同じ古い記録で期限到来と判定することを防ぐ。
+    /// 記録は実行の成否に関わらず先に書く。回収が失敗し続ける状態 (権限不足など)
+    /// で、Push のたびに走査をやり直さないため。
+    /// </para>
+    /// <para>
+    /// 例外は投げない。回収は Push の成果に影響しない後始末で、これが原因で
+    /// 成功した Push をエラー扱いにするわけにはいかないため。失敗はログに
+    /// 残し、次の機会に回す。
+    /// </para>
+    /// </summary>
+    public BlobGarbageCollectionResult? CollectGarbageIfDue(ISyncStorage storage)
+    {
+        var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
+        try
+        {
+            using var mutex = CreateGcMutex(storage);
+            if (!TryAcquire(mutex, TimeSpan.Zero))
+            {
+                // 同じ保存先の回収が実行中。取れる頃には実行済みになっているので、
+                // 待たずに次の機会へ回す。回収そのものは並走しても安全 (猶予期間と
+                // 削除直前の読み直しで守られる) で、避けたいのは走査の重複だけ。
+                return null;
+            }
+            try
+            {
+                var current = _store.Load();
+                var key = storage.StateKeyPrefix;
+                var now = DateTimeOffset.Now;
+                // 未来を指す記録は無かったものとして扱う (期限到来)。時計が進んだ
+                // 状態で書かれた記録をそのまま信じると、時計を直した後、その未来
+                // 時刻から間隔が経つまで回収が止まる。保存側のマージも同じ基準で
+                // 未来の記録を捨てるので、ここで書く記録が置き換わる。
+                if (current.LastGcAt.TryGetValue(key, out var last)
+                    && last <= now + SettingsStore.LastGcAtFutureTolerance
+                    && now - last < AutoGcInterval)
+                {
+                    return null;
+                }
+                _store.SaveLastGcAt(key, now);
+
+                logger.LogInformation("自動回収を開始します: {Target}", storage.DisplayName);
+                return new BlobGarbageCollector(storage, logger).Collect();
+            }
+            finally
+            {
+                mutex.ReleaseMutex();
+            }
+        }
+        catch (Exception ex)
+        {
+            // 同期先の不調 (SyncStorageException) だけでなく、settings.json の
+            // 読み書きの失敗もここで止める。どれも Push の結果を汚す理由にならない。
+            logger.LogWarning(ex, "自動回収を中止しました");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 間引きをせず、今すぐ回収する。GUI と CLI の手動実行用。
+    /// <para>
+    /// 実行時刻は自動回収と同じ記録に残し、直後の自動回収を省かせる。
+    /// dry-run では残さない。何も消していないので、続く自動回収を省かせる
+    /// 理由が無い。排他は dry-run でも共有する (走査の重複は同じため)。
+    /// </para>
+    /// <para>
+    /// 失敗は自動回収と違って握りつぶさない。手動実行では結果を待っている
+    /// 利用者がいるので、失敗を伝えて対処 (権限の見直しなど) につなげる。
+    /// </para>
+    /// </summary>
+    public BlobGarbageCollectionResult CollectGarbageNow(
+        ISyncStorage storage,
+        TimeSpan? gracePeriod = null,
+        bool dryRun = false)
+    {
+        using var mutex = CreateGcMutex(storage);
+        // 同じ保存先の回収と重なった場合はしばらく待ち、それでも取れなければ
+        // 続行せずに中止する。排他を無視して進めると、回収に時間がかかるケース
+        // (オブジェクトが多い = 走査が高くつくケース) ほど課金対象の走査を
+        // 重複させ、排他を入れた意味が無くなる。中止の理由は例外で呼び出し元へ
+        // 伝え、「押したのに何も起きない」ようには見せない。
+        if (!TryAcquire(mutex, TimeSpan.FromSeconds(30)))
+        {
+            throw new SyncStorageException(
+                "同じ保存先に対する回収が既に実行中です。終わってからやり直してください。");
+        }
+        try
+        {
+            if (!dryRun)
+            {
+                _store.SaveLastGcAt(storage.StateKeyPrefix, DateTimeOffset.Now);
+            }
+            var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
+            logger.LogInformation("手動回収を開始します: {Target}", storage.DisplayName);
+            return new BlobGarbageCollector(storage, logger).Collect(gracePeriod, dryRun);
+        }
+        finally
+        {
+            mutex.ReleaseMutex();
+        }
+    }
+
+    /// <summary>
+    /// <see cref="CollectGarbageIfDue"/> をバックグラウンドで実行する。
+    /// <para>
+    /// 常駐アプリの経路 (自動 Push・GUI の Push) から使う。回収は初回や
+    /// 溜まっている場合に時間がかかりうるので、Push の完了報告や次の自動 Push を
+    /// その完了で待たせない。プロセスの終了で途中打ち切りになっても、消し残しは
+    /// 次回の実行が回収するだけなので害はない。
+    /// </para>
+    /// </summary>
+    public void CollectGarbageInBackground(ISyncStorage storage)
+        // CollectGarbageIfDue は例外を投げないので、切り離した Task を
+        // 観測しなくても未処理例外にはならない。
+        => _ = Task.Run(() => CollectGarbageIfDue(storage));
 
     /// <summary>
     /// <see cref="SyncSettings.ToolState"/> のキー。同期先ごとに分けることで、

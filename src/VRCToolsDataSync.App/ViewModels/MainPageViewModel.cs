@@ -950,7 +950,7 @@ public partial class MainPageViewModel : ObservableObject
                     case ConflictChoice.ForceOverwrite:
                         AppendLog($"{displayName} 強制 Push 実行");
                         var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
-                        ReportPushResult(displayName, forced);
+                        ReportPushResult(displayName, forced, storage);
                         break;
                     case ConflictChoice.PullFirst:
                         AppendLog($"{displayName} 先に Pull を実行");
@@ -964,7 +964,7 @@ public partial class MainPageViewModel : ObservableObject
             }
             else
             {
-                ReportPushResult(displayName, result);
+                ReportPushResult(displayName, result, storage);
             }
         }
         catch (RunningProcessException ex)
@@ -1007,7 +1007,42 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
-    private void ReportPushResult(string displayName, SyncResult result)
+    /// <summary>
+    /// 手動でのストレージの回収 (issue #55)。自動回収と違って間引かず今すぐ実行し、
+    /// 結果も失敗もログに出す。実行後は自動回収の記録が更新されるので、
+    /// 直後の Push で回収が重ねて走ることはない。
+    /// </summary>
+    [RelayCommand]
+    private async Task CollectGarbageAsync()
+    {
+        if (!TryCreateStorage(out var storage)) return;
+        IsBusy = true;
+        try
+        {
+            AppendLog("ストレージの回収を開始...");
+            var result = await Task.Run(() => _runner.CollectGarbageNow(storage));
+            AppendLog(
+                $"ストレージの回収 完了: {result.Deleted} 件 ({result.DescribeDeletedBytes()}) を削除 " +
+                $"/ 参照あり {result.Live} 件 / 猶予期間内 {result.Young} 件");
+            if (result.Failed > 0)
+            {
+                AppendLog($"  {result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります");
+            }
+        }
+        catch (Exception ex)
+        {
+            // 同期先の不調 (SyncStorageException) に限らず、manifest の破損
+            // (JsonException) や実行時刻を記録できない場合 (IOException など) も
+            // ここで受ける。RelayCommand から漏らすと画面に何も出ない。
+            AppendLog($"ストレージの回収 失敗: {ex.Message}");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private void ReportPushResult(string displayName, SyncResult result, ISyncStorage storage)
     {
         switch (result.Outcome)
         {
@@ -1017,6 +1052,9 @@ public partial class MainPageViewModel : ObservableObject
                 // 同期させ、続く自動 Push が古いバージョンで不要な競合通知を
                 // 起こさないようにする。
                 _coordinator?.RefreshSettings(_settings);
+                // Push の後始末として、参照が切れた実体の回収を試みる (issue #55)。
+                // UI スレッドを待たせないようバックグラウンドで実行する。
+                _runner.CollectGarbageInBackground(storage);
                 break;
             case SyncOutcome.SourceMissing:
                 AppendLog($"{displayName} Push 中止: {result.Message}");
@@ -1078,7 +1116,7 @@ public partial class MainPageViewModel : ObservableObject
                 case ConflictChoice.ForceOverwrite:
                     AppendLog($"[auto] {e.DisplayName} 強制 Push 実行");
                     var pushResult = await Task.Run(() => _runner.Push(e.ServiceFactory(), _settings, storage, force: true));
-                    ReportPushResult(e.DisplayName, pushResult);
+                    ReportPushResult(e.DisplayName, pushResult, storage);
                     break;
                 case ConflictChoice.PullFirst:
                     AppendLog($"[auto] {e.DisplayName} 先に Pull を実行");
