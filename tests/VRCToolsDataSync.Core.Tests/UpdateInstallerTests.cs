@@ -323,4 +323,73 @@ public sealed class UpdateInstallerTests : IDisposable
         File.Delete(TargetFile(UpdateInstaller.LauncherName));
         Assert.Null(UpdateInstaller.FindInstallRoot(Path.Combine(TargetDir, "app")));
     }
+
+    [Fact(DisplayName = "掴まれている抑止は待ちきれずに諦める")]
+    public void SingleInstanceHoldGivesUpWhileAnotherProcessHoldsIt()
+    {
+        var name = "vrctoolsdatasync-tests-" + Guid.NewGuid().ToString("N");
+        using var release = new ManualResetEventSlim(false);
+        using var acquired = new ManualResetEventSlim(false);
+
+        // 抑止は所有権がスレッドに紐づく。掴む側と試す側を分ける。
+        var holder = new Thread(() =>
+        {
+            using var mutex = new Mutex(initiallyOwned: true, name: name);
+            acquired.Set();
+            release.Wait();
+            mutex.ReleaseMutex();
+        })
+        { IsBackground = true };
+        holder.Start();
+        Assert.True(acquired.Wait(TimeSpan.FromSeconds(5)));
+
+        Assert.Null(UpdateInstaller.TryHoldNamedMutex(name, TimeSpan.FromMilliseconds(200)));
+
+        release.Set();
+        Assert.True(holder.Join(TimeSpan.FromSeconds(5)));
+
+        using var held = UpdateInstaller.TryHoldNamedMutex(name, TimeSpan.FromSeconds(5));
+        Assert.NotNull(held);
+    }
+
+    [Fact(DisplayName = "握ったまま終わった抑止は放棄として掴み直せる")]
+    public void SingleInstanceHoldTakesOverAnAbandonedMutex()
+    {
+        var name = "vrctoolsdatasync-tests-" + Guid.NewGuid().ToString("N");
+        using var acquired = new ManualResetEventSlim(false);
+
+        // 手放さずに終わるスレッドで、終了時 Exit の App と同じ形を作る。
+        // Mutex 自体はこの場で持つ。掴んだスレッドと一緒に手を捨てると、
+        // 待つ相手そのものが消えて放棄の経路を通らない。
+        using var owned = new Mutex(initiallyOwned: false, name: name);
+        var holder = new Thread(() =>
+        {
+            owned.WaitOne();
+            acquired.Set();
+        })
+        { IsBackground = true };
+        holder.Start();
+        Assert.True(acquired.Wait(TimeSpan.FromSeconds(5)));
+        Assert.True(holder.Join(TimeSpan.FromSeconds(5)));
+
+        // AbandonedMutexException で降りず、所有権を引き取る。
+        using var held = UpdateInstaller.TryHoldNamedMutex(name, TimeSpan.FromSeconds(5));
+        Assert.NotNull(held);
+    }
+
+    [Fact(DisplayName = "掴んだ抑止を捨てると次の手が掴める")]
+    public void SingleInstanceHoldIsReleasedOnDispose()
+    {
+        var name = "vrctoolsdatasync-tests-" + Guid.NewGuid().ToString("N");
+
+        var held = UpdateInstaller.TryHoldNamedMutex(name, TimeSpan.FromSeconds(5));
+        Assert.NotNull(held);
+
+        // ヘルパは起動し直しの前に明示的に手放し、その後 using からもう一度来る。
+        held!.Dispose();
+        held.Dispose();
+
+        using var again = UpdateInstaller.TryHoldNamedMutex(name, TimeSpan.FromSeconds(5));
+        Assert.NotNull(again);
+    }
 }

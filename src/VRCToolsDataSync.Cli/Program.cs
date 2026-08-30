@@ -692,16 +692,22 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, long? wai
         // 旧 app\ を読み込んで掴み、入れ替えを失敗させたり、置き換え済みの
         // 一式をもう一度置き換えさせて退避した旧版を上書きさせたりする。
         //
-        // App はこの名前の Mutex が既にあるかで判断するので、所有権ではなく
-        // 開いた手を持ち続けるだけでよい。
-        using var singleInstance = new Mutex(
-            initiallyOwned: false, name: UpdateInstaller.SingleInstanceMutexName, out var createdNew);
-        if (!createdNew)
+        // 「既にあるか」では見ない (#66)。呼び出し元は適用のロックと抑止の
+        // 両方を握ったまま終わり、OS はその二つを同時には手放さない。適用の
+        // ロックが先に空くと、こちらは抑止がまだ閉じ終わらないうちに見に行き、
+        // 居ない App を「動いている」と読む。そうなると置き換えも起動し直しも
+        // せずに降りるので、利用者から見れば App が閉じたきりになる。
+        using var singleInstance = UpdateInstaller.TryHoldSingleInstance(
+            UpdateInstaller.SingleInstanceHandOverTimeout);
+        if (singleInstance is null)
         {
-            // 呼び出し元とは別の App が動いている。正規の位置にはまだ触って
-            // いないので、取得を残したまま引き下がる。あちらが終わった後の
-            // 起動でやり直せる。ここで待つと、あちらが適用のロック (こちらが
-            // 握っている) を待っている場合に噛み合わなくなる。
+            // 待っても空かなかった。呼び出し元とは別の App が動いている。
+            // 正規の位置にはまだ触っていないので、取得を残したまま引き下がる。
+            // あちらが終わった後の起動でやり直せる。開き直しもしない。画面は
+            // 既にあるので、増やしても利用者の役に立たない。
+            //
+            // 上限を切ってあるのは、あちらが適用のロック (こちらが握っている)
+            // を待っている場合に噛み合わなくなるからである。
             Console.Error.WriteLine("App が起動しているため、置き換えを中止しました。");
             try { logger.LogWarning("App が動いているため置き換えない"); } catch { /* best-effort */ }
             return 6;
