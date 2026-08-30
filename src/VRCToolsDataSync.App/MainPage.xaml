@@ -125,7 +125,7 @@
                                     Command="{x:Bind ViewModel.CollectGarbageCommand}"
                                     IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
                         </StackPanel>
-                        <TextBlock Text="どの PC からも参照されなくなって 7 日以上経ったデータを保存先から削除します。Push の後始末として 1 日 1 回自動でも実行されます。"
+                        <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから 7 日以上経ったデータを保存先から削除します。Push の後始末として 1 日 1 回自動でも実行されます。"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap" />
                     </StackPanel>

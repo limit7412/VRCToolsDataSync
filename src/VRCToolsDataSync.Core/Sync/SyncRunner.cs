@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Settings;
@@ -112,10 +114,41 @@ public sealed class SyncRunner
     /// </summary>
     public static readonly TimeSpan AutoGcInterval = TimeSpan.FromHours(20);
 
-    // 自動回収の同時実行を避ける。回収そのものは並走しても安全 (猶予期間と
-    // 削除直前の読み直しで守られる) だが、同じ対象を二重に走査するだけ無駄になる。
-    // 待たずにスキップするのは、待った側が取る頃には実行済みになっているため。
-    private static readonly object AutoGcLock = new();
+    /// <summary>
+    /// 回収の排他に使う Mutex を作る。
+    /// <para>
+    /// プロセス内のロックではなく名前付き Mutex にするのは、GUI と CLI が
+    /// 別プロセスで同じ保存先へ Push しうるため。プロセス内の排他では期限の判定と
+    /// 時刻の記録が不可分にならず、双方が同じ古い記録を読んで、課金対象の走査
+    /// (S3 の List) を二重に行う。
+    /// </para>
+    /// <para>
+    /// 名前は保存先ごとに分ける。全体で 1 つにすると、ある保存先の回収が進行して
+    /// いる間に別の保存先への回収が弾かれ、実行時刻も記録されないまま取り残される。
+    /// <see cref="ISyncStorage.StateKeyPrefix"/> はパスなど Mutex 名に使えない文字を
+    /// 含むため、ハッシュにして使う。Global\ は付けずユーザセッション内のみの排他に
+    /// する (settings.json と保存先の認証情報はユーザ毎のため)。
+    /// </para>
+    /// </summary>
+    private static Mutex CreateGcMutex(ISyncStorage storage)
+    {
+        var name = "VRCToolsDataSync.BlobGc." + Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(storage.StateKeyPrefix)));
+        return new Mutex(initiallyOwned: false, name);
+    }
+
+    private static bool TryAcquire(Mutex mutex, TimeSpan timeout)
+    {
+        try
+        {
+            return mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 保持したまま死んだプロセスから所有権が渡ってきた。取れてはいるので続行。
+            return true;
+        }
+    }
 
     /// <summary>
     /// 前回の自動回収から <see cref="AutoGcInterval"/> が空いていれば、参照が
@@ -124,8 +157,10 @@ public sealed class SyncRunner
     /// <para>
     /// 前回の実行時刻は settings.json のディスク上の値で判定する。GUI と CLI は
     /// 別プロセスで同じ保存先へ Push しうるので、手元の settings インスタンス
-    /// では互いの実行を知れない。記録は実行の成否に関わらず先に書く。回収が
-    /// 失敗し続ける状態 (権限不足など) で、Push のたびに走査をやり直さないため。
+    /// では互いの実行を知れない。判定から記録までは保存先ごとの Mutex の中で行い、
+    /// 並走した相手が同じ古い記録で期限到来と判定することを防ぐ。
+    /// 記録は実行の成否に関わらず先に書く。回収が失敗し続ける状態 (権限不足など)
+    /// で、Push のたびに走査をやり直さないため。
     /// </para>
     /// <para>
     /// 例外は投げない。回収は Push の成果に影響しない後始末で、これが原因で
@@ -135,10 +170,17 @@ public sealed class SyncRunner
     /// </summary>
     public BlobGarbageCollectionResult? CollectGarbageIfDue(ISyncStorage storage)
     {
-        if (!Monitor.TryEnter(AutoGcLock)) return null;
+        var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
         try
         {
-            var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
+            using var mutex = CreateGcMutex(storage);
+            if (!TryAcquire(mutex, TimeSpan.Zero))
+            {
+                // 同じ保存先の回収が実行中。取れる頃には実行済みになっているので、
+                // 待たずに次の機会へ回す。回収そのものは並走しても安全 (猶予期間と
+                // 削除直前の読み直しで守られる) で、避けたいのは走査の重複だけ。
+                return null;
+            }
             try
             {
                 var current = _store.Load();
@@ -153,17 +195,17 @@ public sealed class SyncRunner
                 logger.LogInformation("自動回収を開始します: {Target}", storage.DisplayName);
                 return new BlobGarbageCollector(storage, logger).Collect();
             }
-            catch (Exception ex)
+            finally
             {
-                // 同期先の不調 (SyncStorageException) だけでなく、settings.json の
-                // 読み書きの失敗もここで止める。どれも Push の結果を汚す理由にならない。
-                logger.LogWarning(ex, "自動回収を中止しました");
-                return null;
+                mutex.ReleaseMutex();
             }
         }
-        finally
+        catch (Exception ex)
         {
-            Monitor.Exit(AutoGcLock);
+            // 同期先の不調 (SyncStorageException) だけでなく、settings.json の
+            // 読み書きの失敗もここで止める。どれも Push の結果を汚す理由にならない。
+            logger.LogWarning(ex, "自動回収を中止しました");
+            return null;
         }
     }
 
@@ -177,14 +219,25 @@ public sealed class SyncRunner
     /// </summary>
     public BlobGarbageCollectionResult CollectGarbageNow(ISyncStorage storage)
     {
-        // 自動回収と同時に走った場合は待つ。飛ばすと「押したのに何も起きない」
-        // ように見えるため、自動側と違って TryEnter にしない。
-        lock (AutoGcLock)
+        using var mutex = CreateGcMutex(storage);
+        // 同じ保存先の回収と重なった場合は待つ。飛ばすと「押したのに何も起きない」
+        // ように見えるため。上限を置くのは、相手がハング相当の場合に UI を無期限に
+        // 待たせないため。取れないまま進んでも回収は並走に安全で、走査が重複する
+        // だけに留まる。
+        var acquired = TryAcquire(mutex, TimeSpan.FromSeconds(30));
+        try
         {
             _store.SaveLastGcAt(storage.StateKeyPrefix, DateTimeOffset.Now);
             var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
             logger.LogInformation("手動回収を開始します: {Target}", storage.DisplayName);
             return new BlobGarbageCollector(storage, logger).Collect();
+        }
+        finally
+        {
+            if (acquired)
+            {
+                try { mutex.ReleaseMutex(); } catch { /* best-effort */ }
+            }
         }
     }
 

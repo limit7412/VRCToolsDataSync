@@ -1029,8 +1029,11 @@ public partial class MainPageViewModel : ObservableObject
                 AppendLog($"  {result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります");
             }
         }
-        catch (SyncStorageException ex)
+        catch (Exception ex)
         {
+            // 同期先の不調 (SyncStorageException) に限らず、manifest の破損
+            // (JsonException) や実行時刻を記録できない場合 (IOException など) も
+            // ここで受ける。RelayCommand から漏らすと画面に何も出ない。
             AppendLog($"ストレージの回収 失敗: {ex.Message}");
         }
         finally
