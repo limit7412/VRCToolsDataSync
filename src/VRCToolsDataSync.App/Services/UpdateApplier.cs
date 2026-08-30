@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Settings;
@@ -32,6 +33,16 @@ public static class UpdateApplier
     public static bool TryHandOverToStaged(ILoggerFactory loggerFactory)
     {
         var logger = loggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
+
+        if (StartedWithSkipSwitch())
+        {
+            // 置き換えを断念したヘルパが開き直した回である。同じ取得をまた
+            // 渡すと、ヘルパがまた同じ理由で断念して開き直す往復になる。
+            // この回は見送り、そのまま起動する。取得は残るので、断念の理由
+            // (空き容量など) が解けた後の起動で適用し直せる。
+            LogQuietly(() => logger.LogInformation("この起動では取得済みの更新を適用しない (見送りの指定つきで起動された)"));
+            return false;
+        }
 
         try
         {
@@ -81,6 +92,19 @@ public static class UpdateApplier
         {
             // 適用に入れなくても、今の版のまま起動は続けられる。
             LogQuietly(() => logger.LogWarning(ex, "取得済みの更新の適用に入れなかった"));
+            return false;
+        }
+    }
+
+    private static bool StartedWithSkipSwitch()
+    {
+        try
+        {
+            return Environment.GetCommandLineArgs()
+                .Any(arg => string.Equals(arg, UpdateInstaller.SkipUpdateApplySwitch, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
             return false;
         }
     }

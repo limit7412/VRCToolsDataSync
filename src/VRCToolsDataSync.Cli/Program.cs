@@ -745,7 +745,11 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
         Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
         Console.Error.WriteLine("空き容量を作ってから起動し直すと、取得済みの更新がそのまま適用されます。");
         Log(() => logger.LogError(ex, "空き容量が足りないため置き換えを見送った"));
-        if (relaunch) TryRelaunchApp(target, logger);
+
+        // 見送りの指定つきで開き直す。付けずに開き直すと、その App が同じ
+        // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、
+        // という往復になる。
+        if (relaunch) TryRelaunchApp(target, logger, skipUpdateApply: true);
         return 9;
     }
     catch (UpdateRollbackException ex)
@@ -818,17 +822,23 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
     return 0;
 }
 
-static bool TryRelaunchApp(string target, ILogger logger)
+/// <param name="skipUpdateApply">
+/// 取得しておいたものを残したまま開き直す場合に true。開き直した App が
+/// 同じ取得をまたこちらへ渡してこないよう、見送りの指定を渡す。
+/// </param>
+static bool TryRelaunchApp(string target, ILogger logger, bool skipUpdateApply = false)
 {
     try
     {
         var appDirectory = Path.Combine(target, "app");
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        var start = new System.Diagnostics.ProcessStartInfo
         {
             FileName = Path.Combine(appDirectory, UpdateInstaller.AppExecutableName),
             WorkingDirectory = appDirectory,
             UseShellExecute = true,
-        });
+        };
+        if (skipUpdateApply) start.Arguments = UpdateInstaller.SkipUpdateApplySwitch;
+        System.Diagnostics.Process.Start(start);
         return true;
     }
     catch (Exception ex)

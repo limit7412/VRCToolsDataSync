@@ -66,6 +66,16 @@ public class UpdateInstaller
     /// <summary>cli ディレクトリに入る CLI の本体 (マネージドアセンブリ) の名前。</summary>
     public const string CliAssemblyName = "VRCToolsDataSync.Cli.dll";
 
+    /// <summary>
+    /// 更新の適用を 1 回だけ見送らせるために App へ渡す切り替え。
+    /// <para>
+    /// 置き換えを断念したヘルパが App を開き直すとき、取得しておいたものを
+    /// 残す場合に渡す。渡さないと、開き直った App が同じ取得をまたヘルパへ
+    /// 渡し、ヘルパがまた同じ理由で断念して開き直す、という往復になる。
+    /// </para>
+    /// </summary>
+    public const string SkipUpdateApplySwitch = "--skip-update-apply";
+
     /// <summary>置き換えの対象になる、インストール先直下のディレクトリ。</summary>
     private static readonly string[] Parts = { "app", "cli" };
 
