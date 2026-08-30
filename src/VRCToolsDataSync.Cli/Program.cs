@@ -599,9 +599,15 @@ static int CollectGarbage(int graceDays, bool dryRun)
         if (result.Failed > 0)
         {
             Console.Error.WriteLine($"{result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります。");
-            return 1;
         }
-        return 0;
+        if (result.FailedUploads > 0)
+        {
+            // 削除の失敗と分けて出す。要る権限が違うので、混ぜると原因を切り分けられない。
+            Console.Error.WriteLine(
+                $"{result.FailedUploads} 件の未完了のアップロードを中断できませんでした。" +
+                "API キーに s3:AbortMultipartUpload の権限があるか確認してください。");
+        }
+        return result.Failed > 0 || result.FailedUploads > 0 ? 1 : 0;
     }
     catch (SyncStorageException ex)
     {

@@ -1031,6 +1031,13 @@ public partial class MainPageViewModel : ObservableObject
             {
                 AppendLog($"  {result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります");
             }
+            if (result.FailedUploads > 0)
+            {
+                // 削除の失敗と分けて出す。要る権限が違うので、混ぜると原因を切り分けられない。
+                AppendLog(
+                    $"  {result.FailedUploads} 件の未完了のアップロードを中断できませんでした " +
+                    "(API キーの権限を確認してください)");
+            }
         }
         catch (Exception ex)
         {

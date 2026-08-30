@@ -315,7 +315,29 @@ public sealed class BlobGarbageCollectorTests
         Assert.Equal(1, result.Deleted);
         Assert.False(storage.Has(BlobKeys.Prefix + "bbb"));
         Assert.Equal(0, result.AbortedUploads);
-        Assert.Equal(1, result.Failed);
+
+        // 中断の失敗は削除の失敗と分けて数える。要る権限が違うため、
+        // 混ぜると原因を切り分けられない。
+        Assert.Equal(1, result.FailedUploads);
+        Assert.Equal(0, result.Failed);
+    }
+
+    [Fact(DisplayName = "manifest の参照が無くても、未完了のアップロードは中断する")]
+    public void AbortsIncompleteUploadsEvenWithoutLiveReferences()
+    {
+        // 最初の Push がマルチパートの途中で切れると、断片だけが残って manifest は
+        // 無い。実体の削除はここで止めるが、断片の片付けまで止めると課金され続ける
+        // ものを消す手立てが無くなる (#59)。
+        var storage = StorageAt(LongAgo);
+        storage.Seed(BlobKeys.Prefix + "aaa", "would be deleted", LongAgo);
+        storage.IncompleteUploads.Add(
+            new IncompleteUpload(BlobKeys.Prefix + "bbb", "upload-1", LongAgo));
+
+        Assert.Throws<SyncStorageException>(() => new BlobGarbageCollector(storage).Collect(Grace));
+
+        // 断片は消えている。実体には触っていない。
+        Assert.Empty(storage.IncompleteUploads);
+        Assert.True(storage.Has(BlobKeys.Prefix + "aaa"));
     }
 
     [Fact(DisplayName = "未完了のアップロードを一覧できなくても、実体の回収は成立させる")]

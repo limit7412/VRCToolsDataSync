@@ -10,8 +10,13 @@ namespace VRCToolsDataSync.Core.Storage;
 /// <param name="Young">参照されていないが、猶予期間内で残したもの。</param>
 /// <param name="Deleted">削除したもの。</param>
 /// <param name="DeletedBytes">削除したものの合計サイズ (分かる場合)。</param>
-/// <param name="Failed">削除や中断に失敗したもの。</param>
+/// <param name="Failed">削除に失敗したもの。</param>
 /// <param name="AbortedUploads">中断した、未完了のアップロード (#59)。</param>
+/// <param name="FailedUploads">
+/// 中断に失敗した、未完了のアップロード (#59)。
+/// 削除の失敗とは分けて数える。要る権限が違うため (s3:DeleteObject と
+/// s3:AbortMultipartUpload)、混ぜると原因の切り分けができない。
+/// </param>
 public sealed record BlobGarbageCollectionResult(
     int Scanned,
     int Live,
@@ -19,7 +24,8 @@ public sealed record BlobGarbageCollectionResult(
     int Deleted,
     long DeletedBytes,
     int Failed,
-    int AbortedUploads = 0)
+    int AbortedUploads = 0,
+    int FailedUploads = 0)
 {
     /// <summary>削除した合計サイズの表示用文字列 (例: "1.2 GB")。CLI と GUI で共用する。</summary>
     public string DescribeDeletedBytes()
@@ -47,9 +53,10 @@ public sealed record BlobGarbageCollectionResult(
 /// <para>
 /// 参照が 1 件も集まらなかった場合は回収そのものを中止する。manifest を読めない
 /// 一瞬に当たっただけかもしれず、その判断のまま走らせると全部消すことになる。
-/// このとき、未完了のアップロードの片付け (#59) にも入らない。そちらは manifest の
-/// 参照とは無関係なので中止する理由が無いが、manifest がまだ無い保存先は最初の
-/// Push が通れば手に入るので、次の回収がまとめて片付ける。
+/// 中止するのは実体の削除だけである。未完了のアップロードの片付け (#59) は
+/// manifest の参照と無関係なので、その前に済ませる。最初の Push がマルチパートの
+/// 途中で切れた保存先には manifest がまだ無く、後に回すと課金され続ける断片を
+/// 消す手立てが無くなる。
 /// </para>
 /// <para>
 /// 削除の直前には <see cref="ISyncStorage.Stat"/> で更新日時を読み直し、その状態を
@@ -98,7 +105,15 @@ public sealed class BlobGarbageCollector
             throw new ArgumentOutOfRangeException(nameof(gracePeriod), "猶予期間に負の値は指定できません");
         }
 
-        // 生きている参照を先に集める。manifest を読んでから列挙する順にすることで、
+        var threshold = DateTimeOffset.UtcNow - grace;
+
+        // 未完了のアップロードは manifest から参照されない。実体の削除を止める
+        // 判断とは無関係なので、その手前で片付ける。最初の Push がマルチパートの
+        // 途中で切れた保存先には manifest がまだ無く、下の中止に巻き込むと、
+        // 課金され続ける断片を消す手立てが無くなる (#59)。
+        var (aborted, abortFailures) = AbortStaleUploads(threshold, dryRun);
+
+        // 生きている参照を集める。manifest を読んでから列挙する順にすることで、
         // 「読んだ後に公開された manifest が参照するオブジェクト」は列挙側に現れても
         // 新しいので猶予期間に守られる。逆順にすると、列挙してから manifest を読むまでの
         // 間に公開されたものを取りこぼす。
@@ -118,9 +133,9 @@ public sealed class BlobGarbageCollector
             throw new SyncStorageException(
                 "manifest から参照されている実体が 1 件もありません。" +
                 "manifest がまだ無いか、読めない状態だった可能性があります。" +
-                "この状態で回収すると生きている実体まで消すため、中止しました。");
+                "この状態で回収すると生きている実体まで消すため、中止しました。" +
+                (aborted > 0 ? $" (未完了のアップロード {aborted} 件は中断しました)" : string.Empty));
         }
-        var threshold = DateTimeOffset.UtcNow - grace;
 
         var scanned = 0;
         var liveCount = 0;
@@ -193,18 +208,13 @@ public sealed class BlobGarbageCollector
             }
         }
 
-        // 実体の回収とは別に、未完了のまま残ったアップロードも片付ける (#59)。
-        // 送信済みのパートは列挙に現れないが、保存容量としては課金される。
-        var (aborted, abortFailures) = AbortStaleUploads(threshold, dryRun);
-        failed += abortFailures;
-
         var result = new BlobGarbageCollectionResult(
-            scanned, liveCount, young, deleted, deletedBytes, failed, aborted);
+            scanned, liveCount, young, deleted, deletedBytes, failed, aborted, abortFailures);
         _logger.LogInformation(
             "回収完了 scanned={Scanned} live={Live} young={Young} deleted={Deleted} " +
-            "aborted={Aborted} failed={Failed}",
-            result.Scanned, result.Live, result.Young, result.Deleted,
-            result.AbortedUploads, result.Failed);
+            "failed={Failed} aborted={Aborted} abortFailed={AbortFailed}",
+            result.Scanned, result.Live, result.Young, result.Deleted, result.Failed,
+            result.AbortedUploads, result.FailedUploads);
         return result;
     }
 
