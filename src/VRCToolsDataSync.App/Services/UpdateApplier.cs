@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Update;
 
 namespace VRCToolsDataSync_App.Services;
@@ -448,12 +449,19 @@ public static class UpdateApplier
         try
         {
             var appDirectory = AppContext.BaseDirectory;
-            Process.Start(new ProcessStartInfo
+            var start = new ProcessStartInfo
             {
                 FileName = Path.Combine(appDirectory, UpdateInstaller.AppExecutableName),
                 WorkingDirectory = appDirectory,
                 UseShellExecute = true,
-            });
+            };
+
+            // トレイへ常駐して起動した回なら、開き直しもそうする (issue #54)。
+            // 付けずに開き直すと、窓を出さないと決めた利用者の前に、更新の
+            // たびに画面が現れる。
+            if (App.StartedMinimized) start.Arguments = StartupRegistration.MinimizedSwitch;
+
+            Process.Start(start);
         }
         catch (Exception ex)
         {
@@ -566,6 +574,9 @@ public static class UpdateApplier
             LogQuietly(() => logger.LogWarning(ex, "自分の開始時刻を読めなかった"));
         }
         startInfo.ArgumentList.Add("--relaunch");
+
+        // 置き換えの後の開き直しも、こちらと同じ出方に揃える (issue #54)。
+        if (App.StartedMinimized) startInfo.ArgumentList.Add("--relaunch-minimized");
 
         // 起こしたヘルパがすぐ落ちていないか見る。exe があっても、自己完結の
         // ランタイムを欠いた一式なら、プロセスの生成だけ成功して引数を読む前に

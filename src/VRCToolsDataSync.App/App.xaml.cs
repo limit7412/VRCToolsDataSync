@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using H.NotifyIcon;
@@ -7,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
 using VRCToolsDataSync_App.Services;
@@ -103,6 +105,34 @@ public partial class App : Application
     }
 
     public static TrayIconManager Tray { get; } = new();
+
+    /// <summary>
+    /// ウィンドウを出さずにトレイへ常駐して起動する回か (issue #54)。
+    /// <para>
+    /// 自動起動の登録に付いた指定を、起動の引数から読む。設定ファイルに置くと
+    /// 手で起動したときにもウィンドウが開かなくなり、トレイのアイコンを作れて
+    /// いない環境では画面へ辿り着く手立てが無くなる。
+    /// </para>
+    /// <para>
+    /// 更新の後に開き直す経路もこれを見る。開き直しで窓が出てくると、
+    /// トレイへ常駐させたはずの利用者に断りなく画面が現れる。
+    /// </para>
+    /// </summary>
+    internal static bool StartedMinimized { get; } = ReadMinimizedSwitch();
+
+    private static bool ReadMinimizedSwitch()
+    {
+        try
+        {
+            return Environment.GetCommandLineArgs().Any(arg => string.Equals(
+                arg, StartupRegistration.MinimizedSwitch, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            // 引数を読めないだけで起動を止める理由は無い。これまでどおり窓を出す。
+            return false;
+        }
+    }
 
     // 本体の更新確認 (issue #45)。OnLaunched で作る。MainPage の VM が
     // 画面への反映のために参照する。
@@ -299,7 +329,22 @@ public partial class App : Application
 
             Window = new MainWindow();
             Window.Closed += OnWindowClosed;
-            Window.Activate();
+
+            // トレイ常駐の指定つきなら Activate しない (issue #54)。WinUI の
+            // ウィンドウは一度も Activate されるまで現れないので、出してから
+            // 隠す形にせずに済み、一瞬ちらつくこともない。
+            //
+            // 画面の中身はここまでで組み上がっている。MainWindow の構築が
+            // MainPage を作り、その構築子が VM と購読を張るためで、Activate を
+            // 待つものは無い。後からトレイ経由で出しても同じ状態で開く。
+            if (StartedMinimized)
+            {
+                LogLifecycle("StartMinimized: ウィンドウを出さずにトレイへ常駐する");
+            }
+            else
+            {
+                Window.Activate();
+            }
 
             // SessionEnding はバックグラウンドスレッドで動くため、UI スレッド
             // 専用の Window から WindowHandle を取ろうとすると COMException が

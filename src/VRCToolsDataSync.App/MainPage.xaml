@@ -152,6 +152,11 @@
                                     Command="{x:Bind ViewModel.UnregisterStartupCommand}"
                                     IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
                         </StackPanel>
+                        <ToggleSwitch Header="ウィンドウを出さずにタスクトレイへ常駐する"
+                                      IsOn="{x:Bind ViewModel.StartupMinimized, Mode=TwoWay}" />
+                        <TextBlock Text="この指定が効くのは自動起動のときだけです。手で起動した場合はこれまでどおりウィンドウが開きます。登録済みのまま切り替えると、その場で登録し直します。"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
                     </StackPanel>
 
                     <StackPanel Spacing="4">
