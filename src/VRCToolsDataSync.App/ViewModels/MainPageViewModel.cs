@@ -274,6 +274,31 @@ public partial class MainPageViewModel : ObservableObject
     [ObservableProperty]
     public partial string StartupStatus { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 自動起動のときウィンドウを出さずにトレイへ常駐するか (issue #54)。
+    /// <para>
+    /// 保存先は設定ファイルではなく、スタートアップに登録するコマンドである。
+    /// 手で起動したときはこれまでどおりウィンドウが開く。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    public partial bool StartupMinimized { get; set; }
+
+    // 登録内容から書き戻している間は、変更を登録し直しに繋げない。
+    private bool _syncingStartupState;
+
+    partial void OnStartupMinimizedChanged(bool value)
+    {
+        if (_syncingStartupState) return;
+
+        // まだ登録していなければ、次に「登録」を押したときに反映される。
+        if (!StartupRegistered) return;
+
+        // 登録済みなら、その場で登録し直す。反映する場所が別にあると、
+        // 切り替えたつもりのものが効かないまま残る。
+        RegisterStartup();
+    }
+
     // VRCX Launch 設定
     [ObservableProperty]
     public partial string VrcxExecutablePath { get; set; } = string.Empty;
@@ -872,8 +897,10 @@ public partial class MainPageViewModel : ObservableObject
         }
         try
         {
-            StartupRegistration.Register(path);
-            AppendLog($"スタートアップに登録しました: {path}");
+            StartupRegistration.Register(path, StartupMinimized);
+            AppendLog(StartupMinimized
+                ? $"スタートアップに登録しました (トレイへ常駐): {path}"
+                : $"スタートアップに登録しました: {path}");
         }
         catch (Exception ex)
         {
@@ -910,14 +937,29 @@ public partial class MainPageViewModel : ObservableObject
     {
         var registered = StartupRegistration.IsRegistered();
         StartupRegistered = registered;
-        if (registered)
+
+        // 常駐の指定は登録内容から作り直す。設定を別に持たないので、レジストリを
+        // 手で書き換えられても表示が食い違わない。書き戻しが登録し直しを
+        // 呼び返さないよう、その間だけ印を立てる。
+        _syncingStartupState = true;
+        try
         {
-            var cmd = StartupRegistration.GetRegisteredCommand();
-            StartupStatus = $"登録済み: {cmd}";
+            if (registered)
+            {
+                var command = StartupRegistration.GetRegisteredCommand();
+                StartupMinimized = StartupRegistration.StartsMinimized(command);
+                StartupStatus = $"登録済み: {command}";
+            }
+            else
+            {
+                // 未登録のときは切り替えに触らない。解除してから登録し直すまでの
+                // 間に選んだはずの指定が戻ると、もう一度選ぶことになる。
+                StartupStatus = "未登録";
+            }
         }
-        else
+        finally
         {
-            StartupStatus = "未登録";
+            _syncingStartupState = false;
         }
     }
 

@@ -2,6 +2,7 @@ using System.CommandLine;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Update;
@@ -206,6 +207,9 @@ var applyWaitStartedOption = new Option<long?>(
 var applyRelaunchOption = new Option<bool>(
     aliases: new[] { "--relaunch" },
     description: "置き換えた後に App を起動し直す");
+var applyRelaunchMinimizedOption = new Option<bool>(
+    aliases: new[] { "--relaunch-minimized" },
+    description: "起動し直すときウィンドウを出さずトレイへ常駐させる (issue #54)");
 
 var selfUpdateApplyCommand = new Command("apply", "取得済みの更新でインストール先を置き換える");
 selfUpdateApplyCommand.AddOption(applySourceOption);
@@ -213,6 +217,7 @@ selfUpdateApplyCommand.AddOption(applyTargetOption);
 selfUpdateApplyCommand.AddOption(applyWaitPidOption);
 selfUpdateApplyCommand.AddOption(applyWaitStartedOption);
 selfUpdateApplyCommand.AddOption(applyRelaunchOption);
+selfUpdateApplyCommand.AddOption(applyRelaunchMinimizedOption);
 selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     ctx.ExitCode = ApplySelfUpdate(
@@ -220,7 +225,8 @@ selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationConte
         target: ctx.ParseResult.GetValueForOption(applyTargetOption)!,
         waitPid: ctx.ParseResult.GetValueForOption(applyWaitPidOption),
         waitStarted: ctx.ParseResult.GetValueForOption(applyWaitStartedOption),
-        relaunch: ctx.ParseResult.GetValueForOption(applyRelaunchOption));
+        relaunch: ctx.ParseResult.GetValueForOption(applyRelaunchOption),
+        relaunchMinimized: ctx.ParseResult.GetValueForOption(applyRelaunchMinimizedOption));
 });
 
 var selfUpdateCommand = new Command("self-update", "本体の更新を適用する (App が内部で使う)")
@@ -622,7 +628,8 @@ static int CollectGarbage(int graceDays, bool dryRun)
     }
 }
 
-static int ApplySelfUpdate(string source, string target, int? waitPid, long? waitStarted, bool relaunch)
+static int ApplySelfUpdate(
+    string source, string target, int? waitPid, long? waitStarted, bool relaunch, bool relaunchMinimized)
 {
     // ログの置き場所を作れなくても続ける。ここで落ちると、親の App は
     // 「起きてすぐ落ちたヘルパ = 壊れた配布物」と見なして取得を捨てる。
@@ -713,7 +720,7 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, long? wai
             return 6;
         }
 
-        return ApplySelfUpdateCore(source, target, relaunch, logger, singleInstance);
+        return ApplySelfUpdateCore(source, target, relaunch, relaunchMinimized, logger, singleInstance);
     }
     finally
     {
@@ -796,7 +803,12 @@ static bool WaitForCaller(int? waitPid, long? waitStarted, ILogger logger)
 /// 掴んだまま起動すると、起動した App が「他に動いている」と見て即座に終わる。
 /// </param>
 static int ApplySelfUpdateCore(
-    string source, string target, bool relaunch, ILogger logger, IDisposable? singleInstance = null)
+    string source,
+    string target,
+    bool relaunch,
+    bool relaunchMinimized,
+    ILogger logger,
+    IDisposable? singleInstance = null)
 {
     // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
     // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
@@ -828,7 +840,7 @@ static int ApplySelfUpdateCore(
         // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、
         // という往復になる。
         singleInstance?.Dispose();
-        if (relaunch) TryRelaunchApp(target, logger, skipUpdateApply: true);
+        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized, skipUpdateApply: true);
         return 9;
     }
     catch (UpdateRollbackException ex)
@@ -889,12 +901,12 @@ static int ApplySelfUpdateCore(
 
         // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。
         singleInstance?.Dispose();
-        if (relaunch) TryRelaunchApp(target, logger);
+        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized);
         return 1;
     }
 
     singleInstance?.Dispose();
-    if (relaunch && !TryRelaunchApp(target, logger))
+    if (relaunch && !TryRelaunchApp(target, logger, relaunchMinimized))
     {
         // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
         return 1;
@@ -903,11 +915,17 @@ static int ApplySelfUpdateCore(
     return 0;
 }
 
+/// <param name="minimized">
+/// ウィンドウを出さずトレイへ常駐させて開き直す場合に true (issue #54)。
+/// 呼び出し元の App がそう起動していたときに渡ってくる。付けずに開き直すと、
+/// 窓を出さないと決めた利用者の前に、更新のたびに画面が現れる。
+/// </param>
 /// <param name="skipUpdateApply">
 /// 取得しておいたものを残したまま開き直す場合に true。開き直した App が
 /// 同じ取得をまたこちらへ渡してこないよう、見送りの指定を渡す。
 /// </param>
-static bool TryRelaunchApp(string target, ILogger logger, bool skipUpdateApply = false)
+static bool TryRelaunchApp(
+    string target, ILogger logger, bool minimized = false, bool skipUpdateApply = false)
 {
     try
     {
@@ -918,7 +936,11 @@ static bool TryRelaunchApp(string target, ILogger logger, bool skipUpdateApply =
             WorkingDirectory = appDirectory,
             UseShellExecute = true,
         };
-        if (skipUpdateApply) start.Arguments = UpdateInstaller.SkipUpdateApplySwitch;
+
+        var switches = new List<string>();
+        if (skipUpdateApply) switches.Add(UpdateInstaller.SkipUpdateApplySwitch);
+        if (minimized) switches.Add(StartupRegistration.MinimizedSwitch);
+        if (switches.Count > 0) start.Arguments = string.Join(" ", switches);
         System.Diagnostics.Process.Start(start);
         return true;
     }
