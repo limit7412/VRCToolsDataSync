@@ -233,11 +233,16 @@ public sealed class SyncRunner
         bool dryRun = false)
     {
         using var mutex = CreateGcMutex(storage);
-        // 同じ保存先の回収と重なった場合は待つ。飛ばすと「押したのに何も起きない」
-        // ように見えるため。上限を置くのは、相手がハング相当の場合に呼び出し元を
-        // 無期限に待たせないため。取れないまま進んでも回収は並走に安全で、走査が
-        // 重複するだけに留まる。
-        var acquired = TryAcquire(mutex, TimeSpan.FromSeconds(30));
+        // 同じ保存先の回収と重なった場合はしばらく待ち、それでも取れなければ
+        // 続行せずに中止する。排他を無視して進めると、回収に時間がかかるケース
+        // (オブジェクトが多い = 走査が高くつくケース) ほど課金対象の走査を
+        // 重複させ、排他を入れた意味が無くなる。中止の理由は例外で呼び出し元へ
+        // 伝え、「押したのに何も起きない」ようには見せない。
+        if (!TryAcquire(mutex, TimeSpan.FromSeconds(30)))
+        {
+            throw new SyncStorageException(
+                "同じ保存先に対する回収が既に実行中です。終わってからやり直してください。");
+        }
         try
         {
             if (!dryRun)
@@ -250,10 +255,7 @@ public sealed class SyncRunner
         }
         finally
         {
-            if (acquired)
-            {
-                try { mutex.ReleaseMutex(); } catch { /* best-effort */ }
-            }
+            mutex.ReleaseMutex();
         }
     }
 
