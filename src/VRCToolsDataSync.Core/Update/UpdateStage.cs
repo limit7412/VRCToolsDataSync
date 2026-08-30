@@ -514,7 +514,21 @@ public sealed class UpdateStage
             throw new IOException($"前回の展開先を消せなかったため展開しない: {ExtractDirectory}");
         }
 
-        System.IO.Compression.ZipFile.ExtractToDirectory(ZipPath, ExtractDirectory);
+        try
+        {
+            System.IO.Compression.ZipFile.ExtractToDirectory(ZipPath, ExtractDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                       or NotSupportedException or ArgumentException)
+        {
+            // ここへ来る失敗は、空きを確かめた後に残るもの、つまり Windows では
+            // 作れない項目名 (予約された装置名・使えない文字・長すぎる経路など)
+            // である。名前の規則を 1 つずつ数え上げても塞ぎ切れないため、
+            // 「展開できない配布物」としてまとめて断る。呼び出し側はこれを見て
+            // 取得ごと捨てるので、同じ ZIP で失敗を繰り返さない。
+            throw new InvalidDataException($"展開できない ZIP: {ZipPath}", ex);
+        }
+
         return ExtractDirectory;
     }
 
@@ -569,6 +583,39 @@ public sealed class UpdateStage
                     $"展開後の大きさが桁違いの ZIP は展開しない: {total} バイトを超える");
             }
         }
+
+        EnsureSpaceFor(total);
+    }
+
+    /// <summary>
+    /// 展開に足りる空きがあるかを先に見る。
+    /// <para>
+    /// 容量不足は配布物の問題ではないので、ここで <see cref="IOException"/> として
+    /// 断り、取得は残したまま次の機会へ回す。逆にここを通れば、展開の最中の
+    /// 失敗は「Windows で作れない名前」など配布物の形の問題として扱ってよい
+    /// (<see cref="ExtractForApply"/> がそう扱う)。空きを読めない置き場所
+    /// (ネットワーク越しなど) では見送る。読めないことを不足の証拠にはできない。
+    /// </para>
+    /// </summary>
+    private void EnsureSpaceFor(long required)
+    {
+        long available;
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(Directory));
+            if (string.IsNullOrEmpty(root)) return;
+            available = new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            _logger.LogDebug(ex, "空き容量を読めなかったため確認を見送る: {Directory}", Directory);
+            return;
+        }
+
+        if (available >= required) return;
+
+        throw new IOException(
+            $"展開に足りる空きが無いため展開しない: {required} バイト必要だが {available} バイトしかない");
     }
 
     /// <summary>
@@ -620,11 +667,55 @@ public sealed class UpdateStage
             // なる段 ("..." など) は Windows の名前として成り立たない。
             var trimmed = segment.TrimEnd('.', ' ');
             if (trimmed.Length == 0) return null;
+            if (!IsCreatableOnWindows(trimmed)) return null;
             resolved.Add(trimmed);
         }
 
         return string.Join('/', resolved);
     }
+
+    /// <summary>
+    /// 段が Windows のファイル名として作れるかを見る。
+    /// <para>
+    /// 使えない文字 (<c>? * | " &lt; &gt; :</c> と制御文字) と、予約された装置名
+    /// (<c>CON</c> や <c>LPT1</c>、<c>CON.dll</c> のように後ろに拡張子が付いた形も含む)
+    /// は、Windows ではその名前のファイルを作れない。配布物の側でも作れない
+    /// はずなので、正しい配布物を誤って断ることはない。
+    /// </para>
+    /// </summary>
+    private static bool IsCreatableOnWindows(string segment)
+    {
+        foreach (var c in segment)
+        {
+            if (c < ' ') return false;
+            if (InvalidNameChars.Contains(c)) return false;
+        }
+
+        // 装置名の判定は最初の "." より前だけを見る。CON.dll も CON と同じ装置を
+        // 指すため、Windows では作れない。
+        var dot = segment.IndexOf('.');
+        var baseName = dot < 0 ? segment : segment[..dot];
+        return !ReservedDeviceNames.Contains(baseName);
+    }
+
+    /// <summary>
+    /// Windows のファイル名に使えない文字。区切りの "/" と "\" は段に分ける前に
+    /// 処理済みなので、ここには現れない。
+    /// </summary>
+    private const string InvalidNameChars = "<>:\"|?*";
+
+    /// <summary>
+    /// 予約された装置名。末尾の空白と点は <see cref="ExtractionKeyOf"/> で
+    /// 落としてから渡すため、ここでは素の名前だけを見る。
+    /// </summary>
+    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "COM\u00b9", "COM\u00b2", "COM\u00b3",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
+    };
 
     /// <summary>記録された大きさと digest の両方を見る。大きさが先なのは、違っていれば読まずに落とせるため。</summary>
     /// <remarks>

@@ -420,6 +420,52 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
 
+    [Theory(DisplayName = "Windows で作れない名前の項目がある ZIP は断る")]
+    [InlineData("app/CON")]
+    [InlineData("app/CON.dll")]
+    [InlineData("app/con.dll")]
+    [InlineData("app/LPT1.txt")]
+    [InlineData("NUL/foo.dll")]
+    [InlineData("app/foo?.dll")]
+    [InlineData("app/foo|bar.dll")]
+    [InlineData("app/foo:bar.dll")]
+    [InlineData("app/foo*.dll")]
+    public void RefusesArchiveWithNamesWindowsCannotCreate(string entryName)
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 予約された装置名と使えない文字は、Windows ではその名前のファイルを
+        // 作れない。展開の最中に落ちると容量不足と区別できないため、
+        // 配布物の問題として先に断る。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry(entryName);
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
+    [Fact(DisplayName = "装置名を含んでいても、別の名前の一部なら通す")]
+    public void AllowsNamesThatMerelyContainReservedWords()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // CONFIG や NULL は装置名ではない。断ると正しい配布物を弾く。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/CONFIG.json");
+            archive.CreateEntry("app/NULL.dll");
+            archive.CreateEntry("app/COM10.dll");
+        }
+
+        var extracted = stage.ExtractForApply();
+        Assert.True(File.Exists(Path.Combine(extracted, "app", "CONFIG.json")));
+    }
+
     [Fact(DisplayName = "存在の判定は、無いと分かった場合だけ false にする")]
     public void PresenceIsUnknownWhenItCannotBeDetermined()
     {
