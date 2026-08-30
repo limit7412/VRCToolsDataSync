@@ -567,7 +567,8 @@ static int CollectGarbage(int graceDays, bool dryRun)
             "      削除の直前の読み直しも、この設定では書き直しを捉えられないことがあります。");
     }
 
-    var settings = new SettingsStore().Load();
+    var store = new SettingsStore();
+    var settings = store.Load();
     Console.WriteLine($"保存先: {SyncStorageFactory.DescribeTarget(settings)}");
     try
     {
@@ -577,10 +578,12 @@ static int CollectGarbage(int graceDays, bool dryRun)
             builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
         });
         var storage = SyncStorageFactory.Create(settings, loggerFactory: loggerFactory);
-        var collector = new BlobGarbageCollector(
-            storage, loggerFactory.CreateLogger<BlobGarbageCollector>());
 
-        var result = collector.Collect(TimeSpan.FromDays(graceDays), dryRun);
+        // BlobGarbageCollector を直接呼ばず、GUI と同じ手動実行の経路を通す。
+        // 直接呼ぶと保存先ごとの排他と実行時刻の記録を迂回し、自動回収との
+        // 並走で走査が重複するうえ、直後の Push がもう一度回収を走らせる。
+        var runner = new SyncRunner(store, loggerFactory);
+        var result = runner.CollectGarbageNow(storage, TimeSpan.FromDays(graceDays), dryRun);
 
         Console.WriteLine(dryRun
             ? $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 回収対象 {result.Deleted} 件 ({result.DescribeDeletedBytes()})"
@@ -596,6 +599,12 @@ static int CollectGarbage(int graceDays, bool dryRun)
     {
         Console.Error.WriteLine($"回収できませんでした: {ex.Message}");
         return 2;
+    }
+    catch (Exception ex)
+    {
+        // 実行時刻を記録できない場合 (settings.json の破損など) もここに来る。
+        Console.Error.WriteLine($"エラー: {ex.Message}");
+        return 1;
     }
 }
 

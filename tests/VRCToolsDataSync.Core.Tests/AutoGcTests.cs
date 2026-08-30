@@ -153,6 +153,57 @@ public sealed class AutoGcTests : IDisposable
         Assert.True(storage.Has(BlobKeys.Prefix + "bbb"));
     }
 
+    [Fact(DisplayName = "dry-run は排他だけ共有し、実行時刻を記録しない")]
+    public void DryRunDoesNotRecordTime()
+    {
+        var store = CreateStore();
+        var storage = StorageWithOrphan();
+        var runner = new SyncRunner(store);
+
+        var preview = runner.CollectGarbageNow(storage, dryRun: true);
+
+        // 数えるだけで消さず、記録も残さない。何も消していないので、続く
+        // 自動回収を省かせる理由が無い。
+        Assert.Equal(1, preview.Deleted);
+        Assert.True(storage.Has(BlobKeys.Prefix + "bbb"));
+        Assert.False(CreateStore().Load().LastGcAt.ContainsKey(storage.StateKeyPrefix));
+        Assert.NotNull(runner.CollectGarbageIfDue(storage));
+    }
+
+    [Fact(DisplayName = "未来を指す記録は無視して回収し、正しい時刻で置き換える")]
+    public void FutureRecordDoesNotSuppressGc()
+    {
+        // 時計が進んだ状態で回収され、その後に時刻が修正されたケース。
+        // 未来の記録をそのまま信じると、その時刻から間隔が経つまで回収が止まる。
+        var store = CreateStore();
+        var storage = StorageWithOrphan();
+        Directory.CreateDirectory(_directory);
+        var future = DateTimeOffset.UtcNow + TimeSpan.FromDays(2);
+        File.WriteAllText(
+            store.FilePath,
+            $$"""{ "lastGcAt": { "{{storage.StateKeyPrefix}}": "{{future:O}}" } }""");
+
+        var result = new SyncRunner(store).CollectGarbageIfDue(storage);
+
+        Assert.NotNull(result);
+        var recorded = CreateStore().Load().LastGcAt[storage.StateKeyPrefix];
+        Assert.True(recorded <= DateTimeOffset.Now + SettingsStore.LastGcAtFutureTolerance);
+    }
+
+    [Fact(DisplayName = "settings.json が読めない場合、時刻の保存は既定値で上書きせずに失敗する")]
+    public void SaveLastGcAtDoesNotClobberCorruptedSettings()
+    {
+        // マージは読めないディスクを「無い」扱いにするので、確かめずに保存すると
+        // 既定値だらけの settings が破損したファイルを正常な形で上書きし、
+        // 保存先などの設定が無言で消える。
+        var store = CreateStore();
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(store.FilePath, "{ broken");
+
+        Assert.ThrowsAny<Exception>(() => store.SaveLastGcAt("fake|", DateTimeOffset.Now));
+        Assert.Equal("{ broken", File.ReadAllText(store.FilePath));
+    }
+
     [Fact(DisplayName = "実行時刻の記録は、古い設定の保存で巻き戻らない")]
     public void LastGcAtNeverMovesBackwardsOnStaleSave()
     {

@@ -185,12 +185,18 @@ public sealed class SyncRunner
             {
                 var current = _store.Load();
                 var key = storage.StateKeyPrefix;
+                var now = DateTimeOffset.Now;
+                // 未来を指す記録は無かったものとして扱う (期限到来)。時計が進んだ
+                // 状態で書かれた記録をそのまま信じると、時計を直した後、その未来
+                // 時刻から間隔が経つまで回収が止まる。保存側のマージも同じ基準で
+                // 未来の記録を捨てるので、ここで書く記録が置き換わる。
                 if (current.LastGcAt.TryGetValue(key, out var last)
-                    && DateTimeOffset.Now - last < AutoGcInterval)
+                    && last <= now + SettingsStore.LastGcAtFutureTolerance
+                    && now - last < AutoGcInterval)
                 {
                     return null;
                 }
-                _store.SaveLastGcAt(key, DateTimeOffset.Now);
+                _store.SaveLastGcAt(key, now);
 
                 logger.LogInformation("自動回収を開始します: {Target}", storage.DisplayName);
                 return new BlobGarbageCollector(storage, logger).Collect();
@@ -210,27 +216,37 @@ public sealed class SyncRunner
     }
 
     /// <summary>
-    /// 間引きをせず、今すぐ回収する。GUI の手動実行用。
+    /// 間引きをせず、今すぐ回収する。GUI と CLI の手動実行用。
     /// <para>
     /// 実行時刻は自動回収と同じ記録に残し、直後の自動回収を省かせる。
+    /// dry-run では残さない。何も消していないので、続く自動回収を省かせる
+    /// 理由が無い。排他は dry-run でも共有する (走査の重複は同じため)。
+    /// </para>
+    /// <para>
     /// 失敗は自動回収と違って握りつぶさない。手動実行では結果を待っている
     /// 利用者がいるので、失敗を伝えて対処 (権限の見直しなど) につなげる。
     /// </para>
     /// </summary>
-    public BlobGarbageCollectionResult CollectGarbageNow(ISyncStorage storage)
+    public BlobGarbageCollectionResult CollectGarbageNow(
+        ISyncStorage storage,
+        TimeSpan? gracePeriod = null,
+        bool dryRun = false)
     {
         using var mutex = CreateGcMutex(storage);
         // 同じ保存先の回収と重なった場合は待つ。飛ばすと「押したのに何も起きない」
-        // ように見えるため。上限を置くのは、相手がハング相当の場合に UI を無期限に
-        // 待たせないため。取れないまま進んでも回収は並走に安全で、走査が重複する
-        // だけに留まる。
+        // ように見えるため。上限を置くのは、相手がハング相当の場合に呼び出し元を
+        // 無期限に待たせないため。取れないまま進んでも回収は並走に安全で、走査が
+        // 重複するだけに留まる。
         var acquired = TryAcquire(mutex, TimeSpan.FromSeconds(30));
         try
         {
-            _store.SaveLastGcAt(storage.StateKeyPrefix, DateTimeOffset.Now);
+            if (!dryRun)
+            {
+                _store.SaveLastGcAt(storage.StateKeyPrefix, DateTimeOffset.Now);
+            }
             var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
             logger.LogInformation("手動回収を開始します: {Target}", storage.DisplayName);
-            return new BlobGarbageCollector(storage, logger).Collect();
+            return new BlobGarbageCollector(storage, logger).Collect(gracePeriod, dryRun);
         }
         finally
         {
