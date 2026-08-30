@@ -11,9 +11,9 @@ namespace VRCToolsDataSync_App.Services;
 /// <summary>
 /// 本体の更新確認を回す常駐側の入り口 (issue #45)。
 /// <para>
-/// 起動からしばらく後に一度、以後は 1 日ごとに確認する。手動の確認も
-/// ここを通す。確認そのもの (<see cref="UpdateChecker"/>) と、通知済みの
-/// 記録の永続化、チャンネル設定の読み出しをまとめる。
+/// 起動からしばらく後に一度、以後は 1 日ごとに確認する。止める設定は無く、
+/// 確認は常に自動で走る。確認そのもの (<see cref="UpdateChecker"/>) と、
+/// 通知済みの記録の永続化、チャンネル設定の読み出しをまとめる。
 /// </para>
 /// </summary>
 public sealed class UpdateManager : IDisposable
@@ -31,7 +31,7 @@ public sealed class UpdateManager : IDisposable
     private readonly ILogger _logger;
     private readonly Timer _timer;
 
-    // 手動と定期の確認が重ならないように直列化する。
+    // 定期の確認と、チャンネルを変えたときの確認が重ならないように直列化する。
     private readonly SemaphoreSlim _checkGate = new(1, 1);
 
     // 取得は 1 本ずつ。同じ ZIP へ 2 本が書くと壊れる。
@@ -43,21 +43,21 @@ public sealed class UpdateManager : IDisposable
     // 大きくても百数十 MB の ZIP であり、これで足りない回線では待っても仕方がない。
     private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(30);
 
-    // 後始末が取得の終わりを待つ上限。ここで待たされるのは手動の確認と
-    // ぶつかったときだけで、待ちきれなくても次の起動が同じ後始末をやり直す。
+    // 後始末が取得の終わりを待つ上限。待ちきれなくても、次の起動が同じ
+    // 後始末をやり直す。
     private static readonly TimeSpan CleanUpWait = TimeSpan.FromMinutes(5);
 
     // 破棄と一緒に、走っている取得を打ち切るための元。
     private readonly CancellationTokenSource _lifetime = new();
 
     /// <summary>
-    /// 確認が終わるたびに上がる。定期の確認では通知済みの抑止を通した後の結果になる。
+    /// 確認が終わるたびに上がる。結果は通知済みの抑止を通した後のものになる。
     /// 第 2 引数は確認に使ったチャンネル。確認中にチャンネルを変えて保存すると
     /// 前のチャンネルの結果が遅れて届くため、受け側は保存済みのチャンネルと
     /// 突き合わせてから画面や通知に載せる。
     /// ハンドラはバックグラウンドスレッドで呼ばれるので、UI 側でディスパッチする。
     /// </summary>
-    public event Action<UpdateCheckResult, UpdateChannel, bool>? CheckCompleted;
+    public event Action<UpdateCheckResult, UpdateChannel>? CheckCompleted;
 
     /// <summary>取得が済んで置き換え待ちになった (または捨てられた) ときに上がる。</summary>
     public event Action? StagedChanged;
@@ -117,19 +117,16 @@ public sealed class UpdateManager : IDisposable
     /// <summary>
     /// 新しい版を探す。チャンネルは呼び出しの時点の設定から読む。
     /// <para>
-    /// 定期の確認 (manual=false) は設定で止められ、知らせ済みの版を UpToDate へ
-    /// 倒してから返す。手動の確認は設定に関わらず走り、抑止前の結末を返す。
-    /// 押した人に「最新である」と答えながら画面に新しい版を出すわけにはいかない。
+    /// 確認は起動のたびに必ず走る。止める設定は置かない。知らせ済みの版は
+    /// UpToDate へ倒してから返し、同じ版のバルーンを起動のたびに出さない。
     /// </para>
     /// </summary>
-    public async Task<UpdateCheckResult?> CheckAsync(bool manual, CancellationToken cancellationToken = default)
+    public async Task<UpdateCheckResult?> CheckAsync(CancellationToken cancellationToken = default)
     {
         UpdateChannel channel;
         try
         {
-            var update = _runner.LoadSettings().Update;
-            if (!manual && !update.CheckEnabled) return null;
-            channel = update.Channel;
+            channel = _runner.LoadSettings().Update.Channel;
         }
         catch (Exception ex)
         {
@@ -141,38 +138,11 @@ public sealed class UpdateManager : IDisposable
         try
         {
             var result = await _checker.CheckAsync(CurrentVersion, channel, cancellationToken).ConfigureAwait(false);
-            if (!manual)
-            {
-                result = _checker.SuppressNotified(result);
-
-                // 確認の最中に「自動で確認」を切られていたら、この結果は流さない。
-                // 開始前の判定だけだと、切った後にバルーンが出て、その版が
-                // 通知済みとして記録されてしまう。読めない場合も流さない側に倒す。
-                //
-                // 捨てるときは確認そのものも無かったことにする。確認済みのまま
-                // 残すと、自動確認を戻したときに「確認済み」と見なされて確認を
-                // 省き、捨てた候補が画面にだけ出て通知されない状態が次の定期確認
-                // まで続く。
-                bool enabled;
-                try
-                {
-                    enabled = _runner.LoadSettings().Update.CheckEnabled;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "更新確認の設定を読み直せなかった");
-                    enabled = false;
-                }
-                if (!enabled)
-                {
-                    _checker.InvalidateChecked();
-                    return null;
-                }
-            }
+            result = _checker.SuppressNotified(result);
 
             try
             {
-                CheckCompleted?.Invoke(result, channel, manual);
+                CheckCompleted?.Invoke(result, channel);
             }
             catch (Exception ex)
             {
@@ -216,7 +186,7 @@ public sealed class UpdateManager : IDisposable
         // 取るので、詰まることはない。
         //
         // 最初の確認は起動から 30 秒後なので、普段この待ちは空振りする。
-        // 手動の確認とぶつかった場合も、待ちきれなければ次の起動へ回す。
+        // 取得とぶつかった場合も、待ちきれなければ次の起動へ回す。
         var held = false;
         try
         {
@@ -521,7 +491,7 @@ public sealed class UpdateManager : IDisposable
     {
         try
         {
-            await CheckAsync(manual: false).ConfigureAwait(false);
+            await CheckAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {

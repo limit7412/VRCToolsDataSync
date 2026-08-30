@@ -59,8 +59,8 @@ public partial class MainPageViewModel : ObservableObject
         if (_updates is not null)
         {
             // 確認も取得もバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
-            _updates.CheckCompleted += (result, channel, manual) =>
-                OnUi(() => HandleUpdateCheckCompleted(result, channel, manual));
+            _updates.CheckCompleted += (result, channel) =>
+                OnUi(() => HandleUpdateCheckCompleted(result, channel));
             _updates.StagedChanged += () => OnUi(RefreshStagedRow);
             RefreshStagedRow();
         }
@@ -294,9 +294,6 @@ public partial class MainPageViewModel : ObservableObject
     public partial int UpdateChannelIndex { get; set; }
 
     [ObservableProperty]
-    public partial bool UpdateCheckEnabled { get; set; } = true;
-
-    [ObservableProperty]
     public partial string UpdateStatus { get; set; } = string.Empty;
 
     // 新しい版が見つかったときだけ出す行 (版の表示とリリースページへのボタン)。
@@ -352,11 +349,9 @@ public partial class MainPageViewModel : ObservableObject
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
         var settings = _runner.LoadSettings();
-        // 更新確認の設定は、保存の前のディスク側の値を控えておく。
-        // 自動確認を戻したときと、チャンネルを変えたときに確認し直すために使う。
-        var previousUpdate = settings.Update ?? new UpdateSettings();
-        var checkWasEnabled = previousUpdate.CheckEnabled;
-        var previousChannel = previousUpdate.Channel;
+        // チャンネルを変えたときに確認し直すため、保存の前のディスク側の値を
+        // 控えておく。
+        var previousChannel = (settings.Update ?? new UpdateSettings()).Channel;
         settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
@@ -379,8 +374,7 @@ public partial class MainPageViewModel : ObservableObject
 
         // チャンネルを変えた直後は、表示が前のチャンネルの結果のまま残る。
         // 状態欄を新しいチャンネルの確認状態から作り直し、まだ確認できて
-        // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
-        // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
+        // いなければ確認し直す。
         RefreshUpdateBanner();
         // 取得済みの行も作り直す。stable へ切り替えると、test で取ったものは
         // 出さなくなる (押しても捨てられるだけなので、出したままにしない)。
@@ -391,36 +385,20 @@ public partial class MainPageViewModel : ObservableObject
         var channel = update.Channel;
         if (_updates is not null)
         {
-            // 次のどちらかなら、確認済みでも確認し直す。
-            //
-            // 自動確認を戻したとき: 止めていた間は定期の確認が走っておらず、
-            // 残っている結果は古い。
-            //
-            // チャンネルを変えたとき: そのチャンネルの確認済みの印だけでは
-            // 足りない。stable の結果がある状態で test へ変え、その確認の途中で
-            // stable へ戻すと、印は残っているのに、遅れて届いた test の結果が
-            // 確認の状態を上書きしてしまう。どちらの場合も、次の定期確認まで
-            // 最大 1 日、古い結果を「最新」と出し続けるわけにはいかない。
-            var reEnabled = !checkWasEnabled && update.CheckEnabled;
-            var channelChanged = previousChannel != channel;
-            var stale = reEnabled || channelChanged;
-
-            // 自動確認を止めている間は確認が走らない。「確認しています...」を
-            // 出すと、結果が来ないままその表示で固まる。未確認として見せ、
-            // 手動確認に委ねる。
-            if (stale && !update.CheckEnabled)
-            {
-                UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
-            }
-            else if (stale)
+            // チャンネルを変えたら、確認済みでも確認し直す。そのチャンネルの
+            // 確認済みの印だけでは足りない。stable の結果がある状態で test へ
+            // 変え、その確認の途中で stable へ戻すと、印は残っているのに、
+            // 遅れて届いた test の結果が確認の状態を上書きしてしまう。次の
+            // 定期確認まで最大 1 日、古い結果を「最新」と出し続けることになる。
+            if (previousChannel != channel)
             {
                 UpdateStatus = "確認しています...";
-                _ = _updates.CheckAsync(manual: false);
+                _ = _updates.CheckAsync();
             }
             else if (!_updates.HasChecked(channel))
             {
                 UpdateStatus = $"未確認 (実行中: {_updates.CurrentVersion})";
-                _ = _updates.CheckAsync(manual: false);
+                _ = _updates.CheckAsync();
             }
             else if (_updates.Available(channel) is { } available)
             {
@@ -570,7 +548,6 @@ public partial class MainPageViewModel : ObservableObject
     {
         var update = _settings.Update ?? new UpdateSettings();
         UpdateChannelIndex = update.Channel == UpdateChannel.Test ? TestChannelIndex : 0;
-        UpdateCheckEnabled = update.CheckEnabled;
         UpdateStatus = _updates is null
             ? "更新確認は利用できません"
             : $"未確認 (実行中: {_updates.CurrentVersion})";
@@ -582,31 +559,7 @@ public partial class MainPageViewModel : ObservableObject
         settings.Update.Channel = UpdateChannelIndex == TestChannelIndex
             ? UpdateChannel.Test
             : UpdateChannel.Stable;
-        settings.Update.CheckEnabled = UpdateCheckEnabled;
         // NotifiedVersion は画面で編集しない。読み込んだ値をそのまま保つ。
-    }
-
-    /// <summary>
-    /// 「今すぐ確認」ボタン。定期確認と違い、設定で確認を止めていても走る。
-    /// 押した人が結果を待っているためで、結果の表示は CheckCompleted 経由で行う。
-    /// </summary>
-    [RelayCommand]
-    private async Task CheckUpdateAsync()
-    {
-        if (_updates is null) return;
-        UpdateStatus = "確認しています...";
-        try
-        {
-            var result = await _updates.CheckAsync(manual: true);
-            if (result is null)
-            {
-                UpdateStatus = "確認できませんでした (設定を読めません)";
-            }
-        }
-        catch (Exception ex)
-        {
-            UpdateStatus = $"確認できませんでした: {ex.Message}";
-        }
     }
 
     [RelayCommand]
@@ -632,12 +585,12 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>
     /// 確認の結果を画面へ反映する。UI スレッドで呼ばれる。
     /// <para>
-    /// 定期確認 (manual=false) では、知らせ済みの版が UpToDate に倒されて届く。
-    /// その場合も新しい版の行は出したままにする。通知を抑えるのは繰り返しの
-    /// バルーンであって、画面からの導線ではない。
+    /// 知らせ済みの版は UpToDate に倒されて届く。その場合も新しい版の行は
+    /// 出したままにする。通知を抑えるのは繰り返しのバルーンであって、
+    /// 画面からの導線ではない。
     /// </para>
     /// </summary>
-    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel, bool manual)
+    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel)
     {
         if (_updates is null) return;
 
@@ -672,13 +625,10 @@ public partial class MainPageViewModel : ObservableObject
         if (result.Outcome == UpdateCheckOutcome.Available && result.Release is { } release)
         {
             AppendLog($"新しい版 {release.Tag} が出ています (実行中: {current})");
-            if (!manual)
-            {
-                // 手動確認は画面を見ながらの操作なのでバルーンまでは出さない。
-                ToastRequested?.Invoke(
-                    "VRCToolsDataSync の更新",
-                    $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
-            }
+            // 確認は背後で走るので、画面を見ていない利用者にも届くようバルーンを出す。
+            ToastRequested?.Invoke(
+                "VRCToolsDataSync の更新",
+                $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
             // 画面と通知に出せた後で覚える。出せなかった版まで覚えると、
             // 利用者が一度も見ないまま以後の確認で抑止される。
             _updates.MarkNotified(release);
