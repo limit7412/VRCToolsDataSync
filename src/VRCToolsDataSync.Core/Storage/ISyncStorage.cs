@@ -128,6 +128,31 @@ public interface ISyncStorage
     IEnumerable<StoredObject> List(string keyPrefix);
 
     /// <summary>
+    /// 未完了のまま残っているアップロードを列挙する。孤児の回収 (GC) だけが使う。
+    /// <para>
+    /// 大きなファイルを分割して送る仕組み (S3 のマルチパートアップロード) では、
+    /// 送信が途中で切れると送信済みの断片が同期先に残る。断片は
+    /// <see cref="List"/> に現れないため回収の対象から漏れる一方、保存容量としては
+    /// 課金され続ける (#59)。
+    /// </para>
+    /// <para>
+    /// 分割して送る仕組みを持たない同期先は空を返す。「無い」が正しい答えであり、
+    /// 未対応を表すわけではない。
+    /// </para>
+    /// </summary>
+    IEnumerable<IncompleteUpload> ListIncompleteUploads();
+
+    /// <summary>
+    /// 未完了のアップロードを中断し、送信済みの断片を捨てる。
+    /// 既に無い場合も成功として扱う (捨てたいものが無いため)。
+    /// <para>
+    /// 中断そのものができなかった場合は <see cref="SyncStorageException"/> を投げる。
+    /// 呼び出し側が 1 件の失敗として扱えるよう、同期先の種類によらない型に揃える。
+    /// </para>
+    /// </summary>
+    void AbortIncompleteUpload(IncompleteUpload upload);
+
+    /// <summary>
     /// manifest の更新を監視する仕組みを作る。ローカルフォルダはファイル監視、
     /// S3 互換モードは定期的な問い合わせで実現する。
     /// </summary>
@@ -165,3 +190,13 @@ public interface IManifestWatcher : IDisposable
 /// 削除の条件には <see cref="LastModified"/> を使う。
 /// </remarks>
 public sealed record StoredObject(string Key, DateTimeOffset LastModified, long Size);
+
+/// <summary>同期先に残っている、未完了のアップロード 1 件 (#59)。</summary>
+/// <param name="Key">送ろうとしていたキー。表示とログにだけ使う。</param>
+/// <param name="UploadId">中断に要る識別子。同じキーに複数の未完了がありうる。</param>
+/// <param name="InitiatedAt">送信を開始した時刻。猶予期間の判定に使う。</param>
+/// <remarks>
+/// 大きさは持たない。送信済みのパートを数え上げるには 1 件ずつ問い合わせが要り、
+/// 中断すると決めた後には使い道が無い。
+/// </remarks>
+public sealed record IncompleteUpload(string Key, string UploadId, DateTimeOffset InitiatedAt);

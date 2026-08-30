@@ -294,7 +294,8 @@ static int RunPush(
                 if (gc is not null)
                 {
                     Console.WriteLine(
-                        $"  ストレージ容量の解放: {gc.Deleted} 件 ({gc.DescribeDeletedBytes()}) を削除");
+                        $"  ストレージ容量の解放: {gc.Deleted} 件 ({gc.DescribeDeletedBytes()}) を削除" +
+                        (gc.AbortedUploads > 0 ? $" / 未完了のアップロード {gc.AbortedUploads} 件を中断" : string.Empty));
                 }
                 return 0;
             case SyncOutcome.ConflictDetected:
@@ -588,6 +589,13 @@ static int CollectGarbage(int graceDays, bool dryRun)
         Console.WriteLine(dryRun
             ? $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 解放対象 {result.Deleted} 件 ({result.DescribeDeletedBytes()})"
             : $"走査 {result.Scanned} 件: 参照あり {result.Live} / 猶予期間内 {result.Young} / 解放 {result.Deleted} 件 ({result.DescribeDeletedBytes()})");
+        if (result.AbortedUploads > 0)
+        {
+            // 未完了のアップロードは一覧に現れないまま課金される。件数だけ出す。
+            Console.WriteLine(dryRun
+                ? $"未完了のアップロード: 中断対象 {result.AbortedUploads} 件"
+                : $"未完了のアップロード: {result.AbortedUploads} 件を中断");
+        }
         if (result.Failed > 0)
         {
             Console.Error.WriteLine($"{result.Failed} 件の削除に失敗しました。次回の実行で再度対象になります。");

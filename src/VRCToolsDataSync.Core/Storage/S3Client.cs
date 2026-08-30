@@ -495,7 +495,102 @@ internal sealed class S3Client
         }
     }
 
-    private void AbortMultipartUpload(string key, string uploadId)
+    /// <summary>
+    /// 未完了のまま残っているマルチパートアップロードを列挙する (#59)。
+    /// <para>
+    /// 送信が途中で切れた分は、送信済みのパートが同期先に残る。これは
+    /// <see cref="ListObjects"/> には現れないが、保存容量としては課金される。
+    /// </para>
+    /// </summary>
+    public IEnumerable<(string Key, string UploadId, DateTimeOffset Initiated)> ListMultipartUploads(string keyPrefix)
+    {
+        // 続きの位置はキーと uploadId の対で表す。同じキーに複数の未完了が
+        // ある場合があるため、キーだけでは次の頁の先頭を指定できない。
+        string? keyMarker = null;
+        string? uploadIdMarker = null;
+        do
+        {
+            var query = new List<KeyValuePair<string, string>>
+            {
+                new("uploads", string.Empty),
+                new("prefix", keyPrefix),
+            };
+            if (keyMarker is not null)
+            {
+                query.Add(new KeyValuePair<string, string>("key-marker", keyMarker));
+            }
+            if (uploadIdMarker is not null)
+            {
+                query.Add(new KeyValuePair<string, string>("upload-id-marker", uploadIdMarker));
+            }
+
+            string body;
+            using (var cts = new CancellationTokenSource(_options.Timeout))
+            {
+                using var response = Send(
+                    HttpMethod.Get, key: string.Empty, query, contentFactory: null,
+                    AwsV4Signer.EmptyPayloadHash, headers: null,
+                    HttpCompletionOption.ResponseContentRead, cts.Token);
+                EnsureSuccess(response, $"未完了のアップロードの一覧 ({keyPrefix})", cts.Token);
+                body = ReadFullBody(response, cts.Token);
+            }
+
+            XDocument document;
+            try
+            {
+                document = XDocument.Parse(body);
+            }
+            catch (Exception ex)
+            {
+                throw new SyncStorageException($"未完了のアップロードの一覧を解釈できませんでした ({keyPrefix})", ex);
+            }
+
+            var root = document.Root;
+            if (root is null) yield break;
+
+            foreach (var element in ChildElements(root, "Upload"))
+            {
+                var key = ChildElements(element, "Key").FirstOrDefault()?.Value;
+                var uploadId = ChildElements(element, "UploadId").FirstOrDefault()?.Value;
+                if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(uploadId)) continue;
+
+                // 開始時刻を読めない場合は「たった今」として扱う。猶予期間に
+                // 守らせる側へ倒す。分からないものを古い扱いにすると、進行中の
+                // 送信を中断しかねない。
+                var initiated = DateTimeOffset.TryParse(
+                    ChildElements(element, "Initiated").FirstOrDefault()?.Value,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal,
+                    out var parsed)
+                    ? parsed
+                    : DateTimeOffset.UtcNow;
+                yield return (key, uploadId, initiated);
+            }
+
+            var truncated = ChildElements(root, "IsTruncated").FirstOrDefault()?.Value;
+            if (string.Equals(truncated, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                keyMarker = ChildElements(root, "NextKeyMarker").FirstOrDefault()?.Value;
+                uploadIdMarker = ChildElements(root, "NextUploadIdMarker").FirstOrDefault()?.Value;
+
+                // 続きの位置を返さない実装もある。そこで打ち切らないと、同じ頁を
+                // 取り続ける輪に入る。
+                if (string.IsNullOrEmpty(keyMarker)) yield break;
+            }
+            else
+            {
+                keyMarker = null;
+                uploadIdMarker = null;
+            }
+        }
+        while (keyMarker is not null);
+    }
+
+    /// <summary>
+    /// マルチパートアップロードを中断し、送信済みのパートを捨てる。
+    /// 既に無い場合も成功として扱う (捨てたいものが無いため)。
+    /// </summary>
+    public void AbortMultipartUpload(string key, string uploadId)
     {
         using var cts = new CancellationTokenSource(_options.Timeout);
         var query = new List<KeyValuePair<string, string>> { new("uploadId", uploadId) };
@@ -503,7 +598,11 @@ internal sealed class S3Client
             HttpMethod.Delete, key, query, contentFactory: null,
             AwsV4Signer.EmptyPayloadHash, headers: null,
             HttpCompletionOption.ResponseContentRead, cts.Token);
-        EnsureSuccess(response, $"マルチパートアップロードの中断 ({key})");
+
+        // 既に無いものを消しに行った形 (別の PC が先に中断した、送信が完了した)
+        // は成功として扱う。捨てたいものが無いのだから、やり直す理由が無い。
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return;
+        EnsureSuccess(response, $"マルチパートアップロードの中断 ({key})", cts.Token);
     }
 
     // --- 送信 ---

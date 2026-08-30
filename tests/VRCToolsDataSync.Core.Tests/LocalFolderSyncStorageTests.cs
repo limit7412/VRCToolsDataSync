@@ -243,4 +243,14 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
         // 検査に使ったファイルを残さない。
         Assert.Empty(Directory.GetFiles(_root));
     }
+    [Fact(DisplayName = "同期フォルダに未完了のアップロードは無い")]
+    public void HasNoIncompleteUploads()
+    {
+        // 分割して送る仕組みが無いので、未完了は原理的に生じない。回収の側は
+        // これを「無い」として受け取り、S3 との違いを意識せずに済む (#59)。
+        var storage = new LocalFolderSyncStorage(_root);
+
+        Assert.Empty(storage.ListIncompleteUploads());
+    }
+
 }
