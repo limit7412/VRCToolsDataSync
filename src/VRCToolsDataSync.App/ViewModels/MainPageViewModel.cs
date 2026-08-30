@@ -1008,21 +1008,59 @@ public partial class MainPageViewModel : ObservableObject
     }
 
     /// <summary>
-    /// 手動でのストレージの回収 (issue #55)。自動回収と違って間引かず今すぐ実行し、
-    /// 結果も失敗もログに出す。実行後は自動回収の記録が更新されるので、
-    /// 直後の Push で回収が重ねて走ることはない。
+    /// 手動での容量の解放 (issue #55) で使う猶予期間 (日)。
+    /// <para>
+    /// 画面の NumberBox と直に結ぶため double で持つ。設定には保存しない。
+    /// 短くするのは「今そこにある容量を空けたい」ときの一回きりの操作で、
+    /// 自動実行が使う既定 (<see cref="BlobGarbageCollector.DefaultGracePeriod"/>) を
+    /// 恒久的に緩める意味にはならないためである。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    public partial double GcGraceDays { get; set; } = BlobGarbageCollector.DefaultGracePeriod.TotalDays;
+
+    /// <summary>
+    /// 画面から指定できる猶予期間の下限 (日)。
+    /// <para>
+    /// 0 を選ばせない。猶予期間は他の PC が送っている最中のデータを巻き込まない
+    /// ための余裕で、解放の安全性はほぼこれに乗っている。0 では書かれたばかりの
+    /// データがそのまま対象になり、削除の直前の読み直しも効かなくなる。
+    /// 承知のうえで詰めたい場合は CLI の <c>--grace-days</c> を使う。
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// x:Bind は静的メンバーをインスタンスの経路から解決できないため、
+    /// 画面から読めるようインスタンスのプロパティにしている。
+    /// </remarks>
+    public double MinGcGraceDays => 1;
+
+    /// <summary>画面から指定できる猶予期間の上限 (日)。</summary>
+    public double MaxGcGraceDays => 365;
+
+    /// <summary>
+    /// 手動での容量の解放 (issue #55)。自動実行と違って間引かず今すぐ走らせ、
+    /// 結果も失敗もログに出す。実行後は自動実行の記録が更新されるので、
+    /// 直後の Push で重ねて走ることはない。
     /// </summary>
     [RelayCommand]
     private async Task CollectGarbageAsync()
     {
         if (!TryCreateStorage(out var storage)) return;
+
+        // NumberBox は入力を消すと NaN を返す。範囲の内側へ寄せてから使う。
+        var graceDays = double.IsNaN(GcGraceDays)
+            ? BlobGarbageCollector.DefaultGracePeriod.TotalDays
+            : Math.Clamp(GcGraceDays, MinGcGraceDays, MaxGcGraceDays);
+        GcGraceDays = graceDays;
+
         IsBusy = true;
         try
         {
-            AppendLog("ストレージの回収を開始...");
-            var result = await Task.Run(() => _runner.CollectGarbageNow(storage));
+            AppendLog($"ストレージ容量の解放を開始 (猶予期間 {graceDays:0.#} 日)...");
+            var result = await Task.Run(
+                () => _runner.CollectGarbageNow(storage, TimeSpan.FromDays(graceDays)));
             AppendLog(
-                $"ストレージの回収 完了: {result.Deleted} 件 ({result.DescribeDeletedBytes()}) を削除 " +
+                $"ストレージ容量の解放 完了: {result.Deleted} 件 ({result.DescribeDeletedBytes()}) を削除 " +
                 $"/ 参照あり {result.Live} 件 / 猶予期間内 {result.Young} 件");
             if (result.Failed > 0)
             {
@@ -1034,7 +1072,7 @@ public partial class MainPageViewModel : ObservableObject
             // 同期先の不調 (SyncStorageException) に限らず、manifest の破損
             // (JsonException) や実行時刻を記録できない場合 (IOException など) も
             // ここで受ける。RelayCommand から漏らすと画面に何も出ない。
-            AppendLog($"ストレージの回収 失敗: {ex.Message}");
+            AppendLog($"ストレージ容量の解放 失敗: {ex.Message}");
         }
         finally
         {
