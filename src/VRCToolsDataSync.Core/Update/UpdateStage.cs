@@ -498,8 +498,8 @@ public sealed class UpdateStage
     /// <summary>
     /// 昇格の最後の付け替えだけが済んでいない状態を、ここで仕上げる。
     /// <para>
-    /// 昇格は「新しい記録を横へ書く → 古い記録を消す → ZIP を入れ替える →
-    /// 記録を置く」の順で進む。最後の付け替えだけが失敗すると、新しい ZIP は
+    /// 昇格は「新しい記録を横へ書く → 古い記録を横へ退避する → ZIP を入れ替える →
+    /// 新しい記録を置く」の順で進む。最後の付け替えだけが失敗すると、新しい ZIP は
     /// 正規の場所に居るのに記録が無い、という形で止まる。片方だけの状態として
     /// 捨てると、照合まで通った取得を丸ごと捨てることになる。横に残っている
     /// 記録を置き直せば済むので、捨てる判断の前に一度試す。
@@ -599,17 +599,21 @@ public sealed class UpdateStage
     /// </summary>
     public string ExtractForApply()
     {
-        EnsureExtractable();
-
-        // 前の展開が残っていたら消す。消し切れないまま重ねて展開すると、
+        // 前の展開が残っていたら先に消す。消し切れないまま重ねて展開すると、
         // 新しい版で消えたはずのファイルがそのまま残り、その混ざった一式を
         // インストールしてしまう。消し切れない場合はここで止める (取得は残る
         // ので、掴んでいたものが放されれば次の起動でやり直せる)。
+        //
+        // EnsureExtractable より先に消すのは、あちらが空きを測るためである。
+        // 残骸を数に入れたまま測ると、消せば足りる状況でも容量不足として断り、
+        // その先の削除まで進めないまま繰り返すことになる。
         DeleteDirectoryQuietly(ExtractDirectory);
         if (System.IO.Directory.Exists(ExtractDirectory))
         {
             throw new IOException($"前回の展開先を消せなかったため展開しない: {ExtractDirectory}");
         }
+
+        EnsureExtractable();
 
         try
         {
