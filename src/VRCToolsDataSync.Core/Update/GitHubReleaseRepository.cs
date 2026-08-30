@@ -76,6 +76,15 @@ public sealed class GitHubReleaseRepository : IReleaseRepository, IDisposable
             new ProductInfoHeaderValue("VRCToolsDataSync", "1"));
         _httpClient.DefaultRequestHeaders.Accept.Add(
             new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        // 手前のキャッシュに答えさせない。GitHub は一覧に短い max-age を付けて
+        // 返すので、公開したばかりの版が、間に立つキャッシュのせいで一覧に
+        // 出ないことがある。確認は 1 日に一度と、利用者が押したときだけである。
+        // 毎回取り直しても負荷にはならない。
+        _httpClient.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue
+        {
+            NoCache = true,
+            NoStore = true,
+        };
     }
 
     public void Dispose() => _httpClient.Dispose();

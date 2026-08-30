@@ -59,8 +59,8 @@ public partial class MainPageViewModel : ObservableObject
         if (_updates is not null)
         {
             // 確認も取得もバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
-            _updates.CheckCompleted += (result, channel) =>
-                OnUi(() => HandleUpdateCheckCompleted(result, channel));
+            _updates.CheckCompleted += (result, channel, manual) =>
+                OnUi(() => HandleUpdateCheckCompleted(result, channel, manual));
             _updates.StagedChanged += () => OnUi(RefreshStagedRow);
             RefreshStagedRow();
         }
@@ -295,6 +295,10 @@ public partial class MainPageViewModel : ObservableObject
 
     [ObservableProperty]
     public partial string UpdateStatus { get; set; } = string.Empty;
+
+    /// <summary>「今すぐ確認」が走っている間 true。ボタンを塞ぐために使う。</summary>
+    [ObservableProperty]
+    public partial bool IsCheckingUpdate { get; set; }
 
     // 新しい版が見つかったときだけ出す行 (版の表示とリリースページへのボタン)。
     [ObservableProperty]
@@ -562,6 +566,43 @@ public partial class MainPageViewModel : ObservableObject
         // NotifiedVersion は画面で編集しない。読み込んだ値をそのまま保つ。
     }
 
+    /// <summary>
+    /// 「今すぐ確認」ボタン。定期の確認を待たずに GitHub へ問い合わせる。
+    /// <para>
+    /// 覚えている結果も、知らせ済みの版の抑止も通さない。押した人は、今この
+    /// 瞬間に新しい版が出ているかを知りたい。結果の表示は CheckCompleted 経由で
+    /// 行う。
+    /// </para>
+    /// </summary>
+    [RelayCommand]
+    private async Task CheckUpdateAsync()
+    {
+        // 押し続けても確認が積み上がらないようにする。確認 1 回で GitHub の
+        // API を数回叩くので、連打すると認証無しのレート枠を使い切る。
+        // ボタンは IsCheckingUpdate で塞いであるが、反映が届く前の連打も
+        // ここで落とす。
+        if (_updates is null || IsCheckingUpdate) return;
+
+        IsCheckingUpdate = true;
+        UpdateStatus = "確認しています...";
+        try
+        {
+            var result = await _updates.CheckAsync(manual: true);
+            if (result is null)
+            {
+                UpdateStatus = "確認できませんでした (設定を読めません)";
+            }
+        }
+        catch (Exception ex)
+        {
+            UpdateStatus = $"確認できませんでした: {ex.Message}";
+        }
+        finally
+        {
+            IsCheckingUpdate = false;
+        }
+    }
+
     [RelayCommand]
     private void OpenReleasePage()
     {
@@ -585,12 +626,12 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>
     /// 確認の結果を画面へ反映する。UI スレッドで呼ばれる。
     /// <para>
-    /// 知らせ済みの版は UpToDate に倒されて届く。その場合も新しい版の行は
-    /// 出したままにする。通知を抑えるのは繰り返しのバルーンであって、
-    /// 画面からの導線ではない。
+    /// 自動の確認では、知らせ済みの版が UpToDate に倒されて届く。その場合も
+    /// 新しい版の行は出したままにする。通知を抑えるのは繰り返しのバルーンで
+    /// あって、画面からの導線ではない。
     /// </para>
     /// </summary>
-    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel)
+    private void HandleUpdateCheckCompleted(UpdateCheckResult result, UpdateChannel channel, bool manual)
     {
         if (_updates is null) return;
 
@@ -625,10 +666,14 @@ public partial class MainPageViewModel : ObservableObject
         if (result.Outcome == UpdateCheckOutcome.Available && result.Release is { } release)
         {
             AppendLog($"新しい版 {release.Tag} が出ています (実行中: {current})");
-            // 確認は背後で走るので、画面を見ていない利用者にも届くようバルーンを出す。
-            ToastRequested?.Invoke(
-                "VRCToolsDataSync の更新",
-                $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
+            if (!manual)
+            {
+                // 自動の確認は背後で走るので、画面を見ていない利用者にも届くよう
+                // バルーンを出す。押した人は画面の前に居るので出さない。
+                ToastRequested?.Invoke(
+                    "VRCToolsDataSync の更新",
+                    $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
+            }
             // 画面と通知に出せた後で覚える。出せなかった版まで覚えると、
             // 利用者が一度も見ないまま以後の確認で抑止される。
             _updates.MarkNotified(release);

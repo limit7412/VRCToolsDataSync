@@ -165,8 +165,12 @@
                                 <ComboBoxItem Content="安定版 (stable)" />
                                 <ComboBoxItem Content="テスト版 (test)" />
                             </ComboBox>
+                            <Button Content="今すぐ確認"
+                                    VerticalAlignment="Center"
+                                    Command="{x:Bind ViewModel.CheckUpdateCommand}"
+                                    IsEnabled="{x:Bind ViewModel.IsCheckingUpdate, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
                         </StackPanel>
-                        <TextBlock Text="更新の確認は起動時と 1 日ごとに自動で行われます。チャンネルの変更は「設定を保存」で反映されます。テスト版は master の変更ごとに作られるプレリリースです。"
+                        <TextBlock Text="更新の確認は起動時と 1 日ごとに自動で行われます。「今すぐ確認」は保存済みの結果を使わず、その場で GitHub に問い合わせます。チャンネルの変更は「設定を保存」で反映されます。テスト版は master の変更ごとに作られるプレリリースです。"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap" />
                         <StackPanel Orientation="Horizontal" Spacing="8"

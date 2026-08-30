@@ -12,8 +12,9 @@ namespace VRCToolsDataSync_App.Services;
 /// 本体の更新確認を回す常駐側の入り口 (issue #45)。
 /// <para>
 /// 起動からしばらく後に一度、以後は 1 日ごとに確認する。止める設定は無く、
-/// 確認は常に自動で走る。確認そのもの (<see cref="UpdateChecker"/>) と、
-/// 通知済みの記録の永続化、チャンネル設定の読み出しをまとめる。
+/// 確認は常に自動で走る。画面の「今すぐ確認」もここを通る。確認そのもの
+/// (<see cref="UpdateChecker"/>) と、通知済みの記録の永続化、チャンネル設定の
+/// 読み出しをまとめる。
 /// </para>
 /// </summary>
 public sealed class UpdateManager : IDisposable
@@ -31,7 +32,8 @@ public sealed class UpdateManager : IDisposable
     private readonly ILogger _logger;
     private readonly Timer _timer;
 
-    // 定期の確認と、チャンネルを変えたときの確認が重ならないように直列化する。
+    // 定期の確認、チャンネルを変えたときの確認、手動の確認が重ならないように
+    // 直列化する。
     private readonly SemaphoreSlim _checkGate = new(1, 1);
 
     // 取得は 1 本ずつ。同じ ZIP へ 2 本が書くと壊れる。
@@ -51,13 +53,16 @@ public sealed class UpdateManager : IDisposable
     private readonly CancellationTokenSource _lifetime = new();
 
     /// <summary>
-    /// 確認が終わるたびに上がる。結果は通知済みの抑止を通した後のものになる。
+    /// 確認が終わるたびに上がる。自動の確認では通知済みの抑止を通した後の
+    /// 結果になる。
     /// 第 2 引数は確認に使ったチャンネル。確認中にチャンネルを変えて保存すると
     /// 前のチャンネルの結果が遅れて届くため、受け側は保存済みのチャンネルと
     /// 突き合わせてから画面や通知に載せる。
+    /// 第 3 引数は手動の確認かどうか。押した人が画面を見ているので、受け側は
+    /// バルーンを出さない。
     /// ハンドラはバックグラウンドスレッドで呼ばれるので、UI 側でディスパッチする。
     /// </summary>
-    public event Action<UpdateCheckResult, UpdateChannel>? CheckCompleted;
+    public event Action<UpdateCheckResult, UpdateChannel, bool>? CheckCompleted;
 
     /// <summary>取得が済んで置き換え待ちになった (または捨てられた) ときに上がる。</summary>
     public event Action? StagedChanged;
@@ -120,8 +125,15 @@ public sealed class UpdateManager : IDisposable
     /// 確認は起動のたびに必ず走る。止める設定は置かない。知らせ済みの版は
     /// UpToDate へ倒してから返し、同じ版のバルーンを起動のたびに出さない。
     /// </para>
+    /// <para>
+    /// <paramref name="manual"/> のときは、その抑止を通さずに結末を返す。
+    /// 押した人に「最新である」と答えながら画面に新しい版を出すわけには
+    /// いかない。覚えている結果も使わず、必ず GitHub へ問い合わせる。
+    /// </para>
     /// </summary>
-    public async Task<UpdateCheckResult?> CheckAsync(CancellationToken cancellationToken = default)
+    /// <param name="manual">画面の「今すぐ確認」から呼ばれたか。</param>
+    public async Task<UpdateCheckResult?> CheckAsync(
+        bool manual = false, CancellationToken cancellationToken = default)
     {
         UpdateChannel channel;
         try
@@ -138,11 +150,11 @@ public sealed class UpdateManager : IDisposable
         try
         {
             var result = await _checker.CheckAsync(CurrentVersion, channel, cancellationToken).ConfigureAwait(false);
-            result = _checker.SuppressNotified(result);
+            if (!manual) result = _checker.SuppressNotified(result);
 
             try
             {
-                CheckCompleted?.Invoke(result, channel);
+                CheckCompleted?.Invoke(result, channel, manual);
             }
             catch (Exception ex)
             {
