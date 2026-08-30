@@ -504,6 +504,25 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
     }
 
+    [Fact(DisplayName = "展開の失敗の数は、別の ZIP のものを引き継がない")]
+    public void ExtractFailureCountIsScopedToTheStagedZip()
+    {
+        var stage = StageWith("0.0.10");
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry("app/foo.dll");
+        }
+
+        // 前の ZIP で 2 回失敗した数が消せずに残っている状況。
+        File.WriteAllText(Path.Combine(_directory, "extract-failures"), "deadbeef 2");
+        File.WriteAllText(stage.ExtractDirectory, "");
+
+        // 引き継いでいれば 3 回目として捨てられる。別の ZIP の数なので 1 回目として
+        // 扱い、取得は残す。
+        Assert.Throws<IOException>(() => stage.ExtractForApply());
+    }
+
     [Fact(DisplayName = "展開が通れば、それまでの失敗の数は忘れる")]
     public void ForgetsExtractionFailuresAfterASuccess()
     {

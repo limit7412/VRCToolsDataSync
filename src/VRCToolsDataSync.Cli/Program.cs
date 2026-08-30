@@ -591,12 +591,26 @@ static int CollectGarbage(int graceDays, bool dryRun)
 
 static int ApplySelfUpdate(string source, string target, int? waitPid, long? waitStarted, bool relaunch)
 {
-    using var loggerFactory = LoggerFactory.Create(builder =>
+    // ログの置き場所を作れなくても続ける。ここで落ちると、親の App は
+    // 「起きてすぐ落ちたヘルパ = 壊れた配布物」と見なして取得を捨てる。
+    // 数百 MB の取り直しを、ログを書けないことの代償にしてはいけない。
+    ILoggerFactory? loggerFactory = null;
+    try
     {
-        builder.SetMinimumLevel(LogLevel.Information);
-        builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
-    });
-    var logger = loggerFactory.CreateLogger("SelfUpdate");
+        loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Information);
+            builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"ログを開けませんでした ({ex.Message})。ログ無しで続行します。");
+    }
+
+    using var loggerFactoryScope = loggerFactory;
+    var logger = loggerFactory?.CreateLogger("SelfUpdate")
+        ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
 
     // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
     // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま

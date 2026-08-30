@@ -702,10 +702,13 @@ public sealed class UpdateStage
         // EnsureExtractable より先に消すのは、あちらが空きを測るためである。
         // 残骸を数に入れたまま測ると、消せば足りる状況でも容量不足として断り、
         // その先の削除まで進めないまま繰り返すことになる。
-        DeleteDirectoryQuietly(ExtractDirectory);
-        if (System.IO.Directory.Exists(ExtractDirectory))
+        // 消せない場合も、展開そのものの失敗と同じ数え方に乗せる。掴まれている
+        // だけなら次の機会に通るが、何度やっても消せないなら取得を持ち続けても
+        // 適用できないので、そこで捨てて抜け出す。
+        if (!DeleteDirectoryQuietly(ExtractDirectory))
         {
-            throw new IOException($"前回の展開先を消せなかったため展開しない: {ExtractDirectory}");
+            throw ClassifyExtractFailure(
+                new IOException($"前回の展開先を消せなかったため展開しない: {ExtractDirectory}"));
         }
 
         EnsureExtractable();
@@ -766,13 +769,26 @@ public sealed class UpdateStage
     /// 0 から数え直す。数えられない状況 (容量不足など) は、そもそも取得を
     /// 残したい側なので、数が進まないことが困る形にはならない。
     /// </para>
+    /// <para>
+    /// 中身は「記録の digest」と回数の組にする。数を消し損ねても、別の ZIP の
+    /// 回数として無視されるので、新しい取得が前の回数を引き継がない。
+    /// </para>
     /// </summary>
     private int RecordExtractFailure()
     {
+        // どの ZIP の回数かを、記録の digest で見分ける。数を消す側が失敗した場合や、
+        // 昇格の直後に落ちた場合、前の ZIP の回数がそのまま残る。それを引き継ぐと、
+        // 新しい ZIP が 1 度つまずいただけで捨てられる。
+        var generation = TryLoadMetadata()?.DigestHex ?? string.Empty;
+
         var failures = 1;
         try
         {
-            if (int.TryParse(File.ReadAllText(ExtractFailureCountPath), out var previous) && previous > 0)
+            var parts = File.ReadAllText(ExtractFailureCountPath).Split(' ', 2);
+            if (parts.Length == 2
+                && string.Equals(parts[0], generation, StringComparison.Ordinal)
+                && int.TryParse(parts[1], out var previous)
+                && previous > 0)
             {
                 failures = previous + 1;
             }
@@ -785,7 +801,9 @@ public sealed class UpdateStage
         try
         {
             System.IO.Directory.CreateDirectory(Directory);
-            File.WriteAllText(ExtractFailureCountPath, failures.ToString(CultureInfo.InvariantCulture));
+            File.WriteAllText(
+                ExtractFailureCountPath,
+                $"{generation} {failures.ToString(CultureInfo.InvariantCulture)}");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -1115,15 +1133,29 @@ public sealed class UpdateStage
         }
     }
 
-    private void DeleteDirectoryQuietly(string path)
+    /// <summary>
+    /// 消せたか (もともと無かった場合も true) を返す。
+    /// <para>
+    /// 「あるか」を先に見てから消す形にはしない。<c>Directory.Exists</c> は権限や
+    /// ファイルシステムの一時的な失敗でも false を返すため、消せていないものを
+    /// 消せたことにしてしまう。消しに行って、「無かった」だけを成功として分ける。
+    /// </para>
+    /// </summary>
+    private bool DeleteDirectoryQuietly(string path)
     {
         try
         {
-            if (System.IO.Directory.Exists(path)) System.IO.Directory.Delete(path, recursive: true);
+            System.IO.Directory.Delete(path, recursive: true);
+            return true;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogWarning(ex, "消せなかった: {Path}", path);
+            return false;
         }
     }
 }

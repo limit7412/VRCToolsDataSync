@@ -260,7 +260,7 @@ public class UpdateInstaller
         foreach (var part in Parts)
         {
             var fresh = Path.Combine(_targetDirectory, part + ".new");
-            DeleteDirectoryIfExists(fresh);
+            ClearLeftover(fresh);
             CopyDirectory(Path.Combine(_sourceDirectory, part), fresh);
         }
 
@@ -500,8 +500,25 @@ public class UpdateInstaller
         }
     }
 
+    /// <summary>
+    /// 消す。もともと無ければ何もしない。
+    /// <para>
+    /// 「あるか」を先に見てから消す形にはしない。<c>Directory.Exists</c> は権限や
+    /// ファイルシステムの一時的な失敗でも false を返すため、消せていないものを
+    /// 消せたことにしてしまう。その先で正規の位置に触って失敗すると、呼び出し側は
+    /// 一般の失敗として扱い、取得しておいたものまで捨てる。消しに行って、
+    /// 「無かった」だけを成功として分ける。
+    /// </para>
+    /// </summary>
     private static void DeleteDirectoryIfExists(string path)
     {
-        if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // もともと無い。
+        }
     }
 }
