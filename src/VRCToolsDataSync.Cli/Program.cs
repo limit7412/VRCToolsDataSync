@@ -640,7 +640,27 @@ static int ApplySelfUpdate(string source, string target, int? waitPid, long? wai
         // 取れないまま起動を続けた場合など) 渡ってくることもある。
         if (!WaitForCaller(waitPid, waitStarted, logger)) return 6;
 
-        return ApplySelfUpdateCore(source, target, relaunch, logger);
+        // 多重起動の抑止も掴む。呼び出し元が終わった時点でこれも空くので、
+        // 普通はそのまま取れる。掴まないと、入れ替えの最中に起動した App が
+        // 旧 app\ を読み込んで掴み、入れ替えを失敗させたり、置き換え済みの
+        // 一式をもう一度置き換えさせて退避した旧版を上書きさせたりする。
+        //
+        // App はこの名前の Mutex が既にあるかで判断するので、所有権ではなく
+        // 開いた手を持ち続けるだけでよい。
+        using var singleInstance = new Mutex(
+            initiallyOwned: false, name: UpdateInstaller.SingleInstanceMutexName, out var createdNew);
+        if (!createdNew)
+        {
+            // 呼び出し元とは別の App が動いている。正規の位置にはまだ触って
+            // いないので、取得を残したまま引き下がる。あちらが終わった後の
+            // 起動でやり直せる。ここで待つと、あちらが適用のロック (こちらが
+            // 握っている) を待っている場合に噛み合わなくなる。
+            Console.Error.WriteLine("App が起動しているため、置き換えを中止しました。");
+            try { logger.LogWarning("App が動いているため置き換えない"); } catch { /* best-effort */ }
+            return 6;
+        }
+
+        return ApplySelfUpdateCore(source, target, relaunch, logger, singleInstance);
     }
     finally
     {
@@ -718,7 +738,12 @@ static bool WaitForCaller(int? waitPid, long? waitStarted, ILogger logger)
     }
 }
 
-static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILogger logger)
+/// <param name="singleInstance">
+/// 置き換えの間だけ掴んでいる多重起動の抑止。App を起動し直す前に手放す。
+/// 掴んだまま起動すると、起動した App が「他に動いている」と見て即座に終わる。
+/// </param>
+static int ApplySelfUpdateCore(
+    string source, string target, bool relaunch, ILogger logger, IDisposable? singleInstance = null)
 {
     // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
     // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
@@ -749,6 +774,7 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
         // 見送りの指定つきで開き直す。付けずに開き直すと、その App が同じ
         // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、
         // という往復になる。
+        singleInstance?.Dispose();
         if (relaunch) TryRelaunchApp(target, logger, skipUpdateApply: true);
         return 9;
     }
@@ -809,10 +835,12 @@ static int ApplySelfUpdateCore(string source, string target, bool relaunch, ILog
         }
 
         // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。
+        singleInstance?.Dispose();
         if (relaunch) TryRelaunchApp(target, logger);
         return 1;
     }
 
+    singleInstance?.Dispose();
     if (relaunch && !TryRelaunchApp(target, logger))
     {
         // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。

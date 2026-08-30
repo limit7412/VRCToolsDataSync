@@ -86,6 +86,9 @@ public sealed class UpdateStage
     /// <summary>ZIP に添える記録。</summary>
     public string MetadataPath => Path.Combine(Directory, "staged.json");
 
+    /// <summary>昇格の途中で横へ書く記録。付け替えに失敗した場合はここに残る。</summary>
+    private string IncomingMetadataPath => MetadataPath + ".new";
+
     /// <summary>置き換えの直前に ZIP を展開する場所。</summary>
     public string ExtractDirectory => Path.Combine(Directory, "extracted");
 
@@ -181,7 +184,7 @@ public sealed class UpdateStage
 
         // 新しい記録は、対に触る前に横へ書いておく。書けない状況 (容量不足や
         // ACL) はここで分かるので、その場合は前の対が無傷のまま残る。
-        var incomingMetadata = MetadataPath + ".new";
+        var incomingMetadata = IncomingMetadataPath;
         File.WriteAllText(incomingMetadata, JsonSerializer.Serialize(metadata, JsonOptions));
 
         // 記録を先に消す。ZIP を入れ替えた後で記録を置けなかった場合、
@@ -432,6 +435,7 @@ public sealed class UpdateStage
         var zip = DeleteQuietly(ZipPath);
         var metadata = DeleteQuietly(MetadataPath);
         DeleteQuietly(IncomingZipPath);
+        DeleteQuietly(IncomingMetadataPath, quiet: true);
         DeleteDirectoryQuietly(ExtractDirectory);
         ForgetExtractFailures();
         return zip && metadata;
@@ -447,6 +451,8 @@ public sealed class UpdateStage
     /// </summary>
     public void DiscardIncomplete()
     {
+        TryFinishInterruptedPromote();
+
         var zip = Present(ZipPath);
         var metadata = Present(MetadataPath);
 
@@ -457,6 +463,38 @@ public sealed class UpdateStage
 
         _logger.LogInformation("途中で終わった取得を片付ける: {Path}", ZipPath);
         Discard();
+    }
+
+    /// <summary>
+    /// 昇格の最後の付け替えだけが済んでいない状態を、ここで仕上げる。
+    /// <para>
+    /// 昇格は「新しい記録を横へ書く → 古い記録を消す → ZIP を入れ替える →
+    /// 記録を置く」の順で進む。最後の付け替えだけが失敗すると、新しい ZIP は
+    /// 正規の場所に居るのに記録が無い、という形で止まる。片方だけの状態として
+    /// 捨てると、照合まで通った取得を丸ごと捨てることになる。横に残っている
+    /// 記録を置き直せば済むので、捨てる判断の前に一度試す。
+    /// </para>
+    /// <para>
+    /// 置き直した対が食い違っている場合 (ZIP を入れ替える前に止まっていた場合)
+    /// は、この後の照合が digest と大きさで気付いて捨てる。ここで確かめ直す
+    /// 必要は無い。
+    /// </para>
+    /// </summary>
+    private void TryFinishInterruptedPromote()
+    {
+        if (Present(ZipPath) != true) return;
+        if (Present(MetadataPath) != false) return;
+        if (Present(IncomingMetadataPath) != true) return;
+
+        try
+        {
+            _logger.LogInformation("昇格の途中で止まった記録を置き直す: {Path}", MetadataPath);
+            MoveWithRetry(IncomingMetadataPath, MetadataPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "昇格の途中で止まった記録を置き直せなかった: {Path}", MetadataPath);
+        }
     }
 
     /// <summary>
@@ -621,20 +659,23 @@ public sealed class UpdateStage
     {
         using var archive = System.IO.Compression.ZipFile.OpenRead(ZipPath);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var total = 0L;
         foreach (var entry in archive.Entries)
         {
             var key = ExtractionKeyOf(entry.FullName);
 
             // ディレクトリの項目は名前が空になる。同じ場所に重なっても害が
-            // 無いので、突き合わせの対象からは外す。ただし展開先の外を指す
-            // かどうかは、ディレクトリの項目でも見る。
+            // 無いので、名前の突き合わせの対象からは外す。ただし展開先の外を
+            // 指すかどうかと、同じ場所にファイルが来ないかは、ディレクトリの
+            // 項目でも見る。
             if (string.IsNullOrEmpty(entry.Name))
             {
                 if (key is null)
                 {
                     throw new InvalidDataException($"展開先の外を指す項目のある ZIP は展開できない: {entry.FullName}");
                 }
+                AddWithAncestors(directories, key);
                 continue;
             }
 
@@ -651,6 +692,10 @@ public sealed class UpdateStage
                 throw new InvalidDataException($"同じパスの項目が複数ある ZIP は展開できない: {entry.FullName}");
             }
 
+            // ファイルの手前の段は、展開すればディレクトリになる。
+            var parent = ParentOf(key);
+            if (parent is not null) AddWithAncestors(directories, parent);
+
             // 足す前に見る。項目の大きさは ZIP の目録に書かれた値をそのまま
             // 受け取るので、桁を偽られると足し算が折り返し、負の合計として
             // 上限も空き容量の確認もすり抜ける。
@@ -663,7 +708,34 @@ public sealed class UpdateStage
             total += entry.Length;
         }
 
+        // 同じ場所をファイルとディレクトリの両方にはできない。app/foo という
+        // ファイルと app/foo/bar.dll のような組み合わせは、名前が重なっていない
+        // ので上の突き合わせでは通るが、展開すれば必ず失敗する。展開の失敗は
+        // 一時的なものと見分けられず数回の空振りになるので、ここで断る。
+        seen.IntersectWith(directories);
+        if (seen.Count > 0)
+        {
+            throw new InvalidDataException(
+                $"同じ場所がファイルとディレクトリの両方になる ZIP は展開できない: {string.Join(", ", seen)}");
+        }
+
         EnsureSpaceFor(total);
+    }
+
+    /// <summary>段の手前を返す。手前が無い (最上段の) 場合は null。</summary>
+    private static string? ParentOf(string key)
+    {
+        var slash = key.LastIndexOf('/');
+        return slash < 0 ? null : key[..slash];
+    }
+
+    /// <summary>ディレクトリとして扱う場所を、その手前の段まで含めて足す。</summary>
+    private static void AddWithAncestors(HashSet<string> directories, string key)
+    {
+        for (string? current = key; current is not null; current = ParentOf(current))
+        {
+            if (!directories.Add(current)) return;
+        }
     }
 
     /// <summary>

@@ -76,6 +76,22 @@ public class UpdateInstaller
     /// </summary>
     public const string SkipUpdateApplySwitch = "--skip-update-apply";
 
+    /// <summary>
+    /// App の多重起動を抑止する Named Mutex の名前。
+    /// <para>
+    /// 更新ヘルパも置き換えの間これを掴む。App はこの名前の Mutex が既にあるかで
+    /// 「他に動いている」を判断するので、掴んでいる間は新しい App が立ち上がらない。
+    /// 掴まないと、置き換えの最中に起動した App が旧 <c>app\</c> を読み込んで
+    /// 掴み、入れ替えを失敗させたり、置き換え済みの一式をもう一度置き換えさせて
+    /// 退避した旧版を上書きさせたりする。
+    /// </para>
+    /// <para>
+    /// <c>Global\</c> は付けない。App 側と同じ名前でなければ意味が無く、
+    /// あちらは対話セッション内の抑止として置かれている (#52)。
+    /// </para>
+    /// </summary>
+    public const string SingleInstanceMutexName = "VRCToolsDataSync.App.SingleInstance";
+
     /// <summary>置き換えの対象になる、インストール先直下のディレクトリ。</summary>
     private static readonly string[] Parts = { "app", "cli" };
 

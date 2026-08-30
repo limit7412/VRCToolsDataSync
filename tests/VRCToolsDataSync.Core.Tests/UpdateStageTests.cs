@@ -516,6 +516,46 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Throws<IOException>(() => stage.ExtractForApply());
     }
 
+    [Fact(DisplayName = "昇格の最後の付け替えだけが済んでいない対は、捨てずに仕上げる")]
+    public void FinishesPromoteThatStoppedAtTheLastRename()
+    {
+        // 昇格を通した後、記録だけを横へ戻す。ZIP は入れ替え済みで記録の
+        // 付け替えだけが失敗した状態と同じ形になる。
+        var stage = StageWith("0.0.10");
+        var zipBefore = File.ReadAllBytes(stage.ZipPath);
+        File.Move(stage.MetadataPath, stage.MetadataPath + ".new");
+
+        stage.DiscardIncomplete();
+
+        // 捨てずに記録を置き直す。照合まで通った取得を、付け替えの失敗だけで
+        // 失わせない。
+        Assert.True(File.Exists(stage.MetadataPath));
+        Assert.False(File.Exists(stage.MetadataPath + ".new"));
+        Assert.Equal(zipBefore, File.ReadAllBytes(stage.ZipPath));
+        Assert.NotNull(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9"));
+    }
+
+    [Theory(DisplayName = "同じ場所がファイルとディレクトリの両方になる ZIP は断る")]
+    [InlineData("app/foo", "app/foo/bar.dll")]
+    [InlineData("app/foo/bar.dll", "app/foo")]
+    [InlineData("app/foo", "app/foo/")]
+    public void RefusesArchiveWhereAFileCollidesWithADirectory(string first, string second)
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 名前としては重なっていないので項目名の突き合わせでは通るが、
+        // 展開すれば必ず失敗する。一時的な失敗と見分けられないため先に断る。
+        using (var file = File.Create(stage.ZipPath))
+        using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            archive.CreateEntry(first);
+            archive.CreateEntry(second);
+        }
+
+        Assert.Throws<InvalidDataException>(() => stage.ExtractForApply());
+    }
+
     [Fact(DisplayName = "存在の判定は、無いと分かった場合だけ false にする")]
     public void PresenceIsUnknownWhenItCannotBeDetermined()
     {
