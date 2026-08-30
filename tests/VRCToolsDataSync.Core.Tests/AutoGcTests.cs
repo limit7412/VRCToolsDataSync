@@ -170,6 +170,31 @@ public sealed class AutoGcTests : IDisposable
         Assert.NotNull(runner.CollectGarbageIfDue(storage));
     }
 
+    [Fact(DisplayName = "手動実行に渡した猶予期間が判定に使われる")]
+    public void ManualRunHonorsGivenGracePeriod()
+    {
+        // GUI の「今すぐ解放」は猶予期間を日数で受け取って渡す。既定 (7 日) では
+        // 残る新しい孤児が、短い猶予期間では対象になることを確かめる。
+        var storage = new FakeSyncStorage { Now = DateTimeOffset.UtcNow };
+        var twoDaysAgo = DateTimeOffset.UtcNow - TimeSpan.FromDays(2);
+        storage.Seed(BlobKeys.Prefix + "aaa", "live", twoDaysAgo);
+        storage.Seed(BlobKeys.Prefix + "bbb", "orphan", twoDaysAgo);
+        storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
+
+        // 既定の猶予期間では、2 日前のものはまだ残る。
+        var withDefault = new SyncRunner(CreateStore()).CollectGarbageNow(storage, dryRun: true);
+        Assert.Equal(0, withDefault.Deleted);
+        Assert.Equal(1, withDefault.Young);
+
+        // 1 日まで詰めると対象になる。
+        var withShortGrace = new SyncRunner(CreateStore())
+            .CollectGarbageNow(storage, TimeSpan.FromDays(1));
+
+        Assert.Equal(1, withShortGrace.Deleted);
+        Assert.False(storage.Has(BlobKeys.Prefix + "bbb"));
+        Assert.True(storage.Has(BlobKeys.Prefix + "aaa"));
+    }
+
     [Fact(DisplayName = "未来を指す記録は無視して回収し、正しい時刻で置き換える")]
     public void FutureRecordDoesNotSuppressGc()
     {

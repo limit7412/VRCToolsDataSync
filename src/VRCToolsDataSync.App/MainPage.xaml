@@ -119,13 +119,23 @@
                     </StackPanel>
 
                     <StackPanel Spacing="4">
-                        <TextBlock Text="ストレージの回収" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock Text="ストレージ容量の解放" Style="{StaticResource BodyStrongTextBlockStyle}" />
                         <StackPanel Orientation="Horizontal" Spacing="8">
-                            <Button Content="今すぐ回収"
+                            <NumberBox Header="猶予期間 (日)"
+                                       Value="{x:Bind ViewModel.GcGraceDays, Mode=TwoWay}"
+                                       Minimum="{x:Bind ViewModel.MinGcGraceDays}"
+                                       Maximum="{x:Bind ViewModel.MaxGcGraceDays}"
+                                       SpinButtonPlacementMode="Compact"
+                                       Width="140" />
+                            <Button Content="今すぐ解放"
+                                    VerticalAlignment="Bottom"
                                     Command="{x:Bind ViewModel.CollectGarbageCommand}"
                                     IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
                         </StackPanel>
-                        <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから 7 日以上経ったデータを保存先から削除します。Push の後始末として 1 日 1 回自動でも実行されます。"
+                        <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから猶予期間より長く経ったデータを保存先から削除します。猶予期間を短くするほど多く解放できます。"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Text="猶予期間は、他の PC が送っている最中のデータを巻き込まないための余裕です。Push の後始末として 1 日 1 回、猶予期間 7 日で自動でも実行されます。"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap" />
                     </StackPanel>
