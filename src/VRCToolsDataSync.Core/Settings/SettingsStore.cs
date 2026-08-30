@@ -157,24 +157,19 @@ public sealed class SettingsStore
     /// 設定を巻き戻す。
     /// </para>
     /// <para>
-    /// settings.json が読めない場合は書かずに例外を伝える。マージは読めない
-    /// ディスクを「無い」扱いにして incoming を採用するので、ここで渡す既定値
-    /// だらけの settings が、破損しただけのファイルを正常な形で上書きし、
-    /// 保存先や自動同期の設定が無言で消えるためである。
+    /// settings.json があるのに読めない場合は書かずに例外を伝える (#57)。ここで
+    /// 渡す settings はこの記録以外すべて既定値なので、読めないまま書くと設定を
+    /// 既定値で塗り潰すことになる。判断は保存と同じ排他の下で行うので、確かめて
+    /// から書くまでの間に割り込まれない。
     /// </para>
     /// </summary>
     public void SaveLastGcAt(string storageStateKey, DateTimeOffset at)
     {
-        // 読めることを先に確かめる。ファイルがまだ無い場合は Load が既定値を
-        // 返すので、初回の保存はそのまま通る。確かめてから保存するまでの間に
-        // 壊れる可能性は残るが、その幅は保存の一瞬しかない。
-        _ = Load();
-
         // 中身はディスク側を全面的に採用し、この記録だけを載せる。
         // どちらが残るかは MergeForSave がキーごとの新しさで決める。
         var settings = new SyncSettings();
         settings.LastGcAt[storageStateKey] = at;
-        SaveInternal(settings, mergeTopLevelFromDisk: true);
+        SaveInternal(settings, mergeTopLevelFromDisk: true, requireReadableDisk: true);
     }
 
     /// <summary>
@@ -185,6 +180,12 @@ public sealed class SettingsStore
     /// こちらが起動時に読んだ古い値で巻き戻す。読み書きはクロスプロセスの
     /// 排他の下で行われるため、読んでから書くまでの間に割り込まれない。
     /// </para>
+    /// <para>
+    /// settings.json があるのに読めない場合は書かずに例外を伝える (#57)。ここで
+    /// 渡す settings はこの記録以外すべて既定値なので、読めないまま書くと設定を
+    /// 既定値で塗り潰すことになる。呼び出し元 (UpdateManager.MarkNotified) は
+    /// これを捕らえて記録に残す。知らせ直しが起きるだけで、設定は失われない。
+    /// </para>
     /// </summary>
     public void SaveNotifiedVersion(string tag)
     {
@@ -192,10 +193,18 @@ public sealed class SettingsStore
         // 実際にどちらの版が残るかは MergeForSave が版の新しさで決める。
         var settings = new SyncSettings();
         settings.Update.NotifiedVersion = tag;
-        SaveInternal(settings, mergeTopLevelFromDisk: true);
+        SaveInternal(settings, mergeTopLevelFromDisk: true, requireReadableDisk: true);
     }
 
-    private void SaveInternal(SyncSettings settings, bool mergeTopLevelFromDisk)
+    /// <param name="requireReadableDisk">
+    /// ディスクの現行値を読めないまま保存してはいけない場合に true。
+    /// 記録だけを書く経路 (<see cref="SaveNotifiedVersion"/> /
+    /// <see cref="SaveLastGcAt"/>) がこれを使う。あちらが渡す
+    /// <see cref="SyncSettings"/> は当の記録以外すべて既定値なので、読めないまま
+    /// 書くと設定を既定値で塗り潰すことになる (#57)。
+    /// </param>
+    private void SaveInternal(
+        SyncSettings settings, bool mergeTopLevelFromDisk, bool requireReadableDisk = false)
     {
         var dir = Path.GetDirectoryName(FilePath);
         if (!string.IsNullOrEmpty(dir))
@@ -233,7 +242,7 @@ public sealed class SettingsStore
                 // tool キー単位でマージする。これにより、別プロセス/別 SyncRunner
                 // が同じ settings.json に対して別 tool の状態更新を入れた直後でも、
                 // 自分の Save がそれを消し飛ばさない。
-                var merged = MergeForSave(settings, mergeTopLevelFromDisk);
+                var merged = MergeForSave(settings, mergeTopLevelFromDisk, requireReadableDisk);
 
                 var tmp = FilePath + ".tmp-" + Guid.NewGuid().ToString("N");
                 try
@@ -304,18 +313,36 @@ public sealed class SettingsStore
     /// </para>
     /// ToolState は tool キーごとに、より新しいタイムスタンプを持つ側を採用する。
     /// </summary>
-    private SyncSettings MergeForSave(SyncSettings incoming, bool mergeTopLevelFromDisk)
+    private SyncSettings MergeForSave(
+        SyncSettings incoming, bool mergeTopLevelFromDisk, bool requireReadableDisk)
     {
         SyncSettings disk;
-        bool diskAvailable;
+        var diskAvailable = false;
         try
         {
             diskAvailable = File.Exists(FilePath);
             disk = Load();
         }
-        catch
+        catch (Exception ex)
         {
-            // 読み込めない場合 (初回 / ファイル破損) はマージ不要、incoming をそのまま使う。
+            // 「まだ無い」と「あるのに読めない」は別の話である (#57)。
+            //
+            // まだ無いなら、incoming をそのまま使うのが正しい (初回の保存)。
+            // あるのに読めない場合に同じ扱いをすると、マージの土台が無いまま
+            // incoming を書くことになる。記録だけを書く経路は既定値だらけの
+            // settings を渡すので、壊れただけの、あるいは一瞬掴まれていただけの
+            // ファイルが既定値で上書きされ、保存先や自動同期の設定が無言で消える。
+            //
+            // 消える前に止める。ファイルはそのまま残るので、中身を直すか退避して
+            // から消せば元に戻せる。
+            if (requireReadableDisk && diskAvailable)
+            {
+                throw new IOException(
+                    $"設定ファイルを読めないため保存しません: {FilePath}。" +
+                    "このまま書くと、読めなかった内容が失われます。" +
+                    "中身を直すか、退避してから消してください。", ex);
+            }
+
             disk = new SyncSettings();
             diskAvailable = false;
         }

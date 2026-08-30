@@ -162,4 +162,47 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         // 数値で書くと、目で読めず手直しもできない。
         Assert.Contains("\"test\"", json, StringComparison.Ordinal);
     }
+    [Fact(DisplayName = "settings.json が読めない場合、通知済みの版の保存は既定値で上書きせずに失敗する")]
+    public void SaveNotifiedVersionDoesNotClobberCorruptedSettings()
+    {
+        // マージは読めないディスクを「無い」扱いにするので、確かめずに保存すると
+        // 既定値だらけの settings が破損したファイルを正常な形で上書きし、
+        // 保存先などの設定が無言で消える (#57)。
+        var store = CreateStore();
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(store.FilePath, "{ broken");
+
+        Assert.ThrowsAny<Exception>(() => store.SaveNotifiedVersion("0.0.10-test1"));
+        Assert.Equal("{ broken", File.ReadAllText(store.FilePath));
+    }
+
+    [Fact(DisplayName = "settings.json がまだ無ければ、記録だけの保存も通る")]
+    public void RecordOnlySaveWorksWhenSettingsFileIsAbsent()
+    {
+        // 「まだ無い」と「あるのに読めない」は別の話である。無いだけなら、
+        // その記録を持つ settings を作るのが正しい。
+        var store = CreateStore();
+        Assert.False(File.Exists(store.FilePath));
+
+        store.SaveNotifiedVersion("0.0.10-test1");
+
+        Assert.Equal("0.0.10-test1", CreateStore().Load().Update.NotifiedVersion);
+    }
+
+    [Fact(DisplayName = "通常の保存は、読めない settings.json でも書き切る")]
+    public void RegularSaveStillWritesOverUnreadableSettings()
+    {
+        // 通常の保存が渡すのは、利用者が画面で組み立てた設定一式である。
+        // 既定値で塗り潰すわけではないので、ここで止めると壊れた settings.json を
+        // 直す手立てが画面から無くなる。
+        var store = CreateStore();
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(store.FilePath, "{ broken");
+
+        var settings = new SyncSettings { CloudFolderPath = @"C:\sync" };
+        store.Save(settings);
+
+        Assert.Equal(@"C:\sync", CreateStore().Load().CloudFolderPath);
+    }
+
 }
