@@ -64,6 +64,14 @@ public partial class MainPageViewModel : ObservableObject
             _updates.StagedChanged += () => OnUi(RefreshStagedRow);
             RefreshStagedRow();
         }
+
+        if (UpdateApplier.StartedAfterDeferral)
+        {
+            // ヘルパが置き換えを断念して開き直した回である (#61)。ログだけだと
+            // 「再起動したのに更新されない」としか分からないので、画面にも出す。
+            AppendLog("前回の再起動では更新を適用できませんでした。インストール先の app.old / cli.old を消せない場合があります。");
+            AppendLog("  詳しい理由は %AppData%\\VRCToolsDataSync\\logs のログを確認してください。");
+        }
     }
 
     /// <summary>
@@ -700,7 +708,9 @@ public partial class MainPageViewModel : ObservableObject
             UpdateStagedText = string.Empty;
             return;
         }
-        UpdateStagedText = $"{staged.Tag} を取得済み。次回起動時に適用されます";
+        UpdateStagedText = UpdateApplier.StartedAfterDeferral
+            ? $"{staged.Tag} を取得済み。前回の再起動では適用できませんでした (ログを確認してください)"
+            : $"{staged.Tag} を取得済み。次回起動時に適用されます";
         UpdateStagedVisibility = Visibility.Visible;
     }
 

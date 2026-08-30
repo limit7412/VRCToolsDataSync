@@ -36,6 +36,11 @@ public static class UpdateApplier
 
         if (StartedWithSkipSwitch())
         {
+            // ヘルパが置き換えを断念して開き直した回である。画面に理由を出せる
+            // よう覚えておく (#61)。ログだけでは、利用者から見て「再起動しても
+            // 更新されない」としか分からない。
+            StartedAfterDeferral = true;
+
             // 置き換えを断念したヘルパが開き直した回である。同じ取得をまた
             // 渡すと、ヘルパがまた同じ理由で断念して開き直す往復になる。
             // この回は見送り、そのまま起動する。取得は残るので、断念の理由
@@ -95,6 +100,16 @@ public static class UpdateApplier
             return false;
         }
     }
+
+    /// <summary>
+    /// 更新ヘルパが置き換えを見送って開き直した回か (#61)。
+    /// <para>
+    /// 見送りは取得を残したまま現行版を開き直すため、利用者から見ると
+    /// 「再起動したのに更新されない」としか分からない。画面へ理由を出すために
+    /// 起動シーケンスの判断をここに残す。
+    /// </para>
+    /// </summary>
+    public static bool StartedAfterDeferral { get; private set; }
 
     private static bool StartedWithSkipSwitch()
     {
