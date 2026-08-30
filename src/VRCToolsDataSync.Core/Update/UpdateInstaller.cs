@@ -193,17 +193,121 @@ public class UpdateInstaller
     }
 
     /// <summary>
-    /// 前回が残したものを消す。消せない場合は、今回の置き換えを見送る。
+    /// 前回が残したものを片付ける。
+    /// <para>
+    /// 置き換えに要るのは、この<b>名前が空いていること</b>だけである
+    /// (<c>app</c> を <c>app.old</c> へ退避するため)。消えている必要は無い。
+    /// そこで、消せない場合は名前をずらして先へ進む。ずらした残骸は後始末
+    /// (<see cref="DiscardPrevious"/>) が次の機会に拾う。
+    /// </para>
+    /// <para>
+    /// 消せないだけで見送っていた頃は、そこから抜け出せなかった (#61)。見送りは
+    /// 取得を残したまま App を開き直し、次の起動がまた同じ残骸で止まる。ロケール
+    /// 資源のディレクトリ 1 つが消せないだけで、以後の更新が永久に入らなくなる。
+    /// </para>
+    /// <para>
+    /// 名前をずらすことすらできない場合だけ、これまでどおり見送る。正規の位置には
+    /// まだ触っていないので、次の機会へ回して差し支えない。
+    /// </para>
     /// </summary>
     private void ClearLeftover(string path)
     {
+        if (TryDelete(path)) return;
+
+        // 消せない残骸を名前ごと退かす。配下を開かずに済むので、再帰的な削除が
+        // 通らない状況でも成功することが多い。
+        var movedAside = MoveAsideName(path);
         try
         {
-            DeleteDirectoryIfExists(path);
+            Move(path, movedAside);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             throw new UpdateDeferredException($"前回の残骸を消せないため置き換えない: {path}", ex);
+        }
+
+        LogQuietly(() => _logger.LogWarning(
+            "前回の残骸を消せないため名前をずらした: {Path} -> {Moved}", path, movedAside));
+
+        // ずらした先も消しておく。消せなくても置き換えは進む。
+        TryDelete(movedAside);
+    }
+
+    /// <summary>
+    /// ディレクトリを消す。消えた (もともと無い場合を含む) なら true。
+    /// テストから消せない状況を差し込めるよう、継ぎ目にしてある。
+    /// </summary>
+    protected virtual bool TryDelete(string path) => TryDeleteDirectory(path, _logger);
+
+    /// <summary>
+    /// 消せない残骸を退かす先の名前。既にあるものとぶつからないよう一意にする。
+    /// </summary>
+    private static string MoveAsideName(string path)
+        => path + ".trash-" + Guid.NewGuid().ToString("N")[..8];
+
+    /// <summary>
+    /// ディレクトリを消す。消えた (もともと無い場合を含む) なら true。
+    /// <para>
+    /// 一度で消えない場合は、配下の読み取り専用の属性を落としてもう一度試す。
+    /// <see cref="Directory.Delete(string, bool)"/> は属性を落とさないため、
+    /// ZIP から展開した木やコピーした木では、これが <c>Access is denied</c> の
+    /// 最もよくある原因になる。
+    /// </para>
+    /// </summary>
+    private static bool TryDeleteDirectory(string path, ILogger logger)
+    {
+        try
+        {
+            DeleteDirectoryIfExists(path);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            LogQuietly(() => logger.LogInformation(ex, "消せなかったので属性を落として試し直す: {Path}", path));
+        }
+
+        try
+        {
+            ClearReadOnlyAttributes(path);
+            DeleteDirectoryIfExists(path);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            LogQuietly(() => logger.LogWarning(ex, "属性を落としても消せなかった: {Path}", path));
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 配下のファイルとディレクトリから読み取り専用の属性を落とす。
+    /// <para>
+    /// 1 件ずつの失敗では止めない。落とせたものだけでも消せるようになることがあり、
+    /// ここで投げると呼び出し側は「消せない」に倒れるだけである。
+    /// </para>
+    /// </summary>
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        if (!Directory.Exists(path)) return;
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(path, "*", SearchOption.AllDirectories))
+        {
+            TryClearReadOnly(entry);
+        }
+        TryClearReadOnly(path);
+
+        static void TryClearReadOnly(string entry)
+        {
+            try
+            {
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReadOnly) == 0) return;
+                File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                // この 1 件は落とせなかった。残りを続ける。
+            }
         }
     }
 
@@ -376,7 +480,8 @@ public class UpdateInstaller
     }
 
     /// <summary>
-    /// 置き換えの後始末。次の起動 (新しい版) から呼び、退避した .old を消す。
+    /// 置き換えの後始末。次の起動 (新しい版) から呼び、退避した .old と、
+    /// 消せずに名前をずらした残骸を消す。
     /// 消せなくても常駐は続ける。次の機会にまた試す。
     /// </summary>
     public static void DiscardPrevious(string targetDirectory, ILogger? logger = null)
@@ -385,15 +490,57 @@ public class UpdateInstaller
         foreach (var part in Parts)
         {
             var backup = Path.Combine(targetDirectory, part + ".old");
-            try
+            if (!Directory.Exists(backup)) continue;
+
+            if (TryDeleteDirectory(backup, log))
             {
-                if (!Directory.Exists(backup)) continue;
-                Directory.Delete(backup, recursive: true);
                 LogQuietly(() => log.LogInformation("置き換え前の {Part} を消した", part));
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            else
             {
-                LogQuietly(() => log.LogWarning(ex, "置き換え前の {Part} を消せなかった", part));
+                LogQuietly(() => log.LogWarning("置き換え前の {Part} を消せなかった", part));
+            }
+        }
+
+        DiscardMovedAside(targetDirectory, log);
+    }
+
+    /// <summary>
+    /// 置き換えのときに名前をずらした残骸を消す (#61)。
+    /// <para>
+    /// ずらすのは、消せない残骸に置き換えを止めさせないためである。ずらした先は
+    /// 誰も参照しないので、消せるようになった時点で片付ける。ここも消せなくて
+    /// 構わない。次の機会にまた試すだけで、置き換えは止まらない。
+    /// </para>
+    /// </summary>
+    private static void DiscardMovedAside(string targetDirectory, ILogger log)
+    {
+        // 名前は "<part>.old.trash-xxxx" / "<part>.new.trash-xxxx" の形になる
+        // (MoveAsideName)。ワイルドカードの照合には DOS 由来の癖があるので、
+        // 一覧を取って名前で見分ける。
+        var prefixes = Parts
+            .SelectMany(part => new[] { part + ".old.trash-", part + ".new.trash-" })
+            .ToArray();
+
+        IEnumerable<string> candidates;
+        try
+        {
+            candidates = Directory.EnumerateDirectories(targetDirectory).ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            LogQuietly(() => log.LogWarning(ex, "退かした残骸を探せなかった: {Target}", targetDirectory));
+            return;
+        }
+
+        foreach (var leftover in candidates)
+        {
+            var name = Path.GetFileName(leftover);
+            if (!prefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) continue;
+
+            if (TryDeleteDirectory(leftover, log))
+            {
+                LogQuietly(() => log.LogInformation("退かした残骸を消した: {Path}", leftover));
             }
         }
     }

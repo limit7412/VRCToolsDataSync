@@ -197,6 +197,118 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.True(Directory.Exists(TargetFile("app.old")));
     }
 
+    /// <summary>指定のディレクトリだけ「消せない」ことにする。</summary>
+    private sealed class UndeletableInstaller : UpdateInstaller
+    {
+        private readonly Func<string, bool> _undeletable;
+
+        public UndeletableInstaller(string source, string target, Func<string, bool> undeletable)
+            : base(source, target)
+        {
+            _undeletable = undeletable;
+        }
+
+        // 消せないのは「そこにある」場合だけである。名前をずらした後の
+        // 元の名前は、消えたものとして扱わないと本物の挙動とずれる。
+        protected override bool TryDelete(string path)
+            => !(Directory.Exists(path) && _undeletable(path)) && base.TryDelete(path);
+    }
+
+    [Fact(DisplayName = "消せない .old があっても、名前をずらして置き換えを進める")]
+    public void MovesUndeletableLeftoverAsideAndContinues()
+    {
+        // 消せない残骸で置き換えが止まると、そこから抜け出せなくなる (#61)。
+        // 要るのは .old という名前が空いていることだけなので、消せなければ
+        // ずらして進む。
+        Directory.CreateDirectory(TargetFile("app.old"));
+        File.WriteAllText(TargetFile("app.old", "stuck.txt"), "stuck");
+
+        // 名前をずらしても中身は消せないままなので、ずらした先も対象にする。
+        var stuck = TargetFile("app.old");
+        var installer = new UndeletableInstaller(
+            SourceDir, TargetDir, path => path.StartsWith(stuck, StringComparison.Ordinal));
+
+        installer.Apply();
+
+        // 置き換えは通っている。
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.Equal("new-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
+
+        // 今回の退避が .old を名乗り、消せなかったものは名前をずらして残る。
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
+        var movedAside = Directory.GetDirectories(TargetDir, "app.old.trash-*");
+        Assert.Single(movedAside);
+        Assert.Equal("stuck", File.ReadAllText(Path.Combine(movedAside[0], "stuck.txt")));
+    }
+
+    [Fact(DisplayName = "ずらすこともできない残骸は、正規の位置に触る前に断る")]
+    public void DefersWhenLeftoverCanBeNeitherDeletedNorMovedAside()
+    {
+        Directory.CreateDirectory(TargetFile("app.old"));
+        var stuck = TargetFile("app.old");
+        var installer = new ImmovableLeftoverInstaller(SourceDir, TargetDir, stuck);
+
+        Assert.Throws<UpdateDeferredException>(() => installer.Apply());
+
+        // 正規の位置は無傷のままである。
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+    }
+
+    /// <summary>消すことも名前をずらすこともできない残骸を作る。</summary>
+    private sealed class ImmovableLeftoverInstaller : UpdateInstaller
+    {
+        private readonly string _stuck;
+
+        public ImmovableLeftoverInstaller(string source, string target, string stuck)
+            : base(source, target)
+        {
+            _stuck = stuck;
+        }
+
+        protected override bool TryDelete(string path)
+            => !(Directory.Exists(path) && path == _stuck) && base.TryDelete(path);
+
+        protected override void Move(string from, string to)
+        {
+            if (from == _stuck) throw new IOException("injected failure");
+            base.Move(from, to);
+        }
+    }
+
+    [Fact(DisplayName = "読み取り専用の残骸は、属性を落として消す")]
+    public void ClearsReadOnlyAttributesBeforeDeletingLeftover()
+    {
+        // Directory.Delete は読み取り専用の属性を落とさない。ZIP から展開した
+        // 木では、これが Access is denied の最もよくある原因になる (#61)。
+        Directory.CreateDirectory(TargetFile("app.old", "locale"));
+        var readOnly = TargetFile("app.old", "locale", "resources.dll");
+        File.WriteAllText(readOnly, "resource");
+        File.SetAttributes(readOnly, FileAttributes.ReadOnly);
+
+        new UpdateInstaller(SourceDir, TargetDir).Apply();
+
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        // 前回の残骸は消えており、ずらした跡も残らない。
+        Assert.Empty(Directory.GetDirectories(TargetDir, "app.old.trash-*"));
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
+    }
+
+    [Fact(DisplayName = "後始末は、ずらして残った残骸も消す")]
+    public void DiscardPreviousRemovesMovedAsideLeftovers()
+    {
+        Directory.CreateDirectory(TargetFile("app.old"));
+        Directory.CreateDirectory(TargetFile("cli.old"));
+        Directory.CreateDirectory(TargetFile("app.old.trash-abcd1234"));
+        Directory.CreateDirectory(TargetFile("cli.new.trash-abcd1234"));
+
+        UpdateInstaller.DiscardPrevious(TargetDir);
+
+        Assert.False(Directory.Exists(TargetFile("app.old")));
+        Assert.False(Directory.Exists(TargetFile("cli.old")));
+        Assert.False(Directory.Exists(TargetFile("app.old.trash-abcd1234")));
+        Assert.False(Directory.Exists(TargetFile("cli.new.trash-abcd1234")));
+    }
+
     [Fact(DisplayName = "インストール先のルートは配布の形だけを認める")]
     public void FindInstallRootAcceptsOnlyDistributedLayout()
     {
