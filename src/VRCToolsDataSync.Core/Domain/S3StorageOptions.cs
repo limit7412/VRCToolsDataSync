@@ -1,4 +1,4 @@
-namespace VRCToolsDataSync.Core.Storage;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>S3 互換ストレージへの接続設定。</summary>
 public sealed class S3StorageOptions

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Sync;
 
 namespace VRCToolsDataSync.Core.Storage;

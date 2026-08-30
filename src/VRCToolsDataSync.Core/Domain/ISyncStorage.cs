@@ -1,6 +1,5 @@
-using VRCToolsDataSync.Core.Sync;
 
-namespace VRCToolsDataSync.Core.Storage;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>
 /// 同期先の抽象。OneDrive などのローカル同期フォルダと、S3 互換オブジェクト

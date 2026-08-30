@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Update;
 

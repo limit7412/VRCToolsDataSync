@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Update;
 using Xunit;
 

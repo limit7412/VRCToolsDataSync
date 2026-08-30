@@ -60,6 +60,19 @@ S3 互換モードの費用は、ほぼ Pull のダウンロード転送量だ�
 | `VRCToolsDataSync.Cli` | `push` / `pull` / `status` / `storage` を提供するコンソール |
 | `VRCToolsDataSync.App` | WinUI 3 (.NET 10) の GUI。設定編集と Push/Pull、コンフリクト解決ダイアログ |
 
+### Core の層 (issue #50)
+
+`Core` はフォルダと名前空間で層を分けている。依存は下向きだけに保つ。
+
+| フォルダ | 置くもの | 依存してよい先 |
+| --- | --- | --- |
+| `Domain` | モデル、境界 (`ISyncStorage` `ISyncService` `IReleaseRepository`)、外部に触れない規則 | なし |
+| `Settings` `Storage` `Sync` `Update` `Watch` `Paths` `Logging` `Startup` | 手順の組み立てと、境界の実装 (S3 / ファイル / レジストリ / GitHub / SQLite) | `Domain` |
+
+**`Domain` はどの層も参照しない。** 実装への言及は `<see cref>` ではなく `<c>` で書く。参照を張ってしまうと向きが崩れるためである。
+
+上の 2 行目はまだ 1 つの塊で、`Sync` と `Storage` と `Watch` が互いを参照している。ここを `UseCase` と `Infra` に割るのは別の段階で行う。
+
 ## 必要環境
 
 - Windows 10 (build 17763) 以降

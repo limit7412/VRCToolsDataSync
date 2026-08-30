@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Update;
 

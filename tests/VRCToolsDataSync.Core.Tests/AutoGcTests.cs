@@ -1,5 +1,5 @@
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Settings;
-using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
 using Xunit;
 

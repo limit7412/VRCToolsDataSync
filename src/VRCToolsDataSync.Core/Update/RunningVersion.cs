@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Update;
 

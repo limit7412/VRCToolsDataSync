@@ -7,7 +7,6 @@ using H.NotifyIcon;
 using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Logging;
-using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;
