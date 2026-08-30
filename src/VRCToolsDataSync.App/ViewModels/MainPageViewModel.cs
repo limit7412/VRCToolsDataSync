@@ -950,7 +950,7 @@ public partial class MainPageViewModel : ObservableObject
                     case ConflictChoice.ForceOverwrite:
                         AppendLog($"{displayName} 強制 Push 実行");
                         var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
-                        ReportPushResult(displayName, forced);
+                        ReportPushResult(displayName, forced, storage);
                         break;
                     case ConflictChoice.PullFirst:
                         AppendLog($"{displayName} 先に Pull を実行");
@@ -964,7 +964,7 @@ public partial class MainPageViewModel : ObservableObject
             }
             else
             {
-                ReportPushResult(displayName, result);
+                ReportPushResult(displayName, result, storage);
             }
         }
         catch (RunningProcessException ex)
@@ -1007,7 +1007,7 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
-    private void ReportPushResult(string displayName, SyncResult result)
+    private void ReportPushResult(string displayName, SyncResult result, ISyncStorage storage)
     {
         switch (result.Outcome)
         {
@@ -1017,6 +1017,9 @@ public partial class MainPageViewModel : ObservableObject
                 // 同期させ、続く自動 Push が古いバージョンで不要な競合通知を
                 // 起こさないようにする。
                 _coordinator?.RefreshSettings(_settings);
+                // Push の後始末として、参照が切れた実体の回収を試みる (issue #55)。
+                // UI スレッドを待たせないようバックグラウンドで実行する。
+                _runner.CollectGarbageInBackground(storage);
                 break;
             case SyncOutcome.SourceMissing:
                 AppendLog($"{displayName} Push 中止: {result.Message}");
@@ -1078,7 +1081,7 @@ public partial class MainPageViewModel : ObservableObject
                 case ConflictChoice.ForceOverwrite:
                     AppendLog($"[auto] {e.DisplayName} 強制 Push 実行");
                     var pushResult = await Task.Run(() => _runner.Push(e.ServiceFactory(), _settings, storage, force: true));
-                    ReportPushResult(e.DisplayName, pushResult);
+                    ReportPushResult(e.DisplayName, pushResult, storage);
                     break;
                 case ConflictChoice.PullFirst:
                     AppendLog($"[auto] {e.DisplayName} 先に Pull を実行");

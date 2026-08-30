@@ -106,6 +106,82 @@ public sealed class SyncRunner
     }
 
     /// <summary>
+    /// 自動回収 (issue #55) の実行間隔。狙いは 1 日 1 回。丸 1 日にすると、
+    /// 毎日ほぼ同じ時刻に Push するユーザで前回からの経過がわずかに届かず、
+    /// 実行が 1 日おきになりがちなので、少し短く取る。
+    /// </summary>
+    public static readonly TimeSpan AutoGcInterval = TimeSpan.FromHours(20);
+
+    // 自動回収の同時実行を避ける。回収そのものは並走しても安全 (猶予期間と
+    // 削除直前の読み直しで守られる) だが、同じ対象を二重に走査するだけ無駄になる。
+    // 待たずにスキップするのは、待った側が取る頃には実行済みになっているため。
+    private static readonly object AutoGcLock = new();
+
+    /// <summary>
+    /// 前回の自動回収から <see cref="AutoGcInterval"/> が空いていれば、参照が
+    /// 切れた実体の回収 (<see cref="BlobGarbageCollector"/>) を実行する。
+    /// Push の後始末として呼ぶ。実行しなかった場合は null を返す。
+    /// <para>
+    /// 前回の実行時刻は settings.json のディスク上の値で判定する。GUI と CLI は
+    /// 別プロセスで同じ保存先へ Push しうるので、手元の settings インスタンス
+    /// では互いの実行を知れない。記録は実行の成否に関わらず先に書く。回収が
+    /// 失敗し続ける状態 (権限不足など) で、Push のたびに走査をやり直さないため。
+    /// </para>
+    /// <para>
+    /// 例外は投げない。回収は Push の成果に影響しない後始末で、これが原因で
+    /// 成功した Push をエラー扱いにするわけにはいかないため。失敗はログに
+    /// 残し、次の機会に回す。
+    /// </para>
+    /// </summary>
+    public BlobGarbageCollectionResult? CollectGarbageIfDue(ISyncStorage storage)
+    {
+        if (!Monitor.TryEnter(AutoGcLock)) return null;
+        try
+        {
+            var logger = _loggerFactory.CreateLogger<BlobGarbageCollector>();
+            try
+            {
+                var current = _store.Load();
+                var key = storage.StateKeyPrefix;
+                if (current.LastGcAt.TryGetValue(key, out var last)
+                    && DateTimeOffset.Now - last < AutoGcInterval)
+                {
+                    return null;
+                }
+                _store.SaveLastGcAt(key, DateTimeOffset.Now);
+
+                logger.LogInformation("自動回収を開始します: {Target}", storage.DisplayName);
+                return new BlobGarbageCollector(storage, logger).Collect();
+            }
+            catch (Exception ex)
+            {
+                // 同期先の不調 (SyncStorageException) だけでなく、settings.json の
+                // 読み書きの失敗もここで止める。どれも Push の結果を汚す理由にならない。
+                logger.LogWarning(ex, "自動回収を中止しました");
+                return null;
+            }
+        }
+        finally
+        {
+            Monitor.Exit(AutoGcLock);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="CollectGarbageIfDue"/> をバックグラウンドで実行する。
+    /// <para>
+    /// 常駐アプリの経路 (自動 Push・GUI の Push) から使う。回収は初回や
+    /// 溜まっている場合に時間がかかりうるので、Push の完了報告や次の自動 Push を
+    /// その完了で待たせない。プロセスの終了で途中打ち切りになっても、消し残しは
+    /// 次回の実行が回収するだけなので害はない。
+    /// </para>
+    /// </summary>
+    public void CollectGarbageInBackground(ISyncStorage storage)
+        // CollectGarbageIfDue は例外を投げないので、切り離した Task を
+        // 観測しなくても未処理例外にはならない。
+        => _ = Task.Run(() => CollectGarbageIfDue(storage));
+
+    /// <summary>
     /// <see cref="SyncSettings.ToolState"/> のキー。同期先ごとに分けることで、
     /// 保存先を切り替えても互いの同期履歴を壊さない。
     /// </summary>

@@ -286,6 +286,16 @@ static int RunPush(
                 Console.WriteLine($"{toolDisplayName} Push 完了 version={result.RemoteVersion}");
                 if (!string.IsNullOrEmpty(result.Message)) Console.WriteLine($"  {result.Message}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
+                // Push の後始末として、参照が切れた実体の回収を試みる (issue #55)。
+                // CLI はこの後すぐプロセスが終わるため、バックグラウンドではなく
+                // ここで待つ。失敗しても Push は成功しているので終了コードには影響しない
+                // (CollectGarbageIfDue は例外を投げない)。
+                var gc = runner.CollectGarbageIfDue(storage);
+                if (gc is not null)
+                {
+                    Console.WriteLine(
+                        $"  ストレージの回収: {gc.Deleted} 件 ({FormatBytes(gc.DeletedBytes)}) を削除");
+                }
                 return 0;
             case SyncOutcome.ConflictDetected:
                 Console.Error.WriteLine($"コンフリクト: リモート version={result.RemoteVersion}, ローカル lastPulled={result.LastPulledVersion}");

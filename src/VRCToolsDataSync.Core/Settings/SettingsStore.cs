@@ -63,6 +63,7 @@ public sealed class SettingsStore
         // JSON に明示的な null が書かれていると、既定値の代わりに null が入る。
         // 読んだ側が毎回それを気にせずに済むよう、ここで既定へ落としておく。
         settings.Update ??= new UpdateSettings();
+        settings.LastGcAt ??= new Dictionary<string, DateTimeOffset>();
         MigrateToolStateKeys(settings);
         return settings;
     }
@@ -134,6 +135,24 @@ public sealed class SettingsStore
     /// その古い値で上書きされて ON 設定が消えてしまう。
     /// </summary>
     public void SaveToolStateOnly(SyncSettings settings) => SaveInternal(settings, mergeTopLevelFromDisk: true);
+
+    /// <summary>
+    /// 自動回収を試みた時刻の記録だけを書く (issue #55)。
+    /// <para>
+    /// 通知済みの版 (<see cref="SaveNotifiedVersion"/>) と同じ理由で、通常の
+    /// <see cref="Save"/> は使わない。回収は Push の後始末として常駐中に走るので、
+    /// 起動時に読んだ古い settings で保存すると、その後に別プロセスが変えた
+    /// 設定を巻き戻す。
+    /// </para>
+    /// </summary>
+    public void SaveLastGcAt(string storageStateKey, DateTimeOffset at)
+    {
+        // 中身はディスク側を全面的に採用し、この記録だけを載せる。
+        // どちらが残るかは MergeForSave がキーごとの新しさで決める。
+        var settings = new SyncSettings();
+        settings.LastGcAt[storageStateKey] = at;
+        SaveInternal(settings, mergeTopLevelFromDisk: true);
+    }
 
     /// <summary>
     /// 通知済みの版の記録だけを書く (issue #45)。
@@ -227,6 +246,7 @@ public sealed class SettingsStore
                     settings.ToolState = merged.ToolState;
                     settings.Launch = merged.Launch;
                     settings.Update = merged.Update;
+                    settings.LastGcAt = merged.LastGcAt;
                 }
                 finally
                 {
@@ -301,6 +321,7 @@ public sealed class SettingsStore
             ToolStateSchema = CurrentToolStateSchema,
             ToolState = new Dictionary<string, ToolSyncState>(),
             Launch = new Dictionary<string, ToolLaunchConfig>(),
+            LastGcAt = new Dictionary<string, DateTimeOffset>(),
         };
 
         // 両方に存在する tool キーは新しい方を採用、片方だけにあるものはそのまま追加。
@@ -332,6 +353,24 @@ public sealed class SettingsStore
         else if (incomingNotified is not null)
         {
             result.Update.NotifiedVersion = incoming.Update!.NotifiedVersion;
+        }
+
+        // 自動回収の記録は、採用元に関わらずキーごとにディスクと incoming の
+        // 新しいほうを採用する。時刻は常に前へ進むので、新旧は比較で決められる。
+        // 通知済みの版と同じく、古い settings を持つ経路の保存が別プロセスの
+        // 記録を巻き戻して、回収を余分に走らせないため。
+        var diskGcAt = disk.LastGcAt ?? new Dictionary<string, DateTimeOffset>();
+        var incomingGcAt = incoming.LastGcAt ?? new Dictionary<string, DateTimeOffset>();
+        foreach (var kv in diskGcAt)
+        {
+            result.LastGcAt[kv.Key] = kv.Value;
+        }
+        foreach (var kv in incomingGcAt)
+        {
+            if (!result.LastGcAt.TryGetValue(kv.Key, out var existing) || kv.Value > existing)
+            {
+                result.LastGcAt[kv.Key] = kv.Value;
+            }
         }
 
         // Launch は Top-level と同じ採用元から取る。理由:
