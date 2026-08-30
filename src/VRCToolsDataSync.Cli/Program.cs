@@ -4,6 +4,7 @@ using VRCToolsDataSync.Core.Logging;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Update;
 
 var rootCommand = new RootCommand("VRCX / VRC Friend Connect データ同期ツール");
 
@@ -182,10 +183,57 @@ storageGcCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx
 });
 storageCommand.AddCommand(storageGcCommand);
 
+// --- self-update: 本体の更新の適用 (issue #45 第 3 段階) ---
+//
+// GUI (App) が展開しておいた新しい一式で、インストール先を置き換える更新ヘルパ。
+// 展開先の cli から起動されるため、置き換える対象 (app / cli) のどれも掴んでいない。
+// 人が直接叩く想定は無いので、ヘルプには出さない。
+
+var applySourceOption = new Option<string>(
+    aliases: new[] { "--source" },
+    description: "展開した新しい一式のディレクトリ")
+{ IsRequired = true };
+var applyTargetOption = new Option<string>(
+    aliases: new[] { "--target" },
+    description: "インストール先のルート")
+{ IsRequired = true };
+var applyWaitPidOption = new Option<int?>(
+    aliases: new[] { "--wait-pid" },
+    description: "このプロセスの終了を待ってから置き換える (呼び出し元の App)");
+var applyWaitStartedOption = new Option<long?>(
+    aliases: new[] { "--wait-started" },
+    description: "--wait-pid のプロセスの開始時刻 (UTC の Ticks)。PID の使い回しを見分ける");
+var applyRelaunchOption = new Option<bool>(
+    aliases: new[] { "--relaunch" },
+    description: "置き換えた後に App を起動し直す");
+
+var selfUpdateApplyCommand = new Command("apply", "取得済みの更新でインストール先を置き換える");
+selfUpdateApplyCommand.AddOption(applySourceOption);
+selfUpdateApplyCommand.AddOption(applyTargetOption);
+selfUpdateApplyCommand.AddOption(applyWaitPidOption);
+selfUpdateApplyCommand.AddOption(applyWaitStartedOption);
+selfUpdateApplyCommand.AddOption(applyRelaunchOption);
+selfUpdateApplyCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
+{
+    ctx.ExitCode = ApplySelfUpdate(
+        source: ctx.ParseResult.GetValueForOption(applySourceOption)!,
+        target: ctx.ParseResult.GetValueForOption(applyTargetOption)!,
+        waitPid: ctx.ParseResult.GetValueForOption(applyWaitPidOption),
+        waitStarted: ctx.ParseResult.GetValueForOption(applyWaitStartedOption),
+        relaunch: ctx.ParseResult.GetValueForOption(applyRelaunchOption));
+});
+
+var selfUpdateCommand = new Command("self-update", "本体の更新を適用する (App が内部で使う)")
+{
+    IsHidden = true,
+};
+selfUpdateCommand.AddCommand(selfUpdateApplyCommand);
+
 rootCommand.AddCommand(pushCommand);
 rootCommand.AddCommand(pullCommand);
 rootCommand.AddCommand(statusCommand);
 rootCommand.AddCommand(storageCommand);
+rootCommand.AddCommand(selfUpdateCommand);
 
 return await rootCommand.InvokeAsync(args);
 
@@ -538,6 +586,308 @@ static int CollectGarbage(int graceDays, bool dryRun)
     {
         Console.Error.WriteLine($"回収できませんでした: {ex.Message}");
         return 2;
+    }
+}
+
+static int ApplySelfUpdate(string source, string target, int? waitPid, long? waitStarted, bool relaunch)
+{
+    // ログの置き場所を作れなくても続ける。ここで落ちると、親の App は
+    // 「起きてすぐ落ちたヘルパ = 壊れた配布物」と見なして取得を捨てる。
+    // 数百 MB の取り直しを、ログを書けないことの代償にしてはいけない。
+    ILoggerFactory? loggerFactory = null;
+    try
+    {
+        loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Information);
+            builder.AddProvider(new FileLoggerProvider(FileLoggerProvider.DefaultLogPath()));
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"ログを開けませんでした ({ex.Message})。ログ無しで続行します。");
+    }
+
+    using var loggerFactoryScope = loggerFactory;
+    var logger = loggerFactory?.CreateLogger("SelfUpdate")
+        ?? (ILogger)Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+
+    // 適用の全体をクロスプロセスのロックで囲う。この間に App を起動されると、
+    // 新しいプロセスが同じ展開先を消して展開し直したり、旧版のファイルを掴んだまま
+    // こちらのリネームとぶつかったりする。App は起動の先頭でこれを待つ。
+    // 名前はインストール先ごとに分かれている。ヘルパ自身の居場所 (展開先) では
+    // なく、置き換える対象から引く。
+    //
+    // 待ちに入るのは、呼び出し元の終了を待つより先である。呼び出し元はロックを
+    // 握ったまま終わるので、その時点でこちらが待ち行列に居ないと、放棄された
+    // ロックを別の待ち手が先に取る。取った相手が展開先を作り直せば、こちらの
+    // 展開元 (--source) が壊れる。
+    //
+    // 上限は呼び出し元の終了待ちに合わせて広く取る。呼び出し元は終了時に
+    // 同期を流すことがあり、その間はロックを握ったままである。
+    using var applyMutex = UpdateStage.CreateApplyMutex(target);
+    var applyMutexHeld = false;
+    try
+    {
+        // 上限は WaitForCaller と同じ長さにする。呼び出し元が終了時 Push を
+        // 流している間、ロックはそちらが握ったままである。
+        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(65));
+    }
+    catch (AbandonedMutexException)
+    {
+        // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
+        // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
+        applyMutexHeld = true;
+    }
+    if (!applyMutexHeld)
+    {
+        // 別のヘルパが動いている。二重に適用しない。
+        Console.Error.WriteLine("別の更新処理が実行中のため、置き換えを中止しました。");
+        try { logger.LogWarning("更新のロックを取れなかったため適用しない"); } catch { /* best-effort */ }
+        return 6;
+    }
+
+    try
+    {
+        // ロックを握ってから、呼び出し元が本当に終わったかを確かめる。普通は
+        // ロックが渡った時点で終わっているが、放棄によらず (呼び出し元がロックを
+        // 取れないまま起動を続けた場合など) 渡ってくることもある。
+        if (!WaitForCaller(waitPid, waitStarted, logger)) return 6;
+
+        // 多重起動の抑止も掴む。呼び出し元が終わった時点でこれも空くので、
+        // 普通はそのまま取れる。掴まないと、入れ替えの最中に起動した App が
+        // 旧 app\ を読み込んで掴み、入れ替えを失敗させたり、置き換え済みの
+        // 一式をもう一度置き換えさせて退避した旧版を上書きさせたりする。
+        //
+        // App はこの名前の Mutex が既にあるかで判断するので、所有権ではなく
+        // 開いた手を持ち続けるだけでよい。
+        using var singleInstance = new Mutex(
+            initiallyOwned: false, name: UpdateInstaller.SingleInstanceMutexName, out var createdNew);
+        if (!createdNew)
+        {
+            // 呼び出し元とは別の App が動いている。正規の位置にはまだ触って
+            // いないので、取得を残したまま引き下がる。あちらが終わった後の
+            // 起動でやり直せる。ここで待つと、あちらが適用のロック (こちらが
+            // 握っている) を待っている場合に噛み合わなくなる。
+            Console.Error.WriteLine("App が起動しているため、置き換えを中止しました。");
+            try { logger.LogWarning("App が動いているため置き換えない"); } catch { /* best-effort */ }
+            return 6;
+        }
+
+        return ApplySelfUpdateCore(source, target, relaunch, logger, singleInstance);
+    }
+    finally
+    {
+        try { applyMutex.ReleaseMutex(); } catch { /* best-effort */ }
+    }
+}
+
+/// <summary>
+/// 呼び出し元の App が終わるのを待つ。App は終了時に同期を流すことがあり、
+/// その間は app\ 配下を掴んだままなので、待たずに進めても退避のリネームで
+/// 失敗するだけである。待ちきれなければ、壊す前にここで止める。
+/// <para>
+/// 上限は長めに取る。短く切ると、Push を終えた App がそのまま終了する一方で
+/// ヘルパはもう居らず、置き換えも起動し直しも行われないまま画面だけが閉じる。
+/// </para>
+/// <para>
+/// それでも待ちきれなかった場合は取得済みの更新を残したまま引き下がる。App が
+/// 生きていれば次の起動が、終了が遅れただけならその次の起動が、同じ更新を
+/// 適用し直す。
+/// </para>
+/// </summary>
+/// <summary>
+/// 開始時刻が一致するか。読めない場合は、同じものとして扱って待つ側に倒す
+/// (待ちには上限があるが、待たずに進むと掴まれたファイルを入れ替えに行く)。
+/// </summary>
+static bool SameProcess(System.Diagnostics.Process process, long startedTicks)
+{
+    try
+    {
+        return process.StartTime.ToUniversalTime().Ticks == startedTicks;
+    }
+    catch (Exception)
+    {
+        return true;
+    }
+}
+
+static bool WaitForCaller(int? waitPid, long? waitStarted, ILogger logger)
+{
+    // 終了時 Push の合計に上限は無い。S3Client の 30 分は操作ごとの上限で、
+    // manifest の取得・オブジェクトの送信・manifest の保存が直列に続き、それが
+    // ツールの数だけ繰り返される。だからここは「Push の上限」ではなく、
+    // 「適用のロックを握ったまま待ち続けてよい長さ」として決めている。
+    //
+    // 待ちきれずに降りても失うものは少ない。取得は残るので、App が終わった後の
+    // 起動が適用し直す。逆に待ち続けると、固まった App の裏でヘルパがロックを
+    // 握ったままになり、以後の取得の昇格も適用も止まる。
+    const int timeoutMilliseconds = 65 * 60 * 1000;
+
+    if (waitPid is not { } pid) return true;
+
+    try
+    {
+        using var process = System.Diagnostics.Process.GetProcessById(pid);
+
+        // 番号だけでは足りない。呼び出し元が終わった後に OS が同じ番号を
+        // 別のプロセスへ回していると、無関係なプロセスを待ってしまう。相手が
+        // 長生きなら、こちらはロックを握ったまま上限まで待ち、置き換えも
+        // 起動し直しもせずに終わる。開始時刻まで見て同じものかを確かめる。
+        if (waitStarted is { } startedTicks && !SameProcess(process, startedTicks))
+        {
+            return true;
+        }
+
+        if (process.WaitForExit(timeoutMilliseconds)) return true;
+
+        Console.Error.WriteLine($"呼び出し元 (PID {pid}) が終了しないため、置き換えを中止しました。次回起動時に適用されます。");
+        try { logger.LogError("呼び出し元 (PID {Pid}) の終了を待ちきれなかった", pid); } catch { /* best-effort */ }
+        return false;
+    }
+    catch (ArgumentException)
+    {
+        // 既に終了している。そのまま進む。
+        return true;
+    }
+}
+
+/// <param name="singleInstance">
+/// 置き換えの間だけ掴んでいる多重起動の抑止。App を起動し直す前に手放す。
+/// 掴んだまま起動すると、起動した App が「他に動いている」と見て即座に終わる。
+/// </param>
+static int ApplySelfUpdateCore(
+    string source, string target, bool relaunch, ILogger logger, IDisposable? singleInstance = null)
+{
+    // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
+    // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
+    // このリポジトリのロガーは例外を投げる。入れ替えの後にそれが飛ぶと、
+    // staged の破棄にも App の起動し直しにも辿り着かず、利用者から見れば
+    // 「再起動して適用」でアプリが閉じただけになる。
+    void Log(Action write)
+    {
+        try { write(); } catch { /* best-effort */ }
+    }
+
+    try
+    {
+        new UpdateInstaller(source, target, logger).Apply();
+        Console.WriteLine("本体を置き換えました。");
+        Log(() => logger.LogInformation("本体を置き換えた: {Target}", target));
+    }
+    catch (UpdateDeferredException ex)
+    {
+        // 正規の位置には触っていない (空き不足、前回の残骸を消せない等)。
+        // 取得済みの ZIP を捨てると、利用者は妨げが退いた後に数百 MB を
+        // 取り直すことになる。残したまま引き下がり、現行版を開き直す。
+        // 妨げが退けば次の起動がそのまま適用する。
+        Console.Error.WriteLine($"置き換えを見送りました: {ex.Message}");
+        Console.Error.WriteLine("原因を取り除いてから起動し直すと、取得済みの更新がそのまま適用されます。");
+        Log(() => logger.LogError(ex, "正規の位置に触る前に断ったため置き換えを見送った"));
+
+        // 見送りの指定つきで開き直す。付けずに開き直すと、その App が同じ
+        // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、
+        // という往復になる。
+        singleInstance?.Dispose();
+        if (relaunch) TryRelaunchApp(target, logger, skipUpdateApply: true);
+        return 9;
+    }
+    catch (UpdateRollbackException ex)
+    {
+        // 正規の位置に一式が無い状態。取得済みの ZIP は復旧の材料になるため消さず、
+        // 壊れた一式を起動し直そうともしない。
+        Console.Error.WriteLine(ex.Message);
+        Console.Error.WriteLine("インストール先が壊れた可能性があります。.old ディレクトリを手で戻すか、ZIP を展開し直してください。");
+        Log(() => logger.LogError(ex, "置き換えの巻き戻しに失敗した"));
+        return 7;
+    }
+    catch (Exception ex)
+    {
+        // 巻き戻しは済んでいて、現行版は無傷のまま動かせる。
+        Console.Error.WriteLine($"置き換えに失敗しました: {ex.Message}");
+        Log(() => logger.LogError(ex, "置き換えに失敗した (巻き戻し済み)"));
+
+        // 取得済みの更新をここで捨てる。残すと次の起動がまた同じ適用へ引き渡して
+        // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
+        // 開けなくなる。展開先はこのヘルパ自身が動いている場所なので消せないが、
+        // ZIP と記録が消えれば次の起動は適用へ入らず、展開先は後始末が拾う。
+        //
+        // 置き場所はインストール先ごとに分かれているため、対象 (--target) から
+        // 引く。ヘルパ自身は展開先から動いており、そこも配布 ZIP と同じ形を
+        // しているので、既定の置き場所を見ると自分の展開先を基にした空の場所を
+        // 掴む。そこを消せても、本当の ZIP と記録は残ったままになる。
+        var stageDirectory = UpdateStage.DirectoryFor(target);
+        var applicable = true;
+        try
+        {
+            var stage = new UpdateStage(stageDirectory, logger);
+            stage.Discard();
+
+            // 開き直してよいのは「次の起動が同じ適用へ入らない」と言い切れる
+            // ときである。両方消せた場合だけでなく、片方だけ消せた場合もそう
+            // である。照合は対がそろっていなければ何も返さない。
+            //
+            // 判定には記録の読み出しではなく、ファイルが残っているかを使う。
+            // 読めないだけのものを「消えた」と取り違えると、次の起動がまた
+            // 同じ適用へ入り、開いては閉じるのを繰り返す。
+            applicable = stage.StagedPairRemains();
+        }
+        catch (Exception discard)
+        {
+            Log(() => logger.LogWarning(discard, "取得済みの更新を捨てられなかった"));
+        }
+
+        if (applicable)
+        {
+            // 対がそろったまま残っている。ここで開き直すと、次の起動がまた同じ
+            // 適用へ入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
+            // 手で片付ける先を伝えて終える。
+            Console.Error.WriteLine(
+                $"取得済みの更新を消せませんでした。{stageDirectory} を手で削除してから起動してください。");
+            Log(() => logger.LogError("取得済みの更新を消せないため、App を起動し直さない"));
+            return 8;
+        }
+
+        // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。
+        singleInstance?.Dispose();
+        if (relaunch) TryRelaunchApp(target, logger);
+        return 1;
+    }
+
+    singleInstance?.Dispose();
+    if (relaunch && !TryRelaunchApp(target, logger))
+    {
+        // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
+        return 1;
+    }
+
+    return 0;
+}
+
+/// <param name="skipUpdateApply">
+/// 取得しておいたものを残したまま開き直す場合に true。開き直した App が
+/// 同じ取得をまたこちらへ渡してこないよう、見送りの指定を渡す。
+/// </param>
+static bool TryRelaunchApp(string target, ILogger logger, bool skipUpdateApply = false)
+{
+    try
+    {
+        var appDirectory = Path.Combine(target, "app");
+        var start = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = Path.Combine(appDirectory, UpdateInstaller.AppExecutableName),
+            WorkingDirectory = appDirectory,
+            UseShellExecute = true,
+        };
+        if (skipUpdateApply) start.Arguments = UpdateInstaller.SkipUpdateApplySwitch;
+        System.Diagnostics.Process.Start(start);
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
+        try { logger.LogWarning(ex, "App の起動し直しに失敗した"); } catch { /* best-effort */ }
+        return false;
     }
 }
 

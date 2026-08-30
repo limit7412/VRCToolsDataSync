@@ -11,4 +11,10 @@ public interface IReleaseRepository
     /// 取れなかった場合は例外を投げる。呼び出し側が握る。
     /// </summary>
     Task<ReleaseCatalog> FetchReleasesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 配布物を path へ取り、宣言された大きさと digest に照合する。
+    /// 照合まで通ったときだけ path にファイルが残る。それ以外は例外を投げる。
+    /// </summary>
+    Task DownloadAsync(ReleaseAsset asset, string path, CancellationToken cancellationToken = default);
 }

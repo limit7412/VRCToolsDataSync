@@ -58,9 +58,11 @@ public partial class MainPageViewModel : ObservableObject
 
         if (_updates is not null)
         {
-            // 確認はバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
+            // 確認も取得もバックグラウンドで終わるため、UI スレッドへ運んでから画面に触る。
             _updates.CheckCompleted += (result, channel, manual) =>
                 OnUi(() => HandleUpdateCheckCompleted(result, channel, manual));
+            _updates.StagedChanged += () => OnUi(RefreshStagedRow);
+            RefreshStagedRow();
         }
     }
 
@@ -299,6 +301,13 @@ public partial class MainPageViewModel : ObservableObject
     // リリースページの URL。表示行と一緒に更新する。
     private string? _releasePageUrl;
 
+    // 取得済みで置き換え待ちの更新があるときだけ出す行 (issue #45 第 3 段階)。
+    [ObservableProperty]
+    public partial Visibility UpdateStagedVisibility { get; set; } = Visibility.Collapsed;
+
+    [ObservableProperty]
+    public partial string UpdateStagedText { get; set; } = string.Empty;
+
     public ObservableCollection<string> LogEntries { get; } = new();
 
     public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
@@ -309,9 +318,28 @@ public partial class MainPageViewModel : ObservableObject
 
     public event Action<string, string>? ToastRequested;
 
+    /// <summary>
+    /// 適用の準備に入った後か。準備を始める時点で立て、終了まで下ろさない
+    /// (準備に失敗した場合だけ下ろす)。
+    /// <para>
+    /// ヘルパは渡した時点のチャンネルで照合を済ませている。その後で設定を
+    /// 保存されると、保存済みの設定と実際に適用される版が食い違う。準備の間も
+    /// 終了時 Push を待っている間もウィンドウは操作できるので、その窓を塞ぐ。
+    /// </para>
+    /// </summary>
+    private bool _handedOverToUpdater;
+
     [RelayCommand]
     private void SaveSettings()
     {
+        if (_handedOverToUpdater)
+        {
+            // 適用はもう動き出している。ここで設定を書き換えても反映されず、
+            // 保存済みの設定と適用される版が食い違うだけになる。
+            AppendLog("更新の適用中です。設定の保存は再起動後に行ってください。");
+            return;
+        }
+
         // 保存直前にディスクの現行値を読み直し、その上へ画面の値を載せる。
         // GUI を開いている間に CLI 側で設定が変わっていても、画面に無い項目
         // (同期履歴など) を起動時の古い値で巻き戻さないため。
@@ -346,6 +374,9 @@ public partial class MainPageViewModel : ObservableObject
         // いなければ確認し直す。自動確認を止めている場合は確認が走らないため、
         // 「未確認」の表示がそのまま残る (手動確認で更新できる)。
         RefreshUpdateBanner();
+        // 取得済みの行も作り直す。stable へ切り替えると、test で取ったものは
+        // 出さなくなる (押しても捨てられるだけなので、出したままにしない)。
+        RefreshStagedRow();
         // ApplyUpdatePropertiesToSettings が必ず入れているが、JSON から明示的な
         // null が入りうる型なので、読む側では既定へ落として扱う。
         var update = _settings.Update ?? new UpdateSettings();
@@ -644,6 +675,104 @@ public partial class MainPageViewModel : ObservableObject
             // 利用者が一度も見ないまま以後の確認で抑止される。
             _updates.MarkNotified(release);
         }
+    }
+
+    /// <summary>
+    /// 取得済みの行を staged の記録へ合わせる。記録はここでは照合しない。
+    /// 照合は適用の直前と次の起動が行い、通らなければそこで捨てられる。
+    /// </summary>
+    private void RefreshStagedRow()
+    {
+        var staged = _updates?.Staged;
+
+        // 保存されているチャンネルで拾わないものは出さない。test で取った後に
+        // stable へ切り替えると、その取得は次の起動でもボタンでも捨てられる。
+        // 出したままだと、押して初めて消える食い違いになる。
+        var channel = _settings.Update?.Channel ?? UpdateChannel.Stable;
+        if (staged is not null && channel != UpdateChannel.Test && !staged.Stable)
+        {
+            staged = null;
+        }
+
+        if (staged is null)
+        {
+            UpdateStagedVisibility = Visibility.Collapsed;
+            UpdateStagedText = string.Empty;
+            return;
+        }
+        UpdateStagedText = $"{staged.Tag} を取得済み。次回起動時に適用されます";
+        UpdateStagedVisibility = Visibility.Visible;
+    }
+
+    /// <summary>
+    /// 「再起動して適用」ボタン。更新ヘルパを起動してから通常の終了シーケンスへ
+    /// 入る。ヘルパはこのプロセスの終了を待って置き換え、新しい版を立ち上げ直す。
+    /// </summary>
+    [RelayCommand]
+    private async Task ApplyStagedUpdateAsync()
+    {
+        if (_updates is null || IsBusy) return;
+
+        // 準備の間 (ロックの待ちは最大 11 分、ヘルパの起動確認に 3 秒) も
+        // 塞いでおく。ここが空いていると、この後の終了時 Push と並走する手動の
+        // 同期を始められてしまい、その同期は Coordinator の追跡の外なので
+        // Environment.Exit で途中のまま切れる。
+        IsBusy = true;
+
+        // 設定の保存はここから止める。準備の中でヘルパを起こし、その生存を
+        // 3 秒見る間も画面は操作できる。渡した後に stable へ変えて保存されると、
+        // 保存済みの設定と適用される版が食い違う。準備に失敗したら下ろす。
+        _handedOverToUpdater = true;
+        bool ready;
+        try
+        {
+            // 起動時の同期がまだ走っていることがある。そのタスクは Coordinator の
+            // 追跡の外なので、待たずに進むと終了時 Push と並走した上で
+            // Environment.Exit に途中で切られる。
+            if (!App.StartupSyncFinished.IsCompleted)
+            {
+                AppendLog("起動時の同期の完了を待っています...");
+                await App.StartupSyncFinished;
+            }
+
+            ready = await Task.Run(() => _updates.PrepareApplyAndSpawnUpdater());
+        }
+        catch
+        {
+            _handedOverToUpdater = false;
+            IsBusy = false;
+            throw;
+        }
+
+        if (!ready)
+        {
+            _handedOverToUpdater = false;
+            IsBusy = false;
+            AppendLog("更新を適用できませんでした。取得し直すか、ログを確認してください。");
+            RefreshStagedRow();
+            return;
+        }
+        AppendLog("更新を適用するため再起動します...");
+
+        // 終了処理の途中で多重起動の抑止を手放さない。手放してから実際に終わる
+        // までの隙に別の App が起動すると、待っているヘルパと入れ替えがぶつかる。
+        App.KeepSingleInstanceUntilExit();
+
+        // Tray「同期して終了」と同じ経路で閉じる。終了時 Push もそのまま流れる。
+        await App.ExitApplicationAsync(waitForToolsToExit: null);
+
+        // ここへ戻ってきたのは、終了に至らなかった場合だけである (ログオフの
+        // 取り消しや、先に始まっていた終了処理との重なり)。適用のロックは
+        // プロセスの終了で手放す約束で握ったままなので、明示的に返す。
+        // 持ち続けると、この後の取得の昇格も、起こしたヘルパの適用も止まる。
+        UpdateApplier.ReleaseHeldApplyLock();
+
+        // 起こしたヘルパはロックと一緒に止めた。適用は動いていないので、
+        // 設定の保存も受け付け直す。
+        _handedOverToUpdater = false;
+        IsBusy = false;
+        AppendLog("終了が取り消されたため、更新は次回起動時に適用されます。");
+        RefreshStagedRow();
     }
 
     /// <summary>

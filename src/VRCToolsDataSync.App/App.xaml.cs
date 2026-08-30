@@ -21,7 +21,8 @@ public partial class App : Application
     // 並走すると、AutoSyncCoordinator が二重 Push を行って manifest.json の
     // 競合検知が暴発するため、プロセス内 _autoPushLock では守れない領域として
     // ここでガードする。Global\ プリフィクスは付けずユーザセッション内のみ排他にする。
-    private const string SingleInstanceMutexName = "VRCToolsDataSync.App.SingleInstance";
+    // 名前は Core に置いてある。更新ヘルパも置き換えの間これを掴むため。
+    private const string SingleInstanceMutexName = VRCToolsDataSync.Core.Update.UpdateInstaller.SingleInstanceMutexName;
     // 既存インスタンスへの「メインウィンドウ復帰」要求に使う Win32 メッセージ。
     // RegisterWindowMessage はユーザセッション内で同名 → 同一 ID が返るため、
     // 別プロセス間でも安全に同期できる。
@@ -179,8 +180,38 @@ public partial class App : Application
         }
     }
 
+    /// <summary>
+    /// 起動時の同期 (Pull → Launch) が終わったことを表す。
+    /// <para>
+    /// この同期は投げっぱなしで走っており、<c>Coordinator</c> の追跡の外にある。
+    /// 終わらないうちに更新の適用へ入ると、終了時 Push と並走した上で
+    /// <c>Environment.Exit</c> に途中で切られる。適用の側はこれを待つ。
+    /// 走らせられなかった場合も完了として扱う (待たせる相手が居ない)。
+    /// </para>
+    /// </summary>
+    internal static System.Threading.Tasks.Task StartupSyncFinished => _startupSyncFinished.Task;
+
+    private static readonly System.Threading.Tasks.TaskCompletionSource _startupSyncFinished =
+        new(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private static void MarkStartupSyncFinished() => _startupSyncFinished.TrySetResult();
+
+    /// <summary>
+    /// 多重起動の抑止を、終了処理の途中で手放さないようにする。
+    /// <para>
+    /// 更新ヘルパを起こした後に使う。手放してから実際に終わるまでの隙に別の
+    /// App が起動すると、待っているヘルパと入れ替えがぶつかる。プロセスの
+    /// 終了で OS が手放すのに任せれば、その隙が無くなる。
+    /// </para>
+    /// </summary>
+    internal static void KeepSingleInstanceUntilExit() => _keepSingleInstanceUntilExit = true;
+
+    private static bool _keepSingleInstanceUntilExit;
+
     internal static void ReleaseSingleInstance()
     {
+        if (_keepSingleInstanceUntilExit) return;
+
         try
         {
             _singleInstanceMutex?.ReleaseMutex();
@@ -247,10 +278,16 @@ public partial class App : Application
                     {
                         try { Coordinator?.Start(); LogLifecycle("Coordinator.Start ok (post-startup-sync)"); }
                         catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+                        MarkStartupSyncFinished();
                     }
                 });
             }
-            catch (Exception ex) { LogStartupFailure("Coordinator.Start", ex); }
+            catch (Exception ex)
+            {
+                LogStartupFailure("Coordinator.Start", ex);
+                // 走らせられなかった。待たせる相手が居ないので、済んだものとして扱う。
+                MarkStartupSyncFinished();
+            }
 
             // 更新確認は Window より先に作る。MainPage の VM が構築時に購読するため。
             // 最初の確認は UpdateManager 側の遅延タイマーが起動同期の後に回す。
@@ -273,6 +310,22 @@ public partial class App : Application
                 LogLifecycle("CachedWindowHandle=" + _cachedWindowHandle.ToString("X"));
             }
             catch (Exception ex) { LogStartupFailure("CacheWindowHandle", ex); }
+
+            // 更新の後始末 (退避した旧版と不要な取得の削除) はウィンドウを
+            // 立てられた後に行う (issue #45 第 3 段階)。起動の前に消すと、
+            // 置き換え直後の起動がここまで来られずに失敗した場合に、
+            // 復旧の材料を失う。
+            try
+            {
+                _ = System.Threading.Tasks.Task.Run(() =>
+                {
+                    // UpdateManager 経由で呼ぶ。後始末で取得が消えたことを
+                    // 画面へ伝えるため (直接呼ぶと表示が残る)。
+                    if (Updates is not null) Updates.CleanUpAfterSuccessfulStart(LoggerFactory);
+                    else UpdateApplier.CleanUpAfterSuccessfulStart(LoggerFactory);
+                });
+            }
+            catch (Exception ex) { LogStartupFailure("UpdateCleanup", ex); }
 
             // Issue #6: Windows ログオフ / シャットダウン時にも同期を流す。
             // 既定の猶予は 5 秒程度しかないため、ShutdownBlockReasonCreate で
@@ -642,11 +695,26 @@ public partial class App : Application
         // など内部リソースが解放され、未 flush のログが確実に書き出される。
         // Environment.Exit(0) は finally を呼ばないため、ここで明示的に
         // Dispose しないとログの末尾が欠ける可能性がある。
+        // 起こしたヘルパが待ちきれずに終わっていたら、こちらで開き直す。
+        // このまま終わると、利用者から見て「再起動して適用」を押したのに画面が
+        // 閉じたきりになる。ヘルパが居ない以上、抑止もロックも持ち続ける理由は
+        // 無いので、先に両方を手放してから起動する。掴んだままだと、起動した
+        // App がそこで止まる。
+        if (UpdateApplier.SpawnedUpdaterDied(UpdateLogger()))
+        {
+            _keepSingleInstanceUntilExit = false;
+            ReleaseSingleInstance();
+            UpdateApplier.ReleaseHeldApplyLock();
+            UpdateApplier.RelaunchApp(UpdateLogger());
+        }
+
         ReleaseSingleInstance();
         LogLifecycle("ExitApplication.Environment.Exit(0)");
         try { LoggerFactory.Dispose(); } catch { /* best-effort */ }
         Environment.Exit(0);
     }
+
+    private static ILogger UpdateLogger() => LoggerFactory.CreateLogger("VRCToolsDataSync.App.SelfUpdate");
 
     private static void LogLifecycle(string message)
     {

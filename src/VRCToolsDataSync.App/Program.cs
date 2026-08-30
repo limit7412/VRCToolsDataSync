@@ -25,6 +25,23 @@ public static class Program
 
         try
         {
+            // 取得しておいた更新があれば、ここで置き換えを更新ヘルパへ渡して終了する
+            // (issue #45 第 3 段階)。多重起動の抑止より後に置くのは、既に常駐している
+            // プロセスがいる状態で置き換えないため。App を組み立てる前に置くのは、
+            // どうせ新しい exe で立ち上げ直すものを立ち上げないため。
+            if (Services.UpdateApplier.TryHandOverToStaged(App.LoggerFactory))
+            {
+                // 多重起動の抑止はここでは手放さない。手放してから実際に終わる
+                // までの隙に別の App が起動すると、その App が app\ 配下を掴んだ
+                // まま、待っているヘルパが入れ替えに入る。適用のロックと同じく、
+                // プロセスの終了で OS が手放すのに任せる。
+                //
+                // Environment.Exit は下の finally を通らないので、ログの
+                // 書き出しだけ先に済ませる。
+                try { App.LoggerFactory.Dispose(); } catch { /* best-effort */ }
+                Environment.Exit(0);
+            }
+
             WinRT.ComWrappersSupport.InitializeComWrappers();
             Application.Start((p) =>
             {
