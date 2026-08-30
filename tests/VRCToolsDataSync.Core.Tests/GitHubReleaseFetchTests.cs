@@ -18,6 +18,9 @@ public sealed class GitHubReleaseFetchTests
 
         public List<string> RequestedPaths { get; } = new();
 
+        /// <summary>要求ごとの Cache-Control。手前のキャッシュへの指示を見るために残す。</summary>
+        public List<string?> RequestedCacheControl { get; } = new();
+
         public StubHandler(Func<string, HttpResponseMessage> respond) => _respond = respond;
 
         protected override Task<HttpResponseMessage> SendAsync(
@@ -25,6 +28,7 @@ public sealed class GitHubReleaseFetchTests
         {
             var url = request.RequestUri!.ToString();
             RequestedPaths.Add(url);
+            RequestedCacheControl.Add(request.Headers.CacheControl?.ToString());
             return Task.FromResult(_respond(url));
         }
     }
@@ -143,5 +147,23 @@ public sealed class GitHubReleaseFetchTests
         var catalog = await repository.FetchReleasesAsync();
 
         Assert.Equal(300, catalog.Releases.Count);
+    }
+
+    [Fact(DisplayName = "問い合わせは手前のキャッシュに答えさせない")]
+    public async Task AsksIntermediariesNotToServeACachedListing()
+    {
+        var handler = new StubHandler(_ => Json(ShortListJson("0.0.9", "0.0.10")));
+        using var repository = new GitHubReleaseRepository("asset.zip", BaseUrl, handler);
+
+        await repository.FetchReleasesAsync();
+
+        // 公開したばかりの版が、間に立つキャッシュのせいで一覧に出ないことがある。
+        Assert.NotEmpty(handler.RequestedCacheControl);
+        Assert.All(handler.RequestedCacheControl, value =>
+        {
+            Assert.NotNull(value);
+            Assert.Contains("no-cache", value!);
+            Assert.Contains("no-store", value!);
+        });
     }
 }
