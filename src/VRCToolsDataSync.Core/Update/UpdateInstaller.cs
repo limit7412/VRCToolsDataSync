@@ -92,11 +92,98 @@ public class UpdateInstaller
     /// 退避した旧版を上書きさせたりする。
     /// </para>
     /// <para>
+    /// ヘルパの側は <see cref="TryHoldSingleInstance"/> で掴む。あちらは
+    /// 「既にあるか」ではなく上限つきで待つ (#66)。
+    /// </para>
+    /// <para>
     /// <c>Global\</c> は付けない。App 側と同じ名前でなければ意味が無く、
     /// あちらは対話セッション内の抑止として置かれている (#52)。
     /// </para>
     /// </summary>
     public const string SingleInstanceMutexName = "VRCToolsDataSync.App.SingleInstance";
+
+    /// <summary>
+    /// 更新ヘルパが多重起動抑止の空きを待つ上限 (#66)。
+    /// <para>
+    /// 呼び出し元の App は、適用のロックと多重起動抑止の両方を握ったまま
+    /// プロセスの終了を迎える。OS はその二つを同時には手放さないので、
+    /// 適用のロックが先に空くと、ヘルパは抑止がまだ閉じ終わらないうちに
+    /// 見に行く。そこで「既にあるか」だけを見ると、居ない App を
+    /// 「動いている」と読む。
+    /// </para>
+    /// <para>
+    /// 待つのは実測で数ミリ秒である。それでもここを秒の単位に取るのは、
+    /// 待ちすぎて失うものが無いからである。本当に動いている App があれば
+    /// 待ちきれずに降り、そのときは画面が既にあるので利用者は困らない。
+    /// </para>
+    /// </summary>
+    public static readonly TimeSpan SingleInstanceHandOverTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// 多重起動抑止を掴む。掴めなければ <c>null</c> を返す。
+    /// <para>
+    /// 更新ヘルパが置き換えの間だけ使う。所有権まで取るので、掴んでいる間に
+    /// 起動した App は抑止に当たって止まる。返したものを捨てると手放す。
+    /// </para>
+    /// <para>
+    /// <see cref="Mutex"/> の所有権はスレッドに紐づく。掴んだスレッドから
+    /// 捨てること。
+    /// </para>
+    /// </summary>
+    public static IDisposable? TryHoldSingleInstance(TimeSpan timeout)
+        => TryHoldNamedMutex(SingleInstanceMutexName, timeout);
+
+    /// <summary>
+    /// 名前つきの <see cref="Mutex"/> を上限つきで掴む。試験から名前を差し替える
+    /// ために分けてある。
+    /// </summary>
+    internal static IDisposable? TryHoldNamedMutex(string name, TimeSpan timeout)
+    {
+        var mutex = new Mutex(initiallyOwned: false, name: name);
+        bool held;
+        try
+        {
+            held = mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 握ったまま終わったプロセスがある (呼び出し元の App がまさにそれ)。
+            // 所有権はこちらに渡っている。
+            held = true;
+        }
+        catch
+        {
+            mutex.Dispose();
+            throw;
+        }
+
+        if (!held)
+        {
+            mutex.Dispose();
+            return null;
+        }
+
+        return new NamedMutexHold(mutex);
+    }
+
+    private sealed class NamedMutexHold : IDisposable
+    {
+        private readonly Mutex _mutex;
+        private bool _released;
+
+        public NamedMutexHold(Mutex mutex) => _mutex = mutex;
+
+        public void Dispose()
+        {
+            // 二度捨てられる。ヘルパは起動し直しの前に明示的に手放し、その後
+            // using の側からもう一度来る。
+            if (_released) return;
+            _released = true;
+
+            try { _mutex.ReleaseMutex(); } catch { /* best-effort */ }
+            _mutex.Dispose();
+        }
+    }
 
     /// <summary>置き換えの対象になる、インストール先直下のディレクトリ。</summary>
     private static readonly string[] Parts = { "app", "cli" };
