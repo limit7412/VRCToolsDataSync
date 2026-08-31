@@ -155,6 +155,20 @@ public partial class App : Application
     private static readonly object _sessionEndCtsLock = new();
     private static CancellationTokenSource _sessionEndCts = new();
 
+    /// <summary>
+    /// 起動が成り立ったか (issue #77)。
+    /// <para>
+    /// <see cref="OnLaunched"/> がウィンドウを組み立て、出す (またはトレイ常駐の
+    /// 指定に従って出さないと決める) ところまで進めば true になる。ここから先は
+    /// 画面へ辿り着けるので、例外を握り潰してアプリを生かす意味がある。
+    /// </para>
+    /// <para>
+    /// 表すのは「ウィンドウを作り終えたか」までである。出した後の描画で投げる
+    /// ような、<see cref="OnLaunched"/> を抜けてから起こる失敗はここに現れない。
+    /// </para>
+    /// </summary>
+    private static volatile bool _startupCompleted;
+
     public App()
     {
         InitializeComponent();
@@ -162,7 +176,28 @@ public partial class App : Application
         UnhandledException += (_, e) =>
         {
             LogStartupFailure("UnhandledException", e.Exception);
-            e.Handled = true;
+
+            // 起動が成り立った後なら、これまでどおり握り潰してアプリを生かす。
+            // 常駐中の例外でいちいち落ちては、同期の途中で画面ごと消えることに
+            // なる。
+            if (_startupCompleted)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            // 起動が成り立つ前は握り潰さない (issue #77)。握り潰すと、ウィンドウ
+            // の無いプロセスがメッセージループと多重起動の抑止を掴んだまま残る。
+            // 利用者から見ると、画面が出ないうえに起動し直しても抑止に当たって
+            // 何も出てこない。タスクマネージャで止めるまで抜けられない。
+            //
+            // 落ちれば抑止は OS が手放すので、起動し直せる。更新の直後であれば、
+            // 更新ヘルパの観察 (issue #53) が拾って退避した一式へ戻す。
+            //
+            // e.Handled は既定の false のままにする。WinUI はここでプロセスを
+            // 終わらせるので、Program.Main の finally は通らない。ログの
+            // 書き出しだけ先に済ませる。
+            try { LoggerFactory.Dispose(); } catch { /* best-effort */ }
         };
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
@@ -342,6 +377,10 @@ public partial class App : Application
             {
                 Window.Activate();
             }
+
+            // ここまで来れば画面へ辿り着ける。以後の例外は握り潰してアプリを
+            // 生かす (issue #77)。ここより前で投げた場合は落とす。
+            _startupCompleted = true;
 
             // SessionEnding はバックグラウンドスレッドで動くため、UI スレッド
             // 専用の Window から WindowHandle を取ろうとすると COMException が
