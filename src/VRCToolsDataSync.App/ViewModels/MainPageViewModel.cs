@@ -27,9 +27,15 @@ public partial class MainPageViewModel : ObservableObject
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
     private Action<Action>? _uiDispatch;
-    // 問い合わせの枠は画面に 1 つしかないため、AskAsync はここで直列化する。
-    // 先に出したものが答えられるまで後続は待つ。待っている間も先客のボタンは
-    // 押せるので、待ちが解けないということは無い。
+    // 問い合わせと、その答えに応じた同期の実行までを 1 件ずつに絞る。
+    //
+    // 押さえる範囲を「問い合わせを出している間」に縮めてはいけない。縮めると、
+    // 先の答えの Push が走っている最中に次の問い合わせが開き、答え次第で二つの
+    // 同期が同じ保存先へ並走する。枠が 1 つなのは画面の都合にすぎず、直列化の
+    // 理由は保存先のほうにある。
+    //
+    // 待っている間も先客のボタンは押せる (IsBusy に束縛していない) ので、
+    // 待ちが解けないということは無い。
     private readonly SemaphoreSlim _promptGate = new(1, 1);
 
     // x:Bind 用の引数なしコンストラクタ。GUI ホストでは必ず App.Runner を共有して、
@@ -391,6 +397,17 @@ public partial class MainPageViewModel : ObservableObject
             // 適用はもう動き出している。ここで設定を書き換えても反映されず、
             // 保存済みの設定と適用される版が食い違うだけになる。
             AppendLog("更新の適用中です。設定の保存は再起動後に行ってください。");
+            return;
+        }
+
+        if (IsPromptOpen)
+        {
+            // 問い合わせに答えるまで待つ。InfoBar は背後の画面を塞がないので、
+            // 答えを待っている間に保存先を変えられる。上書きする先は問い合わせ
+            // を出す時点で押さえてあるため食い違わないが、_settings だけが先に
+            // 変わると、その保存先へ渡す設定 (マシン名など) と実際に触る保存先が
+            // ずれる。窓を開けておく理由が無いので塞ぐ。
+            AppendLog("画面の問い合わせに答えてから設定を保存してください。");
             return;
         }
 
@@ -1006,23 +1023,35 @@ public partial class MainPageViewModel : ObservableObject
 
             if (result.Outcome == SyncOutcome.ConflictDetected)
             {
-                var choice = await AskConflictAsync(
-                    displayName, result.RemoteVersion ?? 0, result.LastPulledVersion ?? 0);
-                switch (choice)
+                // 問い合わせと、その答えに応じた実行までを 1 件ずつに絞る。
+                // 自動側の問い合わせが答えを待っている間にここへ来た場合、
+                // 先客が実行を終えるまで待つ。同期先は上で組み立てたものを
+                // そのまま使うので、待っている間に設定を触られても変わらない。
+                await _promptGate.WaitAsync();
+                try
                 {
-                    case ConflictChoice.ForceOverwrite:
-                        AppendLog($"{displayName} 強制 Push 実行");
-                        var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
-                        ReportPushResult(displayName, forced, storage);
-                        break;
-                    case ConflictChoice.PullFirst:
-                        AppendLog($"{displayName} 先に Pull を実行");
-                        var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
-                        ReportPullResult(displayName, pulled);
-                        break;
-                    default:
-                        AppendLog($"{displayName} Push をキャンセル");
-                        break;
+                    var choice = await AskConflictAsync(
+                        displayName, result.RemoteVersion ?? 0, result.LastPulledVersion ?? 0);
+                    switch (choice)
+                    {
+                        case ConflictChoice.ForceOverwrite:
+                            AppendLog($"{displayName} 強制 Push 実行");
+                            var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
+                            ReportPushResult(displayName, forced, storage);
+                            break;
+                        case ConflictChoice.PullFirst:
+                            AppendLog($"{displayName} 先に Pull を実行");
+                            var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
+                            ReportPullResult(displayName, pulled);
+                            break;
+                        default:
+                            AppendLog($"{displayName} Push をキャンセル");
+                            break;
+                    }
+                }
+                finally
+                {
+                    _promptGate.Release();
                 }
             }
             else
@@ -1203,10 +1232,6 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>
     /// 画面へ問い合わせを出し、選ばれるまで待つ (issue #10)。
     /// <para>
-    /// 枠は画面に 1 つしかないので <see cref="_promptGate"/> で直列化する。
-    /// 待っている間も先客のボタンは押せるため、待ちが解けないということは無い。
-    /// </para>
-    /// <para>
     /// ウィンドウが出ているかどうかは問わない。トレイへ常駐したままでも
     /// 問い合わせはここに残り続け、後からウィンドウを開いたときにそのまま
     /// 選べる。答えないまま App を終えた場合、待っている側は答えを受け取れず
@@ -1214,45 +1239,44 @@ public partial class MainPageViewModel : ObservableObject
     /// </para>
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// ここは直列化しない。枠が 1 つしかないのは確かだが、押さえるべき範囲は
+    /// 「問い合わせを出している間」ではなく「答えに応じた同期が終わるまで」で
+    /// ある。呼び出し側が <see cref="_promptGate"/> をその範囲で持つこと。
+    /// </para>
+    /// <para>
     /// UI スレッドから呼ぶこと。<see cref="PromptOptions"/> は画面が直接
     /// 束縛しているコレクションで、別スレッドから触ると落ちる。
+    /// </para>
     /// </remarks>
     private async Task<T> AskAsync<T>(
         string title, string message, InfoBarSeverity severity, params (string Label, T Value)[] options)
     {
-        await _promptGate.WaitAsync();
+        // 押されたときの継続をボタンのクリックハンドラの中で走らせない。
+        // 走らせると、答えを受け取った側の処理 (Push や Pull) が
+        // クリックの延長で始まり、画面の更新がその分だけ遅れる。
+        var answer = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        PromptTitle = title;
+        PromptMessage = message;
+        PromptSeverity = severity;
+        PromptOptions.Clear();
+        foreach (var (label, value) in options)
+        {
+            PromptOptions.Add(new PromptOption(label, () => answer.TrySetResult(value)));
+        }
+        IsPromptOpen = true;
+
         try
         {
-            // 押されたときの継続をボタンのクリックハンドラの中で走らせない。
-            // 走らせると、答えを受け取った側の処理 (Push や Pull) が
-            // クリックの延長で始まり、画面の更新がその分だけ遅れる。
-            var answer = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            PromptTitle = title;
-            PromptMessage = message;
-            PromptSeverity = severity;
-            PromptOptions.Clear();
-            foreach (var (label, value) in options)
-            {
-                PromptOptions.Add(new PromptOption(label, () => answer.TrySetResult(value)));
-            }
-            IsPromptOpen = true;
-
-            try
-            {
-                return await answer.Task;
-            }
-            finally
-            {
-                IsPromptOpen = false;
-                PromptOptions.Clear();
-                PromptTitle = string.Empty;
-                PromptMessage = string.Empty;
-            }
+            return await answer.Task;
         }
         finally
         {
-            _promptGate.Release();
+            IsPromptOpen = false;
+            PromptOptions.Clear();
+            PromptTitle = string.Empty;
+            PromptMessage = string.Empty;
         }
     }
 
@@ -1285,11 +1309,16 @@ public partial class MainPageViewModel : ObservableObject
             $"リモート v{e.RemoteVersion} と未同期です。ウィンドウで操作を選択してください。");
         ShowWindowRequested?.Invoke();
 
+        await _promptGate.WaitAsync();
         try
         {
-            var choice = await AskConflictAsync(e.DisplayName, e.RemoteVersion, e.LastPulledVersion);
-
+            // 同期先は問い合わせを出す前に組み立てる。InfoBar は ContentDialog と
+            // 違って背後の画面を塞がないため、答えを待っている間に保存先を
+            // 変えられる。答えた後に組み立てると、画面に出した競合とは無関係の
+            // 保存先を「強制 Push」で上書きしうる。
             if (!TryCreateStorage(out var storage)) return;
+
+            var choice = await AskConflictAsync(e.DisplayName, e.RemoteVersion, e.LastPulledVersion);
 
             switch (choice)
             {
@@ -1315,6 +1344,7 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
+            _promptGate.Release();
         }
     }
 
@@ -1326,13 +1356,18 @@ public partial class MainPageViewModel : ObservableObject
             $"{e.MachineName} が v{e.RemoteVersion} を Push しました。Pull しますか？");
         ShowWindowRequested?.Invoke();
 
+        await _promptGate.WaitAsync();
         try
         {
+            // 競合の側と同じ理由で、同期先は問い合わせを出す前に組み立てる。
+            // こちらは Pull なので、食い違えば手元のツールのデータを無関係の
+            // 保存先の内容で置き換えることになる。
+            if (!TryCreateStorage(out var storage)) return;
+
             var choice = await AskRemoteUpdateAsync(
                 e.DisplayName, e.RemoteVersion, e.LocalVersion, e.MachineName);
 
             if (choice != RemoteUpdateChoice.PullNow) return;
-            if (!TryCreateStorage(out var storage)) return;
 
             AppendLog($"[auto] {e.DisplayName} Pull 実行");
             var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
@@ -1345,6 +1380,7 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
+            _promptGate.Release();
         }
     }
 
