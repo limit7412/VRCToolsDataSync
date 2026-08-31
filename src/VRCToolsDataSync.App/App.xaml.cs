@@ -21,7 +21,7 @@ public partial class App : Application
     // 競合検知が暴発するため、プロセス内 _autoPushLock では守れない領域として
     // ここでガードする。Global\ プリフィクスは付けずユーザセッション内のみ排他にする。
     // 名前は Core に置いてある。更新ヘルパも置き換えの間これを掴むため。
-    private const string SingleInstanceMutexName = VRCToolsDataSync.Core.Update.UpdateInstaller.SingleInstanceMutexName;
+    private const string SingleInstanceMutexName = UpdateInstaller.SingleInstanceMutexName;
     // 既存インスタンスへの「メインウィンドウ復帰」要求に使う Win32 メッセージ。
     // RegisterWindowMessage はユーザセッション内で同名 → 同一 ID が返るため、
     // 別プロセス間でも安全に同期できる。
