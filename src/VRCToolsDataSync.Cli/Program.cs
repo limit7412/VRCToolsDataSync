@@ -662,21 +662,12 @@ static int ApplySelfUpdate(
     //
     // 上限は呼び出し元の終了待ちに合わせて広く取る。呼び出し元は終了時に
     // 同期を流すことがあり、その間はロックを握ったままである。
-    using var applyMutex = UpdateStage.CreateApplyMutex(target);
-    var applyMutexHeld = false;
-    try
-    {
-        // 上限は WaitForCaller と同じ長さにする。呼び出し元が終了時 Push を
-        // 流している間、ロックはそちらが握ったままである。
-        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(65));
-    }
-    catch (AbandonedMutexException)
-    {
-        // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
-        // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
-        applyMutexHeld = true;
-    }
-    if (!applyMutexHeld)
+    //
+    // 握りっぱなしにはしない。置き換えた App が立ち上がったかを見る間は返す
+    // (issue #53)。握ったままだと、起こした App が起動の先頭でこれを待って
+    // 止まり、その姿を「生きている」と読んでしまう。
+    using var applyLock = new ApplyLockHolder(UpdateStage.CreateApplyMutex(target));
+    if (!applyLock.TryAcquire(TimeSpan.FromMinutes(65)))
     {
         // 別のヘルパが動いている。二重に適用しない。
         Console.Error.WriteLine("別の更新処理が実行中のため、置き換えを中止しました。");
@@ -717,11 +708,12 @@ static int ApplySelfUpdate(
             return 6;
         }
 
-        return ApplySelfUpdateCore(source, target, relaunch, relaunchMinimized, logger, singleInstance);
+        return ApplySelfUpdateCore(
+            source, target, relaunch, relaunchMinimized, logger, singleInstance, applyLock);
     }
     finally
     {
-        try { applyMutex.ReleaseMutex(); } catch { /* best-effort */ }
+        applyLock.Release();
     }
 }
 
@@ -805,7 +797,8 @@ static int ApplySelfUpdateCore(
     bool relaunch,
     bool relaunchMinimized,
     ILogger logger,
-    IDisposable? singleInstance = null)
+    IDisposable? singleInstance = null,
+    ApplyLockHolder? applyLock = null)
 {
     // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
     // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
@@ -837,7 +830,7 @@ static int ApplySelfUpdateCore(
         // 取得をまたこちらへ渡し、こちらがまた空き不足で断念して開き直す、
         // という往復になる。
         singleInstance?.Dispose();
-        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized, skipUpdateApply: true);
+        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized, skipUpdateApply: true).Process?.Dispose();
         return 9;
     }
     catch (UpdateRollbackException ex)
@@ -857,35 +850,8 @@ static int ApplySelfUpdateCore(
 
         // 取得済みの更新をここで捨てる。残すと次の起動がまた同じ適用へ引き渡して
         // 同じ失敗を繰り返し、書き込めない場所に置かれた環境では現行版すら
-        // 開けなくなる。展開先はこのヘルパ自身が動いている場所なので消せないが、
-        // ZIP と記録が消えれば次の起動は適用へ入らず、展開先は後始末が拾う。
-        //
-        // 置き場所はインストール先ごとに分かれているため、対象 (--target) から
-        // 引く。ヘルパ自身は展開先から動いており、そこも配布 ZIP と同じ形を
-        // しているので、既定の置き場所を見ると自分の展開先を基にした空の場所を
-        // 掴む。そこを消せても、本当の ZIP と記録は残ったままになる。
-        var stageDirectory = UpdateStage.DirectoryFor(target);
-        var applicable = true;
-        try
-        {
-            var stage = new UpdateStage(stageDirectory, logger);
-            stage.Discard();
-
-            // 開き直してよいのは「次の起動が同じ適用へ入らない」と言い切れる
-            // ときである。両方消せた場合だけでなく、片方だけ消せた場合もそう
-            // である。照合は対がそろっていなければ何も返さない。
-            //
-            // 判定には記録の読み出しではなく、ファイルが残っているかを使う。
-            // 読めないだけのものを「消えた」と取り違えると、次の起動がまた
-            // 同じ適用へ入り、開いては閉じるのを繰り返す。
-            applicable = stage.StagedPairRemains();
-        }
-        catch (Exception discard)
-        {
-            Log(() => logger.LogWarning(discard, "取得済みの更新を捨てられなかった"));
-        }
-
-        if (applicable)
+        // 開けなくなる。
+        if (!TryDiscardStaged(target, logger, out var stageDirectory))
         {
             // 対がそろったまま残っている。ここで開き直すと、次の起動がまた同じ
             // 適用へ入って失敗し、開いては閉じるのを繰り返す。開き直さずに、
@@ -898,18 +864,49 @@ static int ApplySelfUpdateCore(
 
         // 利用者から見れば、これは再起動の操作の途中である。現行版を開き直す。
         singleInstance?.Dispose();
-        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized);
+        if (relaunch) TryRelaunchApp(target, logger, relaunchMinimized).Process?.Dispose();
         return 1;
     }
+
+    // 起こす前に適用のロックを返す (issue #53)。握ったままだと、起こした App は
+    // 起動の先頭 (取得しておいた更新の照合) でこれを待って止まる。観察はその
+    // 止まっている姿を「生きている」と読むので、ロックが空いた後の初期化の
+    // 失敗を捕まえられない。
+    //
+    // 返しても二重適用にはならない。起こした App の照合は、インストール先に
+    // 入っている版と突き合わせて素通りする (#52)。置き換えは済んでいるので、
+    // 入っている版は取得しておいた版と同じである。
+    applyLock?.Release();
 
     singleInstance?.Dispose();
-    if (relaunch && !TryRelaunchApp(target, logger, relaunchMinimized))
+    if (!relaunch) return 0;
+
+    var (started, relaunched) = TryRelaunchApp(target, logger, relaunchMinimized);
+    // 掴んだハンドルは、この後どの経路を通っても抜けるときに返す。
+    using var relaunchedHandle = relaunched;
+    if (!started)
     {
-        // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
-        return 1;
+        // 起こすことすらできなかった。公開された実行ファイルの形が不正だった
+        // 場合や、置き換えた直後にウイルス対策ソフトが隔離した場合がここに来る。
+        // 利用者が手で起動しても同じ理由で失敗するので、置き換えたまま残すと
+        // App を開く手立てが無くなる。生死を見るまでもないので、そのまま戻す。
+        Console.Error.WriteLine("置き換えた App を起こせませんでした。退避しておいた一式へ戻します。");
+        Log(() => logger.LogError("置き換えた App を起こせなかった。退避した一式へ戻す"));
+        return RollBackFailedStart(source, target, relaunchMinimized, logger, Log, applyLock);
     }
 
-    return 0;
+    // 起こせたが掴めなかった。生死を見る手が無いので、そのまま任せる。
+    if (relaunched is null) return 0;
+
+    // 置き換えた一式が立ち上がったかを数秒見る (issue #53)。
+    //
+    // digest が保証するのは「公開されている配布物そのものを取れたこと」まで
+    // であって、中身が起動できることではない。立ち上がらない一式が入ると、
+    // 利用者は App を開けなくなる。退避した .old は残っているが、手で戻す
+    // 以外の経路が無い。
+    if (!CrashedOnStart(relaunched, logger)) return 0;
+
+    return RollBackFailedStart(source, target, relaunchMinimized, logger, Log, applyLock);
 }
 
 /// <param name="minimized">
@@ -921,7 +918,13 @@ static int ApplySelfUpdateCore(
 /// 取得しておいたものを残したまま開き直す場合に true。開き直した App が
 /// 同じ取得をまたこちらへ渡してこないよう、見送りの指定を渡す。
 /// </param>
-static bool TryRelaunchApp(
+/// <returns>
+/// 起こせたかどうかと、起こしたプロセス。<c>UseShellExecute</c> の起動は、
+/// 既に動いているものが使い回された場合に <c>null</c> を返すことがある。
+/// その場合も起動そのものは成り立っているので、掴めなかっただけとして扱う
+/// (生死は見られない)。
+/// </returns>
+static (bool Started, System.Diagnostics.Process? Process) TryRelaunchApp(
     string target, ILogger logger, bool minimized = false, bool skipUpdateApply = false)
 {
     try
@@ -938,13 +941,177 @@ static bool TryRelaunchApp(
         if (skipUpdateApply) switches.Add(UpdateInstaller.SkipUpdateApplySwitch);
         if (minimized) switches.Add(StartupRegistration.MinimizedSwitch);
         if (switches.Count > 0) start.Arguments = string.Join(" ", switches);
-        System.Diagnostics.Process.Start(start);
-        return true;
+        return (true, System.Diagnostics.Process.Start(start));
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"App を起動し直せませんでした: {ex.Message}");
         try { logger.LogWarning(ex, "App の起動し直しに失敗した"); } catch { /* best-effort */ }
+        return (false, null);
+    }
+}
+
+/// <summary>
+/// 起動し直した App が立ち上がったかを数秒見る (issue #53)。
+/// <para>
+/// 早く終わること自体は異常ではない。多重起動の抑止に当たった場合と、取得
+/// しておいた更新をヘルパへ渡した場合は、どちらも終了コード 0 で終わる。
+/// 起動できない一式 (自己完結のランタイムを欠くなど) は apphost が 0 以外で
+/// 落ちるので、そこで見分ける。
+/// </para>
+/// <para>
+/// 見分けを終了コードに委ねているのは、戻す判断を誤ったときの損が大きい
+/// ためである。動く更新を戻して取得まで捨てると、利用者は次の確認まで新しい
+/// 版に上がれない。
+/// </para>
+/// </summary>
+static bool CrashedOnStart(System.Diagnostics.Process app, ILogger logger)
+{
+    const int probeMilliseconds = 5000;
+
+    try
+    {
+        if (!app.WaitForExit(probeMilliseconds)) return false;
+        if (app.ExitCode == 0) return false;
+
+        Console.Error.WriteLine($"置き換えた App が起動直後に終了しました (終了コード {app.ExitCode})。");
+        try
+        {
+            logger.LogError(
+                "置き換えた App が起動直後に終了した (終了コード {ExitCode})。退避した一式へ戻す", app.ExitCode);
+        }
+        catch { /* best-effort */ }
+        return true;
+    }
+    catch (Exception ex)
+    {
+        // 見られなかっただけである。置き換えは済んでいるので、そのまま任せる。
+        try { logger.LogWarning(ex, "起動し直した App の生死を見られなかった"); } catch { /* best-effort */ }
+        return false;
+    }
+}
+
+/// <summary>
+/// 起動できなかった置き換えを戻し、取得を捨てて旧版を開き直す (issue #53)。
+/// </summary>
+static int RollBackFailedStart(
+    string source,
+    string target,
+    bool relaunchMinimized,
+    ILogger logger,
+    Action<Action> log,
+    ApplyLockHolder? applyLock)
+{
+    // 戻す間は適用のロックを取り直す。観察のために返していた間に、別の
+    // プロセスが適用へ入っている可能性がある。取れなければ正規の位置には
+    // 触らない。相手の置き換えと重なると、どちらの版とも言えないものが残る。
+    //
+    // 上限は短くてよい。起こした App は照合の間しか握らず、それは既に
+    // 終わっている (終わったから観察が落ちたと読んだ)。
+    if (applyLock is not null && !applyLock.TryAcquire(TimeSpan.FromMinutes(1)))
+    {
+        Console.Error.WriteLine("別の更新処理が実行中のため、退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning("適用のロックを取り直せないため、起動できなかった置き換えを戻さない"));
+        return 1;
+    }
+
+    // 退避が残っているかを、ロックを取ってから見る。後始末 (DiscardPrevious)
+    // は適用のロックの下で走るので、ここまで来た時点で走り終えているか、まだ
+    // 始まっていないかのどちらかである。
+    //
+    // 残っていなければ、置き換えた一式は後始末が走るところまで動いたという
+    // ことである。後始末はウィンドウを立てられた後にしか走らない。つまり
+    // 起動は成り立っており、その後で落ちた。戻す相手が違う。
+    if (!UpdateInstaller.HasBackups(target))
+    {
+        Console.Error.WriteLine("置き換えた一式は起動できていました。退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning(
+            "後始末が退避を片付けた後に落ちたため、起動できなかった置き換えとしては扱わない"));
+        return 1;
+    }
+
+    // 戻す間は多重起動の抑止を掴む。起動した App が旧 app\ を掴むと、
+    // 戻しのリネームが失敗する。落ちた App は既に手放している。
+    var singleInstance = UpdateInstaller.TryHoldSingleInstance(UpdateInstaller.SingleInstanceHandOverTimeout);
+    if (singleInstance is null)
+    {
+        // 待っても空かなかった。別の App が動いており、その App は置き換えた
+        // 一式で動いている。起動できない一式ではなかったということなので、
+        // 戻す理由のほうが怪しい。
+        //
+        // 掴まれたまま戻しに入ると、なお悪い。戻しは正規の位置を消してから
+        // 退避を戻すため、消す途中で失敗すると、置き換えた一式まで欠ける。
+        // 正規の位置には触らずに引き下がる。
+        Console.Error.WriteLine("App が起動しているため、退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning("App が動いているため、起動できなかった置き換えを戻さない"));
+        return 1;
+    }
+
+    try
+    {
+        new UpdateInstaller(source, target, logger).RollbackApplied();
+        Console.Error.WriteLine("退避しておいた一式へ戻しました。");
+    }
+    catch (Exception ex)
+    {
+        // 正規の位置が欠けたままになりうる。取得しておいた ZIP は復旧の材料に
+        // なるため消さず、壊れた一式を起動し直そうともしない。UpdateRollbackException
+        // と同じ扱いにする。
+        Console.Error.WriteLine($"退避しておいた一式へ戻せませんでした: {ex.Message}");
+        Console.Error.WriteLine("インストール先が壊れた可能性があります。.old ディレクトリを手で戻すか、ZIP を展開し直してください。");
+        log(() => logger.LogError(ex, "起動できなかった置き換えを戻せなかった"));
+        singleInstance?.Dispose();
+        return 7;
+    }
+
+    // 取得を捨てる。残すと、開き直した旧版がまた同じ一式を適用しに行き、
+    // また起動できずに戻す、を繰り返す。
+    if (!TryDiscardStaged(target, logger, out var stageDirectory))
+    {
+        Console.Error.WriteLine(
+            $"取得済みの更新を消せませんでした。{stageDirectory} を手で削除してから起動してください。");
+        log(() => logger.LogError("取得済みの更新を消せないため、App を起動し直さない"));
+        singleInstance?.Dispose();
+        return 8;
+    }
+
+    singleInstance?.Dispose();
+    TryRelaunchApp(target, logger, relaunchMinimized).Process?.Dispose();
+    return 10;
+}
+
+/// <summary>
+/// 取得しておいた更新を捨てる。次の起動が同じ適用へ入らないと言い切れる場合
+/// だけ true を返す。
+/// <para>
+/// 展開先はヘルパ自身が動いている場所なので消せないが、ZIP と記録が消えれば
+/// 次の起動は適用へ入らず、展開先は後始末が拾う。
+/// </para>
+/// <para>
+/// 置き場所はインストール先ごとに分かれているため、対象 (<c>--target</c>) から
+/// 引く。ヘルパ自身は展開先から動いており、そこも配布 ZIP と同じ形をして
+/// いるので、既定の置き場所を見ると自分の展開先を基にした空の場所を掴む。
+/// そこを消せても、本当の ZIP と記録は残ったままになる。
+/// </para>
+/// <para>
+/// 判定には記録の読み出しではなく、ファイルが残っているかを使う。読めない
+/// だけのものを「消えた」と取り違えると、次の起動がまた同じ適用へ入り、
+/// 開いては閉じるのを繰り返す。両方消せた場合だけでなく、片方だけ消せた
+/// 場合も「入らない」と言える。照合は対がそろっていなければ何も返さない。
+/// </para>
+/// </summary>
+static bool TryDiscardStaged(string target, ILogger logger, out string stageDirectory)
+{
+    stageDirectory = UpdateStage.DirectoryFor(target);
+    try
+    {
+        var stage = new UpdateStage(stageDirectory, logger);
+        stage.Discard();
+        return !stage.StagedPairRemains();
+    }
+    catch (Exception ex)
+    {
+        try { logger.LogWarning(ex, "取得済みの更新を捨てられなかった"); } catch { /* best-effort */ }
         return false;
     }
 }
@@ -986,6 +1153,65 @@ static string Mask(string value)
 {
     if (string.IsNullOrEmpty(value)) return "(未設定)";
     return value.Length <= 4 ? new string('*', value.Length) : value[..4] + new string('*', value.Length - 4);
+}
+
+/// <summary>
+/// 適用のロックを、途中で返して取り直せる形で持つ (issue #53)。
+/// <para>
+/// 置き換えた App が立ち上がったかを見る間は、こちらがロックを握っていては
+/// ならない。握ったままだと、起こした App は起動の先頭 (取得しておいた更新の
+/// 照合) でこのロックを待って止まる。観察はその止まっている姿を「生きている」
+/// と読み、ロックが空いた後で初期化に失敗しても誰も戻さない。
+/// </para>
+/// <para>
+/// <see cref="Mutex"/> の所有権はスレッドに紐づく。ヘルパは最初から最後まで
+/// 同じスレッドで動くので、取得も解放もそのまま行える。
+/// </para>
+/// </summary>
+internal sealed class ApplyLockHolder : IDisposable
+{
+    private readonly Mutex _mutex;
+    private bool _held;
+
+    public ApplyLockHolder(Mutex mutex) => _mutex = mutex;
+
+    /// <summary>掴む。既に掴んでいれば何もしない。</summary>
+    public bool TryAcquire(TimeSpan timeout)
+    {
+        if (_held) return true;
+
+        try
+        {
+            _held = _mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
+            // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
+            _held = true;
+        }
+        catch (Exception)
+        {
+            _held = false;
+        }
+
+        return _held;
+    }
+
+    /// <summary>返す。既に返していれば何もしない。</summary>
+    public void Release()
+    {
+        if (!_held) return;
+
+        _held = false;
+        try { _mutex.ReleaseMutex(); } catch { /* best-effort */ }
+    }
+
+    public void Dispose()
+    {
+        Release();
+        _mutex.Dispose();
+    }
 }
 
 internal static class CliConstants

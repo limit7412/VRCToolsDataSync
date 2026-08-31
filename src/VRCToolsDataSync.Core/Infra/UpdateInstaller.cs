@@ -540,16 +540,154 @@ public class UpdateInstaller
     }
 
     /// <summary>
+    /// その part が欠けていては成り立たない実行ファイルと本体アセンブリ。
+    /// <para>
+    /// 配布は単一ファイルにまとめていないので、exe は起動の入り口でしかない。
+    /// 隣の dll が欠けていれば起動できない。<see cref="ValidateLayout"/> と
+    /// <see cref="LooksComplete"/> が見るのと同じ組である。
+    /// </para>
+    /// </summary>
+    private static (string Executable, string Assembly) RequiredFilesOf(string part)
+        => string.Equals(part, "app", StringComparison.OrdinalIgnoreCase)
+            ? (AppExecutableName, AppAssemblyName)
+            : (CliExecutableName, CliAssemblyName);
+
+    /// <summary>
+    /// 済ませた入れ替えを戻す (issue #53)。
+    /// <para>
+    /// 置き換えた一式を起動できなかった場合に呼ぶ。<see cref="Apply"/> の中で
+    /// 使う巻き戻しは、その場で退避したものだけを対象にする。こちらは
+    /// 「入れ替えは通ったが、その後で駄目だと分かった」ときの戻し口である。
+    /// </para>
+    /// <para>
+    /// 戻す前に、退避 (<c>.old</c>) がすべてそろっているかを見る。片方しか
+    /// 残っていない状態で戻すと、旧 app と新 cli が混ざった一式ができる。
+    /// digest も実行ファイルの存在も通るうえ、どちらの版とも言えないものが
+    /// 正規の位置に居座るので、そろっていなければ何も動かさずに断る。
+    /// </para>
+    /// <para>
+    /// 呼ぶのは、置き換えた一式のプロセスが終わっていることを確かめてからに
+    /// すること。動いている間は app\ 配下の DLL を掴んでおり、リネームが
+    /// 失敗する。
+    /// </para>
+    /// </summary>
+    /// <exception cref="UpdateRollbackException">
+    /// 退避がそろっていないか、戻す途中で失敗した。正規の位置が欠けたままに
+    /// なりうるため、取得しておいた ZIP は捨ててはならない。
+    /// </exception>
+    public void RollbackApplied()
+    {
+        foreach (var part in Parts)
+        {
+            var backup = Path.Combine(_targetDirectory, part + ".old");
+            if (!Directory.Exists(backup))
+            {
+                LogQuietly(() => _logger.LogError(
+                    "退避した {Part} が無いため戻せない: {Backup}", part, backup));
+                throw new UpdateRollbackException($"退避した {part} が無いため戻せない: {backup}");
+            }
+
+            // ディレクトリがあるだけでは足りない。中身が欠けた退避を正規の位置へ
+            // 置くと、戻したつもりの側も起動できない。しかも呼び出し側はこれを
+            // 「戻せた」と受け取って取得しておいた ZIP まで捨てるので、旧版も
+            // 新版も起動できず、展開し直す材料も残らない。断って新版を留めれば、
+            // 少なくとも ZIP は残る。
+            var (executable, assembly) = RequiredFilesOf(part);
+            foreach (var required in new[] { executable, assembly })
+            {
+                var path = Path.Combine(backup, required);
+                if (File.Exists(path)) continue;
+
+                LogQuietly(() => _logger.LogError(
+                    "退避した {Part} に {Required} が無いため戻せない: {Path}", part, required, path));
+                throw new UpdateRollbackException($"退避した {part} に {required} が無いため戻せない: {path}");
+            }
+        }
+
+        RollbackSwapped(new List<string>(Parts));
+        RestoreLauncher();
+        LogQuietly(() => _logger.LogInformation("済ませた入れ替えを戻した: {Target}", _targetDirectory));
+    }
+
+    /// <summary>
+    /// 退避しておいたランチャーを戻す (issue #53)。
+    /// <para>
+    /// 退避が無ければ何もしない。差し替えの段で退避に失敗した場合と、
+    /// ランチャーの差し替えそのものが失敗した場合がそれに当たる。どちらでも
+    /// 正規の位置には旧版のランチャーが残っているので、戻す必要が無い。
+    /// </para>
+    /// <para>
+    /// 戻せなかった場合も警告に留める。差し替えの段と同じ理由で、ランチャーは
+    /// 相対参照で app を起動するため、版が食い違っても大抵は動く。app と cli を
+    /// 戻せている以上、ここで例外を投げて「戻せなかった」と伝えるほうが実態から
+    /// 遠い。
+    /// </para>
+    /// </summary>
+    private void RestoreLauncher()
+    {
+        var launcher = Path.Combine(_targetDirectory, LauncherName);
+        var backup = launcher + ".old";
+        if (!File.Exists(backup)) return;
+
+        try
+        {
+            File.Move(backup, launcher, overwrite: true);
+            LogQuietly(() => _logger.LogInformation("退避しておいたランチャーへ戻した"));
+        }
+        catch (Exception ex)
+        {
+            LogQuietly(() => _logger.LogWarning(ex, "退避しておいたランチャーへ戻せなかった: {Name}", LauncherName));
+        }
+    }
+
+    /// <summary>
     /// (4) ランチャーを差し替える。同じディレクトリの一時ファイルへ書き切って
     /// から置き換える。直接上書きすると、書いている途中で容量が尽きた場合に
     /// 欠けたランチャーが残り、通常の起動手段ごと壊れる。
     /// ここで失敗しても app / cli の置き換えは成立しており、旧ランチャーは
     /// 無傷で、相対参照で新しい app を起動できるため、警告に留める。
+    /// <para>
+    /// 差し替えの前に <c>.old</c> へ退避する (issue #53)。退避できない場合は
+    /// 差し替えも行わない。差し替えたうえで戻せないと、旧版の app / cli に
+    /// 新版のランチャーが残る。
+    /// </para>
     /// </summary>
     private void ReplaceLauncher()
     {
         var launcher = Path.Combine(_targetDirectory, LauncherName);
         var launcherTemp = launcher + ".new";
+        var launcherBackup = launcher + ".old";
+
+        // 前回の退避が残っていれば先に消す。残したまま今回の退避に失敗すると、
+        // 戻すときに前々版のランチャーを書き戻すことになる。普段は次の起動の
+        // DiscardPrevious が消しているので、ここに残るのは消せなかった場合だけ
+        // である。
+        try { if (File.Exists(launcherBackup)) File.Delete(launcherBackup); }
+        catch (Exception stale)
+        {
+            LogQuietly(() => _logger.LogWarning(
+                stale, "前回のランチャーの退避を消せなかった: {Path}", launcherBackup));
+        }
+
+        // 差し替える前に退避する。戻すときに要る (issue #53)。ランチャーが
+        // 起動する先や渡す引数は版によって変わりうるので、app / cli だけを
+        // 戻すと、旧版の一式に新版のランチャーが組み合わさる。ヘルパからの
+        // 直接の起動は通っても、次の通常の起動で食い違う。
+        try
+        {
+            File.Copy(launcher, launcherBackup, overwrite: true);
+        }
+        catch (Exception backup)
+        {
+            // 退避できないなら差し替えない。差し替えたうえで戻せないと、旧版の
+            // app / cli に新版のランチャーが残る。差し替えないほうの損は小さい。
+            // ランチャーは相対参照で app を起動するので、旧ランチャーのままでも
+            // 新しい app は起動できる (この段が元から警告で済むのと同じ理由)。
+            LogQuietly(() => _logger.LogWarning(
+                backup, "ランチャーを退避できないため差し替えない: {Name}", LauncherName));
+            return;
+        }
+
         try
         {
             File.Copy(Path.Combine(_sourceDirectory, LauncherName), launcherTemp, overwrite: true);
@@ -594,6 +732,25 @@ public class UpdateInstaller
     }
 
     /// <summary>
+    /// 退避 (<c>.old</c>) が <see cref="Parts"/> のぶんだけ残っているか (issue #53)。
+    /// <para>
+    /// 戻せるかどうかの目安であると同時に、「起動が成り立ったか」の手掛かりでも
+    /// ある。退避を消すのは後始末 (<see cref="DiscardPrevious"/>) だけで、後始末は
+    /// ウィンドウを立てられた後にしか走らない。そろっていなければ、置き換えた
+    /// 一式はそこまで動いたということである。
+    /// </para>
+    /// </summary>
+    public static bool HasBackups(string targetDirectory)
+    {
+        foreach (var part in Parts)
+        {
+            if (!Directory.Exists(Path.Combine(targetDirectory, part + ".old"))) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// 置き換えの後始末。次の起動 (新しい版) から呼び、退避した .old と、
     /// 消せずに名前をずらした残骸を消す。
     /// 消せなくても常駐は続ける。次の機会にまた試す。
@@ -601,6 +758,21 @@ public class UpdateInstaller
     public static void DiscardPrevious(string targetDirectory, ILogger? logger = null)
     {
         var log = logger ?? NullLogger.Instance;
+
+        var launcherBackup = Path.Combine(targetDirectory, LauncherName + ".old");
+        if (File.Exists(launcherBackup))
+        {
+            try
+            {
+                File.Delete(launcherBackup);
+                LogQuietly(() => log.LogInformation("置き換え前のランチャーを消した"));
+            }
+            catch (Exception ex)
+            {
+                LogQuietly(() => log.LogWarning(ex, "置き換え前のランチャーを消せなかった: {Path}", launcherBackup));
+            }
+        }
+
         foreach (var part in Parts)
         {
             var backup = Path.Combine(targetDirectory, part + ".old");

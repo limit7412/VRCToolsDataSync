@@ -56,14 +56,79 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.Equal("new-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName)));
 
         // 旧一式は .old に退避され、次の起動の DiscardPrevious が消す。
+        // ランチャーも同じく退避される (issue #53 で戻す材料にする)。
         Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
         Assert.Equal("old-cli", File.ReadAllText(TargetFile("cli.old", "marker.txt")));
+        Assert.Equal("old-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName + ".old")));
         Assert.False(Directory.Exists(TargetFile("app.new")));
         Assert.False(Directory.Exists(TargetFile("cli.new")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".new")));
 
         UpdateInstaller.DiscardPrevious(TargetDir);
         Assert.False(Directory.Exists(TargetFile("app.old")));
         Assert.False(Directory.Exists(TargetFile("cli.old")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".old")));
+    }
+
+    [Fact(DisplayName = "済ませた入れ替えを戻すと、退避しておいた一式に返る")]
+    public void RollbackAppliedRestoresTheBackedUpBundle()
+    {
+        var installer = new UpdateInstaller(SourceDir, TargetDir);
+        installer.Apply();
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+
+        // 置き換えた一式が起動できなかった状況。退避から戻す。
+        installer.RollbackApplied();
+
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.Equal("old-nested", File.ReadAllText(TargetFile("app", "nested", "marker.txt")));
+        Assert.Equal("old-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
+
+        // ランチャーも戻す。起動する先や渡す引数は版によって変わりうるので、
+        // app / cli だけを戻すと旧版の一式に新版のランチャーが組み合わさる。
+        Assert.Equal("old-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName)));
+
+        // 戻した以上、退避は残らない。残すと次の起動の後始末が拾えなくなる。
+        Assert.False(Directory.Exists(TargetFile("app.old")));
+        Assert.False(Directory.Exists(TargetFile("cli.old")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".old")));
+    }
+
+    [Fact(DisplayName = "退避の中身が欠けていれば、何も動かさずに断る")]
+    public void RollbackAppliedRefusesWhenABackupIsIncomplete()
+    {
+        var installer = new UpdateInstaller(SourceDir, TargetDir);
+        installer.Apply();
+
+        // ディレクトリはあるが、本体アセンブリだけ失われている。ここで戻すと、
+        // 戻したつもりの側も起動できない。しかも呼び出し側はこれを「戻せた」と
+        // 受け取って取得しておいた ZIP まで捨てるので、展開し直す材料も残らない。
+        File.Delete(TargetFile("app.old", UpdateInstaller.AppAssemblyName));
+
+        Assert.Throws<UpdateRollbackException>(() => installer.RollbackApplied());
+
+        // 断った以上、正規の位置には触っていない。ZIP を展開し直せる状態が残る。
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.Equal("new-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
+    }
+
+    [Fact(DisplayName = "退避がそろっていなければ、何も動かさずに断る")]
+    public void RollbackAppliedRefusesWhenABackupIsMissing()
+    {
+        var installer = new UpdateInstaller(SourceDir, TargetDir);
+        installer.Apply();
+
+        // 片方の退避だけが消えている。ここで戻すと、旧 app と新 cli が
+        // 混ざった一式ができる。どちらの版とも言えないものを正規の位置へ
+        // 置くくらいなら、新しいまま留めるほうがましである。
+        Directory.Delete(TargetFile("cli.old"), recursive: true);
+
+        Assert.Throws<UpdateRollbackException>(() => installer.RollbackApplied());
+
+        // 断った以上、app の側にも触っていない。
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
+        Assert.Equal("new-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
     }
 
     [Fact(DisplayName = "前回が残した .new と .old は、空きを測る前に片付ける")]
