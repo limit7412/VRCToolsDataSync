@@ -540,6 +540,45 @@ public class UpdateInstaller
     }
 
     /// <summary>
+    /// 済ませた入れ替えを戻す (issue #53)。
+    /// <para>
+    /// 置き換えた一式を起動できなかった場合に呼ぶ。<see cref="Apply"/> の中で
+    /// 使う巻き戻しは、その場で退避したものだけを対象にする。こちらは
+    /// 「入れ替えは通ったが、その後で駄目だと分かった」ときの戻し口である。
+    /// </para>
+    /// <para>
+    /// 戻す前に、退避 (<c>.old</c>) がすべてそろっているかを見る。片方しか
+    /// 残っていない状態で戻すと、旧 app と新 cli が混ざった一式ができる。
+    /// digest も実行ファイルの存在も通るうえ、どちらの版とも言えないものが
+    /// 正規の位置に居座るので、そろっていなければ何も動かさずに断る。
+    /// </para>
+    /// <para>
+    /// 呼ぶのは、置き換えた一式のプロセスが終わっていることを確かめてからに
+    /// すること。動いている間は app\ 配下の DLL を掴んでおり、リネームが
+    /// 失敗する。
+    /// </para>
+    /// </summary>
+    /// <exception cref="UpdateRollbackException">
+    /// 退避がそろっていないか、戻す途中で失敗した。正規の位置が欠けたままに
+    /// なりうるため、取得しておいた ZIP は捨ててはならない。
+    /// </exception>
+    public void RollbackApplied()
+    {
+        foreach (var part in Parts)
+        {
+            var backup = Path.Combine(_targetDirectory, part + ".old");
+            if (Directory.Exists(backup)) continue;
+
+            LogQuietly(() => _logger.LogError(
+                "退避した {Part} が無いため戻せない: {Backup}", part, backup));
+            throw new UpdateRollbackException($"退避した {part} が無いため戻せない: {backup}");
+        }
+
+        RollbackSwapped(new List<string>(Parts));
+        LogQuietly(() => _logger.LogInformation("済ませた入れ替えを戻した: {Target}", _targetDirectory));
+    }
+
+    /// <summary>
     /// (4) ランチャーを差し替える。同じディレクトリの一時ファイルへ書き切って
     /// から置き換える。直接上書きすると、書いている途中で容量が尽きた場合に
     /// 欠けたランチャーが残り、通常の起動手段ごと壊れる。
