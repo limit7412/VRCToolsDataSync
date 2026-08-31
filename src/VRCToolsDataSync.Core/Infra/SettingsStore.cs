@@ -37,19 +37,27 @@ public sealed class SettingsStore
     // 計算機の中で一意に効くので、その分岐がそもそも要らない。
     //
     // 守る相手ごとに分けるのも、置き場所で決まる。錠前は設定ファイルの隣に置く。
+    //
+    // 旧版と待ち合わせるための Mutex は、移行の間だけ併せて取る (下記)。
     private static string LockPathOf(string filePath) => filePath + ".lock";
 
-    // 錠前ファイルに移る前の版が使っていた Mutex の名前。
-    // 旧版は錠前ファイルを知らないので、これだけでは互いに待ち合わせない。同じ
-    // 対話セッションで、別の場所に展開した旧版とこの版が同じ settings.json を
-    // 保存すると、以前は効いていた直列化が効かず、read-modify-write の
-    // 取りこぼしに戻る。失うのは利用者の設定なので、旧名も取って待ち合わせを保つ。
+    // 錠前ファイルに移る前の 2 つの版が使っていた Mutex の名前。
+    // 旧版は錠前ファイルを知らないので、錠前だけでは互いに待ち合わせない。旧版と
+    // この版が同じ settings.json を保存すると、以前は効いていた直列化が効かず、
+    // read-modify-write の取りこぼしに戻る。失うのは利用者の設定なので、旧名も
+    // 取って待ち合わせを保つ。
     //
-    // 取る順は「旧名 → 錠前ファイル」で固定する。錠前ファイルを取るのはこの版
-    // だけで、この版は必ず旧名から取るので、順の食い違いは起きない。
+    // 2 つあるのは、間に 1 度名前を変えているためである。守れる範囲が違う。
+    //   - Legacy: 接頭辞の無い名前。対話セッションの中でだけ見える
+    //   - CrossSession: Global\ の名前。設定ファイルのパスから引いた鍵で分かれる
+    // どちらか片方では、どちらか片方の版と待ち合わせられない。
     //
-    // 旧版が行き渡ったら消してよい。
+    // 取る順は「Legacy → CrossSession → 錠前ファイル」で固定する。旧版が取るのは
+    // この並びの先頭からの一部でしかないので、順の食い違いは起きない。
+    //
+    // 旧版が行き渡ったら両方消してよい。
     private const string LegacyCrossProcessMutexName = "VRCToolsDataSync.SettingsStore.Save";
+    private const string CrossSessionMutexPrefix = "VRCToolsDataSync.SettingsStore.Save.";
 
     // 錠前の取得のタイムアウト。普通の Save は数十 ms で終わるため、
     // これだけ待っても取れない場合は別プロセスがハング相当なので、
@@ -239,11 +247,17 @@ public sealed class SettingsStore
         // アトミックに完結させる。プロセス内 _saveLock は同一インスタンス内の
         // 並行 Save 直列化用で、別プロセスからの同時 Save は守れない。
         //
-        // 旧名の Mutex を先に取り、その中で錠前ファイルを取る。順は固定である。
+        // 旧版と待ち合わせるための Mutex を先に取り、その中で錠前ファイルを取る。
+        // 順は固定である。
         using var legacyMutex = new Mutex(initiallyOwned: false, name: LegacyCrossProcessMutexName);
+        using var crossSessionMutex = GlobalMutex.Create(
+            CrossSessionMutexPrefix + GlobalMutex.ScopeKeyOf(FilePath));
         var legacyAcquired = TryEnter(legacyMutex);
+        var crossSessionAcquired = false;
         try
         {
+            crossSessionAcquired = TryEnter(crossSessionMutex);
+
             using var crossProcessLock = CrossSessionFileLock.Acquire(
                 LockPathOf(FilePath), CrossProcessLockTimeout);
 
@@ -308,6 +322,8 @@ public sealed class SettingsStore
         }
         finally
         {
+            // 取った順の逆に返す。
+            Exit(crossSessionMutex, crossSessionAcquired);
             Exit(legacyMutex, legacyAcquired);
         }
     }

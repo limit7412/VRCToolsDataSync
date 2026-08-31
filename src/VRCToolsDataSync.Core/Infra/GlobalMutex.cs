@@ -12,9 +12,10 @@ namespace VRCToolsDataSync.Core.Infra;
 /// ロックだけが互いに見えなくなる。
 /// </para>
 /// <para>
-/// 設定の保存はこれを使わない。<see cref="CrossSessionFileLock"/> へ移した
+/// 設定の保存はこれに頼らない。<see cref="CrossSessionFileLock"/> へ移した
 /// (issue #81)。<c>Global\</c> を作れない相手や開けない相手がセッション内だけの
 /// 名前へ落ちると、誰とも待ち合わせずに進む。設定はそこで利用者の入力を失う。
+/// 移行の間、旧版と待ち合わせるためにこちらも併せて取ってはいる。
 /// </para>
 /// </summary>
 internal static class GlobalMutex
