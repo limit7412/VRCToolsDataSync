@@ -5,296 +5,344 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:local="using:VRCToolsDataSync_App"
+    xmlns:vm="using:VRCToolsDataSync_App.ViewModels"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <ScrollViewer Padding="24">
-        <StackPanel Spacing="20" MaxWidth="900" HorizontalAlignment="Stretch">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
 
-            <TextBlock Text="VRCToolsDataSync" Style="{StaticResource TitleTextBlockStyle}" />
+        <!--
+            競合やリモート更新の問い合わせ (issue #10)。ScrollViewer の外へ
+            置いてあるのは、どこまでスクロールしていても見えるようにするため。
+            閉じるボタンは出さない。答えないまま閉じられると、待っている側は
+            答えを受け取れないまま止まる。
+        -->
+        <InfoBar Grid.Row="0"
+                 Margin="24,24,24,0"
+                 IsOpen="{x:Bind ViewModel.IsPromptOpen, Mode=OneWay}"
+                 IsClosable="False"
+                 Severity="{x:Bind ViewModel.PromptSeverity, Mode=OneWay}"
+                 Title="{x:Bind ViewModel.PromptTitle, Mode=OneWay}"
+                 Message="{x:Bind ViewModel.PromptMessage, Mode=OneWay}">
+            <InfoBar.Content>
+                <!--
+                    幅が足りないときは横に送れるようにする。選択肢だけが待って
+                    いる側へ答えを返せる構造で、閉じるボタンも出していないため、
+                    切れて押せなくなると問い合わせから抜ける手が無くなる。
+                -->
+                <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                              HorizontalScrollMode="Auto"
+                              VerticalScrollBarVisibility="Disabled"
+                              VerticalScrollMode="Disabled"
+                              Margin="0,8,0,12">
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.PromptOptions, Mode=OneWay}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" Spacing="8" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:PromptOption">
+                                <Button Content="{x:Bind Label}" Command="{x:Bind ChooseCommand}" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </InfoBar.Content>
+        </InfoBar>
 
-            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="設定" Style="{StaticResource SubtitleTextBlockStyle}" />
+        <ScrollViewer Grid.Row="1" Padding="24">
+            <StackPanel Spacing="20" MaxWidth="900" HorizontalAlignment="Stretch">
 
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="マシン名" />
-                        <TextBox Text="{x:Bind ViewModel.MachineName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                    </StackPanel>
+                <TextBlock Text="VRCToolsDataSync" Style="{StaticResource TitleTextBlockStyle}" />
 
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="データの保存先" />
-                        <ComboBox SelectedIndex="{x:Bind ViewModel.StorageModeIndex, Mode=TwoWay}"
-                                  HorizontalAlignment="Stretch">
-                            <ComboBoxItem Content="同期フォルダ (OneDrive など)" />
-                            <ComboBoxItem Content="S3 互換ストレージ (Cloudflare R2 / Amazon S3 など)" />
-                        </ComboBox>
-                    </StackPanel>
-
-                    <StackPanel Spacing="4" Visibility="{x:Bind ViewModel.LocalFolderSettingsVisibility, Mode=OneWay}">
-                        <TextBlock Text="同期フォルダパス" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBox Grid.Column="0"
-                                     Text="{x:Bind ViewModel.CloudFolderPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                            <Button Grid.Column="1" Content="参照..." Click="OnBrowseCloudFolder" />
-                        </Grid>
-                    </StackPanel>
-
-                    <StackPanel Spacing="8" Visibility="{x:Bind ViewModel.S3SettingsVisibility, Mode=OneWay}">
-                        <TextBlock Text="接続情報" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <TextBlock Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap"
-                                   Text="R2 は https://&lt;アカウントID&gt;.r2.cloudflarestorage.com とリージョン auto、S3 は https://s3.&lt;リージョン&gt;.amazonaws.com とバケットのリージョンを指定する。API キーは対象バケットだけに絞って発行すること。" />
+                <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="設定" Style="{StaticResource SubtitleTextBlockStyle}" />
 
                         <StackPanel Spacing="4">
-                            <TextBlock Text="エンドポイント URL" />
-                            <TextBox Text="{x:Bind ViewModel.S3ServiceUrl, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                     PlaceholderText="https://&lt;アカウントID&gt;.r2.cloudflarestorage.com" />
+                            <TextBlock Text="マシン名" />
+                            <TextBox Text="{x:Bind ViewModel.MachineName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                         </StackPanel>
 
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <StackPanel Grid.Column="0" Spacing="4">
-                                <TextBlock Text="バケット名" />
-                                <TextBox Text="{x:Bind ViewModel.S3BucketName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="データの保存先" />
+                            <ComboBox SelectedIndex="{x:Bind ViewModel.StorageModeIndex, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch">
+                                <ComboBoxItem Content="同期フォルダ (OneDrive など)" />
+                                <ComboBoxItem Content="S3 互換ストレージ (Cloudflare R2 / Amazon S3 など)" />
+                            </ComboBox>
+                        </StackPanel>
+
+                        <StackPanel Spacing="4" Visibility="{x:Bind ViewModel.LocalFolderSettingsVisibility, Mode=OneWay}">
+                            <TextBlock Text="同期フォルダパス" />
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox Grid.Column="0"
+                                         Text="{x:Bind ViewModel.CloudFolderPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                <Button Grid.Column="1" Content="参照..." Click="OnBrowseCloudFolder" />
+                            </Grid>
+                        </StackPanel>
+
+                        <StackPanel Spacing="8" Visibility="{x:Bind ViewModel.S3SettingsVisibility, Mode=OneWay}">
+                            <TextBlock Text="接続情報" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap"
+                                       Text="R2 は https://&lt;アカウントID&gt;.r2.cloudflarestorage.com とリージョン auto、S3 は https://s3.&lt;リージョン&gt;.amazonaws.com とバケットのリージョンを指定する。API キーは対象バケットだけに絞って発行すること。" />
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="エンドポイント URL" />
+                                <TextBox Text="{x:Bind ViewModel.S3ServiceUrl, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                         PlaceholderText="https://&lt;アカウントID&gt;.r2.cloudflarestorage.com" />
                             </StackPanel>
-                            <StackPanel Grid.Column="1" Spacing="4">
-                                <TextBlock Text="リージョン" />
-                                <TextBox Text="{x:Bind ViewModel.S3Region, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                         PlaceholderText="auto" />
+
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" Spacing="4">
+                                    <TextBlock Text="バケット名" />
+                                    <TextBox Text="{x:Bind ViewModel.S3BucketName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Spacing="4">
+                                    <TextBlock Text="リージョン" />
+                                    <TextBox Text="{x:Bind ViewModel.S3Region, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                             PlaceholderText="auto" />
+                                </StackPanel>
+                            </Grid>
+
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="キー接頭辞 (省略可)" />
+                                <TextBox Text="{x:Bind ViewModel.S3KeyPrefix, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                         PlaceholderText="バケット直下に置く場合は空欄" />
                             </StackPanel>
-                        </Grid>
 
-                        <StackPanel Spacing="4">
-                            <TextBlock Text="キー接頭辞 (省略可)" />
-                            <TextBox Text="{x:Bind ViewModel.S3KeyPrefix, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                     PlaceholderText="バケット直下に置く場合は空欄" />
-                        </StackPanel>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="アクセスキー ID" />
+                                <TextBox Text="{x:Bind ViewModel.S3AccessKeyId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            </StackPanel>
 
-                        <StackPanel Spacing="4">
-                            <TextBlock Text="アクセスキー ID" />
-                            <TextBox Text="{x:Bind ViewModel.S3AccessKeyId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                        </StackPanel>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="シークレットアクセスキー" />
+                                <PasswordBox Password="{x:Bind ViewModel.S3SecretAccessKey, Mode=TwoWay}" />
+                                <TextBlock Text="{x:Bind ViewModel.S3SecretStatus, Mode=OneWay}"
+                                           Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap" />
+                            </StackPanel>
 
-                        <StackPanel Spacing="4">
-                            <TextBlock Text="シークレットアクセスキー" />
-                            <PasswordBox Password="{x:Bind ViewModel.S3SecretAccessKey, Mode=TwoWay}" />
-                            <TextBlock Text="{x:Bind ViewModel.S3SecretStatus, Mode=OneWay}"
-                                       Style="{StaticResource CaptionTextBlockStyle}" TextWrapping="Wrap" />
+                            <StackPanel Orientation="Horizontal" Spacing="16">
+                                <ToggleSwitch Header="パス形式" IsOn="{x:Bind ViewModel.S3UsePathStyle, Mode=TwoWay}" />
+                                <ToggleSwitch Header="条件付き書き込み" IsOn="{x:Bind ViewModel.S3UseConditionalWrites, Mode=TwoWay}" />
+                            </StackPanel>
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="接続テスト"
+                                        Command="{x:Bind ViewModel.TestStorageCommand}"
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            </StackPanel>
                         </StackPanel>
 
                         <StackPanel Orientation="Horizontal" Spacing="16">
-                            <ToggleSwitch Header="パス形式" IsOn="{x:Bind ViewModel.S3UsePathStyle, Mode=TwoWay}" />
-                            <ToggleSwitch Header="条件付き書き込み" IsOn="{x:Bind ViewModel.S3UseConditionalWrites, Mode=TwoWay}" />
+                            <ToggleSwitch Header="VRCX 同期" IsOn="{x:Bind ViewModel.SyncVrcx, Mode=TwoWay}" />
+                            <ToggleSwitch Header="VRC Friend Connect 同期" IsOn="{x:Bind ViewModel.SyncFriendConnect, Mode=TwoWay}" />
+                            <ToggleSwitch Header="常駐＋自動同期" IsOn="{x:Bind ViewModel.AutoSyncEnabled, Mode=TwoWay}" />
                         </StackPanel>
 
-                        <StackPanel Orientation="Horizontal" Spacing="8">
-                            <Button Content="接続テスト"
-                                    Command="{x:Bind ViewModel.TestStorageCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="同期付きアクション" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="同期して起動"
+                                        Command="{x:Bind ViewModel.SyncAndLaunchCommand}"
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="ストレージ容量の解放" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <NumberBox Header="猶予期間 (日)"
+                                           Value="{x:Bind ViewModel.GcGraceDays, Mode=TwoWay}"
+                                           Minimum="{x:Bind ViewModel.MinGcGraceDays}"
+                                           Maximum="{x:Bind ViewModel.MaxGcGraceDays}"
+                                           SpinButtonPlacementMode="Compact"
+                                           Width="140" />
+                                <Button Content="今すぐ解放"
+                                        VerticalAlignment="Bottom"
+                                        Command="{x:Bind ViewModel.CollectGarbageCommand}"
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            </StackPanel>
+                            <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから猶予期間より長く経ったデータを保存先から削除します。猶予期間を短くするほど多く解放できます。"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Text="猶予期間は、他の PC が送っている最中のデータを巻き込まないための余裕です。Push の後始末として 1 日 1 回、猶予期間 7 日で自動でも実行されます。"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="登録"
+                                        Command="{x:Bind ViewModel.RegisterStartupCommand}"
+                                        IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                <Button Content="解除"
+                                        Command="{x:Bind ViewModel.UnregisterStartupCommand}"
+                                        IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
+                            </StackPanel>
+                            <ToggleSwitch Header="ウィンドウを出さずにタスクトレイへ常駐する"
+                                          IsOn="{x:Bind ViewModel.StartupMinimized, Mode=TwoWay}" />
+                            <TextBlock Text="この指定が効くのは自動起動のときだけです。手で起動した場合はこれまでどおりウィンドウが開きます。登録済みのまま切り替えると、その場で登録し直します。"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="本体の更新" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.UpdateStatus, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <ComboBox SelectedIndex="{x:Bind ViewModel.UpdateChannelIndex, Mode=TwoWay}"
+                                          VerticalAlignment="Center">
+                                    <ComboBoxItem Content="安定版 (stable)" />
+                                    <ComboBoxItem Content="テスト版 (test)" />
+                                </ComboBox>
+                                <Button Content="今すぐ確認"
+                                        VerticalAlignment="Center"
+                                        Command="{x:Bind ViewModel.CheckUpdateCommand}"
+                                        IsEnabled="{x:Bind ViewModel.IsCheckingUpdate, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                            </StackPanel>
+                            <TextBlock Text="更新の確認は起動時と 1 日ごとに自動で行われます。「今すぐ確認」は保存済みの結果を使わず、その場で GitHub に問い合わせます。チャンネルの変更は「設定を保存」で反映されます。テスト版は master の変更ごとに作られるプレリリースです。"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       TextWrapping="Wrap" />
+                            <StackPanel Orientation="Horizontal" Spacing="8"
+                                        Visibility="{x:Bind ViewModel.UpdateAvailableVisibility, Mode=OneWay}">
+                                <TextBlock Text="{x:Bind ViewModel.UpdateAvailableText, Mode=OneWay}"
+                                           VerticalAlignment="Center" />
+                                <Button Content="リリースページを開く"
+                                        Command="{x:Bind ViewModel.OpenReleasePageCommand}" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="8"
+                                        Visibility="{x:Bind ViewModel.UpdateStagedVisibility, Mode=OneWay}">
+                                <TextBlock Text="{x:Bind ViewModel.UpdateStagedText, Mode=OneWay}"
+                                           VerticalAlignment="Center" />
+                                <Button Content="再起動して適用"
+                                        Command="{x:Bind ViewModel.ApplyStagedUpdateCommand}"
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            </StackPanel>
                         </StackPanel>
                     </StackPanel>
+                </Border>
 
-                    <StackPanel Orientation="Horizontal" Spacing="16">
-                        <ToggleSwitch Header="VRCX 同期" IsOn="{x:Bind ViewModel.SyncVrcx, Mode=TwoWay}" />
-                        <ToggleSwitch Header="VRC Friend Connect 同期" IsOn="{x:Bind ViewModel.SyncFriendConnect, Mode=TwoWay}" />
-                        <ToggleSwitch Header="常駐＋自動同期" IsOn="{x:Bind ViewModel.AutoSyncEnabled, Mode=TwoWay}" />
-                    </StackPanel>
-
-                    <Button Content="設定を保存" Command="{x:Bind ViewModel.SaveSettingsCommand}" />
-
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="同期付きアクション" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <StackPanel Orientation="Horizontal" Spacing="8">
-                            <Button Content="同期して起動"
-                                    Command="{x:Bind ViewModel.SyncAndLaunchCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                        </StackPanel>
-                    </StackPanel>
-
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="ストレージ容量の解放" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <StackPanel Orientation="Horizontal" Spacing="8">
-                            <NumberBox Header="猶予期間 (日)"
-                                       Value="{x:Bind ViewModel.GcGraceDays, Mode=TwoWay}"
-                                       Minimum="{x:Bind ViewModel.MinGcGraceDays}"
-                                       Maximum="{x:Bind ViewModel.MaxGcGraceDays}"
-                                       SpinButtonPlacementMode="Compact"
-                                       Width="140" />
-                            <Button Content="今すぐ解放"
-                                    VerticalAlignment="Bottom"
-                                    Command="{x:Bind ViewModel.CollectGarbageCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                        </StackPanel>
-                        <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから猶予期間より長く経ったデータを保存先から削除します。猶予期間を短くするほど多く解放できます。"
+                <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="VRCX" Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.VrcxStatus, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.VrcxProcessStatus, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap" />
-                        <TextBlock Text="猶予期間は、他の PC が送っている最中のデータを巻き込まないための余裕です。Push の後始末として 1 日 1 回、猶予期間 7 日で自動でも実行されます。"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
-
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="Windows ログイン時の自動起動" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind ViewModel.StartupStatus, Mode=OneWay}"
-                                   Style="{StaticResource CaptionTextBlockStyle}" />
                         <StackPanel Orientation="Horizontal" Spacing="8">
-                            <Button Content="登録"
-                                    Command="{x:Bind ViewModel.RegisterStartupCommand}"
-                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                            <Button Content="解除"
-                                    Command="{x:Bind ViewModel.UnregisterStartupCommand}"
-                                    IsEnabled="{x:Bind ViewModel.StartupRegistered, Mode=OneWay}" />
+                            <Button Content="Push"
+                                    Command="{x:Bind ViewModel.PushVrcxCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            <Button Content="Pull"
+                                    Command="{x:Bind ViewModel.PullVrcxCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
-                        <ToggleSwitch Header="ウィンドウを出さずにタスクトレイへ常駐する"
-                                      IsOn="{x:Bind ViewModel.StartupMinimized, Mode=TwoWay}" />
-                        <TextBlock Text="この指定が効くのは自動起動のときだけです。手で起動した場合はこれまでどおりウィンドウが開きます。登録済みのまま切り替えると、その場で登録し直します。"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   TextWrapping="Wrap" />
-                    </StackPanel>
 
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="本体の更新" Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind ViewModel.UpdateStatus, Mode=OneWay}"
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="VRCX 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox Grid.Column="0"
+                                         Text="{x:Bind ViewModel.VrcxExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                <Button Grid.Column="1" Content="自動検出"
+                                        Command="{x:Bind ViewModel.DetectVrcxExecutableCommand}" />
+                                <Button Grid.Column="2" Content="参照..." Click="OnBrowseVrcxExecutable" />
+                            </Grid>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="16">
+                            <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.VrcxLaunchOnAppStart, Mode=TwoWay}" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="VRC Friend Connect" Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.FriendConnectStatus, Mode=OneWay}"
+                                   Style="{StaticResource BodyTextBlockStyle}" />
+                        <TextBlock Text="{x:Bind ViewModel.FriendConnectProcessStatus, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    TextWrapping="Wrap" />
                         <StackPanel Orientation="Horizontal" Spacing="8">
-                            <ComboBox SelectedIndex="{x:Bind ViewModel.UpdateChannelIndex, Mode=TwoWay}"
-                                      VerticalAlignment="Center">
-                                <ComboBoxItem Content="安定版 (stable)" />
-                                <ComboBoxItem Content="テスト版 (test)" />
-                            </ComboBox>
-                            <Button Content="今すぐ確認"
-                                    VerticalAlignment="Center"
-                                    Command="{x:Bind ViewModel.CheckUpdateCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsCheckingUpdate, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                            <Button Content="Push"
+                                    Command="{x:Bind ViewModel.PushFriendConnectCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            <Button Content="Pull"
+                                    Command="{x:Bind ViewModel.PullFriendConnectCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
-                        <TextBlock Text="更新の確認は起動時と 1 日ごとに自動で行われます。「今すぐ確認」は保存済みの結果を使わず、その場で GitHub に問い合わせます。チャンネルの変更は「設定を保存」で反映されます。テスト版は master の変更ごとに作られるプレリリースです。"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   TextWrapping="Wrap" />
-                        <StackPanel Orientation="Horizontal" Spacing="8"
-                                    Visibility="{x:Bind ViewModel.UpdateAvailableVisibility, Mode=OneWay}">
-                            <TextBlock Text="{x:Bind ViewModel.UpdateAvailableText, Mode=OneWay}"
-                                       VerticalAlignment="Center" />
-                            <Button Content="リリースページを開く"
-                                    Command="{x:Bind ViewModel.OpenReleasePageCommand}" />
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="VRC Friend Connect 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox Grid.Column="0"
+                                         Text="{x:Bind ViewModel.FriendConnectExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                <Button Grid.Column="1" Content="自動検出"
+                                        Command="{x:Bind ViewModel.DetectFriendConnectExecutableCommand}" />
+                                <Button Grid.Column="2" Content="参照..." Click="OnBrowseFriendConnectExecutable" />
+                            </Grid>
                         </StackPanel>
-                        <StackPanel Orientation="Horizontal" Spacing="8"
-                                    Visibility="{x:Bind ViewModel.UpdateStagedVisibility, Mode=OneWay}">
-                            <TextBlock Text="{x:Bind ViewModel.UpdateStagedText, Mode=OneWay}"
-                                       VerticalAlignment="Center" />
-                            <Button Content="再起動して適用"
-                                    Command="{x:Bind ViewModel.ApplyStagedUpdateCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                        <StackPanel Orientation="Horizontal" Spacing="16">
+                            <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.FriendConnectLaunchOnAppStart, Mode=TwoWay}" />
                         </StackPanel>
                     </StackPanel>
-                </StackPanel>
-            </Border>
+                </Border>
 
-            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="VRCX" Style="{StaticResource SubtitleTextBlockStyle}" />
-                    <TextBlock Text="{x:Bind ViewModel.VrcxStatus, Mode=OneWay}"
-                               Style="{StaticResource BodyTextBlockStyle}" />
-                    <TextBlock Text="{x:Bind ViewModel.VrcxProcessStatus, Mode=OneWay}"
-                               Style="{StaticResource CaptionTextBlockStyle}"
-                               TextWrapping="Wrap" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="Push"
-                                Command="{x:Bind ViewModel.PushVrcxCommand}"
-                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                        <Button Content="Pull"
-                                Command="{x:Bind ViewModel.PullVrcxCommand}"
-                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="ログ" Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <ListView ItemsSource="{x:Bind ViewModel.LogEntries}"
+                                  MaxHeight="240"
+                                  SelectionMode="None"
+                                  IsItemClickEnabled="False">
+                            <ListView.ItemContainerStyle>
+                                <Style TargetType="ListViewItem">
+                                    <Setter Property="MinHeight" Value="0" />
+                                    <Setter Property="Padding" Value="0,2" />
+                                </Style>
+                            </ListView.ItemContainerStyle>
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="x:String">
+                                    <TextBlock Text="{x:Bind}" FontFamily="Consolas" />
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
                     </StackPanel>
+                </Border>
 
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="VRCX 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBox Grid.Column="0"
-                                     Text="{x:Bind ViewModel.VrcxExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                            <Button Grid.Column="1" Content="自動検出"
-                                    Command="{x:Bind ViewModel.DetectVrcxExecutableCommand}" />
-                            <Button Grid.Column="2" Content="参照..." Click="OnBrowseVrcxExecutable" />
-                        </Grid>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="16">
-                        <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.VrcxLaunchOnAppStart, Mode=TwoWay}" />
-                    </StackPanel>
-                </StackPanel>
-            </Border>
-
-            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="VRC Friend Connect" Style="{StaticResource SubtitleTextBlockStyle}" />
-                    <TextBlock Text="{x:Bind ViewModel.FriendConnectStatus, Mode=OneWay}"
-                               Style="{StaticResource BodyTextBlockStyle}" />
-                    <TextBlock Text="{x:Bind ViewModel.FriendConnectProcessStatus, Mode=OneWay}"
-                               Style="{StaticResource CaptionTextBlockStyle}"
-                               TextWrapping="Wrap" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="Push"
-                                Command="{x:Bind ViewModel.PushFriendConnectCommand}"
-                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                        <Button Content="Pull"
-                                Command="{x:Bind ViewModel.PullFriendConnectCommand}"
-                                IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
-                    </StackPanel>
-
-                    <StackPanel Spacing="4">
-                        <TextBlock Text="VRC Friend Connect 実行ファイルパス" Style="{StaticResource CaptionTextBlockStyle}" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBox Grid.Column="0"
-                                     Text="{x:Bind ViewModel.FriendConnectExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                            <Button Grid.Column="1" Content="自動検出"
-                                    Command="{x:Bind ViewModel.DetectFriendConnectExecutableCommand}" />
-                            <Button Grid.Column="2" Content="参照..." Click="OnBrowseFriendConnectExecutable" />
-                        </Grid>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="16">
-                        <ToggleSwitch Header="起動時に自動起動" IsOn="{x:Bind ViewModel.FriendConnectLaunchOnAppStart, Mode=TwoWay}" />
-                    </StackPanel>
-                </StackPanel>
-            </Border>
-
-            <Border Padding="16" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
-                <StackPanel Spacing="8">
-                    <TextBlock Text="ログ" Style="{StaticResource SubtitleTextBlockStyle}" />
-                    <ListView ItemsSource="{x:Bind ViewModel.LogEntries}"
-                              MaxHeight="240"
-                              SelectionMode="None"
-                              IsItemClickEnabled="False">
-                        <ListView.ItemContainerStyle>
-                            <Style TargetType="ListViewItem">
-                                <Setter Property="MinHeight" Value="0" />
-                                <Setter Property="Padding" Value="0,2" />
-                            </Style>
-                        </ListView.ItemContainerStyle>
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="x:String">
-                                <TextBlock Text="{x:Bind}" FontFamily="Consolas" />
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
-                </StackPanel>
-            </Border>
-
-        </StackPanel>
-    </ScrollViewer>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
 </Page>

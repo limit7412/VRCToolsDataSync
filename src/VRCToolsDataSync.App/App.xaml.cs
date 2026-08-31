@@ -263,8 +263,8 @@ public partial class App : Application
             // Microsoft.WindowsAppRuntime.Insights.Resource.dll が見つからずに
             // 必ず COMException (0x8007007E) を出す。GUI 自体は問題なく動く
             // ものの、毎回起動ログが汚れて分かりづらいため、最初から呼ばない。
-            // 通知 UI はトースト経由ではなく、GUI 上のログ表示や ContentDialog
-            // で十分代替できている。
+            // 通知 UI はトースト経由ではなく、GUI 上のログ表示や画面の中の
+            // 問い合わせ (issue #10) で十分代替できている。
 
             try
             {

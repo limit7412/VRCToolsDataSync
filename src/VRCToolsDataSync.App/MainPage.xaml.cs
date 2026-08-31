@@ -17,8 +17,10 @@ public sealed partial class MainPage : Page
         // シングルトン参照を持たせる。MainPage は MainWindow の content として
         // 一度だけ生成される想定。
         App.Page = this;
-        ViewModel.ConflictRequested += OnConflictRequested;
-        ViewModel.RemoteUpdateRequested += OnRemoteUpdateRequested;
+        // 競合とリモート更新の問い合わせは、画面の中の InfoBar が受け持つ
+        // (issue #10)。ここでウィンドウを出すのは、常駐中に問い合わせが出た
+        // ことに気付いてもらうためであって、問い合わせの成立の条件ではない。
+        // 出せなくても問い合わせは画面に残り、後から開いたときに選べる。
         ViewModel.ShowWindowRequested += () => App.ShowMainWindow();
         ViewModel.ToastRequested += (title, body) => App.Tray.ShowToast(title, body);
 
@@ -89,41 +91,5 @@ public sealed partial class MainPage : Page
         WinRT.Interop.InitializeWithWindow.Initialize(picker, App.WindowHandle);
         var file = await picker.PickSingleFileAsync();
         return file?.Path;
-    }
-
-    private async Task<ConflictChoice> OnConflictRequested(ConflictPrompt prompt)
-    {
-        var dialog = new ContentDialog
-        {
-            Title = $"{prompt.ToolDisplayName} コンフリクト",
-            Content = $"リモートの方が新しい更新を持っています。\nremote v{prompt.RemoteVersion} / 最後にPullしたバージョン v{prompt.LastPulledVersion}\n\nどう処理しますか？",
-            PrimaryButtonText = "先に Pull",
-            SecondaryButtonText = "強制 Push（上書き）",
-            CloseButtonText = "キャンセル",
-            DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = this.XamlRoot,
-        };
-        var result = await dialog.ShowAsync();
-        return result switch
-        {
-            ContentDialogResult.Primary => ConflictChoice.PullFirst,
-            ContentDialogResult.Secondary => ConflictChoice.ForceOverwrite,
-            _ => ConflictChoice.Cancel,
-        };
-    }
-
-    private async Task<RemoteUpdateChoice> OnRemoteUpdateRequested(RemoteUpdatePrompt prompt)
-    {
-        var dialog = new ContentDialog
-        {
-            Title = $"{prompt.ToolDisplayName}: リモート更新",
-            Content = $"{prompt.MachineName} がクラウドに v{prompt.RemoteVersion} を Push しました。\n手元の最終 Pull は v{prompt.LocalVersion} です。\n\n今 Pull しますか？",
-            PrimaryButtonText = "Pull する",
-            CloseButtonText = "あとで",
-            DefaultButton = ContentDialogButton.Primary,
-            XamlRoot = this.XamlRoot,
-        };
-        var result = await dialog.ShowAsync();
-        return result == ContentDialogResult.Primary ? RemoteUpdateChoice.PullNow : RemoteUpdateChoice.Later;
     }
 }

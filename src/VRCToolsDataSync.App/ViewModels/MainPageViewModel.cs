@@ -10,6 +10,7 @@ using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
 using VRCToolsDataSync.Core.UseCase;
 using VRCToolsDataSync_App.Services;
+using InfoBarSeverity = Microsoft.UI.Xaml.Controls.InfoBarSeverity;
 
 namespace VRCToolsDataSync_App.ViewModels;
 
@@ -26,9 +27,16 @@ public partial class MainPageViewModel : ObservableObject
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
     private Action<Action>? _uiDispatch;
-    // ContentDialog は WinUI 上で同時に複数表示できないため、自動通知の
-    // ダイアログ呼び出しはここでシリアライズして待ち合わせる。
-    private readonly SemaphoreSlim _dialogGate = new(1, 1);
+    // 問い合わせと、その答えに応じた同期の実行までを 1 件ずつに絞る。
+    //
+    // 押さえる範囲を「問い合わせを出している間」に縮めてはいけない。縮めると、
+    // 先の答えの Push が走っている最中に次の問い合わせが開き、答え次第で二つの
+    // 同期が同じ保存先へ並走する。枠が 1 つなのは画面の都合にすぎず、直列化の
+    // 理由は保存先のほうにある。
+    //
+    // 待っている間も先客のボタンは押せる (IsBusy に束縛していない) ので、
+    // 待ちが解けないということは無い。
+    private readonly SemaphoreSlim _promptGate = new(1, 1);
 
     // x:Bind 用の引数なしコンストラクタ。GUI ホストでは必ず App.Runner を共有して、
     // App 側で構成された FileLoggerProvider 経由でログが出るようにする。
@@ -262,7 +270,36 @@ public partial class MainPageViewModel : ObservableObject
     private const string ProcessDetectionUnknown = "プロセス監視: 未開始";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRunSync))]
     public partial bool IsBusy { get; set; }
+
+    /// <summary>
+    /// 自動側の問い合わせと、その答えに応じた同期が走っている間 true (issue #10)。
+    /// <para>
+    /// 自動側は <see cref="IsBusy"/> を立てない。手動の同期が「押せない」ことを
+    /// 表すのが <see cref="IsBusy"/> の役目で、こちらは押した本人が居ないため
+    /// である。ただし触る先は同じなので、画面のボタンは同じように塞ぐ必要が
+    /// ある。<see cref="_promptGate"/> を握っている区間と一致する。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRunSync))]
+    public partial bool IsHandlingPrompt { get; set; }
+
+    /// <summary>
+    /// 同期に触るボタンを押してよいか (issue #10)。
+    /// <para>
+    /// InfoBar は <c>ContentDialog</c> と違って背後の画面を塞がない。塞がないまま
+    /// にすると、自動側の問い合わせに答えて Push が走っている最中に手で Pull を
+    /// 始められる。同じ保存先と同じ手元のデータを二つの同期が同時に触ることに
+    /// なるので、自動側が動いている間はボタンの側で塞ぐ。
+    /// </para>
+    /// <para>
+    /// 問い合わせの選択肢はこれに束縛しない。塞ぐと、答えを待っている本人が
+    /// 答えられなくなる。
+    /// </para>
+    /// </summary>
+    public bool CanRunSync => !IsBusy && !IsHandlingPrompt;
 
     [ObservableProperty]
     public partial bool StartupRegistered { get; set; }
@@ -340,9 +377,31 @@ public partial class MainPageViewModel : ObservableObject
 
     public ObservableCollection<string> LogEntries { get; } = new();
 
-    public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
+    /// <summary>
+    /// 問い合わせを出している間だけ true (issue #10)。
+    /// <para>
+    /// 以前はここで <c>ContentDialog</c> を出しており、表示に
+    /// <c>XamlRoot</c> を要した。ウィンドウを一度も Activate していない回
+    /// (自動起動でトレイへ常駐した場合など) は <c>XamlRoot</c> が定まらず、
+    /// 表示が例外になってログへ落ちるだけだった。利用者から見ると、トーストは
+    /// 出るのに選ぶ場所がどこにも無い。画面の中の InfoBar へ移して、
+    /// ウィンドウの状態と切り離した。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    public partial bool IsPromptOpen { get; set; }
 
-    public event Func<RemoteUpdatePrompt, Task<RemoteUpdateChoice>>? RemoteUpdateRequested;
+    [ObservableProperty]
+    public partial string PromptTitle { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string PromptMessage { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial InfoBarSeverity PromptSeverity { get; set; } = InfoBarSeverity.Warning;
+
+    /// <summary>問い合わせに並べる選択肢。画面はこれを横に並べる。</summary>
+    public ObservableCollection<PromptOption> PromptOptions { get; } = new();
 
     public event Action? ShowWindowRequested;
 
@@ -367,6 +426,17 @@ public partial class MainPageViewModel : ObservableObject
             // 適用はもう動き出している。ここで設定を書き換えても反映されず、
             // 保存済みの設定と適用される版が食い違うだけになる。
             AppendLog("更新の適用中です。設定の保存は再起動後に行ってください。");
+            return;
+        }
+
+        if (IsPromptOpen)
+        {
+            // 問い合わせに答えるまで待つ。InfoBar は背後の画面を塞がないので、
+            // 答えを待っている間に保存先を変えられる。上書きする先は問い合わせ
+            // を出す時点で押さえてあるため食い違わないが、_settings だけが先に
+            // 変わると、その保存先へ渡す設定 (マシン名など) と実際に触る保存先が
+            // ずれる。窓を開けておく理由が無いので塞ぐ。
+            AppendLog("画面の問い合わせに答えてから設定を保存してください。");
             return;
         }
 
@@ -980,29 +1050,37 @@ public partial class MainPageViewModel : ObservableObject
             AppendLog($"{displayName} Push 開始...");
             var result = await Task.Run(() => _runner.Push(service, _settings, storage, force: false));
 
-            if (result.Outcome == SyncOutcome.ConflictDetected && ConflictRequested is not null)
+            if (result.Outcome == SyncOutcome.ConflictDetected)
             {
-                var choice = await ConflictRequested.Invoke(new ConflictPrompt
+                // 問い合わせと、その答えに応じた実行までを 1 件ずつに絞る。
+                // 自動側の問い合わせが答えを待っている間にここへ来た場合、
+                // 先客が実行を終えるまで待つ。同期先は上で組み立てたものを
+                // そのまま使うので、待っている間に設定を触られても変わらない。
+                await _promptGate.WaitAsync();
+                try
                 {
-                    ToolDisplayName = displayName,
-                    RemoteVersion = result.RemoteVersion ?? 0,
-                    LastPulledVersion = result.LastPulledVersion ?? 0,
-                });
-                switch (choice)
+                    var choice = await AskConflictAsync(
+                        displayName, result.RemoteVersion ?? 0, result.LastPulledVersion ?? 0);
+                    switch (choice)
+                    {
+                        case ConflictChoice.ForceOverwrite:
+                            AppendLog($"{displayName} 強制 Push 実行");
+                            var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
+                            ReportPushResult(displayName, forced, storage);
+                            break;
+                        case ConflictChoice.PullFirst:
+                            AppendLog($"{displayName} 先に Pull を実行");
+                            var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
+                            ReportPullResult(displayName, pulled);
+                            break;
+                        default:
+                            AppendLog($"{displayName} Push をキャンセル");
+                            break;
+                    }
+                }
+                finally
                 {
-                    case ConflictChoice.ForceOverwrite:
-                        AppendLog($"{displayName} 強制 Push 実行");
-                        var forced = await Task.Run(() => _runner.Push(service, _settings, storage, force: true));
-                        ReportPushResult(displayName, forced, storage);
-                        break;
-                    case ConflictChoice.PullFirst:
-                        AppendLog($"{displayName} 先に Pull を実行");
-                        var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
-                        ReportPullResult(displayName, pulled);
-                        break;
-                    default:
-                        AppendLog($"{displayName} Push をキャンセル");
-                        break;
+                    _promptGate.Release();
                 }
             }
             else
@@ -1180,6 +1258,78 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 画面へ問い合わせを出し、選ばれるまで待つ (issue #10)。
+    /// <para>
+    /// ウィンドウが出ているかどうかは問わない。トレイへ常駐したままでも
+    /// 問い合わせはここに残り続け、後からウィンドウを開いたときにそのまま
+    /// 選べる。答えないまま App を終えた場合、待っている側は答えを受け取れず
+    /// そこで止まるが、これは以前ダイアログを閉じずに終えた場合と同じである。
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ここは直列化しない。枠が 1 つしかないのは確かだが、押さえるべき範囲は
+    /// 「問い合わせを出している間」ではなく「答えに応じた同期が終わるまで」で
+    /// ある。呼び出し側が <see cref="_promptGate"/> をその範囲で持つこと。
+    /// </para>
+    /// <para>
+    /// UI スレッドから呼ぶこと。<see cref="PromptOptions"/> は画面が直接
+    /// 束縛しているコレクションで、別スレッドから触ると落ちる。
+    /// </para>
+    /// </remarks>
+    private async Task<T> AskAsync<T>(
+        string title, string message, InfoBarSeverity severity, params (string Label, T Value)[] options)
+    {
+        // 押されたときの継続をボタンのクリックハンドラの中で走らせない。
+        // 走らせると、答えを受け取った側の処理 (Push や Pull) が
+        // クリックの延長で始まり、画面の更新がその分だけ遅れる。
+        var answer = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        PromptTitle = title;
+        PromptMessage = message;
+        PromptSeverity = severity;
+        PromptOptions.Clear();
+        foreach (var (label, value) in options)
+        {
+            PromptOptions.Add(new PromptOption(label, () => answer.TrySetResult(value)));
+        }
+        IsPromptOpen = true;
+
+        try
+        {
+            return await answer.Task;
+        }
+        finally
+        {
+            IsPromptOpen = false;
+            PromptOptions.Clear();
+            PromptTitle = string.Empty;
+            PromptMessage = string.Empty;
+        }
+    }
+
+    /// <summary>Push が競合したときに、どう処理するかを尋ねる。</summary>
+    private Task<ConflictChoice> AskConflictAsync(
+        string displayName, long remoteVersion, long lastPulledVersion) =>
+        AskAsync<ConflictChoice>(
+            $"{displayName}: Push が競合しました",
+            $"リモートの方が新しい更新を持っています (リモート v{remoteVersion} / 最後に Pull した版 v{lastPulledVersion})。どう処理しますか。",
+            InfoBarSeverity.Warning,
+            ("先に Pull", ConflictChoice.PullFirst),
+            ("強制 Push (上書き)", ConflictChoice.ForceOverwrite),
+            ("キャンセル", ConflictChoice.Cancel));
+
+    /// <summary>別の PC の Push を見つけたときに、いま Pull するかを尋ねる。</summary>
+    private Task<RemoteUpdateChoice> AskRemoteUpdateAsync(
+        string displayName, long remoteVersion, long localVersion, string machineName) =>
+        AskAsync<RemoteUpdateChoice>(
+            $"{displayName}: リモートに更新があります",
+            $"{machineName} がクラウドに v{remoteVersion} を Push しました。手元の最終 Pull は v{localVersion} です。いま Pull しますか。",
+            InfoBarSeverity.Informational,
+            ("Pull する", RemoteUpdateChoice.PullNow),
+            ("あとで", RemoteUpdateChoice.Later));
+
     private async Task HandleAutoPushConflictAsync(AutoPushConflictEvent e)
     {
         AppendLog($"[auto] {e.DisplayName} Push 競合 remote=v{e.RemoteVersion} (要操作)");
@@ -1188,21 +1338,17 @@ public partial class MainPageViewModel : ObservableObject
             $"リモート v{e.RemoteVersion} と未同期です。ウィンドウで操作を選択してください。");
         ShowWindowRequested?.Invoke();
 
-        if (ConflictRequested is null) return;
-
-        // ContentDialog は WinUI 上で同時に複数表示できないため、
-        // 自動通知のダイアログは _dialogGate で1件ずつ処理する。
-        await _dialogGate.WaitAsync();
+        await _promptGate.WaitAsync();
+        IsHandlingPrompt = true;
         try
         {
-            var choice = await ConflictRequested.Invoke(new ConflictPrompt
-            {
-                ToolDisplayName = e.DisplayName,
-                RemoteVersion = e.RemoteVersion,
-                LastPulledVersion = e.LastPulledVersion,
-            });
-
+            // 同期先は問い合わせを出す前に組み立てる。InfoBar は ContentDialog と
+            // 違って背後の画面を塞がないため、答えを待っている間に保存先を
+            // 変えられる。答えた後に組み立てると、画面に出した競合とは無関係の
+            // 保存先を「強制 Push」で上書きしうる。
             if (!TryCreateStorage(out var storage)) return;
+
+            var choice = await AskConflictAsync(e.DisplayName, e.RemoteVersion, e.LastPulledVersion);
 
             switch (choice)
             {
@@ -1227,8 +1373,9 @@ public partial class MainPageViewModel : ObservableObject
         }
         finally
         {
+            IsHandlingPrompt = false;
             RefreshStatusSummaries();
-            _dialogGate.Release();
+            _promptGate.Release();
         }
     }
 
@@ -1240,23 +1387,19 @@ public partial class MainPageViewModel : ObservableObject
             $"{e.MachineName} が v{e.RemoteVersion} を Push しました。Pull しますか？");
         ShowWindowRequested?.Invoke();
 
-        if (RemoteUpdateRequested is null) return;
-
-        // ContentDialog の同時表示は不可。AutoPushConflict と共通の
-        // _dialogGate で1件ずつ処理する。
-        await _dialogGate.WaitAsync();
+        await _promptGate.WaitAsync();
+        IsHandlingPrompt = true;
         try
         {
-            var choice = await RemoteUpdateRequested.Invoke(new RemoteUpdatePrompt
-            {
-                ToolDisplayName = e.DisplayName,
-                RemoteVersion = e.RemoteVersion,
-                LocalVersion = e.LocalVersion,
-                MachineName = e.MachineName,
-            });
+            // 競合の側と同じ理由で、同期先は問い合わせを出す前に組み立てる。
+            // こちらは Pull なので、食い違えば手元のツールのデータを無関係の
+            // 保存先の内容で置き換えることになる。
+            if (!TryCreateStorage(out var storage)) return;
+
+            var choice = await AskRemoteUpdateAsync(
+                e.DisplayName, e.RemoteVersion, e.LocalVersion, e.MachineName);
 
             if (choice != RemoteUpdateChoice.PullNow) return;
-            if (!TryCreateStorage(out var storage)) return;
 
             AppendLog($"[auto] {e.DisplayName} Pull 実行");
             var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
@@ -1268,8 +1411,9 @@ public partial class MainPageViewModel : ObservableObject
         }
         finally
         {
+            IsHandlingPrompt = false;
             RefreshStatusSummaries();
-            _dialogGate.Release();
+            _promptGate.Release();
         }
     }
 
@@ -1388,13 +1532,7 @@ public partial class MainPageViewModel : ObservableObject
     }
 }
 
-public sealed class ConflictPrompt
-{
-    public required string ToolDisplayName { get; init; }
-    public required long RemoteVersion { get; init; }
-    public required long LastPulledVersion { get; init; }
-}
-
+/// <summary>Push が競合したときに利用者が選べること。</summary>
 public enum ConflictChoice
 {
     Cancel,
@@ -1402,14 +1540,7 @@ public enum ConflictChoice
     ForceOverwrite,
 }
 
-public sealed class RemoteUpdatePrompt
-{
-    public required string ToolDisplayName { get; init; }
-    public required long RemoteVersion { get; init; }
-    public required long LocalVersion { get; init; }
-    public required string MachineName { get; init; }
-}
-
+/// <summary>リモートに更新があったときに利用者が選べること。</summary>
 public enum RemoteUpdateChoice
 {
     Later,

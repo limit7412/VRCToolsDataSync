@@ -77,7 +77,7 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 dotnet run --project src\VRCToolsDataSync.App
 ```
 
-設定カードで保存先を選び (同期フォルダならパスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時はダイアログで「先に Pull」「強制 Push」「キャンセル」を選択する。
+設定カードで保存先を選び (同期フォルダならパスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時は画面の上端に問い合わせが出るので、「先に Pull」「強制 Push」「キャンセル」を選択する。
 
 ウィンドウの × はタスクトレイへの最小化として扱う。終了はトレイメニューの「同期して終了」から行う。
 

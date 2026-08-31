@@ -88,8 +88,8 @@ public sealed class CloudWatcher : IManifestWatcher
     /// <para>
     /// 再試行で待っている間も、ファイルイベントが来れば debounce タイマーは張り直され、
     /// 別の <c>Elapsed</c> がここへ入ってくる。素通しすると同じ更新に対して
-    /// <see cref="ManifestChanged"/> が二重に上がり、GUI ではトーストと Pull 確認
-    /// ダイアログが重複する。
+    /// <see cref="ManifestChanged"/> が二重に上がり、GUI ではトーストと Pull の
+    /// 問い合わせが重複する。
     /// </para>
     /// <para>
     /// 走っている最中に来た分は「もう一周する」ことだけ伝えて戻る。取りこぼしを
