@@ -271,12 +271,14 @@ public sealed class UpdateStageTests : IDisposable
     /// 別のスレッドから同じ名前のロックを取ってみる。Mutex は取った本人には
     /// 何度でも渡るので、分かれているかどうかは別のスレッドからしか見えない。
     /// </summary>
-    private static bool CanHoldOnAnotherThread(string installRoot)
+    private static bool CanHoldOnAnotherThread(
+        string installRoot, Func<string, Mutex>? create = null)
     {
+        var factory = create ?? UpdateStage.CreateApplyMutex;
         var acquired = false;
         var thread = new Thread(() =>
         {
-            using var mutex = UpdateStage.CreateApplyMutex(installRoot);
+            using var mutex = factory(installRoot);
             try { acquired = mutex.WaitOne(0); }
             catch (AbandonedMutexException) { acquired = true; }
             finally { if (acquired) mutex.ReleaseMutex(); }
@@ -308,6 +310,67 @@ public sealed class UpdateStageTests : IDisposable
         }
     }
 
+
+    [Fact(DisplayName = "取得のロックはインストール先ごとに分かれ、適用のロックとも別になる")]
+    public void DownloadMutexIsScopedPerInstallRootAndSeparateFromApply()
+    {
+        var mine = Path.Combine("C:", "apps", "vrctds-" + Guid.NewGuid().ToString("N"));
+        var other = Path.Combine("D:", "elsewhere", "vrctds-" + Guid.NewGuid().ToString("N"));
+
+        using var held = UpdateStage.CreateDownloadMutex(mine);
+        Assert.True(held.WaitOne(0));
+        try
+        {
+            // 同じインストール先の取得は待たされる。置き場所を共有するため。
+            Assert.False(CanHoldOnAnotherThread(mine, UpdateStage.CreateDownloadMutex));
+            // 別のインストール先とは置き場所が分かれているので待つ理由が無い。
+            Assert.True(CanHoldOnAnotherThread(other, UpdateStage.CreateDownloadMutex));
+            // 適用のロックとは別物である。取得は数十分かかりうるので、
+            // その間ずっと起動時の適用を待たせるわけにはいかない。
+            Assert.True(CanHoldOnAnotherThread(mine, UpdateStage.CreateApplyMutex));
+        }
+        finally
+        {
+            held.ReleaseMutex();
+        }
+    }
+
+    [Fact(DisplayName = "インストール先に既に入っている版は適用しない")]
+    public void DiscardsStagedAlreadyInstalled()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 適用のロックを待っている間に、別のプロセスが 0.0.10 への置き換えを
+        // 終えた状況。こちらの実行中の版は 0.0.9 のままなので、実行中との
+        // 比較だけでは素通りする。
+        Assert.Null(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9", installedVersion: "0.0.10"));
+
+        // 通さなかったものはその場で捨てる。残すと次の起動がまた適用しに行く。
+        Assert.False(File.Exists(stage.ZipPath));
+        Assert.False(File.Exists(stage.MetadataPath));
+    }
+
+    [Fact(DisplayName = "インストール先の版が読めなければ実行中の版だけで判断する")]
+    public void FallsBackToRunningVersionWhenInstalledVersionIsUnknown()
+    {
+        var stage = StageWith("0.0.10");
+
+        // 配布の形でない場合や、版を埋め込まずにビルドした場合がここに来る。
+        // 比べようがないことを理由に更新を止めない。
+        Assert.NotNull(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9", installedVersion: null));
+        Assert.NotNull(stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9", installedVersion: "0.0.0-dev"));
+    }
+
+    [Fact(DisplayName = "インストール先が取得より古ければ適用する")]
+    public void AppliesWhenInstalledVersionIsOlder()
+    {
+        var stage = StageWith("0.0.10");
+
+        var staged = stage.TryLoadVerified(UpdateChannel.Stable, "0.0.9", installedVersion: "0.0.9");
+
+        Assert.NotNull(staged);
+        Assert.Equal("0.0.10", staged!.Tag);
+    }
 
     [Fact(DisplayName = "同じパスの項目を持つ ZIP は展開せずに断る")]
     public void RefusesArchiveWithDuplicateEntries()
