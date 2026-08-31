@@ -98,7 +98,7 @@ dotnet run --project src\VRCToolsDataSync.App
 | [docs/architecture.md](docs/architecture.md) | 保存先のレイアウトと、プロジェクト構成・Core の層 |
 | [docs/s3.md](docs/s3.md) | S3 互換ストレージの準備・設定・注意点 |
 | [docs/gc.md](docs/gc.md) | ストレージ容量の解放 (猶予期間、未完了のアップロード) |
-| [docs/update.md](docs/update.md) | 本体の自動アップデートと、0.0.6 以前からの移行 |
+| [docs/update.md](docs/update.md) | 本体の自動アップデート、起動に失敗した場合の振る舞い、0.0.6 以前からの移行 |
 | [docs/release.md](docs/release.md) | CI とリリースビルド |
 
 ## 第三者プロダクトに関する免責
