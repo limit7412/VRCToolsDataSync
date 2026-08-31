@@ -1,5 +1,6 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace VRCToolsDataSync_App.Services;
@@ -25,14 +26,18 @@ namespace VRCToolsDataSync_App.Services;
 /// </summary>
 internal sealed class CrossProcessLock : IDisposable
 {
-    private readonly ManualResetEventSlim _acquired = new(false);
+    // 取得の合図は Task で渡す。待つ側が長く待つ場合 (取得のロックは
+    // 数十分になりうる)、スレッドを塞いだまま待たせたくない。
+    private readonly TaskCompletionSource<bool> _acquired =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     private readonly ManualResetEventSlim _release = new(false);
     private bool _held;
 
     private CrossProcessLock() { }
 
     /// <summary>
-    /// 掴む。取れなければ null を返す。
+    /// 掴む。取れなければ null を返す。待っている間はスレッドを塞ぐ。
     /// </summary>
     /// <param name="createMutex">
     /// 掴む <see cref="Mutex"/> を作る。所有するスレッドの上で呼ばれる。
@@ -41,6 +46,19 @@ internal sealed class CrossProcessLock : IDisposable
     /// <param name="timeout">待つ上限。<see cref="TimeSpan.Zero"/> なら待たない。</param>
     /// <param name="onTimeout">待ちきれなかったときに残す記録。省略できる。</param>
     public static CrossProcessLock? TryAcquire(
+        Func<Mutex> createMutex, string threadName, TimeSpan timeout, ILogger logger, Action? onTimeout = null)
+        => TryAcquireAsync(createMutex, threadName, timeout, logger, onTimeout).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// 掴む。取れなければ null を返す。待っている間もスレッドを塞がない。
+    /// </summary>
+    /// <param name="createMutex">
+    /// 掴む <see cref="Mutex"/> を作る。所有するスレッドの上で呼ばれる。
+    /// </param>
+    /// <param name="threadName">所有するスレッドの名前。ログと診断のためだけに使う。</param>
+    /// <param name="timeout">待つ上限。<see cref="TimeSpan.Zero"/> なら待たない。</param>
+    /// <param name="onTimeout">待ちきれなかったときに残す記録。省略できる。</param>
+    public static async Task<CrossProcessLock?> TryAcquireAsync(
         Func<Mutex> createMutex, string threadName, TimeSpan timeout, ILogger logger, Action? onTimeout = null)
     {
         var owner = new CrossProcessLock();
@@ -59,8 +77,7 @@ internal sealed class CrossProcessLock : IDisposable
             return null;
         }
 
-        owner._acquired.Wait();
-        if (owner._held) return owner;
+        if (await owner._acquired.Task.ConfigureAwait(false)) return owner;
 
         owner.Dispose();
         return null;
@@ -92,7 +109,7 @@ internal sealed class CrossProcessLock : IDisposable
         }
         finally
         {
-            _acquired.Set();
+            _acquired.TrySetResult(_held);
         }
 
         if (!_held)

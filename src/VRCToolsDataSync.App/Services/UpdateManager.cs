@@ -318,12 +318,22 @@ public sealed class UpdateManager : IDisposable
     /// 取得の置き場所を書き換える間だけ握るクロスプロセスのロック (issue #52)。
     /// 取れなければ null を返す。呼び出し側は置き場所に触らずに見送ること。
     /// </summary>
-    /// <param name="timeout">待つ上限。既定では待たない。</param>
-    private CrossProcessLock? TryAcquireDownloadLock(TimeSpan? timeout = null)
+    /// <param name="timeout">待つ上限。</param>
+    private CrossProcessLock? TryAcquireDownloadLock(TimeSpan timeout)
         => CrossProcessLock.TryAcquire(
             () => UpdateStage.CreateDownloadMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory)),
             "VRCToolsDataSync.UpdateDownloadLock",
-            timeout ?? TimeSpan.Zero,
+            timeout,
+            _logger);
+
+    /// <summary>
+    /// <see cref="TryAcquireDownloadLock"/> の、スレッドを塞がない版。
+    /// </summary>
+    private Task<CrossProcessLock?> TryAcquireDownloadLockAsync(TimeSpan timeout)
+        => CrossProcessLock.TryAcquireAsync(
+            () => UpdateStage.CreateDownloadMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory)),
+            "VRCToolsDataSync.UpdateDownloadLock",
+            timeout,
             _logger);
 
     /// <summary>取得の本体。枠を取った状態で呼ぶ。</summary>
@@ -335,17 +345,25 @@ public sealed class UpdateManager : IDisposable
         // インストール先を別の対話セッションの App が動かしていると、
         // _downloadGate はプロセス内にしか効かない (issue #52)。
         //
-        // 待たずに見送る。相手が取っているのは同じ置き場所へ入る同じ配布物
-        // なので、こちらが取り直す意味が無い。相手が昇格すれば、次の確認は
-        // 「取得済み」と見て省く。
+        // 見送らずに待つ。ここへ来た要求は DrainPendingDownloadsAsync が
+        // _pending から取り出した後であり、落とすと次の確認 (24 時間後) まで
+        // 誰も取りに行かない。
+        //
+        // 待った先で何もせずに済むことが多い。相手が取っているのは同じ置き場所へ
+        // 入る同じ配布物なので、相手が昇格していれば、この下の「取得済みか」の
+        // 判定がそのまま省いてくれる。相手が失敗していれば、こちらが取り直す。
+        //
+        // 上限はこちらの取得の上限と同じにする。待つのは、こちらが取得に使えた
+        // はずの時間である。
         //
         // 取るのは try の外である。取得に失敗したときの後片付け
         // (DiscardIncoming) は catch の中にあり、ロックを try に閉じ込めると、
         // その片付けがロックの外で走る。手放した隙に別のプロセスが書き始めた
         // 書きかけを消しうる。
-        using var downloadLock = TryAcquireDownloadLock();
+        using var downloadLock = await TryAcquireDownloadLockAsync(DownloadTimeout).ConfigureAwait(false);
         if (downloadLock is null)
         {
+            // 相手が取得の上限いっぱい掴んだままである。ここまで来たら次の確認へ回す。
             _logger.LogInformation("別のプロセスが取得中のため、{Tag} の取得は見送る", release.Tag);
             return;
         }
