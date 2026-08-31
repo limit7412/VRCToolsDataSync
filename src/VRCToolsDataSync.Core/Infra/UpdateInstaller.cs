@@ -130,6 +130,33 @@ public class UpdateInstaller
     /// 捨てること。
     /// </para>
     /// </summary>
+    /// <summary>
+    /// インストール先に入っている app の版を読む。読めなければ null (issue #52)。
+    /// <para>
+    /// 実行中のプロセスの版 (<see cref="RunningVersion.Current"/>) とは別物である。
+    /// 置き換えは動いているプロセスを差し替えないので、置き換えの後もしばらくは
+    /// 「入っている版」と「動いている版」が食い違う。取得しておいた更新を
+    /// 適用してよいかは、入っているほうと比べないと決められない。
+    /// </para>
+    /// </summary>
+    /// <param name="installRoot">
+    /// インストール先。null は配布の形でない (dotnet run など) ことを表す。
+    /// </param>
+    public static string? InstalledAppVersion(string? installRoot)
+    {
+        if (installRoot is null) return null;
+
+        var directory = Path.Combine(installRoot, "app");
+        return RunningVersion.OfFile(Path.Combine(directory, AppAssemblyName))
+            ?? RunningVersion.OfFile(Path.Combine(directory, AppExecutableName));
+    }
+
+    /// <summary>
+    /// 実行中の一式のインストール先に入っている app の版。読めなければ null。
+    /// </summary>
+    public static string? InstalledAppVersion()
+        => InstalledAppVersion(FindInstallRoot(AppContext.BaseDirectory));
+
     public static IDisposable? TryHoldSingleInstance(TimeSpan timeout)
         => TryHoldNamedMutex(SingleInstanceMutexName, timeout);
 

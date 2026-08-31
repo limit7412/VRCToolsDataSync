@@ -2,7 +2,6 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
@@ -70,7 +69,13 @@ public static class UpdateApplier
                 // ZIP は、この後の初期化が失敗した場合の復旧の材料になる。
                 // 後始末は起動が成り立った後に CleanUpAfterSuccessfulStart が行う。
                 var channel = LoadChannel(logger);
-                var staged = stage.TryLoadVerified(channel, RunningVersion.Current(), discardMismatches: false);
+                // インストール先に入っている版もここで読む。適用のロックの下に
+                // 居るので、読んでいる間に置き換えが進むことはない (issue #52)。
+                var staged = stage.TryLoadVerified(
+                    channel,
+                    RunningVersion.Current(),
+                    UpdateInstaller.InstalledAppVersion(),
+                    discardMismatches: false);
                 if (staged is null) return false;
 
                 if (root is null)
@@ -175,7 +180,8 @@ public static class UpdateApplier
                 var channel = TryLoadChannel(logger);
                 if (channel is not null)
                 {
-                    _ = stage.TryLoadVerified(channel.Value, RunningVersion.Current());
+                    _ = stage.TryLoadVerified(
+                        channel.Value, RunningVersion.Current(), UpdateInstaller.InstalledAppVersion());
                 }
                 else
                 {
@@ -215,8 +221,13 @@ public static class UpdateApplier
     /// 展開や昇格へ進めば、ロックを置いた意味が無い。
     /// </para>
     /// </summary>
-    private static ApplyLock? AcquireApplyLock(ILogger logger)
-        => ApplyLock.TryAcquire(UpdaterWaitTimeout, logger);
+    private static CrossProcessLock? AcquireApplyLock(ILogger logger)
+        => CrossProcessLock.TryAcquire(
+            () => UpdateStage.CreateApplyMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory)),
+            "VRCToolsDataSync.UpdateApplyLock",
+            UpdaterWaitTimeout,
+            logger,
+            () => LogQuietly(() => logger.LogWarning("更新ヘルパの完了を待ちきれなかった。更新には触らずに続ける")));
 
     /// <summary>
     /// ヘルパの完了を待つ上限。
@@ -229,101 +240,6 @@ public static class UpdateApplier
     /// </para>
     /// </summary>
     private static readonly TimeSpan UpdaterWaitTimeout = TimeSpan.FromMinutes(11);
-
-    /// <summary>
-    /// 握った <see cref="Mutex"/> と、それを所有するスレッドの組。
-    /// <para>
-    /// <see cref="Mutex"/> の所有権はスレッドに紐づき、取ったスレッドからしか
-    /// 手放せない。ここでは、取得から解放までを専用のスレッドに閉じ込め、
-    /// 外からは <see cref="Dispose"/> の合図だけで手放せるようにする。
-    /// そうしないと、取得が <c>Task.Run</c> の中で、解放が UI スレッドから、
-    /// というような組み合わせで解放が黙って失敗する。
-    /// </para>
-    /// <para>
-    /// スレッドは背景スレッドなので、合図が来ないまま残ってもプロセスの終了を
-    /// 妨げない。所有権はそのときに OS が手放し、待っているヘルパへ渡る。
-    /// </para>
-    /// </summary>
-    private sealed class ApplyLock : IDisposable
-    {
-        private readonly ManualResetEventSlim _acquired = new(false);
-        private readonly ManualResetEventSlim _release = new(false);
-        private bool _held;
-
-        private ApplyLock() { }
-
-        /// <summary>取れなければ null を返す。</summary>
-        public static ApplyLock? TryAcquire(TimeSpan timeout, ILogger logger)
-        {
-            var owner = new ApplyLock();
-            try
-            {
-                var thread = new Thread(() => owner.Own(timeout, logger))
-                {
-                    IsBackground = true,
-                    Name = "VRCToolsDataSync.UpdateApplyLock",
-                };
-                thread.Start();
-            }
-            catch (Exception ex)
-            {
-                LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
-                return null;
-            }
-
-            owner._acquired.Wait();
-            if (owner._held) return owner;
-
-            owner.Dispose();
-            return null;
-        }
-
-        /// <summary>専用スレッドの中身。取得を伝えた後、解放の合図まで持ち続ける。</summary>
-        private void Own(TimeSpan timeout, ILogger logger)
-        {
-            Mutex? mutex = null;
-            try
-            {
-                mutex = UpdateStage.CreateApplyMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory));
-                try
-                {
-                    _held = mutex.WaitOne(timeout);
-                }
-                catch (AbandonedMutexException)
-                {
-                    // ヘルパが握ったまま落ちた。所有権はこちらに渡っている。
-                    _held = true;
-                }
-
-                if (!_held)
-                {
-                    LogQuietly(() => logger.LogWarning("更新ヘルパの完了を待ちきれなかった。更新には触らずに続ける"));
-                }
-            }
-            catch (Exception ex)
-            {
-                LogQuietly(() => logger.LogWarning(ex, "更新のロックを取れなかった"));
-                _held = false;
-            }
-            finally
-            {
-                _acquired.Set();
-            }
-
-            if (!_held)
-            {
-                mutex?.Dispose();
-                return;
-            }
-
-            _release.Wait();
-            try { mutex!.ReleaseMutex(); } catch { /* best-effort */ }
-            mutex!.Dispose();
-        }
-
-        /// <summary>手放す合図を送る。どのスレッドから呼んでもよい。</summary>
-        public void Dispose() => _release.Set();
-    }
 
     /// <summary>
     /// 更新のロックを取ってから <paramref name="action"/> を行う。取れなければ
@@ -381,7 +297,7 @@ public static class UpdateApplier
     /// プロセスの終了まで握り続けるロック。ここで参照を持つのは、GC に
     /// 片付けさせないためだけである。
     /// </summary>
-    private static ApplyLock? _heldUntilExit;
+    private static CrossProcessLock? _heldUntilExit;
 
     /// <summary>
     /// 終了まで握るはずだったロックを手放す。終了が取り消された経路から呼ぶ。

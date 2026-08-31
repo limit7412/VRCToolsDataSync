@@ -37,6 +37,10 @@ public sealed class UpdateManager : IDisposable
     private readonly SemaphoreSlim _checkGate = new(1, 1);
 
     // 取得は 1 本ずつ。同じ ZIP へ 2 本が書くと壊れる。
+    //
+    // これはプロセス内だけの錠である。同じインストール先を別の対話セッションの
+    // App が動かしている場合はここでは足りないので、実際に書き始める前に
+    // クロスプロセスのロックも取る (issue #52)。
     private readonly SemaphoreSlim _downloadGate = new(1, 1);
 
     // 取得の打ち切り。取得の本文の読み取りは HttpClient のタイムアウトの外に
@@ -209,6 +213,15 @@ public sealed class UpdateManager : IDisposable
                 return;
             }
 
+            // 別のセッションの App が取得している間も消してはいけない
+            // (issue #52)。取得の側と同じ順 (取得 → 適用) で取る。
+            using var downloadLock = TryAcquireDownloadLock(CleanUpWait);
+            if (downloadLock is null)
+            {
+                _logger.LogInformation("別のプロセスが取得中のため、更新の後始末は次の起動へ回す");
+                return;
+            }
+
             UpdateApplier.CleanUpAfterSuccessfulStart(loggerFactory, _stage);
         }
         catch (Exception ex)
@@ -301,10 +314,59 @@ public sealed class UpdateManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// 取得の置き場所を書き換える間だけ握るクロスプロセスのロック (issue #52)。
+    /// 取れなければ null を返す。呼び出し側は置き場所に触らずに見送ること。
+    /// </summary>
+    /// <param name="timeout">待つ上限。</param>
+    private CrossProcessLock? TryAcquireDownloadLock(TimeSpan timeout)
+        => CrossProcessLock.TryAcquire(
+            () => UpdateStage.CreateDownloadMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory)),
+            "VRCToolsDataSync.UpdateDownloadLock",
+            timeout,
+            _logger);
+
+    /// <summary>
+    /// <see cref="TryAcquireDownloadLock"/> の、スレッドを塞がない版。
+    /// </summary>
+    private Task<CrossProcessLock?> TryAcquireDownloadLockAsync(TimeSpan timeout)
+        => CrossProcessLock.TryAcquireAsync(
+            () => UpdateStage.CreateDownloadMutex(UpdateInstaller.FindInstallRoot(AppContext.BaseDirectory)),
+            "VRCToolsDataSync.UpdateDownloadLock",
+            timeout,
+            _logger);
+
     /// <summary>取得の本体。枠を取った状態で呼ぶ。</summary>
     private async Task RunDownloadAsync(ReleaseInfo release, UpdateChannel channel)
     {
         if (release.Asset is not { } asset) return;
+
+        // ここから先はインストール先ごとの置き場所を読み書きする。同じ
+        // インストール先を別の対話セッションの App が動かしていると、
+        // _downloadGate はプロセス内にしか効かない (issue #52)。
+        //
+        // 見送らずに待つ。ここへ来た要求は DrainPendingDownloadsAsync が
+        // _pending から取り出した後であり、落とすと次の確認 (24 時間後) まで
+        // 誰も取りに行かない。
+        //
+        // 待った先で何もせずに済むことが多い。相手が取っているのは同じ置き場所へ
+        // 入る同じ配布物なので、相手が昇格していれば、この下の「取得済みか」の
+        // 判定がそのまま省いてくれる。相手が失敗していれば、こちらが取り直す。
+        //
+        // 上限はこちらの取得の上限と同じにする。待つのは、こちらが取得に使えた
+        // はずの時間である。
+        //
+        // 取るのは try の外である。取得に失敗したときの後片付け
+        // (DiscardIncoming) は catch の中にあり、ロックを try に閉じ込めると、
+        // その片付けがロックの外で走る。手放した隙に別のプロセスが書き始めた
+        // 書きかけを消しうる。
+        using var downloadLock = await TryAcquireDownloadLockAsync(DownloadTimeout).ConfigureAwait(false);
+        if (downloadLock is null)
+        {
+            // 相手が取得の上限いっぱい掴んだままである。ここまで来たら次の確認へ回す。
+            _logger.LogInformation("別のプロセスが取得中のため、{Tag} の取得は見送る", release.Tag);
+            return;
+        }
 
         try
         {
@@ -438,7 +500,11 @@ public sealed class UpdateManager : IDisposable
             var locked = UpdateApplier.TryWithApplyLock(_logger, () =>
             {
                 var channel = _runner.LoadSettings().Update.Channel;
-                var staged = _stage.TryLoadVerified(channel, CurrentVersion);
+                // インストール先に入っている版と比べる。実行中の版だけを見ると、
+                // 適用のロックを待っている間に別のプロセスが置き換えを終えていた
+                // 場合に素通りし、2 度目の置き換えで .old を失う (issue #52)。
+                var staged = _stage.TryLoadVerified(
+                    channel, CurrentVersion, UpdateInstaller.InstalledAppVersion());
                 if (staged is null)
                 {
                     stagedMissing = true;

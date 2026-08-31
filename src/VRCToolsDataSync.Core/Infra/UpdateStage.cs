@@ -266,8 +266,14 @@ public sealed class UpdateStage
     /// インストール先。null は配布の形でない (dotnet run など) ことを表す。
     /// </param>
     public static Mutex CreateApplyMutex(string? installRoot)
+        => CreateScopedMutex("VRCToolsDataSync.Update.Apply.", installRoot);
+
+    /// <summary>
+    /// インストール先ごとに分けた <c>Global\</c> の <see cref="Mutex"/> を作る。
+    /// </summary>
+    private static Mutex CreateScopedMutex(string prefix, string? installRoot)
     {
-        var name = "VRCToolsDataSync.Update.Apply." + (installRoot is null ? "local" : ScopeKeyOf(installRoot));
+        var name = prefix + (installRoot is null ? "local" : ScopeKeyOf(installRoot));
         try
         {
             return new Mutex(initiallyOwned: false, name: @"Global\" + name);
@@ -280,6 +286,37 @@ public sealed class UpdateStage
             return new Mutex(initiallyOwned: false, name: name);
         }
     }
+
+    /// <summary>
+    /// 更新を取得している間だけ握るクロスプロセスのロック (issue #52)。
+    /// <para>
+    /// 押さえる範囲は「<see cref="IncomingZipPath"/> へ書き始めてから、
+    /// 昇格するか捨てるまで」である。取得の置き場所はインストール先ごとに
+    /// 分かれているが、同じインストール先を複数のプロセスが動かしていれば
+    /// 共有する。プロセス内の直列化だけでは、片方が取り終えて昇格を待って
+    /// いる間に、もう片方の取得の失敗処理が完成済みのファイルを消せる。
+    /// </para>
+    /// <para>
+    /// 後始末 (書きかけを含めて消す側) も同じロックの下で行う。取得と重なると、
+    /// 取り終えて昇格を待っているものを消してしまう。
+    /// </para>
+    /// <para>
+    /// 適用のロック (<see cref="CreateApplyMutex"/>) とは別に置く。取得は
+    /// 数十分かかりうるので、同じロックにまとめると、その間ずっと起動時の
+    /// 適用が待たされる。取得の側は適用のロックを昇格のときだけ取るので、
+    /// 取る順は「取得 → 適用」で揃っており、互いに待ち合う形にはならない。
+    /// </para>
+    /// <para>
+    /// 名前空間は <see cref="CreateApplyMutex"/> と同じ理由で <c>Global\</c> を
+    /// 使う。接頭辞が無いと対話セッションごとの名前空間に作られ、置き場所は
+    /// 共有されるのにロックだけが互いに見えなくなる。
+    /// </para>
+    /// </summary>
+    /// <param name="installRoot">
+    /// インストール先。null は配布の形でない (dotnet run など) ことを表す。
+    /// </param>
+    public static Mutex CreateDownloadMutex(string? installRoot)
+        => CreateScopedMutex("VRCToolsDataSync.Update.Download.", installRoot);
 
     /// <summary>
     /// 同じディレクトリ内で名前を付け替える。掴まれている間は短く待って
@@ -337,7 +374,19 @@ public sealed class UpdateStage
     /// 後始末は起動が成り立った後に、既定の破棄付きの呼び出しで行う。
     /// </para>
     /// </summary>
-    public StagedMetadata? TryLoadVerified(UpdateChannel channel, string runningVersion, bool discardMismatches = true)
+    /// <param name="channel">今のチャンネル。</param>
+    /// <param name="runningVersion">実行中のプロセスに埋め込まれた版。</param>
+    /// <param name="installedVersion">
+    /// インストール先に入っている一式の版。読めない場合や配布の形でない場合は
+    /// null を渡す。<paramref name="runningVersion"/> と分けてあるのは、置き換えの
+    /// 後もまだ動き続けている旧版のプロセスがあるためである (issue #52)。
+    /// </param>
+    /// <param name="discardMismatches">通らなかった取得をその場で捨てるか。</param>
+    public StagedMetadata? TryLoadVerified(
+        UpdateChannel channel,
+        string runningVersion,
+        string? installedVersion = null,
+        bool discardMismatches = true)
     {
         StagedMetadata? metadata;
         try
@@ -422,6 +471,26 @@ public sealed class UpdateStage
         {
             _logger.LogInformation(
                 "取得しておいた {Tag} は実行中の {Running} より新しくない", metadata.Tag, runningVersion);
+            if (discardMismatches) Discard();
+            return null;
+        }
+
+        // インストール先に入っている版とも突き合わせる (issue #52)。
+        //
+        // 上の判定は実行中のプロセスの版を見る。適用のロックを待っている間に
+        // 別のプロセスが置き換えを終えていると、こちらはまだ旧版のままなので、
+        // 取っておいた版はこちらより新しく、素通りする。そのまま進めば 2 度目の
+        // 置き換えが走り、1 度目の退避 (.old) が新版で上書きされる。復旧の
+        // 材料である本当の旧版が、そこで失われる。
+        //
+        // 読めない場合は通す。配布の形でない (dotnet run) 場合と、版を埋め込まず
+        // にビルドした場合がここに来る。比べようがないものを理由に止めない。
+        var installed = ReleaseVersion.Parse(installedVersion);
+        if (installed is not null && staged <= installed)
+        {
+            _logger.LogInformation(
+                "取得しておいた {Tag} は既にインストール先の {Installed} へ入っている",
+                metadata.Tag, installedVersion);
             if (discardMismatches) Discard();
             return null;
         }

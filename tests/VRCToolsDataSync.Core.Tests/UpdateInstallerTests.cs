@@ -324,6 +324,24 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.Null(UpdateInstaller.FindInstallRoot(Path.Combine(TargetDir, "app")));
     }
 
+    [Fact(DisplayName = "インストール先に入っている版は app の下から読む")]
+    public void InstalledAppVersionReadsFromAppDirectory()
+    {
+        // 配布の形でなければ読みようが無い。
+        Assert.Null(UpdateInstaller.InstalledAppVersion(null));
+
+        // CreateBundle が置くのはただのテキストなので、版は埋まっていない。
+        Assert.Null(UpdateInstaller.InstalledAppVersion(TargetDir));
+
+        // 版を持つファイルを app の下へ置けば読める。ここでは Core 自身の
+        // アセンブリを借りる (中身は問わない。読めるかどうかだけを見る)。
+        var versioned = typeof(UpdateInstaller).Assembly.Location;
+        Assert.False(string.IsNullOrEmpty(versioned));
+        File.Copy(versioned, TargetFile("app", UpdateInstaller.AppAssemblyName), overwrite: true);
+
+        Assert.NotNull(UpdateInstaller.InstalledAppVersion(TargetDir));
+    }
+
     [Fact(DisplayName = "掴まれている抑止は待ちきれずに諦める")]
     public void SingleInstanceHoldGivesUpWhileAnotherProcessHoldsIt()
     {
