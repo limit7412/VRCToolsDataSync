@@ -14,34 +14,9 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
 - **プロセス検知ガード**: 同期対象のツール (`VRCX`, `VRC Friend Connect`) が実行中の場合は WAL ロックによる DB 破損を避けるため同期を拒否
 - **暗号化**: 保存先のデータは暗号化しない。S3 互換モードのシークレットアクセスキーのみ、Windows の DPAPI で保護して `settings.json` に保存する
 
-## 保存先のレイアウト
+保存先に置くデータの形は [docs/architecture.md](docs/architecture.md) にまとめてある。
 
-ローカル同期フォルダではフォルダ構造、S3 互換ストレージではオブジェクトキーとして、同じ形を使う。
-
-```text
-<保存先のルート>/
-  manifest.json                    # ツール別の version / machineName / files[]
-  blobs/
-    <sha256>                       # 実データ。置き場所は内容から決まる
-```
-
-実データの置き場所は**内容の SHA-256 から決める**。`manifest.json` の `files[]` が、ツールの中での位置 (`vrcx/latest.sqlite3` など) と、その実体がある `blobs/<sha256>` を対応付ける。
-
-```json
-{
-  "relativePath": "vrcx/latest.sqlite3",
-  "sha256": "9f2c…",
-  "blobKey": "blobs/9f2c…"
-}
-```
-
-固定のキーへ上書きしないので、**同じキーには常に同じ中身しか入らない**。2 台が同時に Push しても、manifest の記録と実体がずれることがない。同じ内容を二度送らずに済む利点もある (変わっていないファイルはキーも変わらないため、既にあるものとして送信を省ける)。
-
-参照されなくなった実体はその場では消さない。他の PC が送っている最中のものを巻き込まないよう、猶予期間を置いて削除する (Push の後始末として 1 日 1 回自動で走るほか、GUI の「今すぐ解放」と `storage gc` で手動でも実行できる)。
-
-S3 互換モードでは、この全体をバケット内の任意の接頭辞の下に置ける（`--prefix`）。
-
-### 保存先の選び方
+## 保存先の選び方
 
 | | ローカル同期フォルダ | S3 互換ストレージ |
 | --- | --- | --- |
@@ -52,29 +27,7 @@ S3 互換モードでは、この全体をバケット内の任意の接頭辞�
 
 S3 互換モードの費用は、ほぼ Pull のダウンロード転送量だけで決まる。Cloudflare R2 は転送量が無料で、10GB までの保存も無料枠に収まるため、現実的な使い方では課金されない。Amazon S3 は転送量が月 100GB まで無料で、それを超えると $0.09/GB（東京リージョンは約 $0.114/GB）かかる。大きな DB を自動同期で頻繁に往復させる使い方では S3 が月数千円に達しうるので、既定の推奨は R2 とする。
 
-## 構成
-
-| プロジェクト | 役割 |
-| --- | --- |
-| `VRCToolsDataSync.Core` | 設定 / パス解決 / プロセス検知 / SQLite スナップショット / ハッシュ / バックアップ / manifest / 保存先の抽象 / SyncService |
-| `VRCToolsDataSync.Cli` | `push` / `pull` / `status` / `storage` を提供するコンソール |
-| `VRCToolsDataSync.App` | WinUI 3 (.NET 10) の GUI。設定編集と Push/Pull、コンフリクト解決ダイアログ |
-
-### Core の層 (issue #50)
-
-`Core` はフォルダと名前空間で層を分けている。依存は下向きだけに保つ。
-
-| フォルダ | 置くもの | 依存してよい先 |
-| --- | --- | --- |
-| `Domain` | モデル、境界 (`ISyncStorage` `ISyncService` `IReleaseRepository`)、外部に触れない規則 | なし |
-| `Infra` | 境界の実装と、外部に触れるもの (S3 / ファイル / レジストリ / GitHub / SQLite / プロセス) | `Domain` |
-| `UseCase` | 手順の組み立て (Push/Pull、起動時と終了時の同期、自動同期、容量の解放、更新確認) | `Domain` `Infra` |
-
-`Cli` と `App` は合成ルートで、3 つすべてを参照する。
-
-**`Domain` はどの層も参照しない。`Infra` は `UseCase` を参照しない。** 上の層への言及は `<see cref>` ではなく `<c>` で書く。参照を張ってしまうと、コードでは切れている向きが doc 経由で戻る。
-
-`Infra` と `UseCase` の境目は「外に触れるか」で引いている。`ManifestStore` は `ISyncStorage` を通してしか読み書きしないので `UseCase`、`S3SyncStorage` は実際に通信するので `Infra` である。同期先の実装が manifest のキーを要るため、キーだけは `Domain` の `ManifestKeys` に置いてある。
+S3 互換ストレージの準備と設定の手順は [docs/s3.md](docs/s3.md) を参照。
 
 ## 必要環境
 
@@ -118,116 +71,6 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 | 4 | 同期対象が存在しない |
 | 5 | プロセス実行中で同期不可 |
 
-## S3 互換ストレージを使う
-
-### バケットと API キーを用意する
-
-**Cloudflare R2 の場合**
-
-1. Cloudflare ダッシュボードの R2 でバケットを作る。
-2. 「R2 API トークン」を発行する。権限は「オブジェクトの読み取りと書き込み」、対象は作成したバケットのみに絞る。
-3. 表示される Access Key ID / Secret Access Key と、エンドポイント `https://<アカウントID>.r2.cloudflarestorage.com` を控える。
-
-**Amazon S3 の場合**
-
-1. バケットを作る。パブリックアクセスはすべてブロックのままにする。
-2. そのバケットに対する `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` / `s3:AbortMultipartUpload` / `s3:ListBucket` / `s3:ListBucketMultipartUploads` だけを許可する IAM ポリシーを作り、専用の IAM ユーザに付ける。
-   `s3:ListBucket` は `storage gc` の走査に要る。`s3:ListBucketMultipartUploads` は未完了のアップロードの一覧に、`s3:AbortMultipartUpload` はその中断に要る。64MB を超えるファイルはマルチパートで送るため、送信が途中で切れると送信済みのパートが残り、これらの権限が無いと消せないまま課金され続ける。
-3. そのユーザのアクセスキーを発行し、エンドポイント `https://s3.<リージョン>.amazonaws.com` とあわせて控える。
-
-### 本ツールに設定する
-
-GUI の設定カードで「データの保存先」を「S3 互換ストレージ」に切り替えると、エンドポイント URL・バケット名・リージョン・キー接頭辞・アクセスキーを入力できる。「接続テスト」で到達性を確かめてから「設定を保存」する。
-
-CLI でも設定できる。
-
-```powershell
-# Cloudflare R2
-VRCToolsDataSync.Cli.exe storage s3 `
-  --endpoint "https://<アカウントID>.r2.cloudflarestorage.com" `
-  --bucket "vrctools" `
-  --region auto `
-  --access-key "<Access Key ID>"
-
-# Amazon S3 (東京リージョン)
-VRCToolsDataSync.Cli.exe storage s3 `
-  --endpoint "https://s3.ap-northeast-1.amazonaws.com" `
-  --bucket "vrctools" `
-  --region ap-northeast-1 `
-  --access-key "<Access Key ID>"
-```
-
-`--secret-key` を省略すると、シークレットアクセスキーは画面に表示されない形で入力を求められる。シェルの履歴やプロセス一覧に残さないため、こちらを勧める。スクリプトから渡す場合は環境変数 `VRCTOOLSDATASYNC_S3_SECRET_KEY` を使う。
-
-設定は保存前に実際の接続を試し、到達できなければ保存せずに終了する。確認は読み取りだけでなく、検査用オブジェクトの書き込みと削除まで行う。Push はローカルから消えたファイルの削除も行うので、削除を許可しない API キーもここで弾かれる。あとから確認する場合は `storage test` を使う。
-
-```powershell
-VRCToolsDataSync.Cli.exe storage test
-```
-
-ローカル同期フォルダへ戻す場合は次のとおり。
-
-```powershell
-VRCToolsDataSync.Cli.exe storage local --path "D:\OneDrive\VRCToolsDataSync"
-```
-
-### 不要になったデータを消して容量を解放する
-
-Push は実データを消さない。置き場所が内容から決まるため、同じ内容を別の世代が参照していることがあり、その場で消すと他の PC が公開したばかりの manifest が実体を失いかねないためである。
-
-参照されなくなった実体は、Push の後始末として自動で削除される。GUI の Push (手動・自動とも) と CLI の `push` が成功したとき、前回の実行からおよそ 1 日空いていれば解放が走る。実行の記録は保存先ごとに `settings.json` へ残る。
-
-すぐに空けたい場合は、GUI の「ストレージ容量の解放」の「今すぐ解放」か、CLI の `storage gc` を実行する。対象を確認してから消したい場合は `--dry-run` を使う。
-
-GUI では猶予期間を日数で指定できる (1〜365 日、既定は 7 日)。**短くするほど多く解放できる。** 猶予期間は他の PC が送っている最中のデータを巻き込まないための余裕なので、S3 互換モードなら 1 日でも足りる (Push は数分で終わる)。同期フォルダモードでは伝播遅延のぶん余裕が要るため、既定のままを勧める。0 を指定できるのは CLI だけにしてある (下記の理由による)。
-
-```powershell
-# まず対象を確認する (削除はしない)
-VRCToolsDataSync.Cli.exe storage gc --dry-run
-
-# 解放する
-VRCToolsDataSync.Cli.exe storage gc
-
-# 猶予期間を詰めて、より多く解放する
-VRCToolsDataSync.Cli.exe storage gc --grace-days 1
-```
-
-現在の `manifest.json` から参照されていない実体のうち、**最後に書かれてから 7 日以上経ったもの**が対象になる。この猶予期間は、他の PC が送っている最中の実体 (まだどの manifest からも参照されていない) を巻き込まないためのもので、`--grace-days` で変えられる。
-
-複数 PC で使っている場合、猶予期間を極端に短くすると進行中の Push を壊しうる。既定のままを勧める。
-
-`manifest.json` から参照されている実体が 1 件も見つからない場合、解放は何もせずに中止する。同期クライアントが `manifest.json` を置き換えている一瞬に当たると空の manifest を読みうるためで、その判断のまま進めると生きている実体まで消してしまう。
-
-削除は「直前に読み直した状態のままなら」という条件付きで行う。読み直してから消すまでの間に別の PC が同じ内容を送り直していると、その実体はこれから公開される manifest に参照されるためである。
-
-**この判定は不可分ではない。** 読み直しから削除までの一瞬は、どちらの保存先でも残る。S3 の条件付き削除は `If-Match` に ETag を取るが、ETag は内容の関数なので、内容から決まるキーでは送り直しを区別できない。
-
-**同期フォルダでは、残る幅が伝播遅延そのものになる。** 判定に使えるのは同期クライアントが手元へ持ってきた写しの更新時刻で、別の PC が置き直してもそれが届くまでは古いまま見える。猶予期間もこれを埋めない (同じ写しを基準に測るため)。いずれの場合も、次の Push が実体の欠落を見つけて送り直すため自然に回復する。
-
-### 未完了のアップロードも片付ける
-
-64MB を超えるファイルはマルチパートで送る。送信が途中で切れると、送信済みのパートが同期先に残る。**これはオブジェクトの一覧に現れないが、保存容量としては課金される。** 送信元のプロセスが生きていれば中断を試みるが、PC の電源断やアプリの強制終了では中断が走らない。
-
-解放は、実体の削除と同じ猶予期間で、開始から猶予期間を過ぎた未完了のアップロードを中断する。猶予期間を使うのは、他の PC が今まさに送っている最中のものも未完了として現れるためである。中断してしまうと、その Push をこちらから壊すことになる。
-
-同期フォルダには分割して送る仕組みが無いので、この片付けは S3 互換モードにだけ効く。
-
-### 注意点
-
-- エンドポイントは `https` のみ受け付ける。ファイルの送信では本文のハッシュを署名に含めない代わりに、内容の完全性を TLS に委ねているため。
-- シークレットアクセスキーは DPAPI で保護して保存する。復号できるのは保存した Windows ユーザだけなので、`settings.json` を別 PC へコピーしても S3 の設定は引き継げない。PC ごとに設定し直すこと。
-- 同期履歴 (`toolState`) は保存先ごとに別のキーで持つ。保存先を切り替えても、元の保存先の履歴はそのまま残る。同期フォルダも、フォルダのパスごとに別の履歴になる。
-
-## 更新時の注意 (0.0.6 以前からの移行)
-
-0.0.7 で `manifest.json` の形式が変わった (`schemaVersion` 1 → 2)。実データの置き場所を固定のキーから内容由来のキーへ移したためである。
-
-**同じ保存先を共有するすべての PC を更新すること。** 0.0.7 以降は 1 と 2 のどちらの manifest も読めるが、0.0.6 以前は 2 を読めない。更新していない PC で Pull すると、実体が見つからず「同期先にファイルがありません」で失敗する (データが壊れることはない)。
-
-更新した PC が一度 Push すれば manifest は 2 になる。移行のための操作は要らない。
-
-古い形式で置かれていた実データ (`vrcx/latest.sqlite3` など) は、新しい形式に切り替わった後どの manifest からも参照されなくなるが、`blobs/` の外にあるため `storage gc` の対象にはならない。不要になったら手作業で消す。
-
 ## GUI
 
 ```powershell
@@ -246,60 +89,17 @@ dotnet run --project src\VRCToolsDataSync.App
 
 登録済みのままチェックを切り替えると、その場で登録し直す。更新の後に開き直す経路もこの指定を引き継ぐので、更新のたびに画面が現れることはない。
 
-## 自動アップデート
+## ドキュメント
 
-GUI 常駐中に GitHub Releases を自動で確認し (起動 30 秒後と 1 日ごと)、新しい版が出ていればトレイのバルーンと設定カードの「本体の更新」欄で知らせる。同じ版を繰り返しは知らせない。確認を止める設定は持たない。起動 30 秒後にするのは、起動時同期 (Pull と自動起動) と帯域を取り合わないためである。
+込み入った話は `docs/` に分けてある。
 
-次の確認を待たずに確かめたいときは、設定カードの「今すぐ確認」を押す。覚えている結果も、同じ版を繰り返し知らせないための抑止も通さず、その場で GitHub に問い合わせる。公開したばかりの版を手前のキャッシュに隠されないよう、問い合わせには `Cache-Control: no-cache` を付けている。
-
-チャンネルは設定カードで選ぶ。
-
-- **安定版 (stable)**: `X.Y.Z` の安定版リリースだけを拾う (既定)
-- **テスト版 (test)**: master の変更ごとに作られる `X.Y.Z-testN` のプレリリースも拾う
-
-新しい版の zip は常駐中に取得し、GitHub が公開する SHA-256 と照合してから `%AppData%\VRCToolsDataSync\update\` に置く。置き換えは次の起動時、または「再起動して適用」ボタンで行われる。実行中の一式は自分では置き換えられないため、取得した zip の中の CLI が更新ヘルパとして App の終了を待ってから `app\` と `cli\` を入れ替え、失敗した場合は元の版へ戻す。
-
-置き換えると、直前の一式は `app.old` / `cli.old` として同じ場所に残る。次の起動がこれを消す。ウイルス対策ソフトに掴まれているなどで消せない場合は、`app.old.trash-<英数字>` のように名前をずらしてから置き換えを進め、消せるようになった時点で片付ける。**消せない残骸が置き換えを止めることはない。** 名前をずらすことすらできない場合だけ今回の置き換えを見送り、取得した zip を残したまま現行版で起動する。その場合は設定カードの「本体の更新」欄にその旨を出す。
-
-`dotnet run` や `bin\` 配下の手元ビルドは版を持たない (`0.0.0-dev`) ため、確認も置き換えも行われない。
-
-## CI
-
-`.github/workflows/ci.yml` が PR と master への push をトリガーに Release 構成でビルドする。
-solution 全体 (上のセットアップ手順と同じ `dotnet build VRCToolsDataSync.slnx`) と、RID と Platform を明示した `VRCToolsDataSync.App` の 2 通りを通す。前者は書いてあるとおりの手順が動くことの確認で、後者はリリースに近い経路の確認にあたる。
-`VRCToolsDataSync.App` が WinUI 3 と Windows App SDK に依存しているため、ランナーは `windows-latest` を使う。
-
-## リリースビルド
-
-ローカルで self-contained な実行ファイルを作る場合:
-
-```powershell
-# x64 (既定)
-powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
-
-# arm64 など他アーキ
-powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -Arch arm64
-```
-
-出力先は `artifacts/win-<arch>/{app,cli}/` と `artifacts/VRCToolsDataSync-win-<arch>.zip`。`app/VRCToolsDataSync.App.exe` が GUI、`cli/VRCToolsDataSync.Cli.exe` が CLI。
-
-リリースは **stable** (安定版) と **test** (プレリリース) の 2 チャンネルに分かれている (issue #45)。
-GitHub Actions がどちらも x64 と arm64 をビルドし、GitHub Release に zip を添付する。
-
-| トリガー | ワークフロー | タグ | リリース |
-| --- | --- | --- | --- |
-| master への push | prerelease.yml | 直近の安定版タグの patch を一つ進めた `X.Y.(Z+1)-testN` を自動採番 | プレリリースとして公開 |
-| `0.0.4` 形式のタグの push | release.yml | push したタグ | Draft |
-| Actions タブからの手動実行 | release.yml | 入力したタグ名（空ならアーティファクトのみ） | Draft |
-
-master へのマージは test チャンネルのプレリリースになる。ただし成果物の中身が変わらない push (tests やドキュメントのみ) では作られない。
-安定版は人が出す。`X.Y.Z` のタグを push して作られた Draft を確認して公開するか、リリース画面から手動で作成する。
-minor や major を上げたいときも、目的の番号のタグを push すればよい。
-
-ビルドの前にタグを決め、`-p:Version` で成果物へ版を埋め込む。アプリはこの版を自動アップデートの「実行中の版」として使う。
-
-master への push が短い間隔で続いた場合、待機中のワークフローは後続の実行に置き換えられ、プレリリースは一本にまとまる。
-番号は一つだけ進み、まとめられた変更はそのリリースのノートに含まれる (ノートは直前のタグからの差分で生成される)。
+| 文書 | 内容 |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | 保存先のレイアウトと、プロジェクト構成・Core の層 |
+| [docs/s3.md](docs/s3.md) | S3 互換ストレージの準備・設定・注意点 |
+| [docs/gc.md](docs/gc.md) | ストレージ容量の解放 (猶予期間、未完了のアップロード) |
+| [docs/update.md](docs/update.md) | 本体の自動アップデートと、0.0.6 以前からの移行 |
+| [docs/release.md](docs/release.md) | CI とリリースビルド |
 
 ## 第三者プロダクトに関する免責
 
