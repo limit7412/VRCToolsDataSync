@@ -662,21 +662,12 @@ static int ApplySelfUpdate(
     //
     // 上限は呼び出し元の終了待ちに合わせて広く取る。呼び出し元は終了時に
     // 同期を流すことがあり、その間はロックを握ったままである。
-    using var applyMutex = UpdateStage.CreateApplyMutex(target);
-    var applyMutexHeld = false;
-    try
-    {
-        // 上限は WaitForCaller と同じ長さにする。呼び出し元が終了時 Push を
-        // 流している間、ロックはそちらが握ったままである。
-        applyMutexHeld = applyMutex.WaitOne(TimeSpan.FromMinutes(65));
-    }
-    catch (AbandonedMutexException)
-    {
-        // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
-        // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
-        applyMutexHeld = true;
-    }
-    if (!applyMutexHeld)
+    //
+    // 握りっぱなしにはしない。置き換えた App が立ち上がったかを見る間は返す
+    // (issue #53)。握ったままだと、起こした App が起動の先頭でこれを待って
+    // 止まり、その姿を「生きている」と読んでしまう。
+    using var applyLock = new ApplyLockHolder(UpdateStage.CreateApplyMutex(target));
+    if (!applyLock.TryAcquire(TimeSpan.FromMinutes(65)))
     {
         // 別のヘルパが動いている。二重に適用しない。
         Console.Error.WriteLine("別の更新処理が実行中のため、置き換えを中止しました。");
@@ -717,11 +708,12 @@ static int ApplySelfUpdate(
             return 6;
         }
 
-        return ApplySelfUpdateCore(source, target, relaunch, relaunchMinimized, logger, singleInstance);
+        return ApplySelfUpdateCore(
+            source, target, relaunch, relaunchMinimized, logger, singleInstance, applyLock);
     }
     finally
     {
-        try { applyMutex.ReleaseMutex(); } catch { /* best-effort */ }
+        applyLock.Release();
     }
 }
 
@@ -805,7 +797,8 @@ static int ApplySelfUpdateCore(
     bool relaunch,
     bool relaunchMinimized,
     ILogger logger,
-    IDisposable? singleInstance = null)
+    IDisposable? singleInstance = null,
+    ApplyLockHolder? applyLock = null)
 {
     // ヘルパの流れの上にあるログは、失敗しても流れを止めない。
     // ログの出力先 (%AppData%) が書き込み不可だったり容量が尽きていたりすると、
@@ -875,6 +868,16 @@ static int ApplySelfUpdateCore(
         return 1;
     }
 
+    // 起こす前に適用のロックを返す (issue #53)。握ったままだと、起こした App は
+    // 起動の先頭 (取得しておいた更新の照合) でこれを待って止まる。観察はその
+    // 止まっている姿を「生きている」と読むので、ロックが空いた後の初期化の
+    // 失敗を捕まえられない。
+    //
+    // 返しても二重適用にはならない。起こした App の照合は、インストール先に
+    // 入っている版と突き合わせて素通りする (#52)。置き換えは済んでいるので、
+    // 入っている版は取得しておいた版と同じである。
+    applyLock?.Release();
+
     singleInstance?.Dispose();
     if (!relaunch) return 0;
 
@@ -889,7 +892,7 @@ static int ApplySelfUpdateCore(
         // App を開く手立てが無くなる。生死を見るまでもないので、そのまま戻す。
         Console.Error.WriteLine("置き換えた App を起こせませんでした。退避しておいた一式へ戻します。");
         Log(() => logger.LogError("置き換えた App を起こせなかった。退避した一式へ戻す"));
-        return RollBackFailedStart(source, target, relaunchMinimized, logger, Log);
+        return RollBackFailedStart(source, target, relaunchMinimized, logger, Log, applyLock);
     }
 
     // 起こせたが掴めなかった。生死を見る手が無いので、そのまま任せる。
@@ -903,7 +906,7 @@ static int ApplySelfUpdateCore(
     // 以外の経路が無い。
     if (!CrashedOnStart(relaunched, logger)) return 0;
 
-    return RollBackFailedStart(source, target, relaunchMinimized, logger, Log);
+    return RollBackFailedStart(source, target, relaunchMinimized, logger, Log, applyLock);
 }
 
 /// <param name="minimized">
@@ -992,8 +995,26 @@ static bool CrashedOnStart(System.Diagnostics.Process app, ILogger logger)
 /// 起動できなかった置き換えを戻し、取得を捨てて旧版を開き直す (issue #53)。
 /// </summary>
 static int RollBackFailedStart(
-    string source, string target, bool relaunchMinimized, ILogger logger, Action<Action> log)
+    string source,
+    string target,
+    bool relaunchMinimized,
+    ILogger logger,
+    Action<Action> log,
+    ApplyLockHolder? applyLock)
 {
+    // 戻す間は適用のロックを取り直す。観察のために返していた間に、別の
+    // プロセスが適用へ入っている可能性がある。取れなければ正規の位置には
+    // 触らない。相手の置き換えと重なると、どちらの版とも言えないものが残る。
+    //
+    // 上限は短くてよい。起こした App は照合の間しか握らず、それは既に
+    // 終わっている (終わったから観察が落ちたと読んだ)。
+    if (applyLock is not null && !applyLock.TryAcquire(TimeSpan.FromMinutes(1)))
+    {
+        Console.Error.WriteLine("別の更新処理が実行中のため、退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning("適用のロックを取り直せないため、起動できなかった置き換えを戻さない"));
+        return 1;
+    }
+
     // 戻す間は多重起動の抑止を掴む。起動した App が旧 app\ を掴むと、
     // 戻しのリネームが失敗する。落ちた App は既に手放している。
     var singleInstance = UpdateInstaller.TryHoldSingleInstance(UpdateInstaller.SingleInstanceHandOverTimeout);
@@ -1117,6 +1138,65 @@ static string Mask(string value)
 {
     if (string.IsNullOrEmpty(value)) return "(未設定)";
     return value.Length <= 4 ? new string('*', value.Length) : value[..4] + new string('*', value.Length - 4);
+}
+
+/// <summary>
+/// 適用のロックを、途中で返して取り直せる形で持つ (issue #53)。
+/// <para>
+/// 置き換えた App が立ち上がったかを見る間は、こちらがロックを握っていては
+/// ならない。握ったままだと、起こした App は起動の先頭 (取得しておいた更新の
+/// 照合) でこのロックを待って止まる。観察はその止まっている姿を「生きている」
+/// と読み、ロックが空いた後で初期化に失敗しても誰も戻さない。
+/// </para>
+/// <para>
+/// <see cref="Mutex"/> の所有権はスレッドに紐づく。ヘルパは最初から最後まで
+/// 同じスレッドで動くので、取得も解放もそのまま行える。
+/// </para>
+/// </summary>
+internal sealed class ApplyLockHolder : IDisposable
+{
+    private readonly Mutex _mutex;
+    private bool _held;
+
+    public ApplyLockHolder(Mutex mutex) => _mutex = mutex;
+
+    /// <summary>掴む。既に掴んでいれば何もしない。</summary>
+    public bool TryAcquire(TimeSpan timeout)
+    {
+        if (_held) return true;
+
+        try
+        {
+            _held = _mutex.WaitOne(timeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 呼び出し元が握ったまま終わった (想定の経路)、または前のヘルパが
+            // 握ったまま落ちた。どちらも所有権はこちらに渡っている。
+            _held = true;
+        }
+        catch (Exception)
+        {
+            _held = false;
+        }
+
+        return _held;
+    }
+
+    /// <summary>返す。既に返していれば何もしない。</summary>
+    public void Release()
+    {
+        if (!_held) return;
+
+        _held = false;
+        try { _mutex.ReleaseMutex(); } catch { /* best-effort */ }
+    }
+
+    public void Dispose()
+    {
+        Release();
+        _mutex.Dispose();
+    }
 }
 
 internal static class CliConstants
