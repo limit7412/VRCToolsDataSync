@@ -1,6 +1,5 @@
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Storage;
-using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.UseCase;
 using Xunit;
 
 namespace VRCToolsDataSync.Core.Tests;
@@ -232,13 +231,13 @@ public sealed class BlobGarbageCollectorTests
         var storage = StorageAt(LongAgo);
         storage.Seed(BlobKeys.Prefix + "aaa", "live", LongAgo);
         storage.Seed("vrcx/latest.sqlite3", "old layout", LongAgo);
-        storage.Seed(ManifestStore.ManifestKey, "{}", LongAgo);
+        storage.Seed(ManifestKeys.Manifest, "{}", LongAgo);
         storage.SeedManifest(ManifestReferencing(BlobKeys.Prefix + "aaa"));
 
         var result = new BlobGarbageCollector(storage).Collect(Grace);
 
         Assert.True(storage.Has("vrcx/latest.sqlite3"));
-        Assert.True(storage.Has(ManifestStore.ManifestKey));
+        Assert.True(storage.Has(ManifestKeys.Manifest));
         Assert.Equal(1, result.Scanned);
     }
 

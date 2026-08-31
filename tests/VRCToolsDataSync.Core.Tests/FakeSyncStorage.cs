@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.UseCase;
 
 namespace VRCToolsDataSync.Core.Tests;
 

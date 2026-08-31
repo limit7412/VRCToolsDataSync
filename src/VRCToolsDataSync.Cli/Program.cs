@@ -1,12 +1,8 @@
 using System.CommandLine;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Logging;
-using VRCToolsDataSync.Core.Settings;
-using VRCToolsDataSync.Core.Startup;
-using VRCToolsDataSync.Core.Storage;
-using VRCToolsDataSync.Core.Sync;
-using VRCToolsDataSync.Core.Update;
+using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.UseCase;
 
 var rootCommand = new RootCommand("VRCX / VRC Friend Connect データ同期ツール");
 

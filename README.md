@@ -67,11 +67,14 @@ S3 互換モードの費用は、ほぼ Pull のダウンロード転送量だ�
 | フォルダ | 置くもの | 依存してよい先 |
 | --- | --- | --- |
 | `Domain` | モデル、境界 (`ISyncStorage` `ISyncService` `IReleaseRepository`)、外部に触れない規則 | なし |
-| `Settings` `Storage` `Sync` `Update` `Watch` `Paths` `Logging` `Startup` | 手順の組み立てと、境界の実装 (S3 / ファイル / レジストリ / GitHub / SQLite) | `Domain` |
+| `Infra` | 境界の実装と、外部に触れるもの (S3 / ファイル / レジストリ / GitHub / SQLite / プロセス) | `Domain` |
+| `UseCase` | 手順の組み立て (Push/Pull、起動時と終了時の同期、自動同期、容量の解放、更新確認) | `Domain` `Infra` |
 
-**`Domain` はどの層も参照しない。** 実装への言及は `<see cref>` ではなく `<c>` で書く。参照を張ってしまうと向きが崩れるためである。
+`Cli` と `App` は合成ルートで、3 つすべてを参照する。
 
-上の 2 行目はまだ 1 つの塊で、`Sync` と `Storage` と `Watch` が互いを参照している。ここを `UseCase` と `Infra` に割るのは別の段階で行う。
+**`Domain` はどの層も参照しない。`Infra` は `UseCase` を参照しない。** 上の層への言及は `<see cref>` ではなく `<c>` で書く。参照を張ってしまうと、コードでは切れている向きが doc 経由で戻る。
+
+`Infra` と `UseCase` の境目は「外に触れるか」で引いている。`ManifestStore` は `ISyncStorage` を通してしか読み書きしないので `UseCase`、`S3SyncStorage` は実際に通信するので `Infra` である。同期先の実装が manifest のキーを要るため、キーだけは `Domain` の `ManifestKeys` に置いてある。
 
 ## 必要環境
 

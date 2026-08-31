@@ -1,7 +1,7 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Update;
+using VRCToolsDataSync.Core.Infra;
 using Xunit;
 
 namespace VRCToolsDataSync.Core.Tests;

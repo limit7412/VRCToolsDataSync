@@ -1,7 +1,19 @@
-using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json;
 
 namespace VRCToolsDataSync.Core.Domain;
+
+/// <summary>
+/// manifest そのものの置き場所。同期先のルート直下に置く。
+/// <para>
+/// 同期先の実装がキーを組み立てるために要る。読み書きの手順 (<c>ManifestStore</c>)
+/// とは別の層にあるので、キーだけを Domain に置く。
+/// </para>
+/// </summary>
+public static class ManifestKeys
+{
+    public const string Manifest = "manifest.json";
+}
 
 public sealed class SyncManifest
 {

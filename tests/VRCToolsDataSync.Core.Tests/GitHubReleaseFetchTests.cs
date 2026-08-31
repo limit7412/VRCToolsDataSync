@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Http;
-using VRCToolsDataSync.Core.Update;
+using VRCToolsDataSync.Core.Infra;
 using Xunit;
 
 namespace VRCToolsDataSync.Core.Tests;

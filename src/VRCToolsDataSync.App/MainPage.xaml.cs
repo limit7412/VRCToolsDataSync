@@ -1,6 +1,6 @@
 using System.Threading.Tasks;
-using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml;
 using VRCToolsDataSync_App.ViewModels;
 using Windows.Storage.Pickers;
 

@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using H.NotifyIcon;
 using H.NotifyIcon.Core;
+using VRCToolsDataSync.Core.Infra;
 
 namespace VRCToolsDataSync_App.Tray;
 

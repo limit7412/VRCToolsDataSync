@@ -1,4 +1,4 @@
-using VRCToolsDataSync.Core.Startup;
+using VRCToolsDataSync.Core.Infra;
 using Xunit;
 
 namespace VRCToolsDataSync.Core.Tests;

@@ -1,5 +1,5 @@
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Infra;
 using Xunit;
 
 namespace VRCToolsDataSync.Core.Tests;
