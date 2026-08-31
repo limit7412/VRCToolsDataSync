@@ -29,19 +29,29 @@
                  Title="{x:Bind ViewModel.PromptTitle, Mode=OneWay}"
                  Message="{x:Bind ViewModel.PromptMessage, Mode=OneWay}">
             <InfoBar.Content>
-                <ItemsControl ItemsSource="{x:Bind ViewModel.PromptOptions, Mode=OneWay}"
+                <!--
+                    幅が足りないときは横に送れるようにする。選択肢だけが待って
+                    いる側へ答えを返せる構造で、閉じるボタンも出していないため、
+                    切れて押せなくなると問い合わせから抜ける手が無くなる。
+                -->
+                <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                              HorizontalScrollMode="Auto"
+                              VerticalScrollBarVisibility="Disabled"
+                              VerticalScrollMode="Disabled"
                               Margin="0,8,0,12">
-                    <ItemsControl.ItemsPanel>
-                        <ItemsPanelTemplate>
-                            <StackPanel Orientation="Horizontal" Spacing="8" />
-                        </ItemsPanelTemplate>
-                    </ItemsControl.ItemsPanel>
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:PromptOption">
-                            <Button Content="{x:Bind Label}" Command="{x:Bind ChooseCommand}" />
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.PromptOptions, Mode=OneWay}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" Spacing="8" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:PromptOption">
+                                <Button Content="{x:Bind Label}" Command="{x:Bind ChooseCommand}" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
             </InfoBar.Content>
         </InfoBar>
 
@@ -134,7 +144,7 @@
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <Button Content="接続テスト"
                                         Command="{x:Bind ViewModel.TestStorageCommand}"
-                                        IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             </StackPanel>
                         </StackPanel>
 
@@ -151,7 +161,7 @@
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <Button Content="同期して起動"
                                         Command="{x:Bind ViewModel.SyncAndLaunchCommand}"
-                                        IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             </StackPanel>
                         </StackPanel>
 
@@ -167,7 +177,7 @@
                                 <Button Content="今すぐ解放"
                                         VerticalAlignment="Bottom"
                                         Command="{x:Bind ViewModel.CollectGarbageCommand}"
-                                        IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             </StackPanel>
                             <TextBlock Text="どの PC からも参照されておらず、最後に書き込まれてから猶予期間より長く経ったデータを保存先から削除します。猶予期間を短くするほど多く解放できます。"
                                        Style="{StaticResource CaptionTextBlockStyle}"
@@ -228,7 +238,7 @@
                                            VerticalAlignment="Center" />
                                 <Button Content="再起動して適用"
                                         Command="{x:Bind ViewModel.ApplyStagedUpdateCommand}"
-                                        IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                        IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             </StackPanel>
                         </StackPanel>
                     </StackPanel>
@@ -245,10 +255,10 @@
                         <StackPanel Orientation="Horizontal" Spacing="8">
                             <Button Content="Push"
                                     Command="{x:Bind ViewModel.PushVrcxCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             <Button Content="Pull"
                                     Command="{x:Bind ViewModel.PullVrcxCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
 
                         <StackPanel Spacing="4">
@@ -283,10 +293,10 @@
                         <StackPanel Orientation="Horizontal" Spacing="8">
                             <Button Content="Push"
                                     Command="{x:Bind ViewModel.PushFriendConnectCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                             <Button Content="Pull"
                                     Command="{x:Bind ViewModel.PullFriendConnectCommand}"
-                                    IsEnabled="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource InvertBoolConverter}}" />
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
 
                         <StackPanel Spacing="4">

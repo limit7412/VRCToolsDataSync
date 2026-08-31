@@ -270,7 +270,36 @@ public partial class MainPageViewModel : ObservableObject
     private const string ProcessDetectionUnknown = "プロセス監視: 未開始";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRunSync))]
     public partial bool IsBusy { get; set; }
+
+    /// <summary>
+    /// 自動側の問い合わせと、その答えに応じた同期が走っている間 true (issue #10)。
+    /// <para>
+    /// 自動側は <see cref="IsBusy"/> を立てない。手動の同期が「押せない」ことを
+    /// 表すのが <see cref="IsBusy"/> の役目で、こちらは押した本人が居ないため
+    /// である。ただし触る先は同じなので、画面のボタンは同じように塞ぐ必要が
+    /// ある。<see cref="_promptGate"/> を握っている区間と一致する。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRunSync))]
+    public partial bool IsHandlingPrompt { get; set; }
+
+    /// <summary>
+    /// 同期に触るボタンを押してよいか (issue #10)。
+    /// <para>
+    /// InfoBar は <c>ContentDialog</c> と違って背後の画面を塞がない。塞がないまま
+    /// にすると、自動側の問い合わせに答えて Push が走っている最中に手で Pull を
+    /// 始められる。同じ保存先と同じ手元のデータを二つの同期が同時に触ることに
+    /// なるので、自動側が動いている間はボタンの側で塞ぐ。
+    /// </para>
+    /// <para>
+    /// 問い合わせの選択肢はこれに束縛しない。塞ぐと、答えを待っている本人が
+    /// 答えられなくなる。
+    /// </para>
+    /// </summary>
+    public bool CanRunSync => !IsBusy && !IsHandlingPrompt;
 
     [ObservableProperty]
     public partial bool StartupRegistered { get; set; }
@@ -1310,6 +1339,7 @@ public partial class MainPageViewModel : ObservableObject
         ShowWindowRequested?.Invoke();
 
         await _promptGate.WaitAsync();
+        IsHandlingPrompt = true;
         try
         {
             // 同期先は問い合わせを出す前に組み立てる。InfoBar は ContentDialog と
@@ -1343,6 +1373,7 @@ public partial class MainPageViewModel : ObservableObject
         }
         finally
         {
+            IsHandlingPrompt = false;
             RefreshStatusSummaries();
             _promptGate.Release();
         }
@@ -1357,6 +1388,7 @@ public partial class MainPageViewModel : ObservableObject
         ShowWindowRequested?.Invoke();
 
         await _promptGate.WaitAsync();
+        IsHandlingPrompt = true;
         try
         {
             // 競合の側と同じ理由で、同期先は問い合わせを出す前に組み立てる。
@@ -1379,6 +1411,7 @@ public partial class MainPageViewModel : ObservableObject
         }
         finally
         {
+            IsHandlingPrompt = false;
             RefreshStatusSummaries();
             _promptGate.Release();
         }
