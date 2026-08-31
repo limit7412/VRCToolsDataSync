@@ -1015,6 +1015,21 @@ static int RollBackFailedStart(
         return 1;
     }
 
+    // 退避が残っているかを、ロックを取ってから見る。後始末 (DiscardPrevious)
+    // は適用のロックの下で走るので、ここまで来た時点で走り終えているか、まだ
+    // 始まっていないかのどちらかである。
+    //
+    // 残っていなければ、置き換えた一式は後始末が走るところまで動いたという
+    // ことである。後始末はウィンドウを立てられた後にしか走らない。つまり
+    // 起動は成り立っており、その後で落ちた。戻す相手が違う。
+    if (!UpdateInstaller.HasBackups(target))
+    {
+        Console.Error.WriteLine("置き換えた一式は起動できていました。退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning(
+            "後始末が退避を片付けた後に落ちたため、起動できなかった置き換えとしては扱わない"));
+        return 1;
+    }
+
     // 戻す間は多重起動の抑止を掴む。起動した App が旧 app\ を掴むと、
     // 戻しのリネームが失敗する。落ちた App は既に手放している。
     var singleInstance = UpdateInstaller.TryHoldSingleInstance(UpdateInstaller.SingleInstanceHandOverTimeout);

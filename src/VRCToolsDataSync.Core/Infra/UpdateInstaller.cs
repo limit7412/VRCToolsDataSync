@@ -732,6 +732,25 @@ public class UpdateInstaller
     }
 
     /// <summary>
+    /// 退避 (<c>.old</c>) が <see cref="Parts"/> のぶんだけ残っているか (issue #53)。
+    /// <para>
+    /// 戻せるかどうかの目安であると同時に、「起動が成り立ったか」の手掛かりでも
+    /// ある。退避を消すのは後始末 (<see cref="DiscardPrevious"/>) だけで、後始末は
+    /// ウィンドウを立てられた後にしか走らない。そろっていなければ、置き換えた
+    /// 一式はそこまで動いたということである。
+    /// </para>
+    /// </summary>
+    public static bool HasBackups(string targetDirectory)
+    {
+        foreach (var part in Parts)
+        {
+            if (!Directory.Exists(Path.Combine(targetDirectory, part + ".old"))) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// 置き換えの後始末。次の起動 (新しい版) から呼び、退避した .old と、
     /// 消せずに名前をずらした残骸を消す。
     /// 消せなくても常駐は続ける。次の機会にまた試す。
