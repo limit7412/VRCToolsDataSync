@@ -826,6 +826,68 @@ public sealed class UpdateStage
             $"{failures} 回続けて展開できなかったため配布物の問題として扱う: {ZipPath}", ex);
     }
 
+    /// <summary>
+    /// 起動できなかった配布物の置き場所 (issue #76)。
+    /// <para>
+    /// 記録 (<see cref="MetadataPath"/>) とは別のファイルに置く。取得を捨てても
+    /// 残す必要があるためで、<see cref="Discard"/> はこれに触らない。
+    /// </para>
+    /// </summary>
+    private string StartFailurePath => Path.Combine(Directory, "start-failure");
+
+    /// <summary>
+    /// 起動できなかった配布物を覚える (issue #76)。
+    /// <para>
+    /// 置き換えた一式が起動できず、退避へ戻した後に呼ぶ。覚えないと、旧版で
+    /// 開き直した App が次の確認で同じ配布物をまた取得し、次の起動でまた適用
+    /// しに行く。起動のたびに数十〜百数十 MB を空振りすることになる。
+    /// </para>
+    /// <para>
+    /// タグと digest の組で覚える。同じタグへ配布物を上げ直す運用がある
+    /// (release.yml の <c>--clobber</c>)。直した一式が同じタグで公開された
+    /// 場合は digest が変わるので、そちらは覚えた記録に当たらず取りに行ける。
+    /// </para>
+    /// </summary>
+    public void RecordStartFailure(string tag, string digestHex)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(Directory);
+            File.WriteAllText(StartFailurePath, $"{digestHex} {tag}");
+            _logger.LogInformation("起動できなかった配布物として覚える: {Tag}", tag);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 覚えられなくても、失うのは次の確認 1 回ぶんの取得である。
+            _logger.LogWarning(ex, "起動できなかった配布物を覚えられなかった: {Path}", StartFailurePath);
+        }
+    }
+
+    /// <summary>
+    /// 覚えている「起動できなかった配布物」と同じか (issue #76)。
+    /// <para>
+    /// 読めない場合は false を返す。読めないことを理由に更新を止めるほうが損が
+    /// 大きい。空振りは 1 回で済むが、止めると新しい版が入らなくなる。
+    /// </para>
+    /// </summary>
+    public bool IsKnownStartFailure(string tag, string? digestHex)
+    {
+        if (string.IsNullOrEmpty(digestHex)) return false;
+
+        try
+        {
+            var parts = File.ReadAllText(StartFailurePath).Split(' ', 2);
+            return parts.Length == 2
+                && string.Equals(parts[0], digestHex, StringComparison.Ordinal)
+                && string.Equals(parts[1], tag, StringComparison.Ordinal);
+        }
+        catch (Exception)
+        {
+            // 覚えていない (ファイルが無い) 場合もここへ来る。
+            return false;
+        }
+    }
+
     /// <summary>同じ ZIP の展開をあきらめるまでの回数。</summary>
     private const int MaxExtractAttempts = 3;
 

@@ -372,6 +372,43 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Equal("0.0.10", staged!.Tag);
     }
 
+    [Fact(DisplayName = "起動できなかった配布物は、タグと digest の組で覚える")]
+    public void RemembersTheDistributionThatCouldNotStart()
+    {
+        var stage = CreateStage();
+        Directory.CreateDirectory(_directory);
+
+        // 覚える前は何にも当たらない。
+        Assert.False(stage.IsKnownStartFailure("0.0.10", "abc123"));
+
+        stage.RecordStartFailure("0.0.10", "abc123");
+
+        Assert.True(stage.IsKnownStartFailure("0.0.10", "abc123"));
+
+        // 同じタグへ直した一式が上げ直されると digest が変わる。そちらは
+        // 取りに行けなければならない (release.yml の --clobber)。
+        Assert.False(stage.IsKnownStartFailure("0.0.10", "def456"));
+
+        // 別のタグも当然に通す。
+        Assert.False(stage.IsKnownStartFailure("0.0.11", "abc123"));
+
+        // digest を持たない候補は判断しようがない。止めるより通す。
+        Assert.False(stage.IsKnownStartFailure("0.0.10", null));
+    }
+
+    [Fact(DisplayName = "起動できなかった記録は、取得を捨てても残る")]
+    public void TheStartFailureRecordSurvivesDiscard()
+    {
+        var stage = StageWith("0.0.10");
+        stage.RecordStartFailure("0.0.10", "abc123");
+
+        // 戻す側は「取得を捨てる」と「覚える」を続けて行う。捨てるほうが
+        // 覚えたものまで消すと、次の確認でまた取りに行ってしまう。
+        Assert.True(stage.Discard());
+
+        Assert.True(stage.IsKnownStartFailure("0.0.10", "abc123"));
+    }
+
     [Fact(DisplayName = "同じパスの項目を持つ ZIP は展開せずに断る")]
     public void RefusesArchiveWithDuplicateEntries()
     {

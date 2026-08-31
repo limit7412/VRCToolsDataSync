@@ -187,6 +187,16 @@ public sealed class UpdateManager : IDisposable
     public StagedMetadata? Staged => _stage.TryLoadMetadata();
 
     /// <summary>
+    /// この版は、一度置き換えて起動できなかったものか (issue #76)。
+    /// <para>
+    /// 画面に出す文言を分けるために使う。取得しないことを伝えないと、
+    /// 「新しい版が出ています」と出たまま、いつまでも取得済みにならない。
+    /// </para>
+    /// </summary>
+    public bool IsKnownStartFailure(ReleaseInfo release)
+        => _stage.IsKnownStartFailure(release.Tag, release.Asset?.DigestHex);
+
+    /// <summary>
     /// 置き換えまわりの後始末を行い、済んだことを画面へ伝える (issue #45 第 3 段階)。
     /// <para>
     /// ウィンドウを立てられた後に呼ぶ。ここを通さずに後始末すると、適用の済んだ
@@ -375,6 +385,19 @@ public sealed class UpdateManager : IDisposable
             // 取得は 1 本ずつなので、後から来た今のチャンネルの取得が省かれる。
             if (!MatchesSavedChannel(channel)) return;
             if (!release.IsInChannel(channel)) return;
+
+            // 一度置き換えて起動できなかった配布物は取りに行かない (issue #76)。
+            // 取りに行くと、次の起動でまた適用して、また戻すことになる。起動の
+            // たびに数十〜百数十 MB を空振りする。
+            //
+            // 同じタグへ直した一式が上げ直された場合は digest が変わるので、
+            // そちらは覚えた記録に当たらず取りに行ける。
+            if (_stage.IsKnownStartFailure(release.Tag, asset.DigestHex))
+            {
+                _logger.LogInformation(
+                    "{Tag} は置き換えても起動できなかったため取得しない", release.Tag);
+                return;
+            }
 
             // タグだけでなく digest と大きさも見る。同じタグへ配布物を上げ直す
             // 運用があり (release.yml の --clobber)、タグだけで済ませると
