@@ -372,6 +372,49 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Equal("0.0.10", staged!.Tag);
     }
 
+    [Fact(DisplayName = "設定の保存のロックは、設定ファイルごとに分かれる")]
+    public void SettingsSaveLockIsScopedPerSettingsFile()
+    {
+        // 名前を 1 つにまとめると、別のユーザどうしや、パスを指定して動かして
+        // いる相手まで待ち合わせる。守る相手はファイルなので、そこで分ける。
+        var mine = Path.Combine(_directory, "settings.json");
+        var other = Path.Combine(_directory, "elsewhere", "settings.json");
+
+        Assert.NotEqual(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(other));
+
+        // 同じファイルを別の綴りで指した相手と待ち合わせられないと意味が無い。
+        // 大文字小文字は Windows のファイルシステムに合わせて畳み、綴りは
+        // 絶対パスにそろえる。
+        Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.ToUpperInvariant()));
+        Assert.Equal(
+            GlobalMutex.ScopeKeyOf(mine),
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, ".", "settings.json")));
+        Assert.Equal(
+            GlobalMutex.ScopeKeyOf(mine),
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, "elsewhere", "..", "settings.json")));
+
+        // Windows では区切りがどちらでも同じファイルを指す。
+        Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.Replace('\\', '/')));
+    }
+
+    [Fact(DisplayName = "対話セッションをまたぐロックは、別スレッドから見ても同じものになる")]
+    public void GlobalMutexIsVisibleAcrossThreads()
+    {
+        var name = "vrctoolsdatasync-tests-" + Guid.NewGuid().ToString("N");
+
+        using var held = GlobalMutex.Create(name);
+        Assert.True(held.WaitOne(0));
+        try
+        {
+            Assert.False(CanHoldOnAnotherThread(name, GlobalMutex.Create));
+            Assert.True(CanHoldOnAnotherThread(name + "-other", GlobalMutex.Create));
+        }
+        finally
+        {
+            held.ReleaseMutex();
+        }
+    }
+
     [Fact(DisplayName = "起動できなかった配布物は、タグと digest の組で覚える")]
     public void RemembersTheDistributionThatCouldNotStart()
     {

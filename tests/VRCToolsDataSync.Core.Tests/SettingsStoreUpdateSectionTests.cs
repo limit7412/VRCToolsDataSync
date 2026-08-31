@@ -21,6 +21,42 @@ public sealed class SettingsStoreUpdateSectionTests : IDisposable
         try { Directory.Delete(_directory, recursive: true); } catch { /* best-effort */ }
     }
 
+    [Fact(DisplayName = "別々の settings.json への保存が並走しても、どちらも書き上がる")]
+    public void ConcurrentSavesToDifferentFilesBothComplete()
+    {
+        // 保存は 2 つの Mutex を「旧名 → 新名」の順で取る。旧名は設定ファイルで
+        // 分かれないので、別のファイルへ保存する相手ともここで待ち合わせる。
+        // 順が食い違えば互いに待ち続けるため、並走させて抜けられることを見る。
+        var first = new SettingsStore(Path.Combine(_directory, "first", "settings.json"));
+        var second = new SettingsStore(Path.Combine(_directory, "second", "settings.json"));
+
+        var saves = new[]
+        {
+            Task.Run(() =>
+            {
+                for (var i = 0; i < 20; i++)
+                {
+                    var settings = first.Load();
+                    settings.Update.NotifiedVersion = "0.0.10";
+                    first.Save(settings);
+                }
+            }),
+            Task.Run(() =>
+            {
+                for (var i = 0; i < 20; i++)
+                {
+                    var settings = second.Load();
+                    settings.Update.NotifiedVersion = "0.0.11";
+                    second.Save(settings);
+                }
+            }),
+        };
+
+        Assert.True(Task.WhenAll(saves).Wait(TimeSpan.FromSeconds(30)), "保存が終わらなかった");
+        Assert.Equal("0.0.10", first.Load().Update.NotifiedVersion);
+        Assert.Equal("0.0.11", second.Load().Update.NotifiedVersion);
+    }
+
     [Fact(DisplayName = "update セクションは保存と読み込みで往復する")]
     public void RoundTripsUpdateSection()
     {
