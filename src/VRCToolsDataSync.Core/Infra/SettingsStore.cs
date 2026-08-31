@@ -21,37 +21,40 @@ public sealed class SettingsStore
 
     private readonly object _saveLock = new();
 
-    // クロスプロセス排他用の Named Mutex 名の接頭辞。
+    // クロスプロセス排他は、設定ファイルの隣に置いた錠前ファイルで取る。
     // GUI (App) と CLI が同じ settings.json に対して並走で
     // read-modify-write すると、プロセス内 _saveLock だけではアトミック性が
     // 担保できず、片方の更新が他方に潰される。
     //
-    // 名前は対話セッションをまたいで見えるものにする (issue #52)。%AppData% は
+    // 排他は対話セッションをまたいで効く必要がある (issue #52)。%AppData% は
     // ユーザ毎に分かれるが、同じユーザの 2 つの対話セッション (ユーザーの
-    // 切り替えやリモートデスクトップ) からは同じ場所を指す。セッション内だけの
-    // 名前にしていると、そこで並走した保存を直列化できない。
+    // 切り替えやリモートデスクトップ) からは同じ場所を指す。
     //
-    // 守る相手ごとに名前を分けるため、設定ファイルのパスから引いた鍵を足す。
-    // 名前を 1 つにまとめると、別のユーザどうしや、パスを指定して動かしている
-    // 相手 (テストなど) まで待ち合わせる。
-    private const string CrossProcessMutexPrefix = "VRCToolsDataSync.SettingsStore.Save.";
+    // 名前付き Mutex ではなくファイルを使うのは、名前空間の話を持ち込まない
+    // ためである (issue #81)。Global\ の名前は作るのに権限が要り、作れない相手や
+    // 開けない相手はセッション内だけの名前へ落ちる。落ちた側は誰とも待ち合わせて
+    // いないのに、待ち合わせているつもりで進む。ファイルハンドルの共有の指定は
+    // 計算機の中で一意に効くので、その分岐がそもそも要らない。
+    //
+    // 守る相手ごとに分けるのも、置き場所で決まる。錠前は設定ファイルの隣に置く。
+    private static string LockPathOf(string filePath) => filePath + ".lock";
 
-    // 名前を変える前の版が使っていた名前。
-    // 名前を変えた結果、旧版とこの版は互いの Mutex を見なくなった。同じ対話
-    // セッションで両方が同じ settings.json を保存すると、名前を変える前には
-    // 効いていた直列化が効かず、read-modify-write の取りこぼしに戻る。
-    // 別の場所に展開した旧版が残っている間だけの話だが、失うのは利用者の設定
-    // である。旧名も先に取って、その間だけ待ち合わせを保つ。
+    // 錠前ファイルに移る前の版が使っていた Mutex の名前。
+    // 旧版は錠前ファイルを知らないので、これだけでは互いに待ち合わせない。同じ
+    // 対話セッションで、別の場所に展開した旧版とこの版が同じ settings.json を
+    // 保存すると、以前は効いていた直列化が効かず、read-modify-write の
+    // 取りこぼしに戻る。失うのは利用者の設定なので、旧名も取って待ち合わせを保つ。
     //
-    // 取る順は「旧名 → 新名」で固定する。新名を取るのはこの版だけで、この版は
-    // 必ず旧名から取るので、順の食い違いは起きない。
+    // 取る順は「旧名 → 錠前ファイル」で固定する。錠前ファイルを取るのはこの版
+    // だけで、この版は必ず旧名から取るので、順の食い違いは起きない。
     //
     // 旧版が行き渡ったら消してよい。
     private const string LegacyCrossProcessMutexName = "VRCToolsDataSync.SettingsStore.Save";
-    // Mutex 取得のタイムアウト。普通の Save は数十 ms で終わるため、
+
+    // 錠前の取得のタイムアウト。普通の Save は数十 ms で終わるため、
     // これだけ待っても取れない場合は別プロセスがハング相当なので、
     // 取得を諦めてプロセス内ロックだけで救済し best-effort で書く。
-    private static readonly TimeSpan CrossProcessMutexTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan CrossProcessLockTimeout = TimeSpan.FromSeconds(10);
 
     public string FilePath { get; }
 
@@ -235,20 +238,20 @@ public sealed class SettingsStore
         // クロスプロセス排他: GUI と CLI が並走したケースで read-modify-write を
         // アトミックに完結させる。プロセス内 _saveLock は同一インスタンス内の
         // 並行 Save 直列化用で、別プロセスからの同時 Save は守れない。
-        // initiallyOwned=false でハンドルだけ作り、WaitOne でブロック取得する。
+        //
+        // 旧名の Mutex を先に取り、その中で錠前ファイルを取る。順は固定である。
         using var legacyMutex = new Mutex(initiallyOwned: false, name: LegacyCrossProcessMutexName);
-        using var crossProcessMutex = GlobalMutex.Create(
-            CrossProcessMutexPrefix + GlobalMutex.ScopeKeyOf(FilePath));
         var legacyAcquired = TryEnter(legacyMutex);
-        var mutexAcquired = false;
         try
         {
-            mutexAcquired = TryEnter(crossProcessMutex);
+            using var crossProcessLock = CrossSessionFileLock.Acquire(
+                LockPathOf(FilePath), CrossProcessLockTimeout);
 
-            // タイムアウトで取れなかった場合はプロセス内ロックだけで best-effort 保存。
-            // 取得を諦めるよりは書き込んだ方がマシ (待つほど呼び出し元が長時間ハングする)。
+            // タイムアウトで取れなかった場合 (crossProcessLock.IsHeld が false) は
+            // プロセス内ロックだけで best-effort 保存。取得を諦めるよりは書き込んだ
+            // 方がマシ (待つほど呼び出し元が長時間ハングする)。
 
-            // 一時ファイル名にも GUID を付けて、Mutex 取得失敗時の best-effort 書き込みや
+            // 一時ファイル名にも GUID を付けて、錠前を取れなかったときの best-effort 書き込みや
             // 他プロセスからの同時書き込みでも tmp 衝突しないようにする。
             lock (_saveLock)
             {
@@ -305,8 +308,6 @@ public sealed class SettingsStore
         }
         finally
         {
-            // 取った順の逆に返す。
-            Exit(crossProcessMutex, mutexAcquired);
             Exit(legacyMutex, legacyAcquired);
         }
     }
@@ -315,7 +316,7 @@ public sealed class SettingsStore
     {
         try
         {
-            return mutex.WaitOne(CrossProcessMutexTimeout);
+            return mutex.WaitOne(CrossProcessLockTimeout);
         }
         catch (AbandonedMutexException)
         {

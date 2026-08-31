@@ -372,28 +372,28 @@ public sealed class UpdateStageTests : IDisposable
         Assert.Equal("0.0.10", staged!.Tag);
     }
 
-    [Fact(DisplayName = "設定の保存のロックは、設定ファイルごとに分かれる")]
-    public void SettingsSaveLockIsScopedPerSettingsFile()
+    [Fact(DisplayName = "ロックの鍵は、守る場所ごとに分かれる")]
+    public void ScopeKeyIsScopedPerPath()
     {
-        // 名前を 1 つにまとめると、別のユーザどうしや、パスを指定して動かして
-        // いる相手まで待ち合わせる。守る相手はファイルなので、そこで分ける。
-        var mine = Path.Combine(_directory, "settings.json");
-        var other = Path.Combine(_directory, "elsewhere", "settings.json");
+        // 名前を 1 つにまとめると、別のインストール先どうしまで待ち合わせる。
+        // 守る相手は場所なので、そこで分ける。
+        var mine = Path.Combine(_directory, "install");
+        var other = Path.Combine(_directory, "elsewhere", "install");
 
         Assert.NotEqual(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(other));
 
-        // 同じファイルを別の綴りで指した相手と待ち合わせられないと意味が無い。
+        // 同じ場所を別の綴りで指した相手と待ち合わせられないと意味が無い。
         // 大文字小文字は Windows のファイルシステムに合わせて畳み、綴りは
         // 絶対パスにそろえる。
         Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.ToUpperInvariant()));
         Assert.Equal(
             GlobalMutex.ScopeKeyOf(mine),
-            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, ".", "settings.json")));
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, ".", "install")));
         Assert.Equal(
             GlobalMutex.ScopeKeyOf(mine),
-            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, "elsewhere", "..", "settings.json")));
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, "elsewhere", "..", "install")));
 
-        // Windows では区切りがどちらでも同じファイルを指す。
+        // Windows では区切りがどちらでも同じ場所を指す。
         Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.Replace('\\', '/')));
     }
 
