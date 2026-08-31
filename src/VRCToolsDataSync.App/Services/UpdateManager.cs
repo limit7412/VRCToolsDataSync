@@ -3,8 +3,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Sync;
-using VRCToolsDataSync.Core.Update;
+using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.UseCase;
 
 namespace VRCToolsDataSync_App.Services;
 

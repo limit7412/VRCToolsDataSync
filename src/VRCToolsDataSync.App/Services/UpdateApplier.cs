@@ -5,9 +5,7 @@ using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Settings;
-using VRCToolsDataSync.Core.Startup;
-using VRCToolsDataSync.Core.Update;
+using VRCToolsDataSync.Core.Infra;
 
 namespace VRCToolsDataSync_App.Services;
 

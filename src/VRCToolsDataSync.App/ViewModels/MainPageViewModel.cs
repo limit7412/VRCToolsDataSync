@@ -7,12 +7,8 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.UI.Xaml;
 using VRCToolsDataSync.Core.Domain;
-using VRCToolsDataSync.Core.Paths;
-using VRCToolsDataSync.Core.Settings;
-using VRCToolsDataSync.Core.Startup;
-using VRCToolsDataSync.Core.Storage;
-using VRCToolsDataSync.Core.Sync;
-using VRCToolsDataSync.Core.Watch;
+using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.UseCase;
 using VRCToolsDataSync_App.Services;
 
 namespace VRCToolsDataSync_App.ViewModels;
