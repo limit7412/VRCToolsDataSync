@@ -10,6 +10,7 @@ using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
 using VRCToolsDataSync.Core.UseCase;
 using VRCToolsDataSync_App.Services;
+using InfoBarSeverity = Microsoft.UI.Xaml.Controls.InfoBarSeverity;
 
 namespace VRCToolsDataSync_App.ViewModels;
 
@@ -26,9 +27,10 @@ public partial class MainPageViewModel : ObservableObject
     private SyncSettings _settings;
     private AutoSyncCoordinator? _coordinator;
     private Action<Action>? _uiDispatch;
-    // ContentDialog は WinUI 上で同時に複数表示できないため、自動通知の
-    // ダイアログ呼び出しはここでシリアライズして待ち合わせる。
-    private readonly SemaphoreSlim _dialogGate = new(1, 1);
+    // 問い合わせの枠は画面に 1 つしかないため、AskAsync はここで直列化する。
+    // 先に出したものが答えられるまで後続は待つ。待っている間も先客のボタンは
+    // 押せるので、待ちが解けないということは無い。
+    private readonly SemaphoreSlim _promptGate = new(1, 1);
 
     // x:Bind 用の引数なしコンストラクタ。GUI ホストでは必ず App.Runner を共有して、
     // App 側で構成された FileLoggerProvider 経由でログが出るようにする。
@@ -340,9 +342,31 @@ public partial class MainPageViewModel : ObservableObject
 
     public ObservableCollection<string> LogEntries { get; } = new();
 
-    public event Func<ConflictPrompt, Task<ConflictChoice>>? ConflictRequested;
+    /// <summary>
+    /// 問い合わせを出している間だけ true (issue #10)。
+    /// <para>
+    /// 以前はここで <c>ContentDialog</c> を出しており、表示に
+    /// <c>XamlRoot</c> を要した。ウィンドウを一度も Activate していない回
+    /// (自動起動でトレイへ常駐した場合など) は <c>XamlRoot</c> が定まらず、
+    /// 表示が例外になってログへ落ちるだけだった。利用者から見ると、トーストは
+    /// 出るのに選ぶ場所がどこにも無い。画面の中の InfoBar へ移して、
+    /// ウィンドウの状態と切り離した。
+    /// </para>
+    /// </summary>
+    [ObservableProperty]
+    public partial bool IsPromptOpen { get; set; }
 
-    public event Func<RemoteUpdatePrompt, Task<RemoteUpdateChoice>>? RemoteUpdateRequested;
+    [ObservableProperty]
+    public partial string PromptTitle { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial string PromptMessage { get; set; } = string.Empty;
+
+    [ObservableProperty]
+    public partial InfoBarSeverity PromptSeverity { get; set; } = InfoBarSeverity.Warning;
+
+    /// <summary>問い合わせに並べる選択肢。画面はこれを横に並べる。</summary>
+    public ObservableCollection<PromptOption> PromptOptions { get; } = new();
 
     public event Action? ShowWindowRequested;
 
@@ -980,14 +1004,10 @@ public partial class MainPageViewModel : ObservableObject
             AppendLog($"{displayName} Push 開始...");
             var result = await Task.Run(() => _runner.Push(service, _settings, storage, force: false));
 
-            if (result.Outcome == SyncOutcome.ConflictDetected && ConflictRequested is not null)
+            if (result.Outcome == SyncOutcome.ConflictDetected)
             {
-                var choice = await ConflictRequested.Invoke(new ConflictPrompt
-                {
-                    ToolDisplayName = displayName,
-                    RemoteVersion = result.RemoteVersion ?? 0,
-                    LastPulledVersion = result.LastPulledVersion ?? 0,
-                });
+                var choice = await AskConflictAsync(
+                    displayName, result.RemoteVersion ?? 0, result.LastPulledVersion ?? 0);
                 switch (choice)
                 {
                     case ConflictChoice.ForceOverwrite:
@@ -1180,6 +1200,83 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 画面へ問い合わせを出し、選ばれるまで待つ (issue #10)。
+    /// <para>
+    /// 枠は画面に 1 つしかないので <see cref="_promptGate"/> で直列化する。
+    /// 待っている間も先客のボタンは押せるため、待ちが解けないということは無い。
+    /// </para>
+    /// <para>
+    /// ウィンドウが出ているかどうかは問わない。トレイへ常駐したままでも
+    /// 問い合わせはここに残り続け、後からウィンドウを開いたときにそのまま
+    /// 選べる。答えないまま App を終えた場合、待っている側は答えを受け取れず
+    /// そこで止まるが、これは以前ダイアログを閉じずに終えた場合と同じである。
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// UI スレッドから呼ぶこと。<see cref="PromptOptions"/> は画面が直接
+    /// 束縛しているコレクションで、別スレッドから触ると落ちる。
+    /// </remarks>
+    private async Task<T> AskAsync<T>(
+        string title, string message, InfoBarSeverity severity, params (string Label, T Value)[] options)
+    {
+        await _promptGate.WaitAsync();
+        try
+        {
+            // 押されたときの継続をボタンのクリックハンドラの中で走らせない。
+            // 走らせると、答えを受け取った側の処理 (Push や Pull) が
+            // クリックの延長で始まり、画面の更新がその分だけ遅れる。
+            var answer = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            PromptTitle = title;
+            PromptMessage = message;
+            PromptSeverity = severity;
+            PromptOptions.Clear();
+            foreach (var (label, value) in options)
+            {
+                PromptOptions.Add(new PromptOption(label, () => answer.TrySetResult(value)));
+            }
+            IsPromptOpen = true;
+
+            try
+            {
+                return await answer.Task;
+            }
+            finally
+            {
+                IsPromptOpen = false;
+                PromptOptions.Clear();
+                PromptTitle = string.Empty;
+                PromptMessage = string.Empty;
+            }
+        }
+        finally
+        {
+            _promptGate.Release();
+        }
+    }
+
+    /// <summary>Push が競合したときに、どう処理するかを尋ねる。</summary>
+    private Task<ConflictChoice> AskConflictAsync(
+        string displayName, long remoteVersion, long lastPulledVersion) =>
+        AskAsync<ConflictChoice>(
+            $"{displayName}: Push が競合しました",
+            $"リモートの方が新しい更新を持っています (リモート v{remoteVersion} / 最後に Pull した版 v{lastPulledVersion})。どう処理しますか。",
+            InfoBarSeverity.Warning,
+            ("先に Pull", ConflictChoice.PullFirst),
+            ("強制 Push (上書き)", ConflictChoice.ForceOverwrite),
+            ("キャンセル", ConflictChoice.Cancel));
+
+    /// <summary>別の PC の Push を見つけたときに、いま Pull するかを尋ねる。</summary>
+    private Task<RemoteUpdateChoice> AskRemoteUpdateAsync(
+        string displayName, long remoteVersion, long localVersion, string machineName) =>
+        AskAsync<RemoteUpdateChoice>(
+            $"{displayName}: リモートに更新があります",
+            $"{machineName} がクラウドに v{remoteVersion} を Push しました。手元の最終 Pull は v{localVersion} です。いま Pull しますか。",
+            InfoBarSeverity.Informational,
+            ("Pull する", RemoteUpdateChoice.PullNow),
+            ("あとで", RemoteUpdateChoice.Later));
+
     private async Task HandleAutoPushConflictAsync(AutoPushConflictEvent e)
     {
         AppendLog($"[auto] {e.DisplayName} Push 競合 remote=v{e.RemoteVersion} (要操作)");
@@ -1188,19 +1285,9 @@ public partial class MainPageViewModel : ObservableObject
             $"リモート v{e.RemoteVersion} と未同期です。ウィンドウで操作を選択してください。");
         ShowWindowRequested?.Invoke();
 
-        if (ConflictRequested is null) return;
-
-        // ContentDialog は WinUI 上で同時に複数表示できないため、
-        // 自動通知のダイアログは _dialogGate で1件ずつ処理する。
-        await _dialogGate.WaitAsync();
         try
         {
-            var choice = await ConflictRequested.Invoke(new ConflictPrompt
-            {
-                ToolDisplayName = e.DisplayName,
-                RemoteVersion = e.RemoteVersion,
-                LastPulledVersion = e.LastPulledVersion,
-            });
+            var choice = await AskConflictAsync(e.DisplayName, e.RemoteVersion, e.LastPulledVersion);
 
             if (!TryCreateStorage(out var storage)) return;
 
@@ -1228,7 +1315,6 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
-            _dialogGate.Release();
         }
     }
 
@@ -1240,20 +1326,10 @@ public partial class MainPageViewModel : ObservableObject
             $"{e.MachineName} が v{e.RemoteVersion} を Push しました。Pull しますか？");
         ShowWindowRequested?.Invoke();
 
-        if (RemoteUpdateRequested is null) return;
-
-        // ContentDialog の同時表示は不可。AutoPushConflict と共通の
-        // _dialogGate で1件ずつ処理する。
-        await _dialogGate.WaitAsync();
         try
         {
-            var choice = await RemoteUpdateRequested.Invoke(new RemoteUpdatePrompt
-            {
-                ToolDisplayName = e.DisplayName,
-                RemoteVersion = e.RemoteVersion,
-                LocalVersion = e.LocalVersion,
-                MachineName = e.MachineName,
-            });
+            var choice = await AskRemoteUpdateAsync(
+                e.DisplayName, e.RemoteVersion, e.LocalVersion, e.MachineName);
 
             if (choice != RemoteUpdateChoice.PullNow) return;
             if (!TryCreateStorage(out var storage)) return;
@@ -1269,7 +1345,6 @@ public partial class MainPageViewModel : ObservableObject
         finally
         {
             RefreshStatusSummaries();
-            _dialogGate.Release();
         }
     }
 
@@ -1388,13 +1463,7 @@ public partial class MainPageViewModel : ObservableObject
     }
 }
 
-public sealed class ConflictPrompt
-{
-    public required string ToolDisplayName { get; init; }
-    public required long RemoteVersion { get; init; }
-    public required long LastPulledVersion { get; init; }
-}
-
+/// <summary>Push が競合したときに利用者が選べること。</summary>
 public enum ConflictChoice
 {
     Cancel,
@@ -1402,14 +1471,7 @@ public enum ConflictChoice
     ForceOverwrite,
 }
 
-public sealed class RemoteUpdatePrompt
-{
-    public required string ToolDisplayName { get; init; }
-    public required long RemoteVersion { get; init; }
-    public required long LocalVersion { get; init; }
-    public required string MachineName { get; init; }
-}
-
+/// <summary>リモートに更新があったときに利用者が選べること。</summary>
 public enum RemoteUpdateChoice
 {
     Later,

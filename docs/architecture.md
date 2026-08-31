@@ -36,7 +36,7 @@ S3 互換モードでは、この全体をバケット内の任意の接頭辞�
 | --- | --- |
 | `VRCToolsDataSync.Core` | 設定 / パス解決 / プロセス検知 / SQLite スナップショット / ハッシュ / バックアップ / manifest / 保存先の抽象 / SyncService |
 | `VRCToolsDataSync.Cli` | `push` / `pull` / `status` / `storage` を提供するコンソール |
-| `VRCToolsDataSync.App` | WinUI 3 (.NET 10) の GUI。設定編集と Push/Pull、コンフリクト解決ダイアログ |
+| `VRCToolsDataSync.App` | WinUI 3 (.NET 10) の GUI。設定編集と Push/Pull、コンフリクトの解決 |
 
 ### Core の層 (issue #50)
 
