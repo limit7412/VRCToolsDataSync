@@ -1,7 +1,7 @@
-namespace VRCToolsDataSync.Core.Update;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>
-/// リリースを取る境界。実 API を叩かずに <see cref="UpdateChecker"/> を
+/// リリースを取る境界。実 API を叩かずに <c>UpdateChecker</c> を
 /// 確かめられるよう、抽象を挟む。
 /// </summary>
 public interface IReleaseRepository

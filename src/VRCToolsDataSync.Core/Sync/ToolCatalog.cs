@@ -1,5 +1,5 @@
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Paths;
-using VRCToolsDataSync.Core.Settings;
 
 namespace VRCToolsDataSync.Core.Sync;
 

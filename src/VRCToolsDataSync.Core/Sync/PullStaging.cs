@@ -1,5 +1,5 @@
 using Microsoft.Extensions.Logging;
-using VRCToolsDataSync.Core.Storage;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Sync;
 

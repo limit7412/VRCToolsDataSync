@@ -1,6 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Storage;
 

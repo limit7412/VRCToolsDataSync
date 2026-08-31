@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Sync;
 

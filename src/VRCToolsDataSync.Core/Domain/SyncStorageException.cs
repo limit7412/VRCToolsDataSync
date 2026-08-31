@@ -1,4 +1,4 @@
-namespace VRCToolsDataSync.Core.Storage;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>同期先ストレージの操作が失敗したことを表す。</summary>
 public class SyncStorageException : Exception

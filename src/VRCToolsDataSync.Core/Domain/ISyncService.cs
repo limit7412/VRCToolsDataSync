@@ -1,6 +1,5 @@
-using VRCToolsDataSync.Core.Storage;
 
-namespace VRCToolsDataSync.Core.Sync;
+namespace VRCToolsDataSync.Core.Domain;
 
 public interface ISyncService
 {

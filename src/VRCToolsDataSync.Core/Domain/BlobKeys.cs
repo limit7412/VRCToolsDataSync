@@ -1,4 +1,4 @@
-namespace VRCToolsDataSync.Core.Sync;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>
 /// 同期先へ置くオブジェクトのキーを内容から決める。

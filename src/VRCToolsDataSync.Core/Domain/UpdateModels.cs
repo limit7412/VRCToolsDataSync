@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 
-namespace VRCToolsDataSync.Core.Update;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>更新を拾うチャンネル (issue #45)。</summary>
 public enum UpdateChannel

@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace VRCToolsDataSync.Core.Update;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>
 /// リリースのタグが表す版 (issue #45)。

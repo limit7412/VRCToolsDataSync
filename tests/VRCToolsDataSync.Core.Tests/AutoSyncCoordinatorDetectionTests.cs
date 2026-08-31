@@ -1,3 +1,4 @@
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Watch;

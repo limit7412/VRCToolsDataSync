@@ -1,6 +1,5 @@
-using VRCToolsDataSync.Core.Update;
 
-namespace VRCToolsDataSync.Core.Settings;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>データの保存先の種類。</summary>
 public enum SyncStorageMode
@@ -32,7 +31,7 @@ public sealed class SyncSettings
 
     /// <summary>
     /// <see cref="ToolState"/> のキー体系の版。0 は保存先ごとの接頭辞を持たない
-    /// 旧形式で、<see cref="SettingsStore"/> が読み込み時に一度だけ移行する。
+    /// 旧形式で、<c>SettingsStore</c> が読み込み時に一度だけ移行する。
     /// </summary>
     public int ToolStateSchema { get; set; }
 
@@ -44,7 +43,7 @@ public sealed class SyncSettings
 
     /// <summary>
     /// 自動回収 (issue #55) を最後に試みた時刻。キーは
-    /// <see cref="Storage.ISyncStorage.StateKeyPrefix"/> で、保存先ごとに分けて持つ。
+    /// <see cref="ISyncStorage.StateKeyPrefix"/> で、保存先ごとに分けて持つ。
     /// 保存先を切り替えた直後に、別の保存先での実行を「済んだばかり」と
     /// 取り違えないようにするため。
     /// </summary>
@@ -73,7 +72,7 @@ public sealed class UpdateSettings
 
     /// <summary>
     /// 知らせ済みの版のタグ。同じ版を起動のたびに知らせ直さないための記録で、
-    /// <see cref="UpdateChecker"/> が復元と書き戻しに使う。
+    /// <c>UpdateChecker</c> が復元と書き戻しに使う。
     /// </summary>
     public string NotifiedVersion { get; set; } = string.Empty;
 
@@ -106,7 +105,7 @@ public sealed class S3Settings
 
     /// <summary>
     /// DPAPI で保護したシークレットアクセスキー。
-    /// 平文は settings.json に書かない (<see cref="SecretProtector"/> を参照)。
+    /// 平文は settings.json に書かない (<c>SecretProtector</c> を参照)。
     /// </summary>
     public string? ProtectedSecretAccessKey { get; set; }
 

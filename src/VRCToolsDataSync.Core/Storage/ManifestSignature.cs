@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.Json;
-using VRCToolsDataSync.Core.Sync;
+using VRCToolsDataSync.Core.Domain;
 
 namespace VRCToolsDataSync.Core.Storage;
 

@@ -2,7 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using VRCToolsDataSync.Core.Settings;
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Sync;
 using VRCToolsDataSync.Core.Update;
 

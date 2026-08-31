@@ -1,4 +1,4 @@
-namespace VRCToolsDataSync.Core.Storage;
+namespace VRCToolsDataSync.Core.Domain;
 
 /// <summary>同期先のキーを検証し、ローカルパスへ写す。</summary>
 public static class StorageKey

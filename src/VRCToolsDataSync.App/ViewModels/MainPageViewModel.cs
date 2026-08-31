@@ -6,12 +6,12 @@ using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.UI.Xaml;
+using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Paths;
 using VRCToolsDataSync.Core.Settings;
 using VRCToolsDataSync.Core.Startup;
 using VRCToolsDataSync.Core.Storage;
 using VRCToolsDataSync.Core.Sync;
-using VRCToolsDataSync.Core.Update;
 using VRCToolsDataSync.Core.Watch;
 using VRCToolsDataSync_App.Services;
 
