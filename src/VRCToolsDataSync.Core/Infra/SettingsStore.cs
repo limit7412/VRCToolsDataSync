@@ -35,6 +35,19 @@ public sealed class SettingsStore
     // 名前を 1 つにまとめると、別のユーザどうしや、パスを指定して動かしている
     // 相手 (テストなど) まで待ち合わせる。
     private const string CrossProcessMutexPrefix = "VRCToolsDataSync.SettingsStore.Save.";
+
+    // 名前を変える前の版が使っていた名前。
+    // 名前を変えた結果、旧版とこの版は互いの Mutex を見なくなった。同じ対話
+    // セッションで両方が同じ settings.json を保存すると、名前を変える前には
+    // 効いていた直列化が効かず、read-modify-write の取りこぼしに戻る。
+    // 別の場所に展開した旧版が残っている間だけの話だが、失うのは利用者の設定
+    // である。旧名も先に取って、その間だけ待ち合わせを保つ。
+    //
+    // 取る順は「旧名 → 新名」で固定する。新名を取るのはこの版だけで、この版は
+    // 必ず旧名から取るので、順の食い違いは起きない。
+    //
+    // 旧版が行き渡ったら消してよい。
+    private const string LegacyCrossProcessMutexName = "VRCToolsDataSync.SettingsStore.Save";
     // Mutex 取得のタイムアウト。普通の Save は数十 ms で終わるため、
     // これだけ待っても取れない場合は別プロセスがハング相当なので、
     // 取得を諦めてプロセス内ロックだけで救済し best-effort で書く。
@@ -223,21 +236,14 @@ public sealed class SettingsStore
         // アトミックに完結させる。プロセス内 _saveLock は同一インスタンス内の
         // 並行 Save 直列化用で、別プロセスからの同時 Save は守れない。
         // initiallyOwned=false でハンドルだけ作り、WaitOne でブロック取得する。
+        using var legacyMutex = new Mutex(initiallyOwned: false, name: LegacyCrossProcessMutexName);
         using var crossProcessMutex = GlobalMutex.Create(
             CrossProcessMutexPrefix + GlobalMutex.ScopeKeyOf(FilePath));
-        bool mutexAcquired = false;
+        var legacyAcquired = TryEnter(legacyMutex);
+        var mutexAcquired = false;
         try
         {
-            try
-            {
-                mutexAcquired = crossProcessMutex.WaitOne(CrossProcessMutexTimeout);
-            }
-            catch (AbandonedMutexException)
-            {
-                // 他プロセスが Mutex を保持したまま死んだ場合、所有権はこちらに
-                // 渡ってくる。Mutex 自体は取れているので続行する。
-                mutexAcquired = true;
-            }
+            mutexAcquired = TryEnter(crossProcessMutex);
 
             // タイムアウトで取れなかった場合はプロセス内ロックだけで best-effort 保存。
             // 取得を諦めるよりは書き込んだ方がマシ (待つほど呼び出し元が長時間ハングする)。
@@ -299,11 +305,30 @@ public sealed class SettingsStore
         }
         finally
         {
-            if (mutexAcquired)
-            {
-                try { crossProcessMutex.ReleaseMutex(); } catch { /* best-effort */ }
-            }
+            // 取った順の逆に返す。
+            Exit(crossProcessMutex, mutexAcquired);
+            Exit(legacyMutex, legacyAcquired);
         }
+    }
+
+    private static bool TryEnter(Mutex mutex)
+    {
+        try
+        {
+            return mutex.WaitOne(CrossProcessMutexTimeout);
+        }
+        catch (AbandonedMutexException)
+        {
+            // 他プロセスが Mutex を保持したまま死んだ場合、所有権はこちらに
+            // 渡ってくる。Mutex 自体は取れているので続行する。
+            return true;
+        }
+    }
+
+    private static void Exit(Mutex mutex, bool acquired)
+    {
+        if (!acquired) return;
+        try { mutex.ReleaseMutex(); } catch { /* best-effort */ }
     }
 
     /// <summary>

@@ -22,21 +22,49 @@ internal static class GlobalMutex
     /// 重なりだけでも防げるほうがよい。
     /// </para>
     /// <para>
-    /// 作れなかったことは覚えない。毎回試す。<see cref="UnauthorizedAccessException"/>
-    /// は「この環境では作れない」だけでなく「その名前のものが既にあり、開く権利が
-    /// 無い」でも飛ぶ。名前ごとの事情を環境の事情として覚えると、以後どの名前も
-    /// セッション内だけの名前へ落ちて、黙って守れなくなる。例外の往復より、
-    /// 取り違えないことを採る。
+    /// 断られたら、まず開き直す。<see cref="UnauthorizedAccessException"/> は
+    /// 「この環境では作れない」だけでなく「その名前のものが既にあり、全部の権利
+    /// では開けない」でも飛ぶ。後者でセッション内だけの名前へ落ちると、先客は
+    /// <c>Global\</c> の物を、こちらは別の物を、それぞれ同時に持ててしまう。
+    /// ロックを持っているつもりで誰とも待ち合わせていない状態になり、守りたかった
+    /// 読んで書き戻す一連が並走する。<see cref="Mutex.OpenExisting(string)"/> は
+    /// 待ち合わせに要る権利だけを求めるので、作れなくても開ける場合はこちらが通る。
+    /// </para>
+    /// <para>
+    /// 開くこともできなかったときだけ、セッション内だけの名前へ落ちる。ここは
+    /// 守り切れていない。相手 (たとえば同じ利用者の昇格したプロセス) とは
+    /// 待ち合わせられないままである。それでも落ちるのは、投げると保存そのものが
+    /// できなくなり、並走していなくても書けない側の損が確実に出るためである。
+    /// 落ちた側は、並走したときだけ失う。
+    /// </para>
+    /// <para>
+    /// 断られたことは覚えない。毎回試す。名前ごとの事情を環境の事情として覚えると、
+    /// 以後どの名前もセッション内だけの名前へ落ちて、黙って守れなくなる。
     /// </para>
     /// </summary>
     public static Mutex Create(string name)
     {
+        var globalName = @"Global\" + name;
         try
         {
-            return new Mutex(initiallyOwned: false, name: @"Global\" + name);
+            return new Mutex(initiallyOwned: false, name: globalName);
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or NotSupportedException)
         {
+            try
+            {
+                // 待ち合わせに要る権利 (Synchronize と Modify) だけで開く。
+                return Mutex.OpenExisting(globalName);
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                // 物が無い。つまり断られたのは権限であって、この環境では作れない。
+            }
+            catch (Exception inner) when (inner is UnauthorizedAccessException or IOException or NotSupportedException)
+            {
+                // 物はあるが、開くこともできない。
+            }
+
             return new Mutex(initiallyOwned: false, name: name);
         }
     }
