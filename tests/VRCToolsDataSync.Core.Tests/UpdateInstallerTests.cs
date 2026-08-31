@@ -94,6 +94,24 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".old")));
     }
 
+    [Fact(DisplayName = "退避の中身が欠けていれば、何も動かさずに断る")]
+    public void RollbackAppliedRefusesWhenABackupIsIncomplete()
+    {
+        var installer = new UpdateInstaller(SourceDir, TargetDir);
+        installer.Apply();
+
+        // ディレクトリはあるが、本体アセンブリだけ失われている。ここで戻すと、
+        // 戻したつもりの側も起動できない。しかも呼び出し側はこれを「戻せた」と
+        // 受け取って取得しておいた ZIP まで捨てるので、展開し直す材料も残らない。
+        File.Delete(TargetFile("app.old", UpdateInstaller.AppAssemblyName));
+
+        Assert.Throws<UpdateRollbackException>(() => installer.RollbackApplied());
+
+        // 断った以上、正規の位置には触っていない。ZIP を展開し直せる状態が残る。
+        Assert.Equal("new-app", File.ReadAllText(TargetFile("app", "marker.txt")));
+        Assert.Equal("new-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
+    }
+
     [Fact(DisplayName = "退避がそろっていなければ、何も動かさずに断る")]
     public void RollbackAppliedRefusesWhenABackupIsMissing()
     {
