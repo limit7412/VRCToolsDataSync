@@ -56,14 +56,18 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.Equal("new-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName)));
 
         // 旧一式は .old に退避され、次の起動の DiscardPrevious が消す。
+        // ランチャーも同じく退避される (issue #53 で戻す材料にする)。
         Assert.Equal("old-app", File.ReadAllText(TargetFile("app.old", "marker.txt")));
         Assert.Equal("old-cli", File.ReadAllText(TargetFile("cli.old", "marker.txt")));
+        Assert.Equal("old-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName + ".old")));
         Assert.False(Directory.Exists(TargetFile("app.new")));
         Assert.False(Directory.Exists(TargetFile("cli.new")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".new")));
 
         UpdateInstaller.DiscardPrevious(TargetDir);
         Assert.False(Directory.Exists(TargetFile("app.old")));
         Assert.False(Directory.Exists(TargetFile("cli.old")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".old")));
     }
 
     [Fact(DisplayName = "済ませた入れ替えを戻すと、退避しておいた一式に返る")]
@@ -80,9 +84,14 @@ public sealed class UpdateInstallerTests : IDisposable
         Assert.Equal("old-nested", File.ReadAllText(TargetFile("app", "nested", "marker.txt")));
         Assert.Equal("old-cli", File.ReadAllText(TargetFile("cli", "marker.txt")));
 
+        // ランチャーも戻す。起動する先や渡す引数は版によって変わりうるので、
+        // app / cli だけを戻すと旧版の一式に新版のランチャーが組み合わさる。
+        Assert.Equal("old-cmd", File.ReadAllText(TargetFile(UpdateInstaller.LauncherName)));
+
         // 戻した以上、退避は残らない。残すと次の起動の後始末が拾えなくなる。
         Assert.False(Directory.Exists(TargetFile("app.old")));
         Assert.False(Directory.Exists(TargetFile("cli.old")));
+        Assert.False(File.Exists(TargetFile(UpdateInstaller.LauncherName + ".old")));
     }
 
     [Fact(DisplayName = "退避がそろっていなければ、何も動かさずに断る")]

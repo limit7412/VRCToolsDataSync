@@ -883,8 +883,13 @@ static int ApplySelfUpdateCore(
     using var relaunchedHandle = relaunched;
     if (!started)
     {
-        // 置き換えは済んでいる。起動し直しの失敗は利用者の手起動で補える。
-        return 1;
+        // 起こすことすらできなかった。公開された実行ファイルの形が不正だった
+        // 場合や、置き換えた直後にウイルス対策ソフトが隔離した場合がここに来る。
+        // 利用者が手で起動しても同じ理由で失敗するので、置き換えたまま残すと
+        // App を開く手立てが無くなる。生死を見るまでもないので、そのまま戻す。
+        Console.Error.WriteLine("置き換えた App を起こせませんでした。退避しておいた一式へ戻します。");
+        Log(() => logger.LogError("置き換えた App を起こせなかった。退避した一式へ戻す"));
+        return RollBackFailedStart(source, target, relaunchMinimized, logger, Log);
     }
 
     // 起こせたが掴めなかった。生死を見る手が無いので、そのまま任せる。
@@ -992,6 +997,19 @@ static int RollBackFailedStart(
     // 戻す間は多重起動の抑止を掴む。起動した App が旧 app\ を掴むと、
     // 戻しのリネームが失敗する。落ちた App は既に手放している。
     var singleInstance = UpdateInstaller.TryHoldSingleInstance(UpdateInstaller.SingleInstanceHandOverTimeout);
+    if (singleInstance is null)
+    {
+        // 待っても空かなかった。別の App が動いており、その App は置き換えた
+        // 一式で動いている。起動できない一式ではなかったということなので、
+        // 戻す理由のほうが怪しい。
+        //
+        // 掴まれたまま戻しに入ると、なお悪い。戻しは正規の位置を消してから
+        // 退避を戻すため、消す途中で失敗すると、置き換えた一式まで欠ける。
+        // 正規の位置には触らずに引き下がる。
+        Console.Error.WriteLine("App が起動しているため、退避しておいた一式へは戻しません。");
+        log(() => logger.LogWarning("App が動いているため、起動できなかった置き換えを戻さない"));
+        return 1;
+    }
 
     try
     {

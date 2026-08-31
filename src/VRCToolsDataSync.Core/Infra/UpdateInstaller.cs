@@ -575,7 +575,39 @@ public class UpdateInstaller
         }
 
         RollbackSwapped(new List<string>(Parts));
+        RestoreLauncher();
         LogQuietly(() => _logger.LogInformation("済ませた入れ替えを戻した: {Target}", _targetDirectory));
+    }
+
+    /// <summary>
+    /// 退避しておいたランチャーを戻す (issue #53)。
+    /// <para>
+    /// 退避が無ければ何もしない。差し替えの段で退避に失敗した場合と、
+    /// ランチャーの差し替えそのものが失敗した場合がそれに当たる。どちらでも
+    /// 正規の位置には旧版のランチャーが残っているので、戻す必要が無い。
+    /// </para>
+    /// <para>
+    /// 戻せなかった場合も警告に留める。差し替えの段と同じ理由で、ランチャーは
+    /// 相対参照で app を起動するため、版が食い違っても大抵は動く。app と cli を
+    /// 戻せている以上、ここで例外を投げて「戻せなかった」と伝えるほうが実態から
+    /// 遠い。
+    /// </para>
+    /// </summary>
+    private void RestoreLauncher()
+    {
+        var launcher = Path.Combine(_targetDirectory, LauncherName);
+        var backup = launcher + ".old";
+        if (!File.Exists(backup)) return;
+
+        try
+        {
+            File.Move(backup, launcher, overwrite: true);
+            LogQuietly(() => _logger.LogInformation("退避しておいたランチャーへ戻した"));
+        }
+        catch (Exception ex)
+        {
+            LogQuietly(() => _logger.LogWarning(ex, "退避しておいたランチャーへ戻せなかった: {Name}", LauncherName));
+        }
     }
 
     /// <summary>
@@ -591,6 +623,20 @@ public class UpdateInstaller
         var launcherTemp = launcher + ".new";
         try
         {
+            // 差し替える前に退避する。戻すときに要る (issue #53)。ランチャーが
+            // 起動する先や渡す引数は版によって変わりうるので、app / cli だけを
+            // 戻すと、旧版の一式に新版のランチャーが組み合わさる。ヘルパからの
+            // 直接の起動は通っても、次の通常の起動で食い違う。
+            //
+            // 退避に失敗しても差し替えは進める。ここは元から警告に留める段で
+            // あり、退避が無ければ戻すときにランチャーを飛ばすだけである。
+            try { File.Copy(launcher, launcher + ".old", overwrite: true); }
+            catch (Exception backup)
+            {
+                LogQuietly(() => _logger.LogWarning(
+                    backup, "ランチャーを退避できなかった: {Name}", LauncherName));
+            }
+
             File.Copy(Path.Combine(_sourceDirectory, LauncherName), launcherTemp, overwrite: true);
             File.Move(launcherTemp, launcher, overwrite: true);
         }
@@ -640,6 +686,21 @@ public class UpdateInstaller
     public static void DiscardPrevious(string targetDirectory, ILogger? logger = null)
     {
         var log = logger ?? NullLogger.Instance;
+
+        var launcherBackup = Path.Combine(targetDirectory, LauncherName + ".old");
+        if (File.Exists(launcherBackup))
+        {
+            try
+            {
+                File.Delete(launcherBackup);
+                LogQuietly(() => log.LogInformation("置き換え前のランチャーを消した"));
+            }
+            catch (Exception ex)
+            {
+                LogQuietly(() => log.LogWarning(ex, "置き換え前のランチャーを消せなかった: {Path}", launcherBackup));
+            }
+        }
+
         foreach (var part in Parts)
         {
             var backup = Path.Combine(targetDirectory, part + ".old");
