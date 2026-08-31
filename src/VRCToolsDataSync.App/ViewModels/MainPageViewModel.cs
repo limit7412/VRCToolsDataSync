@@ -735,8 +735,15 @@ public partial class MainPageViewModel : ObservableObject
 
         var current = _updates.CurrentVersion;
 
+        // 一度置き換えて起動できなかった版は取りに行かない (issue #76)。
+        // そのまま「出ています」とだけ出すと、いつまでも取得済みにならない
+        // 理由が分からない。
+        var startFailed = result.Release is { } found && _updates.IsKnownStartFailure(found);
+
         UpdateStatus = result.Outcome switch
         {
+            UpdateCheckOutcome.Available when startFailed =>
+                $"新しい版 {result.Release!.Tag} が出ていますが、この PC では起動できなかったため取得しません",
             UpdateCheckOutcome.Available =>
                 $"新しい版 {result.Release!.Tag} が出ています (実行中: {current})",
             UpdateCheckOutcome.UpToDate when result.Release is not null =>
@@ -756,14 +763,18 @@ public partial class MainPageViewModel : ObservableObject
 
         if (result.Outcome == UpdateCheckOutcome.Available && result.Release is { } release)
         {
-            AppendLog($"新しい版 {release.Tag} が出ています (実行中: {current})");
+            AppendLog(startFailed
+                ? $"新しい版 {release.Tag} が出ていますが、この PC では起動できなかったため取得しません"
+                : $"新しい版 {release.Tag} が出ています (実行中: {current})");
             if (!manual)
             {
                 // 自動の確認は背後で走るので、画面を見ていない利用者にも届くよう
                 // バルーンを出す。押した人は画面の前に居るので出さない。
                 ToastRequested?.Invoke(
                     "VRCToolsDataSync の更新",
-                    $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
+                    startFailed
+                        ? $"新しい版 {release.Tag} は、置き換えても起動できなかったため取得しません。"
+                        : $"新しい版 {release.Tag} が出ています。ウィンドウの設定から開けます。");
             }
             // 画面と通知に出せた後で覚える。出せなかった版まで覚えると、
             // 利用者が一度も見ないまま以後の確認で抑止される。

@@ -1064,6 +1064,12 @@ static int RollBackFailedStart(
         return 7;
     }
 
+    // 何を捨てるのかを、捨てる前に控えておく (issue #76)。捨てた後では読めない。
+    var stage = new UpdateStage(UpdateStage.DirectoryFor(target), logger);
+    StagedMetadata? failed = null;
+    try { failed = stage.TryLoadMetadata(); }
+    catch (Exception ex) { log(() => logger.LogWarning(ex, "起動できなかった配布物の記録を読めなかった")); }
+
     // 取得を捨てる。残すと、開き直した旧版がまた同じ一式を適用しに行き、
     // また起動できずに戻す、を繰り返す。
     if (!TryDiscardStaged(target, logger, out var stageDirectory))
@@ -1073,6 +1079,15 @@ static int RollBackFailedStart(
         log(() => logger.LogError("取得済みの更新を消せないため、App を起動し直さない"));
         singleInstance?.Dispose();
         return 8;
+    }
+
+    // 起動できなかった配布物を覚える (issue #76)。捨てただけでは、開き直した
+    // 旧版が次の確認で同じものをまた取得し、次の起動でまた適用しに行く。
+    // 起動のたびに数十〜百数十 MB を空振りすることになる。
+    if (failed is not null)
+    {
+        try { stage.RecordStartFailure(failed.Tag, failed.DigestHex); }
+        catch (Exception ex) { log(() => logger.LogWarning(ex, "起動できなかった配布物を覚えられなかった")); }
     }
 
     singleInstance?.Dispose();
