@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
@@ -155,15 +154,9 @@ public sealed class UpdateStage
     }
 
     /// <summary>
-    /// インストール先をディレクトリ名にする。パスはそのまま使えないので縮める。
-    /// 大文字小文字は Windows のファイルシステムに合わせて畳む。
+    /// インストール先をディレクトリ名にする。ロックの名前にも同じ鍵を使う。
     /// </summary>
-    private static string ScopeKeyOf(string installRoot)
-    {
-        var normalized = Path.TrimEndingDirectorySeparator(installRoot).ToLowerInvariant();
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
-        return Convert.ToHexStringLower(hash)[..16];
-    }
+    private static string ScopeKeyOf(string installRoot) => GlobalMutex.ScopeKeyOf(installRoot);
 
     /// <summary>
     /// 取得しておいた ZIP (<see cref="IncomingZipPath"/>) を、記録と一緒に
@@ -272,20 +265,7 @@ public sealed class UpdateStage
     /// インストール先ごとに分けた <c>Global\</c> の <see cref="Mutex"/> を作る。
     /// </summary>
     private static Mutex CreateScopedMutex(string prefix, string? installRoot)
-    {
-        var name = prefix + (installRoot is null ? "local" : ScopeKeyOf(installRoot));
-        try
-        {
-            return new Mutex(initiallyOwned: false, name: @"Global\" + name);
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or NotSupportedException)
-        {
-            // Global\ の名前を作れない構成もある (権限を落とした環境や、
-            // 名前に区切りを許さないプラットフォーム)。そこではセッション内
-            // だけの名前で妥協する。同じセッションの重なりは防げる。
-            return new Mutex(initiallyOwned: false, name: name);
-        }
-    }
+        => GlobalMutex.Create(prefix + (installRoot is null ? "local" : ScopeKeyOf(installRoot)));
 
     /// <summary>
     /// 更新を取得している間だけ握るクロスプロセスのロック (issue #52)。

@@ -21,12 +21,20 @@ public sealed class SettingsStore
 
     private readonly object _saveLock = new();
 
-    // クロスプロセス排他用の Named Mutex 名。
+    // クロスプロセス排他用の Named Mutex 名の接頭辞。
     // GUI (App) と CLI が同じ settings.json に対して並走で
     // read-modify-write すると、プロセス内 _saveLock だけではアトミック性が
-    // 担保できず、片方の更新が他方に潰される。Global\ は付けずユーザセッション
-    // 内のみ排他にする (settings は %AppData% 配下なのでユーザ毎にしか共有されない)。
-    private const string CrossProcessMutexName = "VRCToolsDataSync.SettingsStore.Save";
+    // 担保できず、片方の更新が他方に潰される。
+    //
+    // 名前は対話セッションをまたいで見えるものにする (issue #52)。%AppData% は
+    // ユーザ毎に分かれるが、同じユーザの 2 つの対話セッション (ユーザーの
+    // 切り替えやリモートデスクトップ) からは同じ場所を指す。セッション内だけの
+    // 名前にしていると、そこで並走した保存を直列化できない。
+    //
+    // 守る相手ごとに名前を分けるため、設定ファイルのパスから引いた鍵を足す。
+    // 名前を 1 つにまとめると、別のユーザどうしや、パスを指定して動かしている
+    // 相手 (テストなど) まで待ち合わせる。
+    private const string CrossProcessMutexPrefix = "VRCToolsDataSync.SettingsStore.Save.";
     // Mutex 取得のタイムアウト。普通の Save は数十 ms で終わるため、
     // これだけ待っても取れない場合は別プロセスがハング相当なので、
     // 取得を諦めてプロセス内ロックだけで救済し best-effort で書く。
@@ -215,7 +223,8 @@ public sealed class SettingsStore
         // アトミックに完結させる。プロセス内 _saveLock は同一インスタンス内の
         // 並行 Save 直列化用で、別プロセスからの同時 Save は守れない。
         // initiallyOwned=false でハンドルだけ作り、WaitOne でブロック取得する。
-        using var crossProcessMutex = new Mutex(initiallyOwned: false, name: CrossProcessMutexName);
+        using var crossProcessMutex = GlobalMutex.Create(
+            CrossProcessMutexPrefix + GlobalMutex.ScopeKeyOf(FilePath));
         bool mutexAcquired = false;
         try
         {
