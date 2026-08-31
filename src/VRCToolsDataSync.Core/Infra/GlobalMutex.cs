@@ -44,14 +44,22 @@ internal static class GlobalMutex
     /// <summary>
     /// パスを名前に使える短い鍵にする。
     /// <para>
-    /// パスはそのまま名前に使えない (区切りを含む) ので縮める。大文字小文字は
-    /// Windows のファイルシステムに合わせて畳む。守る相手ごとに名前を分けるため
-    /// に使う。まとめてしまうと、無関係な相手どうしが待ち合わせる。
+    /// パスはそのまま名前に使えない (区切りを含む) ので縮める。守る相手ごとに
+    /// 名前を分けるために使う。まとめてしまうと、無関係な相手どうしが待ち合わせる。
+    /// </para>
+    /// <para>
+    /// 縮める前に綴りをそろえる。ここで見ているのはファイルそのものではなく
+    /// 文字列なので、<c>C:\dir\settings.json</c> と <c>C:\dir\.\settings.json</c>
+    /// のように OS が同じ場所へ解決する綴りでも、そのままでは別の鍵になる。
+    /// 別の鍵は別のロックであり、同じ資源を守っているつもりで守れていない状態に
+    /// なる。<see cref="Path.GetFullPath(string)"/> で絶対パスに直して区切りを
+    /// そろえ、末尾の区切りを落とし、大文字小文字を Windows のファイルシステムに
+    /// 合わせて畳む。
     /// </para>
     /// </summary>
     public static string ScopeKeyOf(string path)
     {
-        var normalized = Path.TrimEndingDirectorySeparator(path).ToLowerInvariant();
+        var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)).ToLowerInvariant();
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
         return Convert.ToHexStringLower(hash)[..16];
     }

@@ -382,9 +382,19 @@ public sealed class UpdateStageTests : IDisposable
 
         Assert.NotEqual(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(other));
 
-        // 大文字小文字は Windows のファイルシステムに合わせて畳む。同じ
-        // ファイルを別の綴りで指した相手と待ち合わせられないと意味が無い。
+        // 同じファイルを別の綴りで指した相手と待ち合わせられないと意味が無い。
+        // 大文字小文字は Windows のファイルシステムに合わせて畳み、綴りは
+        // 絶対パスにそろえる。
         Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.ToUpperInvariant()));
+        Assert.Equal(
+            GlobalMutex.ScopeKeyOf(mine),
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, ".", "settings.json")));
+        Assert.Equal(
+            GlobalMutex.ScopeKeyOf(mine),
+            GlobalMutex.ScopeKeyOf(Path.Combine(_directory, "elsewhere", "..", "settings.json")));
+
+        // Windows では区切りがどちらでも同じファイルを指す。
+        Assert.Equal(GlobalMutex.ScopeKeyOf(mine), GlobalMutex.ScopeKeyOf(mine.Replace('\\', '/')));
     }
 
     [Fact(DisplayName = "対話セッションをまたぐロックは、別スレッドから見ても同じものになる")]
