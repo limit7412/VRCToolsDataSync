@@ -48,7 +48,11 @@ public sealed class FriendConnectSyncService : ISyncService
         var manifest = manifestStore.Load();
         manifest.Tools.TryGetValue(Key, out var existing);
 
+        // 非常用の強制 Push は記録を一切信用しないので、全ファイルを置き換えて送る。
+        var replace = options.ReuploadAll;
+
         if (!options.ForceOverwriteOnConflict
+            && !replace
             && existing is not null
             && existing.Version > (options.LastPulledVersion ?? 0))
         {
@@ -68,11 +72,11 @@ public sealed class FriendConnectSyncService : ISyncService
         var files = new List<ManifestFile>();
         var affected = new List<string>();
 
-        files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected));
+        files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace));
 
         if (File.Exists(_paths.DbV11File))
         {
-            files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected));
+            files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace));
         }
         // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
         // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
@@ -81,7 +85,7 @@ public sealed class FriendConnectSyncService : ISyncService
         if (File.Exists(_paths.ConfigJsonFile))
         {
             var (config, sent) = SyncTransfer.Send(
-                storage, remoteFiles, _paths.ConfigJsonFile, ConfigKey);
+                storage, remoteFiles, _paths.ConfigJsonFile, ConfigKey, replace);
             if (sent)
             {
                 affected.Add(ConfigKey);
@@ -93,10 +97,12 @@ public sealed class FriendConnectSyncService : ISyncService
             files.Add(config);
         }
 
-        var noteFiles = PushNotes(storage, remoteFiles, affected);
+        var noteFiles = PushNotes(storage, remoteFiles, affected, replace);
         files.AddRange(noteFiles);
 
-        if (SyncTransfer.IsUnchangedSet(existing, files))
+        // 非常用の強制 Push では、内容が同じでも version を進める。他の PC が壊れた実体を
+        // 取りに行って失敗した後でも、新しい version を見れば取り直しに来る。
+        if (!replace && SyncTransfer.IsUnchangedSet(existing, files))
         {
             // 送るものが何も無いなら manifest も触らない。version を進めると
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
@@ -116,13 +122,18 @@ public sealed class FriendConnectSyncService : ISyncService
         long nextVersion;
         try
         {
-            nextVersion = manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, version => new ToolManifestEntry
+            ToolManifestEntry BuildEntry(long version) => new()
             {
                 Version = version,
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-            });
+            };
+            // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
+            // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
+            nextVersion = replace
+                ? manifestStore.OverwriteToolEntry(Key, BuildEntry)
+                : manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, BuildEntry);
         }
         catch (ToolEntryChangedException ex)
         {
@@ -256,7 +267,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 Outcome = SyncOutcome.Aborted,
                 Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}。" +
                           "同期先のファイルと manifest がずれています。" +
-                          "正しいデータを持つ PC から Push し直すと解消します。",
+                          "正しいデータを持つ PC から非常用の強制 Push を行うと解消します。",
             };
         }
 
@@ -344,18 +355,19 @@ public sealed class FriendConnectSyncService : ISyncService
         string sourceDb,
         string key,
         IReadOnlyList<ManifestFile> remoteFiles,
-        List<string> affected)
+        List<string> affected,
+        bool replace)
     {
         using var staged = storage.BeginUpload();
         SqliteSnapshot.Create(sourceDb, staged.LocalPath);
         var described = SyncTransfer.Describe(staged.LocalPath, key);
-        if (SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
+        if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
         {
             _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
         }
         else
         {
-            staged.Commit(ManifestFileKeys.StorageKeyOf(described));
+            SyncTransfer.Commit(staged, ManifestFileKeys.StorageKeyOf(described), replace);
             affected.Add(key);
         }
         return described;
@@ -369,7 +381,8 @@ public sealed class FriendConnectSyncService : ISyncService
     private List<ManifestFile> PushNotes(
         ISyncStorage storage,
         IReadOnlyList<ManifestFile> remoteFiles,
-        List<string> affected)
+        List<string> affected,
+        bool replace)
     {
         var files = new List<ManifestFile>();
 
@@ -382,7 +395,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 var relative = StorageKey.FromRelativePath(
                     Path.GetRelativePath(_paths.NotesDirectory, localPath));
                 var key = NotesKeyPrefix + relative;
-                var (described, sent) = SyncTransfer.Send(storage, remoteFiles, localPath, key);
+                var (described, sent) = SyncTransfer.Send(storage, remoteFiles, localPath, key, replace);
                 if (sent)
                 {
                     affected.Add(key);

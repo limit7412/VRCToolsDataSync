@@ -93,6 +93,44 @@ public sealed class ManifestStoreTests
         Assert.Equal(1, ex.ActualVersion);
     }
 
+    [Fact(DisplayName = "上書きは見ていた version を問わず、次の version を採番する")]
+    public void OverwriteIgnoresTheVersionSeenEarlier()
+    {
+        // 非常用の強制 Push は全ファイルを置き換えてから呼ぶので、version の変化で
+        // 止める理由が無い。
+        var storage = new FakeSyncStorage();
+        new ManifestStore(storage).UpdateToolEntry("vrcx", 0, EntryWith);
+        new ManifestStore(storage).UpdateToolEntry("vrcx", 1, EntryWith);
+
+        var version = new ManifestStore(storage).OverwriteToolEntry("vrcx", EntryWith);
+
+        Assert.Equal(3, version);
+    }
+
+    [Fact(DisplayName = "上書きでも別 tool のエントリは保つ")]
+    public void OverwriteKeepsOtherToolEntries()
+    {
+        var storage = new FakeSyncStorage();
+        new ManifestStore(storage).UpdateToolEntry("friendconnect", 0, EntryWith);
+
+        new ManifestStore(storage).OverwriteToolEntry("vrcx", EntryWith);
+
+        var manifest = new ManifestStore(storage).Load();
+        Assert.True(manifest.Tools.ContainsKey("vrcx"));
+        Assert.True(manifest.Tools.ContainsKey("friendconnect"));
+    }
+
+    [Fact(DisplayName = "上書きでも扱えない schemaVersion には書き込まない")]
+    public void OverwriteRejectsNewerSchemaVersion()
+    {
+        var storage = new FakeSyncStorage();
+        storage.SeedManifest(new SyncManifest { SchemaVersion = SyncManifest.CurrentSchemaVersion + 1 });
+
+        Assert.Throws<SyncStorageException>(
+            () => new ManifestStore(storage).OverwriteToolEntry("vrcx", EntryWith));
+        Assert.DoesNotContain("TrySaveManifest", storage.Calls);
+    }
+
     [Fact(DisplayName = "別 tool のエントリは保ったまま更新する")]
     public void KeepsOtherToolEntries()
     {

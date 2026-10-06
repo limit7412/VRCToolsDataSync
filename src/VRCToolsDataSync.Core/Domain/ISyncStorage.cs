@@ -169,6 +169,18 @@ public interface IStagedUpload : IDisposable
 
     /// <summary><see cref="LocalPath"/> の内容を <paramref name="key"/> として確定させる。</summary>
     void Commit(string key);
+
+    /// <summary>
+    /// <see cref="Commit"/> と同じく確定させるが、同じキーに既に何かがあれば必ず置き換える。
+    /// 非常用の強制 Push だけが使う。
+    /// <para>
+    /// 通常の <see cref="Commit"/> は、キーが内容から決まることを前提に、既にあるものを
+    /// 同じ内容とみなして残してよい。ところが同期先の実体が壊れている場合 (同期クライアントの
+    /// 事故や手作業での上書き) はこの前提が崩れており、残すと壊れたままになる。
+    /// 置き換えれば、キーが表す内容と実際に置かれる内容が再び一致する。
+    /// </para>
+    /// </summary>
+    void CommitReplacing(string key);
 }
 
 /// <summary>manifest の更新通知。</summary>

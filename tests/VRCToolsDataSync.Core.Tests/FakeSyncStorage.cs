@@ -257,6 +257,14 @@ internal sealed class FakeSyncStorage : ISyncStorage
             Cleanup();
         }
 
+        public void CommitReplacing(string key)
+        {
+            _storage.Calls.Add("CommitReplacing:" + key);
+            _storage._objects[key] = new StoredEntry(File.ReadAllBytes(LocalPath), _storage.Now);
+            _committed = true;
+            Cleanup();
+        }
+
         public void Dispose()
         {
             if (!_committed) _storage.Calls.Add("Discard");

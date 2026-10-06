@@ -16,6 +16,24 @@ public sealed class PushOptions
 
     public required string MachineName { get; init; }
     public bool ForceOverwriteOnConflict { get; init; }
+
+    /// <summary>
+    /// 非常用の強制 Push。同期先の記録を一切信用せず、手元の全ファイルを送り直して
+    /// 同期先を置き換える。<see cref="ForceOverwriteOnConflict"/> を含む。
+    /// <para>
+    /// 通常の Push は manifest の記録と実体の有無を見て送信を省き、何も変わらなければ
+    /// manifest にも触れない。同期先の実体の中身が壊れている (ハッシュが記録と合わない)
+    /// 場合は、この省略のせいで Push し直しても直らず、他の PC の Pull が失敗し続ける。
+    /// その状態から抜け出すための手段で、次の違いがある。
+    /// </para>
+    /// <list type="bullet">
+    /// <item>送信を省かず、同期先に同じキーの実体があっても置き換える。</item>
+    /// <item>内容が前回と同じでも manifest の version を進め、他の PC に取り直させる。</item>
+    /// <item>Push の途中で他の PC が同期先を更新しても、競合として止めずに上書きする。</item>
+    /// </list>
+    /// </summary>
+    public bool ReuploadAll { get; init; }
+
     public long? LastPulledVersion { get; init; }
 }
 

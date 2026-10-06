@@ -1052,6 +1052,12 @@ public partial class MainPageViewModel : ObservableObject
     [RelayCommand]
     private Task PullFriendConnect() => RunPullAsync("VRC Friend Connect", new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>()));
 
+    [RelayCommand]
+    private Task EmergencyPushVrcx() => RunEmergencyPushAsync("VRCX", new VrcxSyncService(logger: _runner.CreateLogger<VrcxSyncService>()));
+
+    [RelayCommand]
+    private Task EmergencyPushFriendConnect() => RunEmergencyPushAsync("VRC Friend Connect", new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>()));
+
     private async Task RunPushAsync(string displayName, ISyncService service)
     {
         if (!TryCreateStorage(out var storage)) return;
@@ -1097,6 +1103,54 @@ public partial class MainPageViewModel : ObservableObject
             else
             {
                 ReportPushResult(displayName, result, storage);
+            }
+        }
+        catch (RunningProcessException ex)
+        {
+            AppendLog($"{displayName}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"{displayName} エラー: {ex.Message}");
+        }
+        finally
+        {
+            RefreshStatusSummaries();
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// 非常用の強制 Push (<see cref="PushOptions.ReuploadAll"/>)。確かめてから実行する。
+    /// <para>
+    /// 同期先をこの PC のデータで丸ごと置き換えるので、他の PC の未取得の変更を失う。
+    /// 押し間違いで走らせないよう、必ず問い合わせを挟む。問い合わせから実行までは
+    /// 競合時の問い合わせと同じく <see cref="_promptGate"/> を握り、自動側の
+    /// 問い合わせと重ならないようにする。
+    /// </para>
+    /// </summary>
+    private async Task RunEmergencyPushAsync(string displayName, ISyncService service)
+    {
+        if (!TryCreateStorage(out var storage)) return;
+        IsBusy = true;
+        try
+        {
+            await _promptGate.WaitAsync();
+            try
+            {
+                if (!await AskEmergencyPushAsync(displayName))
+                {
+                    AppendLog($"{displayName} 非常用の強制 Push をキャンセル");
+                    return;
+                }
+                AppendLog($"{displayName} 非常用の強制 Push 開始 (全ファイルを送り直します)...");
+                var result = await Task.Run(
+                    () => _runner.Push(service, _settings, storage, force: true, reuploadAll: true));
+                ReportPushResult(displayName, result, storage);
+            }
+            finally
+            {
+                _promptGate.Release();
             }
         }
         catch (RunningProcessException ex)
@@ -1330,6 +1384,18 @@ public partial class MainPageViewModel : ObservableObject
             ("先に Pull", ConflictChoice.PullFirst),
             ("強制 Push (上書き)", ConflictChoice.ForceOverwrite),
             ("キャンセル", ConflictChoice.Cancel));
+
+    /// <summary>非常用の強制 Push を本当に行うかを尋ねる。</summary>
+    private Task<bool> AskEmergencyPushAsync(string displayName) =>
+        AskAsync<bool>(
+            $"{displayName}: 非常用の強制 Push",
+            "同期先をこの PC のデータで丸ごと置き換えます。他の PC が Push した変更のうち、" +
+            "この PC が取得していないものは失われます。全ファイルを送り直すため、" +
+            "データが大きいと時間と転送量がかかります。" +
+            "同期先のファイルが壊れていて Pull が失敗し続けるときなど、通常の Push で直らない場合に使ってください。",
+            InfoBarSeverity.Error,
+            ("置き換える", true),
+            ("キャンセル", false));
 
     /// <summary>別の PC の Push を見つけたときに、いま Pull するかを尋ねる。</summary>
     private Task<RemoteUpdateChoice> AskRemoteUpdateAsync(
