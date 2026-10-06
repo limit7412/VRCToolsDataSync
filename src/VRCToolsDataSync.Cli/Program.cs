@@ -162,7 +162,7 @@ storageCommand.AddCommand(storageTestCommand);
 
 var gcGraceOption = new Option<int>(
     aliases: new[] { "--grace-days" },
-    getDefaultValue: () => 7,
+    getDefaultValue: () => (int)BlobGarbageCollector.DefaultGracePeriod.TotalDays,
     description: "この日数より新しいオブジェクトは、参照されていなくても残す");
 var gcDryRunOption = new Option<bool>(
     aliases: new[] { "--dry-run" },
@@ -564,7 +564,7 @@ static int CollectGarbage(int graceDays, bool dryRun)
         // 回収の安全性はほぼこれに乗っている。0 にすると、書かれたばかりの実体が
         // そのまま対象になる。加えて、削除の直前の読み直しも効かなくなる。
         // 判定に使う S3 の Last-Modified は秒単位なので、猶予期間が十分にあれば
-        // 「7 日以上前」と「たった今」を取り違えないが、0 では同じ秒に収まりうる。
+        // 「数日前」と「たった今」を取り違えないが、0 では同じ秒に収まりうる。
         Console.Error.WriteLine(
             "警告: --grace-days 0 では、他の PC が送っている最中の実体を巻き込む可能性があります。");
         Console.Error.WriteLine(

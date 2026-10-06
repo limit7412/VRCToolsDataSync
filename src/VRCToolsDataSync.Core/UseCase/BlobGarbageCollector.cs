@@ -69,7 +69,7 @@ public sealed record BlobGarbageCollectionResult(
 /// 送り直しを区別できない。Win32 にも更新時刻を条件にする不可分な削除は無い。
 /// </para>
 /// <para>
-/// 残る幅は同期先による。S3 互換モードは 1 往復ぶんで、猶予期間 (既定 7 日) に対しては
+/// 残る幅は同期先による。S3 互換モードは 1 往復ぶんで、猶予期間 (既定 3 日) に対しては
 /// 無視できる。<b>同期フォルダモードでは伝播遅延そのもの</b>になる。ここで読める時刻は
 /// 同期クライアントが手元へ持ってきた写しのもので、別の PC の置き直しが届くまでは
 /// 古いまま見えるためである。猶予期間もこれを埋めない (同じ写しを基準に測るため)。
@@ -79,7 +79,7 @@ public sealed record BlobGarbageCollectionResult(
 public sealed class BlobGarbageCollector
 {
     /// <summary>猶予期間の既定値。Push 1 回の所要時間に対して十分長く取る。</summary>
-    public static readonly TimeSpan DefaultGracePeriod = TimeSpan.FromDays(7);
+    public static readonly TimeSpan DefaultGracePeriod = TimeSpan.FromDays(3);
 
     private readonly ISyncStorage _storage;
     private readonly ILogger _logger;
