@@ -83,17 +83,25 @@ internal static class SyncTransfer
     /// 省略した場合に返すハッシュは元のファイルのものだが、それは
     /// <see cref="CanSkipUpload"/> が実在を確かめた実体の内容と一致している。
     /// </para>
+    /// <para>
+    /// <paramref name="replaceExisting"/> を true にすると、省略の判定をせずに必ず送り、
+    /// 同期先に同じキーの実体があっても置き換える。非常用の強制 Push が使う。
+    /// </para>
     /// </summary>
     public static (ManifestFile File, bool Sent) Send(
         ISyncStorage storage,
         IReadOnlyList<ManifestFile> remoteFiles,
         string localPath,
-        string logicalPath)
+        string logicalPath,
+        bool replaceExisting = false)
     {
-        var probe = Describe(localPath, logicalPath);
-        if (CanSkipUpload(storage, remoteFiles, probe))
+        if (!replaceExisting)
         {
-            return (probe, false);
+            var probe = Describe(localPath, logicalPath);
+            if (CanSkipUpload(storage, remoteFiles, probe))
+            {
+                return (probe, false);
+            }
         }
 
         using var staged = storage.BeginUpload();
@@ -104,8 +112,24 @@ internal static class SyncTransfer
         // これを置き去りと誤判定して消しうる。
         File.SetLastWriteTimeUtc(staged.LocalPath, DateTime.UtcNow);
         var described = Describe(staged.LocalPath, logicalPath);
-        staged.Commit(ManifestFileKeys.StorageKeyOf(described));
+        Commit(staged, ManifestFileKeys.StorageKeyOf(described), replaceExisting);
         return (described, true);
+    }
+
+    /// <summary>
+    /// 書き出し済みの内容を確定させる。<paramref name="replaceExisting"/> が true なら、
+    /// 同じキーに既にある実体を置き換える (<see cref="IStagedUpload.CommitReplacing"/>)。
+    /// </summary>
+    public static void Commit(IStagedUpload staged, string key, bool replaceExisting)
+    {
+        if (replaceExisting)
+        {
+            staged.CommitReplacing(key);
+        }
+        else
+        {
+            staged.Commit(key);
+        }
     }
 
     /// <summary>

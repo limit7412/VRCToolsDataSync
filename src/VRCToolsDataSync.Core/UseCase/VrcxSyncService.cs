@@ -43,7 +43,11 @@ public sealed class VrcxSyncService : ISyncService
         var manifest = manifestStore.Load();
         manifest.Tools.TryGetValue(Key, out var existing);
 
+        // 非常用の強制 Push は記録を一切信用しないので、全ファイルを置き換えて送る。
+        var replace = options.ReuploadAll;
+
         if (!options.ForceOverwriteOnConflict
+            && !replace
             && existing is not null
             && existing.Version > (options.LastPulledVersion ?? 0))
         {
@@ -71,13 +75,13 @@ public sealed class VrcxSyncService : ISyncService
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
-            if (SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
+            if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
                 _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
             }
             else
             {
-                staged.Commit(ManifestFileKeys.StorageKeyOf(snapshot));
+                SyncTransfer.Commit(staged, ManifestFileKeys.StorageKeyOf(snapshot), replace);
                 affected.Add(SnapshotKey);
             }
             files.Add(snapshot);
@@ -86,7 +90,7 @@ public sealed class VrcxSyncService : ISyncService
         if (File.Exists(_paths.SettingsJsonFile))
         {
             var (settingsFile, sent) = SyncTransfer.Send(
-                storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey);
+                storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey, replace);
             if (sent)
             {
                 affected.Add(SettingsKey);
@@ -106,7 +110,9 @@ public sealed class VrcxSyncService : ISyncService
         // 他の PC が参照しているオブジェクトを巻き込む。参照されなくなったものは
         // 猶予期間を置いて GC (BlobGarbageCollector) が回収する。
 
-        if (SyncTransfer.IsUnchangedSet(existing, files))
+        // 非常用の強制 Push では、内容が同じでも version を進める。他の PC が壊れた実体を
+        // 取りに行って失敗した後でも、新しい version を見れば取り直しに来る。
+        if (!replace && SyncTransfer.IsUnchangedSet(existing, files))
         {
             // 送るものが何も無いなら manifest も触らない。version を進めると
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
@@ -123,13 +129,18 @@ public sealed class VrcxSyncService : ISyncService
         long nextVersion;
         try
         {
-            nextVersion = manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, version => new ToolManifestEntry
+            ToolManifestEntry BuildEntry(long version) => new()
             {
                 Version = version,
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-            });
+            };
+            // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
+            // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
+            nextVersion = replace
+                ? manifestStore.OverwriteToolEntry(Key, BuildEntry)
+                : manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, BuildEntry);
         }
         catch (ToolEntryChangedException ex)
         {
@@ -255,7 +266,7 @@ public sealed class VrcxSyncService : ISyncService
                 Outcome = SyncOutcome.Aborted,
                 Message = $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}。" +
                           "同期先のファイルと manifest がずれています。" +
-                          "正しいデータを持つ PC から Push し直すと解消します。",
+                          "正しいデータを持つ PC から非常用の強制 Push を行うと解消します。",
             };
         }
 

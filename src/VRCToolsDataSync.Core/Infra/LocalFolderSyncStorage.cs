@@ -417,6 +417,24 @@ public sealed class LocalFolderSyncStorage : ISyncStorage
             _committed = true;
         }
 
+        public void CommitReplacing(string key)
+        {
+            StorageKey.Validate(key);
+            var destination = StorageKey.ToLocalPath(_storage._rootDirectory, key);
+            var directory = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            // 既にあるものを同じ内容とみなさず、書き出した内容で置き換える。置き換えは
+            // 同じフォルダ内の移動なので、読み手から見て中途半端な内容にはならない。
+            // 他のプロセスが開いていて置き換えられない場合は IOException がそのまま出る。
+            // 黙って残すと、壊れた実体を直したつもりで直っていない状態になる。
+            File.Move(LocalPath, destination, overwrite: true);
+            StampWriteTime(destination);
+            _committed = true;
+        }
+
         public void Dispose()
         {
             if (_committed) return;

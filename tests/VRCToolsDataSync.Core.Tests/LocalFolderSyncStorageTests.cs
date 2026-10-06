@@ -40,6 +40,30 @@ public sealed class LocalFolderSyncStorageTests : IDisposable
         return path;
     }
 
+    [Fact(DisplayName = "置き換えの Commit は、同じキーに既にある実体を書いた内容で置き換える")]
+    public void CommitReplacingOverwritesAnExistingBlob()
+    {
+        // 通常の Commit は既にあるものを同じ内容とみなして残す。実体が壊れている
+        // 場合はそれでは直らないので、非常用の強制 Push は置き換えの Commit を使う。
+        var storage = Storage();
+        var source = WriteAgedFile("config.json", "correct", TimeSpan.Zero);
+        var (file, _) = SyncTransfer.Send(storage, Array.Empty<ManifestFile>(), source, "fc/config.json");
+        var blobPath = StorageKey.ToLocalPath(_root, file.BlobKey!);
+        File.WriteAllText(blobPath, "broken");
+
+        SyncTransfer.Send(storage, Array.Empty<ManifestFile>(), source, "fc/config.json");
+        Assert.Equal("broken", File.ReadAllText(blobPath));
+
+        var (_, sent) = SyncTransfer.Send(
+            storage, Array.Empty<ManifestFile>(), source, "fc/config.json", replaceExisting: true);
+
+        Assert.True(sent);
+        Assert.Equal("correct", File.ReadAllText(blobPath));
+        // 書き出しに使った一時ファイルが残っていないこと。
+        Assert.Empty(Directory.EnumerateFiles(Path.GetDirectoryName(blobPath)!)
+            .Where(p => !string.Equals(p, blobPath, StringComparison.OrdinalIgnoreCase)));
+    }
+
     [Fact(DisplayName = "Commit した実体には、コピー元ではなく書いた時刻が刻まれる")]
     public void CommittedBlobCarriesTheWriteTimeNotTheSourceTime()
     {
