@@ -23,7 +23,7 @@ public sealed class AutoGcTests : IDisposable
         try { Directory.Delete(_directory, recursive: true); } catch { /* best-effort */ }
     }
 
-    /// <summary>猶予期間 (既定 7 日) を確実に過ぎている時刻。</summary>
+    /// <summary>猶予期間 (既定 3 日) を確実に過ぎている時刻。</summary>
     private static DateTimeOffset LongAgo => DateTimeOffset.UtcNow - TimeSpan.FromDays(30);
 
     private static SyncManifest ManifestReferencing(params string[] blobKeys)
@@ -173,7 +173,7 @@ public sealed class AutoGcTests : IDisposable
     [Fact(DisplayName = "手動実行に渡した猶予期間が判定に使われる")]
     public void ManualRunHonorsGivenGracePeriod()
     {
-        // GUI の「今すぐ解放」は猶予期間を日数で受け取って渡す。既定 (7 日) では
+        // GUI の「今すぐ解放」は猶予期間を日数で受け取って渡す。既定 (3 日) では
         // 残る新しい孤児が、短い猶予期間では対象になることを確かめる。
         var storage = new FakeSyncStorage { Now = DateTimeOffset.UtcNow };
         var twoDaysAgo = DateTimeOffset.UtcNow - TimeSpan.FromDays(2);
