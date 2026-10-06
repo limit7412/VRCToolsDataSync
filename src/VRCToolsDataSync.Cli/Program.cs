@@ -14,6 +14,10 @@ var forceOption = new Option<bool>(
     aliases: new[] { "--force", "-f" },
     description: "リモートが新しい場合でも強制的に Push する");
 
+var emergencyOption = new Option<bool>(
+    aliases: new[] { "--emergency" },
+    description: "非常用の強制 Push。同期先の記録を信用せず、全ファイルを送り直して同期先を上書きする (--force を含む)");
+
 var noBackupOption = new Option<bool>(
     aliases: new[] { "--no-backup" },
     description: "Pull 前のローカルバックアップを省略する");
@@ -28,11 +32,13 @@ var pushCommand = new Command("push", "ローカルデータをクラウドへ�
 var pushVrcxCommand = new Command("vrcx", "VRCX のデータを Push");
 pushVrcxCommand.AddOption(cloudOption);
 pushVrcxCommand.AddOption(forceOption);
+pushVrcxCommand.AddOption(emergencyOption);
 pushVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var force = ctx.ParseResult.GetValueForOption(forceOption);
-    ctx.ExitCode = RunPush(cloud, force, "VRCX",
+    var emergency = ctx.ParseResult.GetValueForOption(emergencyOption);
+    ctx.ExitCode = RunPush(cloud, force, emergency, "VRCX",
         lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()),
         VrcxSyncService.Key);
 });
@@ -41,11 +47,13 @@ pushCommand.AddCommand(pushVrcxCommand);
 var pushFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Push");
 pushFriendConnectCommand.AddOption(cloudOption);
 pushFriendConnectCommand.AddOption(forceOption);
+pushFriendConnectCommand.AddOption(emergencyOption);
 pushFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var force = ctx.ParseResult.GetValueForOption(forceOption);
-    ctx.ExitCode = RunPush(cloud, force, "VRC Friend Connect",
+    var emergency = ctx.ParseResult.GetValueForOption(emergencyOption);
+    ctx.ExitCode = RunPush(cloud, force, emergency, "VRC Friend Connect",
         lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()),
         FriendConnectSyncService.Key);
 });
@@ -271,6 +279,7 @@ static (SyncRunner runner, SyncSettings settings, ISyncStorage storage, ILoggerF
 static int RunPush(
     string? cloudOverride,
     bool force,
+    bool emergency,
     string toolDisplayName,
     Func<ILoggerFactory, ISyncService> serviceFactory,
     string toolKey)
@@ -281,7 +290,11 @@ static int RunPush(
 
     try
     {
-        var result = runner.Push(serviceFactory(loggerFactory), settings, storage, force);
+        if (emergency)
+        {
+            Console.WriteLine($"{toolDisplayName} 非常用の強制 Push: 全ファイルを送り直して同期先を上書きします");
+        }
+        var result = runner.Push(serviceFactory(loggerFactory), settings, storage, force, reuploadAll: emergency);
 
         switch (result.Outcome)
         {

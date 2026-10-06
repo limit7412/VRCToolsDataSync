@@ -40,11 +40,16 @@ public sealed class SyncRunner
     public ISyncStorage CreateStorage(SyncSettings settings, string? localFolderOverride = null)
         => SyncStorageFactory.Create(settings, localFolderOverride, _loggerFactory);
 
+    /// <param name="reuploadAll">
+    /// 非常用の強制 Push (<see cref="PushOptions.ReuploadAll"/>)。true なら
+    /// <paramref name="force"/> の値によらずコンフリクトを無視する。
+    /// </param>
     public SyncResult Push(
         ISyncService service,
         SyncSettings settings,
         ISyncStorage storage,
-        bool force)
+        bool force,
+        bool reuploadAll = false)
     {
         lock (PushLock)
         {
@@ -53,7 +58,8 @@ public sealed class SyncRunner
             {
                 Storage = storage,
                 MachineName = settings.MachineName,
-                ForceOverwriteOnConflict = force,
+                ForceOverwriteOnConflict = force || reuploadAll,
+                ReuploadAll = reuploadAll,
                 LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
             });
 

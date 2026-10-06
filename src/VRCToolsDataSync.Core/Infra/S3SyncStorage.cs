@@ -318,6 +318,9 @@ public sealed class S3SyncStorage : ISyncStorage
 
         public void Commit(string key) => _storage.Upload(LocalPath, key);
 
+        // PUT は既存のオブジェクトを常に置き換えるので、通常の Commit と同じでよい。
+        public void CommitReplacing(string key) => Commit(key);
+
         public void Dispose()
         {
             if (File.Exists(LocalPath))

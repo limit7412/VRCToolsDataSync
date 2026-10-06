@@ -72,6 +72,22 @@ public sealed class ManifestStore
     /// </para>
     /// </summary>
     public long UpdateToolEntry(string toolKey, long expectedCurrentVersion, Func<long, ToolManifestEntry> buildEntry)
+        => SaveToolEntry(toolKey, expectedCurrentVersion, buildEntry);
+
+    /// <summary>
+    /// 指定 tool のエントリを、保存直前の version を問わずに置き換え、採番した version を返す。
+    /// 非常用の強制 Push だけが使う。
+    /// <para>
+    /// <see cref="UpdateToolEntry"/> が version の変化を拒むのは、送信を省いたファイルが
+    /// 他の PC に上書きされていると manifest と実データがずれるためだった。非常用の
+    /// 強制 Push は省略をせず全ファイルを置き換えてから呼ぶので、その心配が無い。
+    /// 他の tool のエントリを保つための読み直しと、条件付き更新の再試行は通常と同じく行う。
+    /// </para>
+    /// </summary>
+    public long OverwriteToolEntry(string toolKey, Func<long, ToolManifestEntry> buildEntry)
+        => SaveToolEntry(toolKey, expectedCurrentVersion: null, buildEntry);
+
+    private long SaveToolEntry(string toolKey, long? expectedCurrentVersion, Func<long, ToolManifestEntry> buildEntry)
     {
         for (var attempt = 1; ; attempt++)
         {
@@ -85,9 +101,9 @@ public sealed class ManifestStore
             var currentVersion =
                 snapshot.Manifest.Tools.TryGetValue(toolKey, out var previous) ? previous.Version : 0;
 
-            if (currentVersion != expectedCurrentVersion)
+            if (expectedCurrentVersion is long expected && currentVersion != expected)
             {
-                throw new ToolEntryChangedException(toolKey, expectedCurrentVersion, currentVersion);
+                throw new ToolEntryChangedException(toolKey, expected, currentVersion);
             }
 
             var nextVersion = currentVersion + 1;
