@@ -248,10 +248,26 @@ public sealed class DatabaseSummary
     /// <summary>指定した列の内容を、<paramref name="orderBy"/> の順に読んでハッシュにする。</summary>
     private static (long Count, string Digest) DigestRows(
         SqliteConnection connection, string table, IReadOnlyList<string> columns, string orderBy)
+        => DigestQuery(connection, columns.Count,
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(table)} ORDER BY {orderBy}");
+
+    /// <summary>
+    /// rowid が <paramref name="rowId"/> の行のキーのハッシュを返す。行が無ければ null。
+    /// 要約の <see cref="TableSummary.LastRowHash"/> と同じ方法で求める。
+    /// </summary>
+    internal static string? HashRowKey(
+        SqliteConnection connection, string schema, string table, IReadOnlyList<string> keyColumns, long rowId)
+    {
+        var (count, digest) = DigestQuery(connection, keyColumns.Count,
+            $"SELECT {string.Join(", ", keyColumns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE rowid = {rowId.ToString(CultureInfo.InvariantCulture)}");
+        return count == 0 ? null : digest;
+    }
+
+    private static (long Count, string Digest) DigestQuery(SqliteConnection connection, int columnCount, string sql)
     {
         using var command = connection.CreateCommand();
-        command.CommandText =
-            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(table)} ORDER BY {orderBy}";
+        command.CommandText = sql;
         using var reader = command.ExecuteReader();
 
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -260,7 +276,7 @@ public sealed class DatabaseSummary
         while (reader.Read())
         {
             row.Clear();
-            for (var i = 0; i < columns.Count; i++) AppendValue(row, reader, i);
+            for (var i = 0; i < columnCount; i++) AppendValue(row, reader, i);
             row.Append('\n');
             sha.AppendData(Encoding.UTF8.GetBytes(row.ToString()));
             count++;

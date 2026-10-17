@@ -215,6 +215,15 @@ public static class SqliteMerger
         var rowIdAlias = FindRowIdAlias(connection, table);
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
         var sinceRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
+        if (sinceRowId > 0
+            && !string.Equals(
+                HashRowKey(connection, Local, table, rule.KeyColumns, sinceRowId),
+                baseline!.LastRowHash, StringComparison.Ordinal))
+        {
+            // 前回の末尾の行が手元で消され、その rowid が別の行に再利用されている。
+            // どこから先が新しい行か分からないので、全行を候補にする。
+            sinceRowId = 0;
+        }
         var hostMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
 
         // キーで突き合わせるための索引。VRCX の feed には索引が無く、数百万行を

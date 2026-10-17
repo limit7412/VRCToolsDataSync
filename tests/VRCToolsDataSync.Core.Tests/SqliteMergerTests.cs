@@ -110,6 +110,22 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name LIKE 'vrctds_%'"));
     }
 
+    [Fact(DisplayName = "手元で末尾の行を消して rowid が再利用されても、足した行を取りこぼさない")]
+    public void AppendOnlyHandlesReusedRowId()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, """
+            DELETE FROM gamelog_location WHERE location = 'wrld_a:1';
+            INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1');
+            """);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1", "wrld_local:1" },
+            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
     [Fact(DisplayName = "両方に同じ出来事があれば、二重にしない")]
     public void AppendOnlyDoesNotDuplicate()
     {

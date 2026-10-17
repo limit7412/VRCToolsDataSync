@@ -171,9 +171,9 @@ public sealed class SyncRunner
     /// </para>
     /// <para>
     /// マージの後で Push に失敗しても、ローカルはマージ済みのまま残る。
-    /// <see cref="ToolSyncState.LastPulledVersion"/> は土台にした版まで進めるが、
-    /// 前回同期時点の要約は Push が通るまで取り直さないので、次の起動時の Pull は
-    /// 手元の変更を検知して、上書きせずにもう一度マージする。
+    /// Push の間だけ <see cref="ToolSyncState.LastPulledVersion"/> を土台にした版まで
+    /// 進め、失敗したら元に戻す。前回同期時点の要約も取り直さないので、次の起動時の
+    /// Pull は要約と同期履歴が合ったまま手元の変更を検知し、上書きせずにもう一度マージする。
     /// </para>
     /// </summary>
     /// <param name="dryRun">true なら結果を数えるだけで、ローカルにも同期先にも書かない。</param>
@@ -188,10 +188,16 @@ public sealed class SyncRunner
         for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)
         {
             var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
+            var baseline = _baseSummaries.Load(stateKey);
+            if (baseline is not null && baseline.RemoteVersion != state.LastPulledVersion)
+            {
+                // 同期履歴と別の時点の要約は祖先に使えない。祖先なしの 2-way にする。
+                baseline = null;
+            }
             var merged = service.PullMerge(new PullMergeOptions
             {
                 Storage = storage,
-                Baseline = _baseSummaries.Load(stateKey),
+                Baseline = baseline,
                 DryRun = dryRun,
                 SkipBackup = skipBackup,
             });
@@ -201,12 +207,20 @@ public sealed class SyncRunner
             }
 
             // ローカルは土台にした版の内容を含むので、その版まで取り込んだことにする。
+            // Push はこの版を前提に同期先を更新する。
+            var previousPulledVersion = state.LastPulledVersion;
             state.LastPulledVersion = merged.RemoteVersion.Value;
             state.LastPulledAt = DateTimeOffset.Now;
             settings.ToolState[stateKey] = state;
             _store.SaveToolStateOnly(settings);
 
             var pushed = PushOnce(service, settings, storage, force: false, reuploadAll: false);
+            if (pushed.Outcome != SyncOutcome.Success)
+            {
+                state.LastPulledVersion = previousPulledVersion;
+                settings.ToolState[stateKey] = state;
+                _store.SaveToolStateOnly(settings);
+            }
             if (pushed.Outcome != SyncOutcome.ConflictDetected)
             {
                 return new SyncResult
