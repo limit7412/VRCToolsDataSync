@@ -7,8 +7,9 @@ namespace VRCToolsDataSync.Core.Merge;
 public enum MergeTableKind
 {
     /// <summary>
-    /// 追加専用の履歴。行の削除も書き換えも起きない前提で、マージでは和集合を取る。
-    /// 要約には行数と rowid の最大値だけを残す。
+    /// 追加専用の履歴。マージでは和集合を取る。要約には行数と rowid の最大値を残し、
+    /// 既存行で後から書き換わる列 (<see cref="MergeTableRule.GrowingColumns"/>) が
+    /// あれば、その列の内容ハッシュも残す。
     /// </summary>
     AppendOnly,
 
@@ -41,6 +42,11 @@ public enum MergeTableKind
 /// <see cref="MergeTableKind.Watched"/> で比べない列。アプリが自動で書き換える
 /// 時刻列や、作り直しで変わる id を外す。
 /// </param>
+/// <param name="GrowingColumns">
+/// <see cref="MergeTableKind.AppendOnly"/> で、既存行に後から書き込まれる列。VRCX は
+/// ワールドを出たときに gamelog_location の滞在時間 (time) を書き込み、通知を期限切れに
+/// したときに expired を 1 にする。どちらも値が増える方向にしか変わらない。
+/// </param>
 public sealed record MergeTableRule(
     string NamePattern,
     MergeTableKind Kind,
@@ -48,7 +54,8 @@ public sealed record MergeTableRule(
     IReadOnlyList<string>? ValueColumns = null,
     string? EditedAtColumn = null,
     string? Filter = null,
-    IReadOnlyList<string>? IgnoredColumns = null)
+    IReadOnlyList<string>? IgnoredColumns = null,
+    IReadOnlyList<string>? GrowingColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 

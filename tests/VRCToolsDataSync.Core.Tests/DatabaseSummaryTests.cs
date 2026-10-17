@@ -94,6 +94,41 @@ public sealed class DatabaseSummaryTests : IDisposable
             Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
     }
 
+    [Fact(DisplayName = "VRCX: 既存の履歴に後から書き込まれた滞在時間を拾う")]
+    public void VrcxDetectsLocationTimeUpdate()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+
+        // VRCX はワールドを出たときに、入ったときの行へ滞在時間を書き込む。行は増えない。
+        Exec(path, "UPDATE gamelog_location SET time = 3600000 WHERE created_at = '2026-10-01T00:00:00Z'");
+
+        Assert.Equal(
+            new[] { "gamelog_location" },
+            Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
+    }
+
+    [Fact(DisplayName = "VRCX: 新しい形式の通知の追加と既読を拾う")]
+    public void VrcxDetectsNotificationsV2()
+    {
+        var path = CreateVrcx();
+        Exec(path, """
+            CREATE TABLE usr0123abcd_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, seen) VALUES ('not_a', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', 0);
+            """);
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+        Assert.Contains("usr0123abcd_notifications_v2", baseline.Tables.Keys);
+
+        Exec(path, "UPDATE usr0123abcd_notifications_v2 SET seen = 1 WHERE id = 'not_a'");
+        var afterSeen = Summarize(path, MergeProfiles.Vrcx);
+        Assert.Equal(new[] { "usr0123abcd_notifications_v2" }, afterSeen.FindChangedTables(baseline));
+
+        Exec(path, "INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, seen) VALUES ('not_b', '2026-10-02T00:00:00Z', '2026-10-02T00:00:00Z', 0)");
+        Assert.Equal(
+            new[] { "usr0123abcd_notifications_v2" },
+            Summarize(path, MergeProfiles.Vrcx).FindChangedTables(afterSeen));
+    }
+
     [Fact(DisplayName = "VRCX: キャッシュの更新は手元の変更として数えない")]
     public void VrcxIgnoresCaches()
     {
@@ -172,5 +207,17 @@ public sealed class DatabaseSummaryTests : IDisposable
         Assert.NotNull(loaded);
         Assert.Empty(Summarize(path, MergeProfiles.Vrcx).FindChangedTables(loaded!));
         Assert.Null(store.Load("fake|friend-connect"));
+    }
+    [Fact(DisplayName = "同時に保存しても、要約は壊れず一時ファイルも残らない")]
+    public void StoreSavesConcurrently()
+    {
+        var path = CreateVrcx();
+        var store = new BaseSummaryStore(Path.Combine(_root, "base"));
+        var summary = Summarize(path, MergeProfiles.Vrcx);
+
+        Parallel.For(0, 16, _ => store.Save("fake|vrcx", summary));
+
+        Assert.NotNull(store.Load("fake|vrcx"));
+        Assert.Single(Directory.GetFiles(store.RootDirectory));
     }
 }

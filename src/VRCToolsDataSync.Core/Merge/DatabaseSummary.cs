@@ -84,6 +84,7 @@ public sealed class DatabaseSummary
             var missing = rule.KeyColumns
                 .Concat(rule.ValueColumns ?? Array.Empty<string>())
                 .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
+                .Concat(rule.GrowingColumns ?? Array.Empty<string>())
                 .Where(c => !columns.Contains(c, StringComparer.Ordinal))
                 .ToList();
             if (missing.Count > 0)
@@ -94,7 +95,7 @@ public sealed class DatabaseSummary
 
             summary.Tables[table] = rule.Kind switch
             {
-                MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, table),
+                MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, table, rule),
                 MergeTableKind.Keyed => SummarizeKeyed(connection, table, rule, columns),
                 MergeTableKind.Watched => SummarizeWatched(connection, table, rule, columns),
                 _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
@@ -125,18 +126,24 @@ public sealed class DatabaseSummary
         return columns;
     }
 
-    private static TableSummary SummarizeAppendOnly(SqliteConnection connection, string table)
+    private static TableSummary SummarizeAppendOnly(SqliteConnection connection, string table, MergeTableRule rule)
     {
         using var command = connection.CreateCommand();
         command.CommandText = $"SELECT count(*), coalesce(max(rowid), 0) FROM {Quote(table)}";
         using var reader = command.ExecuteReader();
         reader.Read();
-        return new TableSummary
+        var summary = new TableSummary
         {
             Kind = MergeTableKind.AppendOnly,
             RowCount = reader.GetInt64(0),
             MaxRowId = reader.GetInt64(1),
         };
+        if (rule.GrowingColumns is { Count: > 0 } growing)
+        {
+            // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
+            summary.Digest = DigestRows(connection, table, rule.KeyColumns.Concat(growing).ToList(), "rowid").Digest;
+        }
+        return summary;
     }
 
     private static TableSummary SummarizeKeyed(
@@ -186,9 +193,22 @@ public sealed class DatabaseSummary
             return new TableSummary { Kind = MergeTableKind.Watched, Digest = Hash(string.Empty) };
         }
 
+        var (count, digest) = DigestRows(connection, table, selected, string.Join(", ", selected.Select(Quote)));
+        return new TableSummary
+        {
+            Kind = MergeTableKind.Watched,
+            RowCount = count,
+            Digest = digest,
+        };
+    }
+
+    /// <summary>指定した列の内容を、<paramref name="orderBy"/> の順に読んでハッシュにする。</summary>
+    private static (long Count, string Digest) DigestRows(
+        SqliteConnection connection, string table, IReadOnlyList<string> columns, string orderBy)
+    {
         using var command = connection.CreateCommand();
-        var list = string.Join(", ", selected.Select(Quote));
-        command.CommandText = $"SELECT {list} FROM {Quote(table)} ORDER BY {list}";
+        command.CommandText =
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(table)} ORDER BY {orderBy}";
         using var reader = command.ExecuteReader();
 
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -197,18 +217,12 @@ public sealed class DatabaseSummary
         while (reader.Read())
         {
             row.Clear();
-            for (var i = 0; i < selected.Count; i++) AppendValue(row, reader, i);
+            for (var i = 0; i < columns.Count; i++) AppendValue(row, reader, i);
             row.Append('\n');
             sha.AppendData(Encoding.UTF8.GetBytes(row.ToString()));
             count++;
         }
-
-        return new TableSummary
-        {
-            Kind = MergeTableKind.Watched,
-            RowCount = count,
-            Digest = Convert.ToHexString(sha.GetHashAndReset()),
-        };
+        return (count, Convert.ToHexString(sha.GetHashAndReset()));
     }
 
     /// <summary>
@@ -263,7 +277,10 @@ public sealed class TableSummary
     /// <summary><see cref="MergeTableKind.Keyed"/>: キーから内容のハッシュへ。</summary>
     public Dictionary<string, string>? Rows { get; set; }
 
-    /// <summary><see cref="MergeTableKind.Watched"/>: 内容全体のハッシュ。</summary>
+    /// <summary>
+    /// <see cref="MergeTableKind.Watched"/>: 内容全体のハッシュ。
+    /// <see cref="MergeTableKind.AppendOnly"/>: 後から書き換わる列があるときだけ、キーとその列のハッシュ。
+    /// </summary>
     public string? Digest { get; set; }
 
     public bool HasSameContent(TableSummary other)
@@ -271,7 +288,8 @@ public sealed class TableSummary
         if (Kind != other.Kind || RowCount != other.RowCount) return false;
         return Kind switch
         {
-            MergeTableKind.AppendOnly => MaxRowId == other.MaxRowId,
+            MergeTableKind.AppendOnly => MaxRowId == other.MaxRowId
+                                         && string.Equals(Digest, other.Digest, StringComparison.Ordinal),
             MergeTableKind.Keyed => SameRows(Rows, other.Rows),
             MergeTableKind.Watched => string.Equals(Digest, other.Digest, StringComparison.Ordinal),
             _ => false,

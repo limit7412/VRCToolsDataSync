@@ -56,11 +56,23 @@ public sealed class BaseSummaryStore
     {
         Directory.CreateDirectory(RootDirectory);
         // 書きかけで止まった要約を読むと、実際と違う基準で比べることになる。
-        // 一時ファイルに書き切ってから置き換える。
+        // 一時ファイルに書き切ってから置き換える。一時ファイルの名前は呼び出しごとに
+        // 変える。常駐中の GUI と CLI が同時に保存すると、同じ名前では片方の置き換えが
+        // 失敗し、その失敗を受けた呼び出し側が要約を消してしまう。
         var path = PathOf(stateKey);
-        var temp = path + ".tmp";
-        File.WriteAllText(temp, JsonSerializer.Serialize(summary, JsonOptions));
-        File.Move(temp, path, overwrite: true);
+        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temp, JsonSerializer.Serialize(summary, JsonOptions));
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                try { File.Delete(temp); } catch { /* best-effort cleanup */ }
+            }
+        }
     }
 
     /// <summary>
