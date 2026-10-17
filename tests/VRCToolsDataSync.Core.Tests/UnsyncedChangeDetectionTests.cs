@@ -147,6 +147,23 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.Success, result.Outcome);
     }
 
+    [Fact(DisplayName = "要約が同期履歴と別の version のものなら、比べずに従来どおり取り込む")]
+    public void StartupPullIgnoresBaselineOfOtherVersion()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        // 同期履歴を書いた後、要約を書く前に止まった状態を作る。
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var stale = store.Load(key)!;
+        stale.RemoteVersion -= 1;
+        store.Save(key, stale);
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+    }
+
     [Fact(DisplayName = "明示的な Pull は、手元に変更があっても上書きする")]
     public void ExplicitPullStillOverwrites()
     {

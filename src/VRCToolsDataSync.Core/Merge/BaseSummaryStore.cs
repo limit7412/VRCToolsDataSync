@@ -44,6 +44,9 @@ public sealed class BaseSummaryStore
     {
         var path = PathOf(stateKey);
         if (!File.Exists(path)) return null;
+        // 読んでいる間に別のプロセスが置き換えると、Windows では置き換えの側が失敗する。
+        using var _ = AcquireLock(path);
+        if (!File.Exists(path)) return null;
         try
         {
             var summary = JsonSerializer.Deserialize<DatabaseSummary>(File.ReadAllText(path), JsonOptions);
