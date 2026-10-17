@@ -181,6 +181,9 @@ public sealed class SyncRunner
     /// <summary>Push を競合で取り直す回数の上限。</summary>
     private const int MaxMergeAttempts = 3;
 
+    /// <summary>別プロセスのマージが終わるのを待つ上限。テストで短くする。</summary>
+    internal static TimeSpan MergeLockTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
     /// <summary>
     /// 同期先の最新に手元の変更を足してローカルに置き、続けて Push する。
     /// <para>
@@ -216,6 +219,21 @@ public sealed class SyncRunner
     {
         lock (PushLock)
         {
+            // PushLock はこのプロセスの中でしか効かない。常駐の GUI と CLI の merge が
+            // 同じローカル DB を同時に置き換えないよう、プロセスをまたぐ錠前も取る。
+            // 取れなければ、相手の途中の DB を土台にしないようマージを見送る。
+            Directory.CreateDirectory(_baseSummaries.RootDirectory);
+            using var crossProcessLock = CrossSessionFileLock.Acquire(
+                Path.Combine(_baseSummaries.RootDirectory, $"merge-{service.ToolKey}.lock"), MergeLockTimeout);
+            if (!crossProcessLock.IsHeld)
+            {
+                return (new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    Message = "別のプロセスがマージ中のため、マージを見送りました",
+                }, false);
+            }
+
             SyncResult? last = null;
             string? firstBackupPath = null;
             for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)

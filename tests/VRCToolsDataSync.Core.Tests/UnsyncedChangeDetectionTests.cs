@@ -307,4 +307,30 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
         Assert.Equal(remoteVersion, new ManifestStore(_storage).Load().Tools[VrcxSyncService.Key].Version);
     }
+
+    [Fact(DisplayName = "別のプロセスがマージ中なら、マージを見送って手元に書かない")]
+    public void MergeWaitsForOtherProcess()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        var root = Path.Combine(_root, "b", "base");
+        Directory.CreateDirectory(root);
+        var previous = SyncRunner.MergeLockTimeout;
+        SyncRunner.MergeLockTimeout = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            using (new FileStream(Path.Combine(root, $"merge-{VrcxSyncService.Key}.lock"),
+                       FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+                Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+                Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+            }
+        }
+        finally
+        {
+            SyncRunner.MergeLockTimeout = previous;
+        }
+    }
 }
