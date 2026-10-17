@@ -111,6 +111,9 @@ public sealed class StartupSyncOrchestrator
                 SyncOutcome.Success => StartupSyncStepKind.PullSucceeded,
                 SyncOutcome.NothingToDo => StartupSyncStepKind.PullSkipped,
                 SyncOutcome.SourceMissing => StartupSyncStepKind.PullSkipped,
+                // 手元の変更を守るために見送ったもの。失敗ではないが、理由は
+                // メッセージで利用者に伝える。
+                SyncOutcome.LocalChangesPending => StartupSyncStepKind.PullSkipped,
                 _ => StartupSyncStepKind.PullFailed,
             };
             steps.Add(new StartupSyncStep

@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.Merge;
 
 namespace VRCToolsDataSync.Core.UseCase;
 
@@ -16,7 +17,11 @@ public sealed class VrcxSyncService : ISyncService
     private readonly LocalBackup _backup;
     private readonly ILogger<VrcxSyncService> _logger;
 
+    private const string DisplayName = "VRCX";
+
     public string ToolKey => Key;
+
+    public TrackedDatabase TrackedDatabase => new(_paths.SqliteFile, MergeProfiles.Vrcx);
 
     public VrcxSyncService(VrcxPaths? paths = null, LocalBackup? backup = null, ILogger<VrcxSyncService>? logger = null)
     {
@@ -215,6 +220,18 @@ public sealed class VrcxSyncService : ISyncService
                 LastPulledVersion = lastPulled,
                 Message = "ローカルが最新のため Pull スキップ",
             };
+        }
+
+        if (options.SkipIfNotNewer
+            && options.FindUnsyncedLocalChanges?.Invoke() is { Count: > 0 } changed)
+        {
+            // 起動時の自動 Pull は利用者が求めた操作ではない。ここで上書きすると、
+            // 前回の同期の後に手元で増えた履歴や編集が、気付かれないまま
+            // バックアップにしか残らなくなる。
+            _logger.LogInformation(
+                "{Tool} Pull 見送り: 手元に未 Push の変更がある (remote={Remote}, tables={Tables})",
+                DisplayName, entry.Version, string.Join(", ", changed));
+            return SyncResults.LocalChangesPending(DisplayName, entry.Version, changed);
         }
 
         // manifest に載っているファイル集合を正としてローカルへ反映する。

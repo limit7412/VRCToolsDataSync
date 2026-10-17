@@ -100,6 +100,14 @@ public partial class MainPageViewModel : ObservableObject
                     break;
                 case StartupSyncStepKind.PullSkipped:
                     AppendLog($"[{logPrefix}] {step.DisplayName} Pull スキップ: {step.Message}");
+                    if (step.PullResult?.Outcome == SyncOutcome.LocalChangesPending)
+                    {
+                        // ログだけでは気付かれにくい。放っておくと、次の Push で
+                        // 競合の問い合わせに初めて出会うことになる。
+                        ToastRequested?.Invoke(
+                            $"{step.DisplayName}: Pull を見送りました",
+                            "リモートにも手元にも未同期の変更があります。詳しくはウィンドウのログを確認してください。");
+                    }
                     break;
                 case StartupSyncStepKind.LaunchAttempted:
                     var outcome = step.LaunchResult?.Outcome;

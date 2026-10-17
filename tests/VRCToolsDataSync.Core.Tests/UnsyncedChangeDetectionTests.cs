@@ -1,0 +1,175 @@
+using Microsoft.Data.Sqlite;
+using VRCToolsDataSync.Core.Domain;
+using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.Merge;
+using VRCToolsDataSync.Core.UseCase;
+using Xunit;
+
+namespace VRCToolsDataSync.Core.Tests;
+
+/// <summary>
+/// 起動時の自動 Pull が、手元に未 Push の変更がある場合は上書きしないことを確かめる。
+/// 2 台の PC を、別々のデータフォルダと設定ファイルで再現する。
+/// </summary>
+public sealed class UnsyncedChangeDetectionTests : IDisposable
+{
+    private readonly string _root;
+    private readonly FakeSyncStorage _storage = new();
+
+    public UnsyncedChangeDetectionTests()
+    {
+        _root = Path.Combine(Path.GetTempPath(), "vrctds-detect-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_root);
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        try { Directory.Delete(_root, recursive: true); } catch { /* best-effort cleanup */ }
+    }
+
+    /// <summary>1 台ぶんの環境。設定ファイル、要約の置き場所、VRCX のデータを持つ。</summary>
+    private sealed class Machine
+    {
+        public required SyncRunner Runner { get; init; }
+        public required SyncSettings Settings { get; init; }
+        public required VrcxSyncService Service { get; init; }
+        public required VrcxPaths Paths { get; init; }
+    }
+
+    private Machine CreateMachine(string name)
+    {
+        var dir = Path.Combine(_root, name);
+        var store = new SettingsStore(Path.Combine(dir, "settings.json"));
+        var paths = new VrcxPaths(Path.Combine(dir, "VRCX"));
+        Directory.CreateDirectory(paths.RootDirectory);
+        return new Machine
+        {
+            Runner = new SyncRunner(store),
+            Settings = new SyncSettings { MachineName = name },
+            Service = new VrcxSyncService(paths, new LocalBackup(Path.Combine(dir, "backup"))),
+            Paths = paths,
+        };
+    }
+
+    private static void Exec(string path, string sql)
+    {
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static long CountLocations(string path)
+    {
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT count(*) FROM gamelog_location";
+        return (long)command.ExecuteScalar()!;
+    }
+
+    private static void AddLocation(Machine machine, string createdAt)
+        => Exec(machine.Paths.SqliteFile,
+            $"INSERT INTO gamelog_location (created_at, location) VALUES ('{createdAt}', 'wrld_x:1')");
+
+    private SyncResult Push(Machine machine) => machine.Runner.Push(machine.Service, machine.Settings, _storage, force: false);
+
+    private SyncResult StartupPull(Machine machine)
+        => machine.Runner.Pull(machine.Service, machine.Settings, _storage, skipBackup: false, skipIfNotNewer: true);
+
+    /// <summary>
+    /// A が作ったデータを B が取り込み、その後 A がもう一度 Push した状態を作る。
+    /// B の次の起動時 Pull は、リモートが新しいので本来なら上書きに進む。
+    /// </summary>
+    private (Machine A, Machine B) ArrangeRemoteNewer()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        return (a, b);
+    }
+
+    [Fact(DisplayName = "手元に未 Push の履歴があれば、起動時 Pull は上書きを見送る")]
+    public void StartupPullKeepsUnsyncedLocalChanges()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
+        Assert.Contains("gamelog_location", result.Message);
+        // B の手元は 1 件目 (取り込んだもの) と 3 件目 (手元で増えたもの) のまま。
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "手元に変更が無ければ、起動時 Pull は従来どおり取り込む")]
+    public void StartupPullProceedsWithoutLocalChanges()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "前回の要約が無ければ比べられないので、従来どおり取り込む")]
+    public void StartupPullProceedsWithoutBaseline()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        new BaseSummaryStore(Path.Combine(_root, "b", "base"))
+            .Delete(SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key));
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+    }
+
+    [Fact(DisplayName = "明示的な Pull は、手元に変更があっても上書きする")]
+    public void ExplicitPullStillOverwrites()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.NotNull(result.BackupPath);
+    }
+
+    [Fact(DisplayName = "Push の後は、その時点が次の比較の基準になる")]
+    public void PushResetsBaseline()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+
+        // A は直前に Push しているので、手元に未 Push の変更は無い。
+        var baseline = new BaseSummaryStore(Path.Combine(_root, "a", "base"))
+            .Load(SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key));
+        Assert.NotNull(baseline);
+        var current = DatabaseSummary.Compute(a.Paths.SqliteFile, MergeProfiles.Vrcx, out _);
+        Assert.Empty(current!.FindChangedTables(baseline!));
+    }
+}
