@@ -383,15 +383,30 @@ public static class SqliteMerger
             if (mine?.Hash == theirs?.Hash) continue;   // 同じ内容 (両方に無いことも含む)
             if (mine?.Hash == original) continue;       // 手元は変えていない。同期先のまま
 
-            var takeLocal = theirs?.Hash == original    // 同期先は変えていない
+            var conflict = theirs?.Hash != original;    // 同期先も変えている
+            var takeLocal = !conflict
                 || ResolveConflict(connection, table, rule, mine, theirs, key, report);
-            if (!takeLocal) continue;
 
-            var keyValues = (mine ?? theirs)!.KeyValues;
-            ReplaceKey(connection, table, rule, columns, keyValues, copyFromLocal: mine is not null);
-            if (mine is null) deleted++;
-            else if (theirs is null) inserted++;
-            else updated++;
+            // 両方が書き換えていたら、単調に変わる列はどちらの行を残すかに関わらず合成する。
+            // 置き換えると同期先の値が消えるので、合成した値は置き換えの前に読んでおく。
+            var combined = conflict && mine is not null && theirs is not null
+                ? ReadCombinedValues(connection, table, rule, mine.KeyValues)
+                : null;
+
+            if (takeLocal)
+            {
+                var keyValues = (mine ?? theirs)!.KeyValues;
+                ReplaceKey(connection, table, rule, columns, keyValues, copyFromLocal: mine is not null);
+                if (mine is null) deleted++;
+                else if (theirs is null) inserted++;
+                else updated++;
+            }
+            if (combined is not null
+                && WriteValues(connection, table, rule, mine!.KeyValues, combined) > 0
+                && !takeLocal)
+            {
+                updated++;
+            }
         }
 
         return new TableMergeReport(table, inserted, updated, deleted, false, created);
@@ -421,6 +436,70 @@ public static class SqliteMerger
         }
         report.Conflicts.Add(new MergeConflict(table, key, takeLocal));
         return takeLocal;
+    }
+
+    /// <summary>
+    /// 手元と同期先の同じキーの行から、<see cref="MergeTableRule.GrowingColumns"/> は
+    /// 大きい方、<see cref="MergeTableRule.ShrinkingColumns"/> は小さい方の値を取る。
+    /// NULL は値が無いものとして扱う。合成する列が無ければ null を返す。
+    /// </summary>
+    private static Dictionary<string, object?>? ReadCombinedValues(
+        SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues)
+    {
+        var growing = rule.GrowingColumns ?? Array.Empty<string>();
+        var shrinking = rule.ShrinkingColumns ?? Array.Empty<string>();
+        if (growing.Count == 0 && shrinking.Count == 0) return null;
+
+        var names = growing.Concat(shrinking).ToList();
+        var expressions = growing.Select(c => Pick(c, ">"))
+            .Concat(shrinking.Select(c => Pick(c, "<")));
+        using var command = connection.CreateCommand();
+        var keys = new List<string>();
+        for (var i = 0; i < rule.KeyColumns.Count; i++)
+        {
+            var name = "$k" + i;
+            command.Parameters.AddWithValue(name, keyValues[i] ?? DBNull.Value);
+            var k = Quote(rule.KeyColumns[i]);
+            keys.Add($"h.{k} IS {name} AND l.{k} IS {name}");
+        }
+        command.CommandText =
+            $"SELECT {string.Join(", ", expressions)} " +
+            $"FROM main.{Quote(table)} AS h, {Local}.{Quote(table)} AS l " +
+            $"WHERE {string.Join(" AND ", keys)} LIMIT 1";
+        using var reader = command.ExecuteReader();
+        if (!reader.Read()) return null;
+        var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+        for (var i = 0; i < names.Count; i++) values[names[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+        return values;
+
+        static string Pick(string column, string op)
+        {
+            var c = Quote(column);
+            return $"CASE WHEN l.{c} IS NULL THEN h.{c} WHEN h.{c} IS NULL THEN l.{c} " +
+                   $"WHEN l.{c} {op} h.{c} THEN l.{c} ELSE h.{c} END";
+        }
+    }
+
+    /// <summary>同期先のそのキーの行に値を書き、書き換わった行数を返す。</summary>
+    private static int WriteValues(
+        SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues,
+        IReadOnlyDictionary<string, object?> values)
+    {
+        using var command = connection.CreateCommand();
+        var sets = new List<string>();
+        var differs = new List<string>();
+        var i = 0;
+        foreach (var (column, value) in values)
+        {
+            var name = "$v" + i++;
+            command.Parameters.AddWithValue(name, value ?? DBNull.Value);
+            sets.Add($"{Quote(column)} = {name}");
+            differs.Add($"{Quote(column)} IS NOT {name}");
+        }
+        command.CommandText =
+            $"UPDATE main.{Quote(table)} SET {string.Join(", ", sets)} " +
+            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({string.Join(" OR ", differs)})";
+        return command.ExecuteNonQuery();
     }
 
     private static string? ReadEditedAt(

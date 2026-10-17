@@ -117,6 +117,7 @@ public sealed class DatabaseSummary
             .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
             .Concat(rule.OrderColumn is null ? Array.Empty<string>() : new[] { rule.OrderColumn })
             .Concat(rule.GrowingColumns ?? Array.Empty<string>())
+            .Concat(rule.ShrinkingColumns ?? Array.Empty<string>())
             .Where(c => !columns.Contains(c, StringComparer.Ordinal))
             .ToList();
 

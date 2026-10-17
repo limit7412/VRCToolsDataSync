@@ -446,9 +446,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 backupPath = _backup.CreateSnapshot(Key, filesToBackup);
             }
             options.BeforeReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
-            AtomicFile.Copy(hostPath, _paths.SqliteFile);
+            ReplaceDatabase(hostPath, _paths.SqliteFile, _logger);
 
             return new SyncResult
             {
@@ -464,6 +462,49 @@ public sealed class VrcxSyncService : IMergeableSyncService
         {
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             try { Directory.Delete(work, recursive: true); } catch { /* best-effort cleanup */ }
+        }
+    }
+
+    /// <summary>
+    /// SQLite の本体ファイルを <paramref name="source"/> で置き換える。WAL/SHM は消さずに
+    /// 脇へ退けておき、置き換えに失敗したら元に戻す。WAL にはまだ本体へ書き戻されて
+    /// いない変更が残っていることがあり、先に消すと、置き換えに失敗したときに本体は
+    /// 古いまま WAL の変更だけが失われるため。
+    /// </summary>
+    internal static void ReplaceDatabase(string source, string destination, ILogger logger)
+    {
+        var suffix = ".vrctds-aside-" + Guid.NewGuid().ToString("N");
+        var moved = new List<(string Original, string Aside)>();
+        try
+        {
+            foreach (var path in new[] { destination + "-wal", destination + "-shm" })
+            {
+                if (!File.Exists(path)) continue;
+                var aside = path + suffix;
+                File.Move(path, aside);
+                moved.Add((path, aside));
+            }
+            // 置き換えは File.Replace で行うので、失敗しても本体は元のまま残る。
+            AtomicFile.Copy(source, destination);
+        }
+        catch
+        {
+            foreach (var (original, aside) in moved)
+            {
+                try
+                {
+                    File.Move(aside, original, overwrite: true);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "退けたファイルを戻せませんでした。{Aside} を {Original} へ手で戻してください", aside, original);
+                }
+            }
+            throw;
+        }
+        foreach (var (_, aside) in moved)
+        {
+            try { File.Delete(aside); } catch { /* best-effort cleanup */ }
         }
     }
 

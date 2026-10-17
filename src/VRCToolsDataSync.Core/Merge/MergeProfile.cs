@@ -51,6 +51,14 @@ public enum MergeTableKind
 /// <see cref="MergeTableKind.AppendOnly"/> で、既存行に後から書き込まれる列。VRCX は
 /// ワールドを出たときに gamelog_location の滞在時間 (time) を書き込み、通知を期限切れに
 /// したときに expired を 1 にする。どちらも値が増える方向にしか変わらない。
+/// <see cref="MergeTableKind.Keyed"/> では、両方が同じキーを書き換えていたときに、
+/// どちらの行を残してもこの列は大きい方の値にする。既読の印や累計の着用時間のように、
+/// 編集時刻を更新せずに書き換わる列を、もう一方の編集で巻き戻さないため。
+/// </param>
+/// <param name="ShrinkingColumns">
+/// <see cref="MergeTableKind.Keyed"/> で、両方が同じキーを書き換えていたときに小さい方の
+/// 値を残す列。NULL は値が無いものとして扱う。VRCX は通知を期限切れにするとき、
+/// 期限 (expires_at) をその時刻に早める。
 /// </param>
 public sealed record MergeTableRule(
     string NamePattern,
@@ -61,7 +69,8 @@ public sealed record MergeTableRule(
     string? Filter = null,
     IReadOnlyList<string>? IgnoredColumns = null,
     string? OrderColumn = null,
-    IReadOnlyList<string>? GrowingColumns = null)
+    IReadOnlyList<string>? GrowingColumns = null,
+    IReadOnlyList<string>? ShrinkingColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 

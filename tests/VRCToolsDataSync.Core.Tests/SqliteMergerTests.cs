@@ -181,6 +181,65 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Equal(new[] { "1" }, Rows(host, "SELECT seen FROM usr0123abcd_notifications_v2"));
     }
 
+    [Fact(DisplayName = "新しい形式の通知は、既読と期限切れを相手の新しい内容で取り消さない")]
+    public void NotificationsV2KeepSeenAndExpiryOnConflict()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, expires_at, message, seen) VALUES ('not_a', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', '2026-11-01T00:00:00Z', 'm0', 0);
+            INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, expires_at, message, seen) VALUES ('not_b', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', '2026-11-01T00:00:00Z', 'm0', 0);
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        // a: 手元で期限切れにし、同期先は新しい内容を受け取った (updated_at は同期先が新しい)。
+        // b: 同期先で既読にし、手元は新しい内容を受け取った (updated_at は手元が新しい)。
+        Exec(local, """
+            UPDATE usr0123abcd_notifications_v2 SET expires_at = '2026-10-05T00:00:00.000Z', seen = 1 WHERE id = 'not_a';
+            UPDATE usr0123abcd_notifications_v2 SET updated_at = '2026-10-06T00:00:00Z', message = 'm1' WHERE id = 'not_b';
+            """);
+        Exec(host, """
+            UPDATE usr0123abcd_notifications_v2 SET updated_at = '2026-10-06T00:00:00Z', message = 'm1' WHERE id = 'not_a';
+            UPDATE usr0123abcd_notifications_v2 SET seen = 1 WHERE id = 'not_b';
+            """);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "not_a|m1|1|2026-10-05T00:00:00.000Z", "not_b|m1|1|2026-11-01T00:00:00Z" },
+            Rows(host, "SELECT id, message, seen, expires_at FROM usr0123abcd_notifications_v2 ORDER BY id"));
+    }
+
+    [Fact(DisplayName = "アバターの着用履歴は、両方で延びた着用時間の大きい方を残す")]
+    public void AvatarHistoryKeepsLongerTime()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100), ('avtr_b', '2026-10-01T00:00:00Z', 100);
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        // a: 着け直さずに両方で延びた (手元の方が長い)。
+        // b: 同期先で着け直し、手元では着用時間が延びた。
+        Exec(local, """
+            UPDATE usr0123abcd_avatar_history SET time = 500 WHERE avatar_id = 'avtr_a';
+            UPDATE usr0123abcd_avatar_history SET time = 400 WHERE avatar_id = 'avtr_b';
+            """);
+        Exec(host, """
+            UPDATE usr0123abcd_avatar_history SET time = 200 WHERE avatar_id = 'avtr_a';
+            UPDATE usr0123abcd_avatar_history SET created_at = '2026-10-03T00:00:00Z', time = 150 WHERE avatar_id = 'avtr_b';
+            """);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "avtr_a|2026-10-01T00:00:00Z|500", "avtr_b|2026-10-03T00:00:00Z|400" },
+            Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+    }
+
     [Fact(DisplayName = "メモは前回の同期時点と比べ、変えた側の内容を残す")]
     public void KeyedThreeWay()
     {

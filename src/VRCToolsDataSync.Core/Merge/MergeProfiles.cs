@@ -42,12 +42,16 @@ public static class MergeProfiles
 
             // 新しい形式の通知。VRCX は同じ id の行を上書きし、既読や期限を書き換え、
             // 利用者の操作で消す。追加専用ではないので、キー付きとして扱う。
-            new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at"),
+            // 既読 (seen) と期限切れ (expires_at を現在時刻に早める) は updated_at を
+            // 変えないので、両方が書き換えていたら、どちらの行を残してもこの 2 列は合成する。
+            new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at",
+                GrowingColumns: new[] { "seen" }, ShrinkingColumns: new[] { "expires_at" }),
 
             // 着用したアバターの履歴。VRCX はアバターごとに 1 行を持ち、着け直すと
-            // created_at を、着用時間が延びると time を書き換える。両方の PC で書き換えて
-            // いたら、最後に着けた方 (created_at の新しい方) の行を残す。
-            new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at"),
+            // created_at を書き換え、着用時間 (time) は累計に足していく。どちらも増える
+            // 方向にしか変わらないので、両方の PC で書き換えていたら大きい方を残す。
+            new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at",
+                GrowingColumns: new[] { "created_at", "time" }),
 
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),
