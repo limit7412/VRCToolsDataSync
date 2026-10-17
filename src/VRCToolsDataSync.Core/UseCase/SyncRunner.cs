@@ -105,7 +105,7 @@ public sealed class SyncRunner
                 // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
                 // 等を巻き戻してしまう。
                 _store.SaveToolStateOnly(settings);
-                RecordBaseSummary(service, stateKey);
+                RecordBaseSummary(service, stateKey, result.RemoteVersion.Value);
             }
             return result;
         }
@@ -132,7 +132,7 @@ public sealed class SyncRunner
                 ? null
                 : state.LastPulledVersion,
             FindUnsyncedLocalChanges = skipIfNotNewer
-                ? () => FindUnsyncedLocalChanges(service, stateKey)
+                ? () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0)
                 : null,
         });
 
@@ -144,7 +144,7 @@ public sealed class SyncRunner
             settings.ToolState[stateKey] = state;
             // Push と同じ理由で SaveToolStateOnly を使う。
             _store.SaveToolStateOnly(settings);
-            RecordBaseSummary(service, stateKey);
+            RecordBaseSummary(service, stateKey, result.RemoteVersion.Value);
         }
 
         // 起動時の自動 Pull が手元の変更を守って見送った場合、マージが有効なら
@@ -236,7 +236,7 @@ public sealed class SyncRunner
     /// いないのに「手元に変更がある」と判定し続ける。
     /// </para>
     /// </summary>
-    private void RecordBaseSummary(ISyncService service, string stateKey)
+    private void RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion)
     {
         if (service.TrackedDatabase is not { } tracked) return;
         try
@@ -251,6 +251,7 @@ public sealed class SyncRunner
                 _logger.LogInformation("同期時点の要約を取れませんでした ({Tool}): {Reason}", service.ToolKey, reason);
                 return;
             }
+            summary.RemoteVersion = remoteVersion;
             _baseSummaries.Save(stateKey, summary);
         }
         catch (Exception ex)
@@ -264,16 +265,16 @@ public sealed class SyncRunner
     /// 前回の同期の後に手元の DB で変わったテーブルを返す。比べる基準が無い場合や
     /// 読めなかった場合は空を返す (従来どおり上書きさせる)。
     /// </summary>
-    private IReadOnlyList<string> FindUnsyncedLocalChanges(ISyncService service, string stateKey)
+    private IReadOnlyList<string> FindUnsyncedLocalChanges(ISyncService service, string stateKey, long lastPulledVersion)
     {
         if (service.TrackedDatabase is not { } tracked) return Array.Empty<string>();
         try
         {
             if (!File.Exists(tracked.Path)) return Array.Empty<string>();
             var baseline = _baseSummaries.Load(stateKey);
-            if (baseline is null)
+            if (baseline is null || baseline.RemoteVersion != lastPulledVersion)
             {
-                _logger.LogInformation("前回の同期時点の要約が無いため、手元の変更を確かめられません ({Tool})", service.ToolKey);
+                _logger.LogInformation("前回の同期時点の要約が無いか、同期履歴と合わないため、手元の変更を確かめられません ({Tool})", service.ToolKey);
                 return Array.Empty<string>();
             }
             var current = DatabaseSummary.Compute(tracked.Path, tracked.Profile, out var reason);

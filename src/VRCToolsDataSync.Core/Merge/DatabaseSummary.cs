@@ -27,6 +27,13 @@ public sealed class DatabaseSummary
 
     public DateTimeOffset CreatedAt { get; set; }
 
+    /// <summary>
+    /// この要約を取ったときの同期先の version。同期履歴の LastPulledVersion と
+    /// 同じでなければ、要約は別の時点のものなので基準に使わない。同期履歴と要約は
+    /// 別のファイルに保存するので、片方だけ書いた所で止まることがある。
+    /// </summary>
+    public long RemoteVersion { get; set; }
+
     /// <summary>テーブル名から、そのテーブルの要約へ。</summary>
     public Dictionary<string, TableSummary> Tables { get; set; } = new(StringComparer.Ordinal);
 
@@ -143,6 +150,11 @@ public sealed class DatabaseSummary
             RowCount = reader.GetInt64(0),
             MaxRowId = reader.GetInt64(1),
         };
+        // 末尾の行を消した後に 1 行足すと、rowid が再利用されて行数も最大値も
+        // 変わらないことがある。末尾の行のキーも残して、入れ替わりを拾う。
+        summary.LastRowHash = summary.MaxRowId == 0
+            ? null
+            : DigestRows(connection, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
         if (rule.GrowingColumns is { Count: > 0 } growing)
         {
             // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
@@ -314,12 +326,16 @@ public sealed class TableSummary
     /// </summary>
     public string? Digest { get; set; }
 
+    /// <summary><see cref="MergeTableKind.AppendOnly"/>: rowid が最大の行のキーのハッシュ。</summary>
+    public string? LastRowHash { get; set; }
+
     public bool HasSameContent(TableSummary other)
     {
         if (Kind != other.Kind || RowCount != other.RowCount) return false;
         return Kind switch
         {
             MergeTableKind.AppendOnly => MaxRowId == other.MaxRowId
+                                         && string.Equals(LastRowHash, other.LastRowHash, StringComparison.Ordinal)
                                          && string.Equals(Digest, other.Digest, StringComparison.Ordinal),
             MergeTableKind.Keyed => SameRows(Rows, other.Rows),
             MergeTableKind.Watched => string.Equals(Digest, other.Digest, StringComparison.Ordinal),

@@ -44,6 +44,11 @@ public static class MergeProfiles
             // 利用者の操作で消す。追加専用ではないので、キー付きとして扱う。
             new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at"),
 
+            // 着用したアバターの履歴。VRCX はアバターごとに 1 行を持ち、着け直すと
+            // created_at を、着用時間が延びると time を書き換える。両方の PC で書き換えて
+            // いたら、最後に着けた方 (created_at の新しい方) の行を残す。
+            new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at"),
+
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),
             new("world_memos", MergeTableKind.Keyed, new[] { "world_id" }, EditedAtColumn: "edited_at"),

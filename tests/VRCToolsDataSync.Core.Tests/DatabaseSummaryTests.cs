@@ -129,6 +129,39 @@ public sealed class DatabaseSummaryTests : IDisposable
             Summarize(path, MergeProfiles.Vrcx).FindChangedTables(afterSeen));
     }
 
+    [Fact(DisplayName = "VRCX: 末尾の行を消して足し直し、rowid が再利用されても拾う")]
+    public void VrcxDetectsReusedRowId()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+
+        Exec(path, """
+            DELETE FROM gamelog_location WHERE location = 'wrld_a:1';
+            INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_b:1');
+            """);
+        var current = Summarize(path, MergeProfiles.Vrcx);
+
+        Assert.Equal(baseline.Tables["gamelog_location"].MaxRowId, current.Tables["gamelog_location"].MaxRowId);
+        Assert.Equal(new[] { "gamelog_location" }, current.FindChangedTables(baseline));
+    }
+
+    [Fact(DisplayName = "VRCX: 着用したアバターの履歴の追加と着用時間を拾う")]
+    public void VrcxDetectsAvatarHistory()
+    {
+        var path = CreateVrcx();
+        Exec(path, """
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 0);
+            """);
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+
+        Exec(path, "UPDATE usr0123abcd_avatar_history SET time = time + 600000 WHERE avatar_id = 'avtr_a'");
+
+        Assert.Equal(
+            new[] { "usr0123abcd_avatar_history" },
+            Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
+    }
+
     [Fact(DisplayName = "VRCX: キャッシュの更新は手元の変更として数えない")]
     public void VrcxIgnoresCaches()
     {
