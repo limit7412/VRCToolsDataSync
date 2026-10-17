@@ -22,6 +22,9 @@ public sealed class BaseSummaryStore
         Converters = { new JsonStringEnumConverter() },
     };
 
+    /// <summary>ロックを待つ上限。要約の保存は一瞬で終わるので、これを超えるのは異常である。</summary>
+    private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(10);
+
     public string RootDirectory { get; }
 
     public BaseSummaryStore(string rootDirectory)
@@ -55,11 +58,13 @@ public sealed class BaseSummaryStore
     public void Save(string stateKey, DatabaseSummary summary)
     {
         Directory.CreateDirectory(RootDirectory);
-        // 書きかけで止まった要約を読むと、実際と違う基準で比べることになる。
-        // 一時ファイルに書き切ってから置き換える。一時ファイルの名前は呼び出しごとに
-        // 変える。常駐中の GUI と CLI が同時に保存すると、同じ名前では片方の置き換えが
-        // 失敗し、その失敗を受けた呼び出し側が要約を消してしまう。
         var path = PathOf(stateKey);
+        // 常駐中の GUI と CLI が同時に保存することがある。Windows では同じファイルへの
+        // 置き換えが重なると片方が失敗し、その失敗を受けた呼び出し側が要約を消して
+        // しまうので、置き換えをプロセスをまたいで順番に行う。
+        using var _ = AcquireLock(path);
+        // 書きかけで止まった要約を読むと、実際と違う基準で比べることになる。
+        // 一時ファイルに書き切ってから置き換える。
         var temp = $"{path}.{Guid.NewGuid():N}.tmp";
         try
         {
@@ -82,7 +87,34 @@ public sealed class BaseSummaryStore
     public void Delete(string stateKey)
     {
         var path = PathOf(stateKey);
-        if (File.Exists(path)) File.Delete(path);
+        if (!File.Exists(path)) return;
+        using var _ = AcquireLock(path);
+        File.Delete(path);
+    }
+
+    /// <summary>
+    /// 要約ごとのロックファイルを排他で開く。他のプロセスが開いていれば、閉じるまで待つ。
+    /// ロックファイルは消さずに残す。消すと、待っていた側が別のファイルを作って
+    /// 同時にロックを得てしまう。
+    /// </summary>
+    private static FileStream AcquireLock(string path)
+    {
+        var deadline = DateTime.UtcNow + LockTimeout;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(20);
+            }
+            catch (UnauthorizedAccessException) when (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(20);
+            }
+        }
     }
 
     private string PathOf(string stateKey)

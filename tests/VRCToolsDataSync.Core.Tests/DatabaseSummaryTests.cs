@@ -218,6 +218,6 @@ public sealed class DatabaseSummaryTests : IDisposable
         Parallel.For(0, 16, _ => store.Save("fake|vrcx", summary));
 
         Assert.NotNull(store.Load("fake|vrcx"));
-        Assert.Single(Directory.GetFiles(store.RootDirectory));
+        Assert.Empty(Directory.GetFiles(store.RootDirectory, "*.tmp"));
     }
 }
