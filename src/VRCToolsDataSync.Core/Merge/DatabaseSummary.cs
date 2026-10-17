@@ -92,13 +92,15 @@ public sealed class DatabaseSummary
                 return null;
             }
 
-            summary.Tables[table] = rule.Kind switch
+            var tableSummary = rule.Kind switch
             {
                 MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, "main", table, rule),
                 MergeTableKind.Keyed => SummarizeKeyed(connection, table, rule, columns),
                 MergeTableKind.Watched => SummarizeWatched(connection, table, rule, columns),
                 _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
             };
+            tableSummary.Columns = columns;
+            summary.Tables[table] = tableSummary;
         }
 
         reason = null;
@@ -341,6 +343,13 @@ public sealed class TableSummary
     /// <see cref="MergeTableKind.AppendOnly"/>: 後から書き換わる列があるときだけ、キーとその列のハッシュ。
     /// </summary>
     public string? Digest { get; set; }
+
+    /// <summary>
+    /// 要約を取ったときの列の並び。マージでは、今の列と違えば祖先に使わない。
+    /// 列が増えるとキー付きの内容ハッシュがすべて変わり、変えていない行まで
+    /// 編集されたように見えるため。
+    /// </summary>
+    public List<string>? Columns { get; set; }
 
     /// <summary><see cref="MergeTableKind.AppendOnly"/>: rowid が最大の行のキーのハッシュ。</summary>
     public string? LastRowHash { get; set; }

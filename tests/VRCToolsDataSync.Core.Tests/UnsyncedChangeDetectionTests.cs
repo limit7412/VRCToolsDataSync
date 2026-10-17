@@ -224,6 +224,50 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.NothingToDo, StartupPull(b).Outcome);
     }
 
+    [Fact(DisplayName = "マージ後の Push が失敗しても、次のマージは土台にした版を祖先にする")]
+    public void FailedPushAfterMergeKeepsMergedBaseAsAncestor()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        // 祖先 (B が取り込んだ版) から、A がメモを書いて Push する。
+        Exec(a.Paths.SqliteFile, "INSERT INTO memos VALUES ('usr_m', '2026-10-02T00:00:00Z', 'm1')");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+
+        // B は手元に履歴を足してマージする。マージ後の Push は通信の失敗で例外になる。
+        b.Settings.MergeVrcx = true;
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        _storage.OnBeginUpload = () => throw new IOException("network down");
+        Assert.ThrowsAny<IOException>(() => b.Runner.Merge(b.Service, b.Settings, _storage));
+        _storage.OnBeginUpload = null;
+
+        // その間に A がメモを消して Push する。
+        Exec(a.Paths.SqliteFile, "DELETE FROM memos WHERE user_id = 'usr_m'");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+
+        // 同期履歴の保存は設定ファイルの値で上書きする。テストでは設定ファイルに
+        // 書いていないので、マージの有効化をもう一度行う。
+        b.Settings.MergeVrcx = true;
+        var result = StartupPull(b);
+
+        // B のメモはマージで取り込んだ A の内容のままで、B が編集したものではない。
+        // 祖先が古いままだと B の編集に見え、A の削除が取り消される。
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(0, CountRows(b.Paths.SqliteFile, "memos"));
+        Assert.Equal(3, CountLocations(b.Paths.SqliteFile));
+    }
+
+    private static long CountRows(string path, string table)
+    {
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT count(*) FROM {table}";
+        return (long)command.ExecuteScalar()!;
+    }
+
     [Fact(DisplayName = "マージが無効なら、Push の競合はこれまでどおり利用者に返す")]
     public void ConflictingPushWithoutMerge()
     {

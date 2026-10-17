@@ -170,10 +170,11 @@ public sealed class SyncRunner
     /// 負けた場合は、新しい同期先を土台にマージからやり直す。
     /// </para>
     /// <para>
-    /// マージの後で Push に失敗しても、ローカルはマージ済みのまま残る。
-    /// Push の間だけ <see cref="ToolSyncState.LastPulledVersion"/> を土台にした版まで
-    /// 進め、失敗したら元に戻す。前回同期時点の要約も取り直さないので、次の起動時の
-    /// Pull は要約と同期履歴が合ったまま手元の変更を検知し、上書きせずにもう一度マージする。
+    /// マージの後、Push の前に、<see cref="ToolSyncState.LastPulledVersion"/> を土台に
+    /// した版まで進め、祖先の要約もその版の要約に置き換える。ローカルはその版に手元の
+    /// 変更を足したものなので、この組が正しい基準になる。Push が失敗しても (例外を
+    /// 含む)、次の Push はそのまま手元の変更を送れる。他の PC が先に Push していれば、
+    /// やり直しや次の起動時の Pull は、この版を祖先にして手元の変更だけを足し直す。
     /// </para>
     /// </summary>
     /// <param name="dryRun">true なら結果を数えるだけで、ローカルにも同期先にも書かない。</param>
@@ -206,21 +207,23 @@ public sealed class SyncRunner
                 return merged;
             }
 
-            // ローカルは土台にした版の内容を含むので、その版まで取り込んだことにする。
-            // Push はこの版を前提に同期先を更新する。
-            var previousPulledVersion = state.LastPulledVersion;
+            // ローカルは土台にした版に手元の変更を足したものになった。祖先の要約を先に
+            // その版のものへ替え、続けて同期履歴もその版まで進める。要約を先にするのは、
+            // 間で止まったときに、古い要約と新しい同期履歴の組み合わせを残さないため。
+            if (merged.MergeReport?.HostBaseline is { } hostBaseline)
+            {
+                _baseSummaries.Save(stateKey, hostBaseline);
+            }
+            else
+            {
+                _baseSummaries.Delete(stateKey);
+            }
             state.LastPulledVersion = merged.RemoteVersion.Value;
             state.LastPulledAt = DateTimeOffset.Now;
             settings.ToolState[stateKey] = state;
             _store.SaveToolStateOnly(settings);
 
             var pushed = PushOnce(service, settings, storage, force: false, reuploadAll: false);
-            if (pushed.Outcome != SyncOutcome.Success)
-            {
-                state.LastPulledVersion = previousPulledVersion;
-                settings.ToolState[stateKey] = state;
-                _store.SaveToolStateOnly(settings);
-            }
             if (pushed.Outcome != SyncOutcome.ConflictDetected)
             {
                 return new SyncResult

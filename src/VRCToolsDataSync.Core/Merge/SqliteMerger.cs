@@ -14,6 +14,12 @@ public sealed class MergeReport
 
     public bool Succeeded => AbortReason is null;
 
+    /// <summary>
+    /// 土台にした同期先の DB の、マージ前の要約。マージの後は、手元の DB はこの版に
+    /// 手元の変更を足したものになるので、次に比べる基準 (祖先) はこれになる。
+    /// </summary>
+    public DatabaseSummary? HostBaseline { get; set; }
+
     /// <summary>手元から足した・書き換えた・消した行の合計。</summary>
     public long ChangedRows => Tables.Sum(t => t.Inserted + t.Updated + t.Deleted);
 
@@ -195,9 +201,27 @@ public static class SqliteMerger
             return null;
         }
 
+        // キー付きの内容ハッシュは、要約を取ったときの列で求める。前回の同期の後に
+        // VRCX の更新で列が増えると、今の列で求めたハッシュは祖先と必ず食い違い、
+        // 変えていない行まで編集されたように見えるため。列が減ったなど古い列で
+        // 求められない場合は、祖先なしで合わせる。
+        var hashColumns = localColumns;
+        if (baseline is not null)
+        {
+            if (baseline.Columns is null
+                || !baseline.Columns.All(c => localColumns.Contains(c, StringComparer.Ordinal)))
+            {
+                baseline = null;
+            }
+            else
+            {
+                hashColumns = baseline.Columns;
+            }
+        }
+
         return rule.Kind == MergeTableKind.AppendOnly
             ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created)
-            : MergeKeyed(connection, table, rule, localColumns, baseline, created, report);
+            : MergeKeyed(connection, table, rule, localColumns, hashColumns, baseline, created, report);
     }
 
     /// <summary>
@@ -214,7 +238,8 @@ public static class SqliteMerger
         var source = $"{Local}.{Quote(table)}";
         var rowIdAlias = FindRowIdAlias(connection, table);
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
-        var sinceRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
+        // 同期先に無くて作ったテーブルは空なので、手元の全行を候補にする。
+        var sinceRowId = !created && baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
         if (sinceRowId > 0
             && !string.Equals(
                 HashRowKey(connection, Local, table, rule.KeyColumns, sinceRowId),
@@ -331,10 +356,11 @@ public static class SqliteMerger
     /// </summary>
     private static TableMergeReport MergeKeyed(
         SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, TableSummary? baseline, bool created, MergeReport report)
+        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
+        TableSummary? baseline, bool created, MergeReport report)
     {
-        var local = ReadKeyedRows(connection, Local, table, rule, columns);
-        var host = ReadKeyedRows(connection, "main", table, rule, columns);
+        var local = ReadKeyedRows(connection, Local, table, rule, hashColumns);
+        var host = ReadKeyedRows(connection, "main", table, rule, hashColumns);
         var ancestor = baseline is { Kind: MergeTableKind.Keyed, Rows: { } rows }
             ? rows
             : new Dictionary<string, string>(StringComparer.Ordinal);

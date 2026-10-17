@@ -405,7 +405,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
             SqliteSnapshot.Create(_paths.SqliteFile, localPath);
 
             // (3) 写しどうしでマージする。手元の DB にはまだ触れない。
+            //     マージ後の祖先にするため、土台の要約をマージの前に取っておく。
+            var hostBaseline = DatabaseSummary.Compute(hostPath, MergeProfiles.Vrcx, out _);
+            if (hostBaseline is not null) hostBaseline.RemoteVersion = entry.Version;
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, options.Baseline, options.DryRun);
+            report.HostBaseline = hostBaseline;
             _logger.LogInformation("VRCX マージ: {Report}", report.Describe());
             if (!report.Succeeded)
             {

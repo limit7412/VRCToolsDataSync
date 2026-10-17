@@ -273,6 +273,40 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.True(Assert.Single(report.Tables, t => t.Table == "usr0123abcd_feed_gps").Created);
     }
 
+    [Fact(DisplayName = "同期先に無くて作った履歴のテーブルには、手元の全行を写す")]
+    public void CreatedTableCopiesAllRows()
+    {
+        var feed = """
+            CREATE TABLE usr0123abcd_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-01T00:00:00Z', 'usr_x', 'wrld_a:1');
+            """;
+        var (host, local, _) = Arrange();
+        Exec(local, feed);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        Exec(local, "INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-02T00:00:00Z', 'usr_x', 'wrld_b:1')");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(2, Rows(host, "SELECT id FROM usr0123abcd_feed_gps").Count);
+    }
+
+    [Fact(DisplayName = "前回の同期の後に列が増えても、変えていない行を編集されたとは見ない")]
+    public void ComparesWithBaselineColumns()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE memos ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(local, "DELETE FROM memos WHERE user_id = 'usr_d'");
+
+        var report = Merge(host, local, baseline);
+
+        // 今の列でハッシュを求めると、同期先の usr_d が編集されたように見え、
+        // 手元の削除が「編集と削除の競合」として取り消される。
+        Assert.Empty(report.Conflicts);
+        Assert.DoesNotContain("usr_d|d0", Rows(host, "SELECT user_id, memo FROM memos"));
+    }
+
     [Fact(DisplayName = "列が食い違えば中止し、同期先の写しには何も書かない")]
     public void AbortsOnColumnMismatch()
     {
