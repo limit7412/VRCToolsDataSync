@@ -51,6 +51,7 @@ public partial class MainPageViewModel : ObservableObject
         MachineName = _settings.MachineName;
         CloudFolderPath = _settings.CloudFolderPath;
         SyncVrcx = _settings.SyncVrcx;
+        MergeVrcx = _settings.MergeVrcx;
         SyncFriendConnect = _settings.SyncFriendConnect;
         AutoSyncEnabled = _settings.AutoSyncEnabled;
         LoadStorageSettingsToProperties();
@@ -94,6 +95,10 @@ public partial class MainPageViewModel : ObservableObject
                     break;
                 case StartupSyncStepKind.PullSucceeded:
                     AppendLog($"[{logPrefix}] {step.DisplayName} Pull 完了 v{step.PullResult?.RemoteVersion}");
+                    if (step.PullResult?.MergeReport is not null)
+                    {
+                        AppendLog($"[{logPrefix}] {step.DisplayName} {step.PullResult.Message}");
+                    }
                     break;
                 case StartupSyncStepKind.PullFailed:
                     AppendLog($"[{logPrefix}] {step.DisplayName} Pull 失敗: {step.Message}");
@@ -162,6 +167,10 @@ public partial class MainPageViewModel : ObservableObject
             {
                 case SyncOutcome.Success:
                     AppendLog($"[auto] {e.DisplayName} Push 完了 v{e.Result.RemoteVersion}");
+                    if (e.Result.MergeReport is not null)
+                    {
+                        AppendLog($"[auto] {e.DisplayName} {e.Result.Message}");
+                    }
                     // Coordinator 側の SyncRunner.Push が settings を保存しているが、
                     // VM 側の _settings は別インスタンスのため、再読み込みしないと
                     // 古い LastPulledVersion で次回手動 Push が無駄なコンフリクトを起こす。
@@ -206,6 +215,10 @@ public partial class MainPageViewModel : ObservableObject
 
     [ObservableProperty]
     public partial bool SyncVrcx { get; set; }
+
+    /// <summary>VRCX を置き換えではなくマージで同期するか (issue #87)。</summary>
+    [ObservableProperty]
+    public partial bool MergeVrcx { get; set; }
 
     [ObservableProperty]
     public partial bool SyncFriendConnect { get; set; }
@@ -458,6 +471,7 @@ public partial class MainPageViewModel : ObservableObject
         settings.MachineName = string.IsNullOrWhiteSpace(MachineName) ? Environment.MachineName : MachineName.Trim();
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
+        settings.MergeVrcx = MergeVrcx;
         settings.SyncFriendConnect = SyncFriendConnect;
         settings.AutoSyncEnabled = AutoSyncEnabled;
         ApplyStoragePropertiesToSettings(settings);
@@ -1292,6 +1306,11 @@ public partial class MainPageViewModel : ObservableObject
         {
             case SyncOutcome.Success:
                 AppendLog($"{displayName} Push 完了 version={result.RemoteVersion} files={result.AffectedFiles.Count}");
+                if (result.MergeReport is not null)
+                {
+                    // 競合をマージで解いた Push。何を足したかを残す。
+                    AppendLog($"  {result.Message}");
+                }
                 // 常駐側 Coordinator が保持する settings の LastPulledVersion を
                 // 同期させ、続く自動 Push が古いバージョンで不要な競合通知を
                 // 起こさないようにする。

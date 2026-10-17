@@ -18,6 +18,19 @@ public sealed class SyncSettings
     public bool SyncVrcx { get; set; } = true;
     public bool SyncFriendConnect { get; set; } = true;
 
+    /// <summary>
+    /// VRCX の DB を、置き換えではなくマージで同期するか (issue #87)。既定は無効。
+    /// 有効にすると、起動時の自動 Pull で手元に未 Push の変更が見つかった場合と、
+    /// Push がリモートの方が新しいことで競合した場合に、上書きの代わりにマージする。
+    /// </summary>
+    public bool MergeVrcx { get; set; }
+
+    /// <summary>
+    /// ツールをマージで同期するか。Friend Connect は、開発者に確認するまで
+    /// 行単位の書き込みを行わないので対象にしない。
+    /// </summary>
+    public bool IsMergeEnabled(string toolKey) => toolKey == "vrcx" && MergeVrcx;
+
     public bool AutoSyncEnabled { get; set; } = false;
 
     /// <summary>

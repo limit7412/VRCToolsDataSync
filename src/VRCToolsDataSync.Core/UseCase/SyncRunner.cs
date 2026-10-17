@@ -59,6 +59,29 @@ public sealed class SyncRunner
         bool force,
         bool reuploadAll = false)
     {
+        var result = PushOnce(service, settings, storage, force, reuploadAll);
+
+        // リモートの方が新しくて止まった Push は、マージが有効ならマージしてから送り直す。
+        // 強制 Push は利用者が上書きを選んだ操作なので、マージに回さない。
+        if (result.Outcome == SyncOutcome.ConflictDetected
+            && !force
+            && !reuploadAll
+            && settings.IsMergeEnabled(service.ToolKey)
+            && service is IMergeableSyncService mergeable)
+        {
+            _logger.LogInformation("Push が競合したのでマージします ({Tool})", service.ToolKey);
+            return Merge(mergeable, settings, storage);
+        }
+        return result;
+    }
+
+    private SyncResult PushOnce(
+        ISyncService service,
+        SyncSettings settings,
+        ISyncStorage storage,
+        bool force,
+        bool reuploadAll)
+    {
         lock (PushLock)
         {
             var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
@@ -123,7 +146,85 @@ public sealed class SyncRunner
             _store.SaveToolStateOnly(settings);
             RecordBaseSummary(service, stateKey);
         }
+
+        // 起動時の自動 Pull が手元の変更を守って見送った場合、マージが有効なら
+        // 上書きの代わりにマージする。
+        if (result.Outcome == SyncOutcome.LocalChangesPending
+            && settings.IsMergeEnabled(service.ToolKey)
+            && service is IMergeableSyncService mergeable)
+        {
+            _logger.LogInformation("手元に未 Push の変更があるのでマージします ({Tool})", service.ToolKey);
+            return Merge(mergeable, settings, storage, skipBackup);
+        }
         return result;
+    }
+
+    /// <summary>Push を競合で取り直す回数の上限。</summary>
+    private const int MaxMergeAttempts = 3;
+
+    /// <summary>
+    /// 同期先の最新に手元の変更を足してローカルに置き、続けて Push する。
+    /// <para>
+    /// マージの直後に必ず Push する。マージ結果を同期先に載せないと、他の PC が
+    /// 同じ食い違いに出会い、同じマージを繰り返すことになる。Push が他の PC の Push に
+    /// 負けた場合は、新しい同期先を土台にマージからやり直す。
+    /// </para>
+    /// <para>
+    /// マージの後で Push に失敗しても、ローカルはマージ済みのまま残る。
+    /// <see cref="ToolSyncState.LastPulledVersion"/> は土台にした版まで進めるが、
+    /// 前回同期時点の要約は Push が通るまで取り直さないので、次の起動時の Pull は
+    /// 手元の変更を検知して、上書きせずにもう一度マージする。
+    /// </para>
+    /// </summary>
+    /// <param name="dryRun">true なら結果を数えるだけで、ローカルにも同期先にも書かない。</param>
+    public SyncResult Merge(
+        IMergeableSyncService service,
+        SyncSettings settings,
+        ISyncStorage storage,
+        bool skipBackup = false,
+        bool dryRun = false)
+    {
+        SyncResult? last = null;
+        for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)
+        {
+            var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
+            var merged = service.PullMerge(new PullMergeOptions
+            {
+                Storage = storage,
+                Baseline = _baseSummaries.Load(stateKey),
+                DryRun = dryRun,
+                SkipBackup = skipBackup,
+            });
+            if (dryRun || merged.Outcome != SyncOutcome.Success || !merged.RemoteVersion.HasValue)
+            {
+                return merged;
+            }
+
+            // ローカルは土台にした版の内容を含むので、その版まで取り込んだことにする。
+            state.LastPulledVersion = merged.RemoteVersion.Value;
+            state.LastPulledAt = DateTimeOffset.Now;
+            settings.ToolState[stateKey] = state;
+            _store.SaveToolStateOnly(settings);
+
+            var pushed = PushOnce(service, settings, storage, force: false, reuploadAll: false);
+            if (pushed.Outcome != SyncOutcome.ConflictDetected)
+            {
+                return new SyncResult
+                {
+                    Outcome = pushed.Outcome,
+                    RemoteVersion = pushed.RemoteVersion,
+                    BackupPath = merged.BackupPath,
+                    MergeReport = merged.MergeReport,
+                    AffectedFiles = pushed.AffectedFiles,
+                    Message = pushed.Outcome == SyncOutcome.Success
+                        ? merged.Message
+                        : $"{merged.Message}。ただし Push に失敗しました: {pushed.Message}",
+                };
+            }
+            _logger.LogInformation("マージ後の Push が競合しました。やり直します ({Attempt}/{Max})", attempt, MaxMergeAttempts);
+            last = pushed;
+        }
+        return last!;
     }
 
     /// <summary>

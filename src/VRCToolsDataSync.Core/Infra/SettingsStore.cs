@@ -302,6 +302,7 @@ public sealed class SettingsStore
                     settings.MachineName = merged.MachineName;
                     settings.SyncVrcx = merged.SyncVrcx;
                     settings.SyncFriendConnect = merged.SyncFriendConnect;
+                    settings.MergeVrcx = merged.MergeVrcx;
                     settings.AutoSyncEnabled = merged.AutoSyncEnabled;
                     settings.StorageMode = merged.StorageMode;
                     settings.S3 = merged.S3;
@@ -409,6 +410,7 @@ public sealed class SettingsStore
             MachineName = topLevelSource.MachineName,
             SyncVrcx = topLevelSource.SyncVrcx,
             SyncFriendConnect = topLevelSource.SyncFriendConnect,
+            MergeVrcx = topLevelSource.MergeVrcx,
             AutoSyncEnabled = topLevelSource.AutoSyncEnabled,
             // 保存先の種類と S3 接続設定も Top-level と同じ採用元から取る。
             // Push/Pull 経由の Save がユーザの保存先変更を巻き戻さないようにする。

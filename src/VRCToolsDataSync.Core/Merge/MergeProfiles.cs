@@ -17,24 +17,25 @@ public static class MergeProfiles
     public static MergeProfile Vrcx { get; } = new()
     {
         ToolKey = "vrcx",
+        SupportsMerge = true,
         Rules = new MergeTableRule[]
         {
             // VRChat のログから作る履歴。UNIQUE 制約の列をそのままキーにする。
-            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" }),
-            new("gamelog_join_leave", MergeTableKind.AppendOnly, new[] { "created_at", "type", "display_name" }),
-            new("gamelog_portal_spawn", MergeTableKind.AppendOnly, new[] { "created_at", "display_name" }),
-            new("gamelog_video_play", MergeTableKind.AppendOnly, new[] { "created_at", "video_url" }),
-            new("gamelog_resource_load", MergeTableKind.AppendOnly, new[] { "created_at", "resource_url" }),
-            new("gamelog_event", MergeTableKind.AppendOnly, new[] { "created_at", "data" }),
-            new("gamelog_external", MergeTableKind.AppendOnly, new[] { "created_at", "message" }),
+            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" }, OrderColumn: "created_at"),
+            new("gamelog_join_leave", MergeTableKind.AppendOnly, new[] { "created_at", "type", "display_name" }, OrderColumn: "created_at"),
+            new("gamelog_portal_spawn", MergeTableKind.AppendOnly, new[] { "created_at", "display_name" }, OrderColumn: "created_at"),
+            new("gamelog_video_play", MergeTableKind.AppendOnly, new[] { "created_at", "video_url" }, OrderColumn: "created_at"),
+            new("gamelog_resource_load", MergeTableKind.AppendOnly, new[] { "created_at", "resource_url" }, OrderColumn: "created_at"),
+            new("gamelog_event", MergeTableKind.AppendOnly, new[] { "created_at", "data" }, OrderColumn: "created_at"),
+            new("gamelog_external", MergeTableKind.AppendOnly, new[] { "created_at", "message" }, OrderColumn: "created_at"),
 
             // フレンドの動きの履歴。UNIQUE 制約が無いので、キーは本ツールで決める。
-            new(UserPrefix + "feed_gps", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "location" }),
-            new(UserPrefix + "feed_status", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "status" }),
-            new(UserPrefix + "feed_bio", MergeTableKind.AppendOnly, new[] { "created_at", "user_id" }),
-            new(UserPrefix + "feed_avatar", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "avatar_name" }),
-            new(UserPrefix + "feed_online_offline", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }),
-            new(UserPrefix + "friend_log_history", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }),
+            new(UserPrefix + "feed_gps", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "location" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_status", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "status" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_bio", MergeTableKind.AppendOnly, new[] { "created_at", "user_id" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_avatar", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "avatar_name" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_online_offline", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
+            new(UserPrefix + "friend_log_history", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
             new(UserPrefix + "notifications", MergeTableKind.AppendOnly, new[] { "id" }),
 
             // ユーザーが手で編集するもの。

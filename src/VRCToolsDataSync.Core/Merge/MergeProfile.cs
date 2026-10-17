@@ -41,6 +41,11 @@ public enum MergeTableKind
 /// <see cref="MergeTableKind.Watched"/> で比べない列。アプリが自動で書き換える
 /// 時刻列や、作り直しで変わる id を外す。
 /// </param>
+/// <param name="OrderColumn">
+/// <see cref="MergeTableKind.AppendOnly"/> で、出来事の順序を表す列。行を足した後、
+/// id の順がこの列の順と合うように振り直す。VRCX は id の大きい行を「最新」と
+/// して扱うため、古い出来事を後から足すと最新として表示されてしまう。
+/// </param>
 public sealed record MergeTableRule(
     string NamePattern,
     MergeTableKind Kind,
@@ -48,7 +53,8 @@ public sealed record MergeTableRule(
     IReadOnlyList<string>? ValueColumns = null,
     string? EditedAtColumn = null,
     string? Filter = null,
-    IReadOnlyList<string>? IgnoredColumns = null)
+    IReadOnlyList<string>? IgnoredColumns = null,
+    string? OrderColumn = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
@@ -56,14 +62,19 @@ public sealed record MergeTableRule(
 }
 
 /// <summary>
-/// ツールごとのマージの規則一式。今は前回同期時点の要約 (<see cref="DatabaseSummary"/>)
-/// を取るためだけに使い、行の書き込みはまだ行わない。
+/// ツールごとのマージの規則一式。前回同期時点の要約 (<see cref="DatabaseSummary"/>) と、
+/// 行を合成するマージ (<see cref="SqliteMerger"/>) の両方がこれに従う。
 /// </summary>
 public sealed class MergeProfile
 {
     public required string ToolKey { get; init; }
 
     public required IReadOnlyList<MergeTableRule> Rules { get; init; }
+
+    /// <summary>
+    /// 行を書き込むマージを許すか。false のツールは要約による検知だけを行う。
+    /// </summary>
+    public bool SupportsMerge { get; init; }
 
     /// <summary>
     /// DB のスキーマが本ツールの対応している版かを確かめる。対応していれば

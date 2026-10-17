@@ -16,6 +16,29 @@ public interface ISyncService
     SyncResult Pull(PullOptions options);
 }
 
+/// <summary>
+/// 行を合成するマージに対応したツール。マージは「同期先の最新を土台にし、手元にしか
+/// 無い変更を足し戻す」操作で、結果はローカルに置くだけである。同期先へ反映する
+/// Push は呼び出し側 (<c>SyncRunner</c>) が続けて行う。
+/// </summary>
+public interface IMergeableSyncService : ISyncService
+{
+    SyncResult PullMerge(PullMergeOptions options);
+}
+
+public sealed class PullMergeOptions
+{
+    public required ISyncStorage Storage { get; init; }
+
+    /// <summary>前回同期した時点の要約。無ければ 2-way のマージになる。</summary>
+    public DatabaseSummary? Baseline { get; init; }
+
+    /// <summary>true なら結果を数えるだけで、ローカルには何も書かない。</summary>
+    public bool DryRun { get; init; }
+
+    public bool SkipBackup { get; init; }
+}
+
 public sealed class PushOptions
 {
     /// <summary>同期先。ローカル同期フォルダか S3 互換ストレージのどちらか。</summary>
@@ -75,6 +98,9 @@ public sealed class SyncResult
     public long? LastPulledVersion { get; init; }
     public string? BackupPath { get; init; }
     public IReadOnlyList<string> AffectedFiles { get; init; } = Array.Empty<string>();
+
+    /// <summary>マージを行った場合の内訳。</summary>
+    public MergeReport? MergeReport { get; init; }
 }
 
 public enum SyncOutcome

@@ -6,7 +6,7 @@ using VRCToolsDataSync.Core.Merge;
 
 namespace VRCToolsDataSync.Core.UseCase;
 
-public sealed class VrcxSyncService : ISyncService
+public sealed class VrcxSyncService : IMergeableSyncService
 {
     public const string Key = "vrcx";
 
@@ -338,6 +338,128 @@ public sealed class VrcxSyncService : ISyncService
             BackupPath = backupPath,
             AffectedFiles = affected,
         };
+    }
+
+    /// <summary>
+    /// 同期先の最新のスナップショットを土台に、手元の DB にしか無い変更を足した DB を作り、
+    /// ローカルの DB と置き換える。同期先へは送らない。
+    /// <para>
+    /// 設定ファイル (VRCX.json) には触れない。続く Push で手元のものが送られる。
+    /// 設定は行単位で合わせられず、どちらかを選ぶしかないため、マージを始めた PC の
+    /// ものを残す。
+    /// </para>
+    /// </summary>
+    public SyncResult PullMerge(PullMergeOptions options)
+    {
+        ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
+
+        if (!_paths.Exists())
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.SourceMissing,
+                Message = $"VRCX のデータが見つかりません: {_paths.SqliteFile}",
+            };
+        }
+
+        var storage = options.Storage;
+        var manifest = new ManifestStore(storage).Load();
+        if (!manifest.Tools.TryGetValue(Key, out var entry)
+            || entry.Files.FirstOrDefault(f => f.RelativePath == SnapshotKey) is not { } remoteSnapshot)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.NothingToDo,
+                Message = "クラウド側に VRCX のデータがありません",
+            };
+        }
+
+        var work = Path.Combine(Path.GetTempPath(), "VRCToolsDataSync-merge-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            // (1) 土台にする同期先のスナップショットを取り出し、記録と合うか確かめる。
+            var hostPath = Path.Combine(work, "remote.sqlite3");
+            if (!storage.TryDownload(ManifestFileKeys.StorageKeyOf(remoteSnapshot), hostPath))
+            {
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.SourceMissing,
+                    Message = $"クラウド側にスナップショットがありません: {SnapshotKey}",
+                };
+            }
+            if (!string.IsNullOrEmpty(remoteSnapshot.Sha256)
+                && !string.Equals(FileHasher.Sha256(hostPath), remoteSnapshot.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    Message = $"取得したファイルの内容が manifest の記録と一致しません: {SnapshotKey}。" +
+                              "正しいデータを持つ PC から非常用の強制 Push を行うと解消します。",
+                };
+            }
+
+            // (2) 手元の DB の写しを取る。WAL を統合するためと、マージ中に手元の
+            //     ファイルを開いたままにしないため。
+            var localPath = Path.Combine(work, "local.sqlite3");
+            SqliteSnapshot.Create(_paths.SqliteFile, localPath);
+
+            // (3) 写しどうしでマージする。手元の DB にはまだ触れない。
+            var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, options.Baseline, options.DryRun);
+            _logger.LogInformation("VRCX マージ: {Report}", report.Describe());
+            if (!report.Succeeded)
+            {
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    RemoteVersion = entry.Version,
+                    Message = report.Describe(),
+                    MergeReport = report,
+                };
+            }
+            if (options.DryRun)
+            {
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Success,
+                    RemoteVersion = entry.Version,
+                    Message = "(dry-run) " + report.Describe(),
+                    MergeReport = report,
+                };
+            }
+
+            // (4) ここから先はローカルを書き換える。Pull と同じく WAL/SHM ごと退避してから消す。
+            string? backupPath = null;
+            if (!options.SkipBackup)
+            {
+                var filesToBackup = new List<string>
+                {
+                    _paths.SqliteFile,
+                    Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-wal"),
+                    Path.Combine(_paths.RootDirectory, "VRCX.sqlite3-shm"),
+                };
+                if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
+                backupPath = _backup.CreateSnapshot(Key, filesToBackup);
+            }
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
+            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
+            AtomicFile.Copy(hostPath, _paths.SqliteFile);
+
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Success,
+                RemoteVersion = entry.Version,
+                BackupPath = backupPath,
+                Message = report.Describe(),
+                MergeReport = report,
+                AffectedFiles = new[] { SnapshotKey },
+            };
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { Directory.Delete(work, recursive: true); } catch { /* best-effort cleanup */ }
+        }
     }
 
     private static void DeleteIfExists(string dir, string fileName)

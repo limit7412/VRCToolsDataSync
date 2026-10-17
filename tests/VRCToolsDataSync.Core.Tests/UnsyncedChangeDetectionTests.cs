@@ -172,4 +172,62 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         var current = DatabaseSummary.Compute(a.Paths.SqliteFile, MergeProfiles.Vrcx, out _);
         Assert.Empty(current!.FindChangedTables(baseline!));
     }
+
+    [Fact(DisplayName = "マージが有効なら、起動時 Pull は手元の変更を残したまま取り込み、Push まで済ませる")]
+    public void StartupPullMergesWhenEnabled()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        b.Settings.MergeVrcx = true;
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.NotNull(result.MergeReport);
+        Assert.Equal(3, CountLocations(b.Paths.SqliteFile));
+
+        // マージ結果は同期先に載っているので、A は普通の Pull で 3 件を受け取る。
+        var pulled = a.Runner.Pull(a.Service, a.Settings, _storage, skipBackup: false, skipIfNotNewer: true);
+        Assert.Equal(SyncOutcome.Success, pulled.Outcome);
+        Assert.Equal(3, CountLocations(a.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "マージが有効なら、リモートの方が新しくて止まった Push はマージしてから送る")]
+    public void ConflictingPushMergesWhenEnabled()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        b.Settings.MergeVrcx = true;
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = Push(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(3, CountLocations(b.Paths.SqliteFile));
+        // Push の後は要約が取り直され、手元に未 Push の変更は残っていない。
+        Assert.Equal(SyncOutcome.NothingToDo, StartupPull(b).Outcome);
+    }
+
+    [Fact(DisplayName = "マージが無効なら、Push の競合はこれまでどおり利用者に返す")]
+    public void ConflictingPushWithoutMerge()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        Assert.Equal(SyncOutcome.ConflictDetected, Push(b).Outcome);
+    }
+
+    [Fact(DisplayName = "dry-run のマージは、手元にも同期先にも書かない")]
+    public void DryRunMergeWritesNothing()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        var remoteVersion = new ManifestStore(_storage).Load().Tools[VrcxSyncService.Key].Version;
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage, dryRun: true);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(1, result.MergeReport!.ChangedRows);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.Equal(remoteVersion, new ManifestStore(_storage).Load().Tools[VrcxSyncService.Key].Version);
+    }
 }

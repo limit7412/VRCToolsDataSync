@@ -94,6 +94,31 @@ dotnet run --project src\VRCToolsDataSync.App
 
 登録済みのままチェックを切り替えると、その場で登録し直す。更新の後に開き直す経路もこの指定を引き継ぐので、更新のたびに画面が現れることはない。
 
+## マージ同期（VRCX、試験的）
+
+既定の同期は置き換えで、2 台の PC で並行して変更が生まれると、後から Push した側だけが残る。マージ同期を有効にすると、VRCX の DB について次の 2 つの場面で、上書きの代わりに「同期先の最新に、手元にしか無い変更を足す」処理を行い、結果をそのまま Push する。
+
+- 起動時の自動 Pull で、手元に未 Push の変更が見つかったとき
+- Push が「リモートの方が新しい」ことで競合したとき（強制 Push を除く）
+
+足すのは、追加専用の履歴（`gamelog_*`、feed、フレンドの履歴、通知）と、手で編集するデータ（メモ、お気に入り、アバターのタグ）だけである。手で編集するデータは前回の同期時点と比べ、変えた側の内容を残す。両方で別々に編集されていたら編集時刻の新しい方を残す。キャッシュなど規則の対象外のテーブルは同期先の内容がそのまま残る。手元の DB はマージ前にバックアップへ退避し、両方の DB の列が食い違うなど想定外の状態ではマージを中止して従来の動作に戻る。`VRCX.json` はマージせず、手元のものを Push する。
+
+GUI では設定カードの「VRCX をマージで同期 (試験的)」で切り替える。CLI では次のとおり。
+
+```powershell
+# 有効化 / 無効化
+dotnet run --project src\VRCToolsDataSync.Cli -- merge vrcx --enable
+dotnet run --project src\VRCToolsDataSync.Cli -- merge vrcx --disable
+
+# 何を足すかを確かめるだけ (手元にも同期先にも書かない)
+dotnet run --project src\VRCToolsDataSync.Cli -- merge vrcx --dry-run
+
+# 今すぐマージして Push する
+dotnet run --project src\VRCToolsDataSync.Cli -- merge vrcx
+```
+
+VRC Friend Connect はマージの対象外で、置き換えのままである。
+
 ## 非常用の強制 Push
 
 通常の強制 Push (`--force` と、コンフリクト時の「強制 Push」) はコンフリクトの検査を飛ばすだけで、送信の省略はそのまま行う。省略の判断は、manifest に記録したハッシュと同期先に実体があるかどうかで決まる。そのため、同期先の実体の中身だけが壊れた場合 (同期クライアントの事故や手作業での上書き) は、Push し直しても壊れた実体が残り、他の PC の Pull が「manifest の記録と一致しません」で失敗し続ける。
