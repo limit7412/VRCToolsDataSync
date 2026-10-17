@@ -14,6 +14,7 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
     - `thumbnails\`（写真のサムネイル）と、存在する場合は `notes\`
 - **保存先**: ローカル同期フォルダ（パスはユーザーが手動指定）または S3 互換オブジェクトストレージ
 - **マージ戦略**: last-writer-wins。Pull 前にローカルを `%AppData%\VRCToolsDataSync\backup\<tool>\<timestamp>\` へ自動退避（既定10世代）
+- **未同期の変更の保護**: 同期のたびに、DB のうち手で編集するデータと追加専用の履歴だけの要約を `%AppData%\VRCToolsDataSync\base\` に残す。起動時の自動 Pull は、リモートが新しくても手元の要約が前回から変わっていれば上書きを見送り、通知する。明示的な Pull はこれまでどおり上書きする
 - **転送の省略**: manifest に記録した SHA-256 と手元のファイルが一致する場合、送信も取得も行わない
 - **プロセス検知ガード**: 同期対象のツール (`VRCX`, `VRC Friend Connect`) が実行中の場合は WAL ロックによる DB 破損を避けるため同期を拒否
 - **暗号化**: 保存先のデータは暗号化しない。S3 互換モードのシークレットアクセスキーのみ、Windows の DPAPI で保護して `settings.json` に保存する

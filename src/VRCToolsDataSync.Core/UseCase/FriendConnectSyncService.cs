@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.Merge;
 
 namespace VRCToolsDataSync.Core.UseCase;
 
@@ -19,7 +20,11 @@ public sealed class FriendConnectSyncService : ISyncService
     private readonly LocalBackup _backup;
     private readonly ILogger<FriendConnectSyncService> _logger;
 
+    private const string DisplayName = "Friend Connect";
+
     public string ToolKey => Key;
+
+    public TrackedDatabase TrackedDatabase => new(_paths.DbV11File, MergeProfiles.FriendConnect);
 
     public FriendConnectSyncService(
         FriendConnectPaths? paths = null,
@@ -232,6 +237,18 @@ public sealed class FriendConnectSyncService : ISyncService
                 LastPulledVersion = lastPulled,
                 Message = "ローカルが最新のため Pull スキップ",
             };
+        }
+
+        if (options.SkipIfNotNewer
+            && options.FindUnsyncedLocalChanges?.Invoke() is { Count: > 0 } changed)
+        {
+            // 起動時の自動 Pull は利用者が求めた操作ではない。ここで上書きすると、
+            // 前回の同期の後に手元で増えた履歴や編集が、気付かれないまま
+            // バックアップにしか残らなくなる。
+            _logger.LogInformation(
+                "{Tool} Pull 見送り: 手元に未 Push の変更がある (remote={Remote}, tables={Tables})",
+                DisplayName, entry.Version, string.Join(", ", changed));
+            return SyncResults.LocalChangesPending(DisplayName, entry.Version, changed);
         }
 
         // どちらの DB も任意として扱い、少なくとも片方があることだけを求める。

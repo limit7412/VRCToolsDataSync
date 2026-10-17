@@ -1,9 +1,16 @@
 
+using VRCToolsDataSync.Core.Merge;
+
 namespace VRCToolsDataSync.Core.Domain;
 
 public interface ISyncService
 {
     string ToolKey { get; }
+
+    /// <summary>
+    /// 前回同期時点の要約を取る DB と、その規則。要約を取らないツールは null。
+    /// </summary>
+    TrackedDatabase? TrackedDatabase { get; }
 
     SyncResult Push(PushOptions options);
     SyncResult Pull(PullOptions options);
@@ -50,6 +57,14 @@ public sealed class PullOptions
     // false のままにして、「ユーザが意図的に呼んだ Pull は従来通り上書きする」セマンティクスを維持する。
     public long? LastPulledVersion { get; init; }
     public bool SkipIfNotNewer { get; init; }
+
+    /// <summary>
+    /// 前回の同期の後に手元で変わったテーブルを返す (無ければ空)。起動時の自動 Pull
+    /// (<see cref="SkipIfNotNewer"/>) で、リモートが新しいと分かった後に呼ぶ。
+    /// 変わったテーブルがあれば上書きせず <see cref="SyncOutcome.LocalChangesPending"/>
+    /// を返す。比べられない場合 (前回の要約が無いなど) は空を返し、従来どおり上書きする。
+    /// </summary>
+    public Func<IReadOnlyList<string>>? FindUnsyncedLocalChanges { get; init; }
 }
 
 public sealed class SyncResult
@@ -69,4 +84,9 @@ public enum SyncOutcome
     ConflictDetected,
     SourceMissing,
     Aborted,
+
+    /// <summary>
+    /// 起動時の自動 Pull で、手元に未 Push の変更があったので上書きを見送った。
+    /// </summary>
+    LocalChangesPending,
 }
