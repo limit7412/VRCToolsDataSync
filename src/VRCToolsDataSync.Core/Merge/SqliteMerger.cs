@@ -226,7 +226,7 @@ public static class SqliteMerger
         }
 
         return rule.Kind == MergeTableKind.AppendOnly
-            ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created)
+            ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report)
             : MergeKeyed(connection, table, rule, localColumns, hashColumns, baseline, created, report);
     }
 
@@ -236,23 +236,22 @@ public static class SqliteMerger
     /// 同期で同期先にも渡っているので、全件を突き合わせる必要が無い。
     /// <see cref="MergeTableRule.GrowingColumns"/> だけは既存行も見て、大きい方の値を残す。
     /// </summary>
-    private static TableMergeReport MergeAppendOnly(
+    private static TableMergeReport? MergeAppendOnly(
         SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, TableSummary? baseline, bool created)
+        IReadOnlyList<string> columns, TableSummary? baseline, bool created, MergeReport report)
     {
         var target = $"main.{Quote(table)}";
         var source = $"{Local}.{Quote(table)}";
         var rowIdAlias = FindRowIdAlias(connection, table);
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
         var sinceRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
-        if (sinceRowId > 0
-            && !string.Equals(
-                HashRowKey(connection, Local, table, rule.KeyColumns, sinceRowId),
-                baseline!.LastRowHash, StringComparison.Ordinal))
+        if (sinceRowId > 0 && WasDeletedLocally(connection, table, rule, baseline!))
         {
-            // 前回の末尾の行が手元で消され、その rowid が別の行に再利用されている。
-            // どこから先が新しい行か分からないので、全行を候補にする。
-            sinceRowId = 0;
+            // VRCX は履歴の行を消す操作を持つ。和集合を取ると、手元で消した行が同期先から
+            // 戻ってしまう。どの行を消したかは要約から分からないので、マージを中止する。
+            // 祖先が無い 2-way のマージでは、この削除を見分けられない。
+            report.AbortReason = $"手元でテーブル {table} の行が消されています。消した行を同期先から戻さないよう、自動マージを中止しました";
+            return null;
         }
         var hostMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
 
@@ -294,6 +293,25 @@ public static class SqliteMerger
                          && RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId);
 
         return new TableMergeReport(table, inserted, updated, 0, renumbered, created);
+    }
+
+    /// <summary>
+    /// 前回の同期の時点にあった行が、手元で消されたかを調べる。前回の末尾の行が別の
+    /// 行に入れ替わっているか、前回の最大 rowid までの行数が減っていれば消されている。
+    /// </summary>
+    private static bool WasDeletedLocally(
+        SqliteConnection connection, string table, MergeTableRule rule, TableSummary baseline)
+    {
+        if (!string.Equals(
+                HashRowKey(connection, Local, table, rule.KeyColumns, baseline.MaxRowId),
+                baseline.LastRowHash, StringComparison.Ordinal))
+        {
+            return true;
+        }
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT count(*) FROM {Local}.{Quote(table)} WHERE rowid <= $max";
+        command.Parameters.AddWithValue("$max", baseline.MaxRowId);
+        return (long)command.ExecuteScalar()! < baseline.RowCount;
     }
 
     /// <summary>
@@ -359,11 +377,20 @@ public static class SqliteMerger
     /// 両方が別々に変えたキーは、編集時刻の新しい方を残す。編集時刻が無ければ
     /// 同期先の内容を残す。
     /// </summary>
-    private static TableMergeReport MergeKeyed(
+    private static TableMergeReport? MergeKeyed(
         SqliteConnection connection, string table, MergeTableRule rule,
         IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
         TableSummary? baseline, bool created, MergeReport report)
     {
+        if (rule.ValueColumns is null && hashColumns.Count < columns.Count
+            && FindKeyWithDifferentAddedColumns(connection, table, rule, columns, hashColumns) is { } differing)
+        {
+            // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
+            // 古い列だけで比べると、手元で変えた新しい列の値を同期先の値で上書きしうる。
+            report.AbortReason = $"テーブル {table} の新しい列の値が同期先と手元で違い (キー {differing})、どちらの変更か判断できないため自動マージを中止しました";
+            return null;
+        }
+
         var local = ReadKeyedRows(connection, Local, table, rule, hashColumns);
         var host = ReadKeyedRows(connection, "main", table, rule, hashColumns);
         var ancestor = baseline is { Kind: MergeTableKind.Keyed, Rows: { } rows }
@@ -410,6 +437,24 @@ public static class SqliteMerger
         }
 
         return new TableMergeReport(table, inserted, updated, deleted, false, created);
+    }
+
+    /// <summary>
+    /// 祖先の要約の後に増えた列だけを比べ、手元と同期先の両方にあって値が違うキーを
+    /// 1 つ返す。無ければ null。
+    /// </summary>
+    private static string? FindKeyWithDifferentAddedColumns(
+        SqliteConnection connection, string table, MergeTableRule rule,
+        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns)
+    {
+        var added = columns.Where(c => !hashColumns.Contains(c, StringComparer.Ordinal)).ToList();
+        var local = ReadKeyedRows(connection, Local, table, rule, added);
+        var host = ReadKeyedRows(connection, "main", table, rule, added);
+        foreach (var (key, mine) in local)
+        {
+            if (host.TryGetValue(key, out var theirs) && mine.Hash != theirs.Hash) return key;
+        }
+        return null;
     }
 
     /// <summary>両方が別々に変えたキーで、手元の内容を採るかを決める。</summary>

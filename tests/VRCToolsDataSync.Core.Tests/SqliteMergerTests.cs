@@ -110,8 +110,8 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name LIKE 'vrctds_%'"));
     }
 
-    [Fact(DisplayName = "手元で末尾の行を消して rowid が再利用されても、足した行を取りこぼさない")]
-    public void AppendOnlyHandlesReusedRowId()
+    [Fact(DisplayName = "手元で末尾の履歴を消して rowid が再利用されたら、消した行を戻さずに中止する")]
+    public void AppendOnlyAbortsOnReusedRowId()
     {
         var (host, local, baseline) = Arrange();
         Exec(local, """
@@ -119,11 +119,26 @@ public sealed class SqliteMergerTests : IDisposable
             INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1');
             """);
 
-        Merge(host, local, baseline);
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
 
-        Assert.Equal(
-            new[] { "wrld_a:1", "wrld_local:1" },
-            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+        Assert.False(report.Succeeded);
+        Assert.Contains("gamelog_location", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "手元で途中の履歴を消していたら、消した行を戻さずに中止する")]
+    public void AppendOnlyAbortsOnLocalDeletion()
+    {
+        var (host, local, _) = Arrange();
+        const string add = "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_b:1')";
+        Exec(host, add);
+        Exec(local, add);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        Exec(local, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("gamelog_location", report.AbortReason);
     }
 
     [Fact(DisplayName = "両方に同じ出来事があれば、二重にしない")]
@@ -364,6 +379,21 @@ public sealed class SqliteMergerTests : IDisposable
         // 手元の削除が「編集と削除の競合」として取り消される。
         Assert.Empty(report.Conflicts);
         Assert.DoesNotContain("usr_d|d0", Rows(host, "SELECT user_id, memo FROM memos"));
+    }
+
+    [Fact(DisplayName = "前回の同期の後に増えた列の値が両方で違えば、上書きせずに中止する")]
+    public void AbortsWhenAddedColumnDiffers()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE memos ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(local, "UPDATE memos SET extra = 'x' WHERE user_id = 'usr_a'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("memos", report.AbortReason);
     }
 
     [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]

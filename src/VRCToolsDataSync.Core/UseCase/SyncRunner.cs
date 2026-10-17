@@ -308,7 +308,16 @@ public sealed class SyncRunner
                 _logger.LogInformation("マージ後の Push が競合しました。やり直します ({Attempt}/{Max})", attempt, MaxMergeAttempts);
                 last = pushed;
             }
-            return (last!, true);
+            // 送り直しが上限まで競合した。ローカルは既にマージ結果で置き換えているので、
+            // 操作前の状態を戻せるよう、最初のバックアップを結果に残す。
+            return (new SyncResult
+            {
+                Outcome = last!.Outcome,
+                RemoteVersion = last.RemoteVersion,
+                BackupPath = firstBackupPath,
+                AffectedFiles = last.AffectedFiles,
+                Message = last.Message,
+            }, true);
         }
     }
 
