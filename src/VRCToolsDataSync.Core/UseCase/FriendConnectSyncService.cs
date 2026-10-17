@@ -13,6 +13,7 @@ public sealed class FriendConnectSyncService : ISyncService
     private const string DbV11Key = "friend-connect/db/db_1.1.sqlite";
     private const string ConfigKey = "friend-connect/config.json";
     private const string NotesKeyPrefix = "friend-connect/notes/";
+    private const string ThumbnailsKeyPrefix = "friend-connect/thumbnails/";
 
     private readonly FriendConnectPaths _paths;
     private readonly LocalBackup _backup;
@@ -28,18 +29,32 @@ public sealed class FriendConnectSyncService : ISyncService
         _paths = paths ?? FriendConnectPaths.Default();
         _backup = backup ?? new LocalBackup();
         _logger = logger ?? NullLogger<FriendConnectSyncService>.Instance;
+        _directories = new[]
+        {
+            new SyncedDirectory(_paths.NotesDirectory, NotesKeyPrefix),
+            new SyncedDirectory(_paths.ThumbnailsDirectory, ThumbnailsKeyPrefix),
+        };
     }
+
+    /// <summary>
+    /// フォルダごと同期するもの。中のファイルを 1 件ずつ manifest に載せる。
+    /// </summary>
+    private sealed record SyncedDirectory(string LocalDirectory, string KeyPrefix);
+
+    private readonly IReadOnlyList<SyncedDirectory> _directories;
 
     public SyncResult Push(PushOptions options)
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
 
-        if (!_paths.Exists() || !File.Exists(_paths.DbFile))
+        // 必須にするのは現行の本体 DB だけ。旧版の db.sqlite は古くから使っている PC に
+        // しか無いので、これを必須にすると新しく入れた PC から Push できない。
+        if (!_paths.Exists() || !File.Exists(_paths.DbV11File))
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.SourceMissing,
-                Message = $"VRC Friend Connect のデータが見つかりません: {_paths.DbFile}",
+                Message = $"VRC Friend Connect のデータが見つかりません: {_paths.DbV11File}",
             };
         }
 
@@ -72,11 +87,11 @@ public sealed class FriendConnectSyncService : ISyncService
         var files = new List<ManifestFile>();
         var affected = new List<string>();
 
-        files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace));
+        files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace));
 
-        if (File.Exists(_paths.DbV11File))
+        if (File.Exists(_paths.DbFile))
         {
-            files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace));
+            files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace));
         }
         // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
         // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
@@ -97,8 +112,10 @@ public sealed class FriendConnectSyncService : ISyncService
             files.Add(config);
         }
 
-        var noteFiles = PushNotes(storage, remoteFiles, affected, replace);
-        files.AddRange(noteFiles);
+        foreach (var directory in _directories)
+        {
+            files.AddRange(PushDirectory(storage, directory, remoteFiles, affected, replace));
+        }
 
         // 非常用の強制 Push では、内容が同じでも version を進める。他の PC が壊れた実体を
         // 取りに行って失敗した後でも、新しい version を見れば取り直しに来る。
@@ -190,15 +207,20 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
+        var remoteFiles = entry.Files.ToDictionary(f => f.RelativePath, StringComparer.Ordinal);
+        remoteFiles.TryGetValue(DbV11Key, out var remoteDbV11);
+        remoteFiles.TryGetValue(DbKey, out var remoteDb);
+
         // Issue #19: 起動時自動 Pull の暴走防止。VRCX 側と同じ判定。
-        // ローカル必須ファイル (db.sqlite) が消えているケースでは skip せず
-        // 通常 Pull に進めて復元する (#20 レビュー指摘)。Push 側のガードと同じく
-        // _paths.Exists() (Root のみ) では不十分なので DbFile の存在もチェック。
+        // 同期先にある DB がローカルで消えているケースでは skip せず
+        // 通常 Pull に進めて復元する (#20 レビュー指摘)。_paths.Exists() は
+        // Root しか見ないので、DB ファイルの存在も確かめる。
         if (options.SkipIfNotNewer
             && options.LastPulledVersion is long lastPulled
             && entry.Version <= lastPulled
             && _paths.Exists()
-            && File.Exists(_paths.DbFile))
+            && (remoteDbV11 is null || File.Exists(_paths.DbV11File))
+            && (remoteDb is null || File.Exists(_paths.DbFile)))
         {
             _logger.LogInformation(
                 "Friend Connect Pull スキップ: ローカルが最新 (remote={Remote}, lastPulled={LastPulled})",
@@ -212,13 +234,15 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        var remoteFiles = entry.Files.ToDictionary(f => f.RelativePath, StringComparer.Ordinal);
-        if (!remoteFiles.TryGetValue(DbKey, out var remoteDb))
+        // どちらの DB も任意として扱い、少なくとも片方があることだけを求める。
+        // 以前の版は旧版の db.sqlite を必ず載せていたので、その版が書いた manifest には
+        // db_1.1.sqlite が無いことがある。逆に今の版は db.sqlite の無い PC からも Push する。
+        if (remoteDbV11 is null && remoteDb is null)
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {DbKey}",
+                Message = $"クラウド側にスナップショットがありません: {DbV11Key}",
             };
         }
 
@@ -229,27 +253,22 @@ public sealed class FriendConnectSyncService : ISyncService
         //     途中で失敗しても手元のデータは元のまま残る。
         using var staging = new PullStaging(_logger);
 
-        if (!staging.Fetch(storage, remoteDb, _paths.DbFile))
-        {
-            return new SyncResult
-            {
-                Outcome = SyncOutcome.SourceMissing,
-                Message = $"クラウド側にスナップショットがありません: {DbKey}",
-            };
-        }
-
-        remoteFiles.TryGetValue(DbV11Key, out var remoteDbV11);
         remoteFiles.TryGetValue(ConfigKey, out var remoteConfig);
-        var remoteNotes = entry.Files
-            .Where(f => f.RelativePath.StartsWith(NotesKeyPrefix, StringComparison.Ordinal))
-            .ToList();
+        var remoteDirectoryFiles = _directories.ToDictionary(
+            d => d,
+            d => entry.Files
+                .Where(f => f.RelativePath.StartsWith(d.KeyPrefix, StringComparison.Ordinal))
+                .ToList());
 
         // manifest が要求するファイルはすべて揃わなければ Pull を成功にしない。
         // 欠けたまま成功にすると LastPulledVersion だけ進み、以後の起動時 Pull は
         // この version を最新とみなして省略するため、差異が固定される。
         var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File)
+            ?? FetchOptional(staging, storage, remoteDb, _paths.DbFile)
             ?? FetchOptional(staging, storage, remoteConfig, _paths.ConfigJsonFile)
-            ?? FetchNotes(staging, storage, remoteNotes);
+            ?? _directories
+                .Select(d => FetchDirectory(staging, storage, d, remoteDirectoryFiles[d]))
+                .FirstOrDefault(key => key is not null);
         if (missing is not null)
         {
             return new SyncResult
@@ -288,10 +307,12 @@ public sealed class FriendConnectSyncService : ISyncService
                 Path.Combine(_paths.DbDirectory, "db_1.1.sqlite-shm"),
             };
 
-            var dirsToBackup = new List<string>();
-            if (Directory.Exists(_paths.NotesDirectory)) dirsToBackup.Add(_paths.NotesDirectory);
+            var dirsToBackup = _directories
+                .Select(d => d.LocalDirectory)
+                .Where(Directory.Exists)
+                .ToList();
 
-            // notes の退避からは取り出し中のファイルを外す。バックアップは
+            // notes や thumbnails の退避からは取り出し中のファイルを外す。バックアップは
             // 取り出しの後に取るので、除外しないとリモート版の複製が一時名のまま
             // 毎回混ざり、その世代を復元すると実データとして残ってしまう。
             backupPath = _backup.CreateSnapshot(
@@ -308,7 +329,8 @@ public sealed class FriendConnectSyncService : ISyncService
         // 起動時の自動 Pull (SkipIfNotNewer) では消さない。差し替えるものが無いのに
         // 未反映のローカル変更を捨てることになるため。
         var explicitPull = !options.SkipIfNotNewer;
-        if (staging.IsStaged(_paths.DbFile) || explicitPull)
+        // 旧版の db.sqlite も、リモートから消えた場合に本体だけ削除する経路がある。
+        if (staging.IsStaged(_paths.DbFile) || explicitPull || remoteDb is null)
         {
             DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
             DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
@@ -332,11 +354,18 @@ public sealed class FriendConnectSyncService : ISyncService
         {
             File.Delete(_paths.DbV11File);
         }
+        if (remoteDb is null && File.Exists(_paths.DbFile))
+        {
+            File.Delete(_paths.DbFile);
+        }
         if (remoteConfig is null && File.Exists(_paths.ConfigJsonFile))
         {
             File.Delete(_paths.ConfigJsonFile);
         }
-        RemoveStaleNotes(remoteNotes);
+        foreach (var directory in _directories)
+        {
+            RemoveStaleFiles(directory, remoteDirectoryFiles[directory]);
+        }
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
             entry.Version, backupPath ?? "(none)");
@@ -374,27 +403,28 @@ public sealed class FriendConnectSyncService : ISyncService
     }
 
     /// <summary>
-    /// notes フォルダを送る。ローカルから消えたファイルは、ここで作る一覧に
-    /// 載らないことで「無い」ことを表す。実データの回収は
-    /// <see cref="Storage.BlobGarbageCollector"/> に任せる。
+    /// フォルダ (notes, thumbnails) を送る。ローカルから消えたファイルは、ここで作る
+    /// 一覧に載らないことで「無い」ことを表す。実データの回収は
+    /// <see cref="BlobGarbageCollector"/> に任せる。
     /// </summary>
-    private List<ManifestFile> PushNotes(
+    private List<ManifestFile> PushDirectory(
         ISyncStorage storage,
+        SyncedDirectory directory,
         IReadOnlyList<ManifestFile> remoteFiles,
         List<string> affected,
         bool replace)
     {
         var files = new List<ManifestFile>();
 
-        if (Directory.Exists(_paths.NotesDirectory))
+        if (Directory.Exists(directory.LocalDirectory))
         {
-            foreach (var localPath in Directory.EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories))
+            foreach (var localPath in Directory.EnumerateFiles(directory.LocalDirectory, "*", SearchOption.AllDirectories))
             {
                 // 中断した Pull が残した取り出し中のファイルは同期対象ではない。
                 if (PullStaging.IsIncomingFile(localPath)) continue;
                 var relative = StorageKey.FromRelativePath(
-                    Path.GetRelativePath(_paths.NotesDirectory, localPath));
-                var key = NotesKeyPrefix + relative;
+                    Path.GetRelativePath(directory.LocalDirectory, localPath));
+                var key = directory.KeyPrefix + relative;
                 var (described, sent) = SyncTransfer.Send(storage, remoteFiles, localPath, key, replace);
                 if (sent)
                 {
@@ -425,43 +455,47 @@ public sealed class FriendConnectSyncService : ISyncService
         return staging.Fetch(storage, remote, targetPath) ? null : remote.RelativePath;
     }
 
-    /// <summary>notes を取り出す。見つからないキーがあればその名前を返す。</summary>
-    private string? FetchNotes(PullStaging staging, ISyncStorage storage, IReadOnlyList<ManifestFile> notes)
+    /// <summary>フォルダの中身を取り出す。見つからないキーがあればその名前を返す。</summary>
+    private static string? FetchDirectory(
+        PullStaging staging,
+        ISyncStorage storage,
+        SyncedDirectory directory,
+        IReadOnlyList<ManifestFile> files)
     {
-        if (notes.Count == 0) return null;
+        if (files.Count == 0) return null;
 
-        Directory.CreateDirectory(_paths.NotesDirectory);
-        foreach (var note in notes)
+        Directory.CreateDirectory(directory.LocalDirectory);
+        foreach (var file in files)
         {
-            if (!staging.Fetch(storage, note, ToLocalNotePath(note))) return note.RelativePath;
+            if (!staging.Fetch(storage, file, ToLocalPath(directory, file))) return file.RelativePath;
         }
         return null;
     }
 
-    /// <summary>リモートから消えた note をローカルからも取り除く。</summary>
-    private void RemoveStaleNotes(IReadOnlyList<ManifestFile> notes)
+    /// <summary>リモートから消えたファイルをローカルのフォルダからも取り除く。</summary>
+    private static void RemoveStaleFiles(SyncedDirectory directory, IReadOnlyList<ManifestFile> files)
     {
-        if (notes.Count == 0)
+        if (files.Count == 0)
         {
-            if (Directory.Exists(_paths.NotesDirectory))
+            if (Directory.Exists(directory.LocalDirectory))
             {
-                Directory.Delete(_paths.NotesDirectory, recursive: true);
+                Directory.Delete(directory.LocalDirectory, recursive: true);
             }
             return;
         }
 
-        if (!Directory.Exists(_paths.NotesDirectory)) return;
+        if (!Directory.Exists(directory.LocalDirectory)) return;
 
         var keep = new HashSet<string>(
-            notes.Select(n => Path.GetFullPath(ToLocalNotePath(n))),
+            files.Select(f => Path.GetFullPath(ToLocalPath(directory, f))),
             StringComparer.OrdinalIgnoreCase);
 
-        // 握りつぶすと次の Push で古い note が manifest に再登録されてしまう。
+        // 握りつぶすと次の Push で古いファイルが manifest に再登録されてしまう。
         // 列挙しながら削除すると取りこぼしうるので、先に一覧を確定させる。
-        var localNotes = Directory
-            .EnumerateFiles(_paths.NotesDirectory, "*", SearchOption.AllDirectories)
+        var localFiles = Directory
+            .EnumerateFiles(directory.LocalDirectory, "*", SearchOption.AllDirectories)
             .ToList();
-        foreach (var localPath in localNotes)
+        foreach (var localPath in localFiles)
         {
             if (keep.Contains(Path.GetFullPath(localPath))) continue;
             File.Delete(localPath);
@@ -469,12 +503,12 @@ public sealed class FriendConnectSyncService : ISyncService
     }
 
     /// <summary>
-    /// note のキーをローカルパスへ写す。manifest は他 PC が書いたものなので、
+    /// フォルダ内のファイルのキーをローカルパスへ写す。manifest は他 PC が書いたものなので、
     /// <see cref="StorageKey.ToLocalPath"/> がキーの形を検証し、
-    /// notes フォルダの外へ書き出させない。
+    /// 対象フォルダの外へ書き出させない。
     /// </summary>
-    private string ToLocalNotePath(ManifestFile note)
-        => StorageKey.ToLocalPath(_paths.NotesDirectory, note.RelativePath[NotesKeyPrefix.Length..]);
+    private static string ToLocalPath(SyncedDirectory directory, ManifestFile file)
+        => StorageKey.ToLocalPath(directory.LocalDirectory, file.RelativePath[directory.KeyPrefix.Length..]);
 
     private static void DeleteIfExists(string dir, string fileName)
     {

@@ -45,9 +45,21 @@ public sealed class FriendConnectPaths
 {
     public string RootDirectory { get; }
     public string DbDirectory => Path.Combine(RootDirectory, "db");
+
+    /// <summary>
+    /// 旧版の DB。v1.1 より前の Friend Connect が使っていたもので、現行版は書き込まない。
+    /// 古くから使っている PC にだけ残っているので、同期では任意のファイルとして扱う。
+    /// </summary>
     public string DbFile => Path.Combine(DbDirectory, "db.sqlite");
+
+    /// <summary>現行の Friend Connect が使っている本体 DB。同期に必須。</summary>
     public string DbV11File => Path.Combine(DbDirectory, "db_1.1.sqlite");
+
     public string NotesDirectory => Path.Combine(RootDirectory, "notes");
+
+    /// <summary>写真のサムネイル。DB の写真の記録と対応している。</summary>
+    public string ThumbnailsDirectory => Path.Combine(RootDirectory, "thumbnails");
+
     public string ConfigJsonFile => Path.Combine(RootDirectory, "config.json");
 
     public FriendConnectPaths(string rootDirectory)
@@ -65,31 +77,22 @@ public sealed class FriendConnectPaths
 
     public bool Exists() => Directory.Exists(RootDirectory);
 
-    // VRC Friend Connect は Steam 配布のため、Steam ライブラリ配下を探す。
-    // - 既定: C:\Program Files (x86)\Steam\steamapps\common\VRC Friend Connect
-    // - libraryfolders.vdf を解析して追加ライブラリも見るのは将来の課題。
-    //   現状はユーザに「実行ファイルを選択」させる UI を出す前提なので、
-    //   既定のパスだけ試して見つからなければ null を返す。
+    // 実行ファイルの既知の置き場所を順に試す。見つからなければ null を返し、
+    // GUI 側で「実行ファイルを選択」に誘導する (VRCX と同じ考え方)。
+    // - インストーラ版: %LocalAppData%\Programs\vrc-friend-connect\VRC Friend Connect.exe
+    //   BOOTH で配布されているのはこの形で、実機でもここに入っていた。
+    // - Steam 配下: 以前はここを前提にしていた。配信を確認できていないが、
+    //   探しても害は無いので候補に残す。追加ライブラリ (libraryfolders.vdf) は見ない。
     // 実行ファイル名候補は ProcessGuard.FriendConnectProcessNames と揃える。
     public static string? TryFindExecutable()
     {
-        var steamRoots = new[]
-        {
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                "Steam"),
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                "Steam"),
-        };
         var exeNames = new[] { "VRC Friend Connect.exe", "VRCFriendConnect.exe" };
-        foreach (var steam in steamRoots)
+        foreach (var dir in CandidateInstallDirectories())
         {
-            if (string.IsNullOrEmpty(steam)) continue;
-            var commonDir = Path.Combine(steam, "steamapps", "common", "VRC Friend Connect");
+            if (string.IsNullOrEmpty(dir)) continue;
             foreach (var exe in exeNames)
             {
-                var full = Path.Combine(commonDir, exe);
+                var full = Path.Combine(dir, exe);
                 if (File.Exists(full))
                 {
                     return Path.GetFullPath(full);
@@ -97,5 +100,23 @@ public sealed class FriendConnectPaths
             }
         }
         return null;
+    }
+
+    private static IEnumerable<string> CandidateInstallDirectories()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrEmpty(localAppData))
+        {
+            yield return Path.Combine(localAppData, "Programs", "vrc-friend-connect");
+        }
+        foreach (var programFiles in new[]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+        })
+        {
+            if (string.IsNullOrEmpty(programFiles)) continue;
+            yield return Path.Combine(programFiles, "Steam", "steamapps", "common", "VRC Friend Connect");
+        }
     }
 }

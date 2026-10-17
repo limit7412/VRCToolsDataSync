@@ -7,7 +7,11 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
 
 - **同期対象**
   - **VRCX**: `%AppData%\VRCX\VRCX.sqlite3` と `VRCX.json`
-  - **VRC Friend Connect**: `%AppData%\VRC Friend Connect\db\` の `db.sqlite` / `db_1.1.sqlite` と、ルート直下の `config.json`、存在する場合は `notes\`
+  - **VRC Friend Connect**: `%AppData%\VRC Friend Connect\` の次のファイル
+    - `db\db_1.1.sqlite`（現行版の本体 DB。必須）
+    - `db\db.sqlite`（v1.1 より前の版が使っていた DB。古くから使っている PC にだけあり、ある場合だけ同期する）
+    - `config.json`（ライセンスキーと各種トークンを含む。同期先に置かれる点に注意）
+    - `thumbnails\`（写真のサムネイル）と、存在する場合は `notes\`
 - **保存先**: ローカル同期フォルダ（パスはユーザーが手動指定）または S3 互換オブジェクトストレージ
 - **マージ戦略**: last-writer-wins。Pull 前にローカルを `%AppData%\VRCToolsDataSync\backup\<tool>\<timestamp>\` へ自動退避（既定10世代）
 - **転送の省略**: manifest に記録した SHA-256 と手元のファイルが一致する場合、送信も取得も行わない
@@ -125,7 +129,7 @@ GUI では各ツールのカードの「非常用の強制 Push...」から実�
 本ツールは [VRCX](https://github.com/vrcx-team/VRCX)（vrcx-team, MIT License）および VRC Friend Connect（たぴおかシステムズ, クローズドソース）の作者・開発元と一切の提携・支援関係はありません。
 
 - 本ツールは VRCX および VRC Friend Connect の本体コードやバイナリを再配布しません。ユーザーのローカル PC 上に存在する各アプリのデータファイル（SQLite / JSON / メモ）をコピー・スナップショット化し、ユーザーが指定した保存先（ローカル同期フォルダまたは S3 互換オブジェクトストレージ）経由で別 PC に反映するのみです。
-- 本ツールは VRC Friend Connect のスキーマ解析・改変・リバースエンジニアリングを行いません。`VACUUM INTO` を含む SQLite 操作はファイル単位の取り扱いに留まります。
+- 本ツールは VRC Friend Connect の実行ファイルや通信の解析（リバースエンジニアリング）を行いません。DB は SQLite ファイルとして扱い、中身を読み取る場合は先にスキーマの版を確かめ、本ツールが対応を確認した版に限ります。DB への書き込みは行わず、`VACUUM INTO` による写しの作成とファイル単位の差し替えに留めます。
 - VRCX および VRC Friend Connect 各々の利用規約遵守はユーザー自身の責任です。
 
 ## ライセンス
