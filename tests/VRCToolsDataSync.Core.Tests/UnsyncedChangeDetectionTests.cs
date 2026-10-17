@@ -268,6 +268,22 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         return (long)command.ExecuteScalar()!;
     }
 
+    [Fact(DisplayName = "競合した Push をマージできなければ、元の競合として返す")]
+    public void ConflictingPushReturnsConflictWhenMergeAborts()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        b.Settings.MergeVrcx = true;
+        // 手元だけ列が違うので、マージは中止になる。
+        Exec(b.Paths.SqliteFile, "ALTER TABLE memos ADD COLUMN extra TEXT");
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = Push(b);
+
+        Assert.Equal(SyncOutcome.ConflictDetected, result.Outcome);
+        Assert.Contains("自動マージはできませんでした", result.Message);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+    }
+
     [Fact(DisplayName = "マージが無効なら、Push の競合はこれまでどおり利用者に返す")]
     public void ConflictingPushWithoutMerge()
     {

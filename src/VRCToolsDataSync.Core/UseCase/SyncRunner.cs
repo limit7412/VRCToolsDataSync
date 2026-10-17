@@ -59,20 +59,39 @@ public sealed class SyncRunner
         bool force,
         bool reuploadAll = false)
     {
-        var result = PushOnce(service, settings, storage, force, reuploadAll);
-
-        // リモートの方が新しくて止まった Push は、マージが有効ならマージしてから送り直す。
-        // 強制 Push は利用者が上書きを選んだ操作なので、マージに回さない。
-        if (result.Outcome == SyncOutcome.ConflictDetected
-            && !force
-            && !reuploadAll
-            && settings.IsMergeEnabled(service.ToolKey)
-            && service is IMergeableSyncService mergeable)
+        // 競合からのマージと送り直しが終わるまで、他の Push を待たせる。マージは
+        // ローカルの DB と同期履歴を書き換えるので、並んで走ると互いの途中の結果を
+        // 土台にしてしまう。lock は同じスレッドからなら入り直せる。
+        lock (PushLock)
         {
-            _logger.LogInformation("Push が競合したのでマージします ({Tool})", service.ToolKey);
-            return Merge(mergeable, settings, storage);
+            var result = PushOnce(service, settings, storage, force, reuploadAll);
+
+            // リモートの方が新しくて止まった Push は、マージが有効ならマージしてから送り直す。
+            // 強制 Push は利用者が上書きを選んだ操作なので、マージに回さない。
+            if (result.Outcome == SyncOutcome.ConflictDetected
+                && !force
+                && !reuploadAll
+                && settings.IsMergeEnabled(service.ToolKey)
+                && service is IMergeableSyncService mergeable)
+            {
+                _logger.LogInformation("Push が競合したのでマージします ({Tool})", service.ToolKey);
+                var (merged, localReplaced) = MergeCore(mergeable, settings, storage, skipBackup: false, dryRun: false);
+                if (!localReplaced)
+                {
+                    // マージできなかった (列の食い違いなど)。ローカルは元のままなので、
+                    // 利用者が Pull か強制 Push を選べるよう、元の競合として返す。
+                    return new SyncResult
+                    {
+                        Outcome = SyncOutcome.ConflictDetected,
+                        RemoteVersion = result.RemoteVersion,
+                        AffectedFiles = result.AffectedFiles,
+                        Message = $"{result.Message} (自動マージはできませんでした: {merged.Message})",
+                    };
+                }
+                return merged;
+            }
+            return result;
         }
-        return result;
     }
 
     private SyncResult PushOnce(
@@ -170,11 +189,12 @@ public sealed class SyncRunner
     /// 負けた場合は、新しい同期先を土台にマージからやり直す。
     /// </para>
     /// <para>
-    /// マージの後、Push の前に、<see cref="ToolSyncState.LastPulledVersion"/> を土台に
+    /// ローカルを置き換える直前に、<see cref="ToolSyncState.LastPulledVersion"/> を土台に
     /// した版まで進め、祖先の要約もその版の要約に置き換える。ローカルはその版に手元の
-    /// 変更を足したものなので、この組が正しい基準になる。Push が失敗しても (例外を
-    /// 含む)、次の Push はそのまま手元の変更を送れる。他の PC が先に Push していれば、
-    /// やり直しや次の起動時の Pull は、この版を祖先にして手元の変更だけを足し直す。
+    /// 変更を足したものになるので、この組が正しい基準になる。置き換えに失敗したら
+    /// 両方を元に戻す。Push が失敗しても (例外を含む)、次の Push はそのまま手元の変更を
+    /// 送れる。他の PC が先に Push していれば、やり直しや次の起動時の Pull は、この版を
+    /// 祖先にして手元の変更だけを足し直す。
     /// </para>
     /// </summary>
     /// <param name="dryRun">true なら結果を数えるだけで、ローカルにも同期先にも書かない。</param>
@@ -184,64 +204,108 @@ public sealed class SyncRunner
         ISyncStorage storage,
         bool skipBackup = false,
         bool dryRun = false)
+        => MergeCore(service, settings, storage, skipBackup, dryRun).Result;
+
+    /// <returns>結果と、ローカルをマージ結果で置き換えたか。</returns>
+    private (SyncResult Result, bool LocalReplaced) MergeCore(
+        IMergeableSyncService service,
+        SyncSettings settings,
+        ISyncStorage storage,
+        bool skipBackup,
+        bool dryRun)
     {
-        SyncResult? last = null;
-        for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)
+        lock (PushLock)
         {
-            var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
-            var baseline = _baseSummaries.Load(stateKey);
-            if (baseline is not null && baseline.RemoteVersion != state.LastPulledVersion)
+            SyncResult? last = null;
+            string? firstBackupPath = null;
+            for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)
             {
+                var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
+                var previousBaseline = _baseSummaries.Load(stateKey);
+                var previousPulledVersion = state.LastPulledVersion;
+                var previousPulledAt = state.LastPulledAt;
                 // 同期履歴と別の時点の要約は祖先に使えない。祖先なしの 2-way にする。
-                baseline = null;
-            }
-            var merged = service.PullMerge(new PullMergeOptions
-            {
-                Storage = storage,
-                Baseline = baseline,
-                DryRun = dryRun,
-                SkipBackup = skipBackup,
-            });
-            if (dryRun || merged.Outcome != SyncOutcome.Success || !merged.RemoteVersion.HasValue)
-            {
-                return merged;
-            }
+                var baseline = previousBaseline?.RemoteVersion == previousPulledVersion ? previousBaseline : null;
 
-            // ローカルは土台にした版に手元の変更を足したものになった。祖先の要約を先に
-            // その版のものへ替え、続けて同期履歴もその版まで進める。要約を先にするのは、
-            // 間で止まったときに、古い要約と新しい同期履歴の組み合わせを残さないため。
-            if (merged.MergeReport?.HostBaseline is { } hostBaseline)
-            {
-                _baseSummaries.Save(stateKey, hostBaseline);
-            }
-            else
-            {
-                _baseSummaries.Delete(stateKey);
-            }
-            state.LastPulledVersion = merged.RemoteVersion.Value;
-            state.LastPulledAt = DateTimeOffset.Now;
-            settings.ToolState[stateKey] = state;
-            _store.SaveToolStateOnly(settings);
-
-            var pushed = PushOnce(service, settings, storage, force: false, reuploadAll: false);
-            if (pushed.Outcome != SyncOutcome.ConflictDetected)
-            {
-                return new SyncResult
+                var committed = false;
+                SyncResult merged;
+                try
                 {
-                    Outcome = pushed.Outcome,
-                    RemoteVersion = pushed.RemoteVersion,
-                    BackupPath = merged.BackupPath,
-                    MergeReport = merged.MergeReport,
-                    AffectedFiles = pushed.AffectedFiles,
-                    Message = pushed.Outcome == SyncOutcome.Success
-                        ? merged.Message
-                        : $"{merged.Message}。ただし Push に失敗しました: {pushed.Message}",
-                };
+                    merged = service.PullMerge(new PullMergeOptions
+                    {
+                        Storage = storage,
+                        Baseline = baseline,
+                        DryRun = dryRun,
+                        // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
+                        SkipBackup = skipBackup || attempt > 1,
+                        BeforeReplaceLocal = (remoteVersion, hostBaseline) =>
+                        {
+                            // 置き換えた後のローカルは、土台にした版に手元の変更を足したもの
+                            // になる。祖先の要約と同期履歴を、置き換えの前にその版へそろえる。
+                            committed = true;
+                            if (hostBaseline is null) _baseSummaries.Delete(stateKey);
+                            else _baseSummaries.Save(stateKey, hostBaseline);
+                            state.LastPulledVersion = remoteVersion;
+                            state.LastPulledAt = DateTimeOffset.Now;
+                            settings.ToolState[stateKey] = state;
+                            _store.SaveToolStateOnly(settings);
+                        },
+                    });
+                }
+                catch
+                {
+                    // そろえた後でローカルを置き換えられなかった。ローカルは元のままなので、
+                    // 祖先の要約と同期履歴も元へ戻す。
+                    if (committed)
+                    {
+                        RestoreBaseline(stateKey, previousBaseline);
+                        state.LastPulledVersion = previousPulledVersion;
+                        state.LastPulledAt = previousPulledAt;
+                        settings.ToolState[stateKey] = state;
+                        _store.SaveToolStateOnly(settings);
+                    }
+                    throw;
+                }
+                if (dryRun || merged.Outcome != SyncOutcome.Success || !merged.RemoteVersion.HasValue)
+                {
+                    return (merged, attempt > 1);
+                }
+                firstBackupPath ??= merged.BackupPath;
+
+                var pushed = PushOnce(service, settings, storage, force: false, reuploadAll: false);
+                if (pushed.Outcome != SyncOutcome.ConflictDetected)
+                {
+                    return (new SyncResult
+                    {
+                        Outcome = pushed.Outcome,
+                        RemoteVersion = pushed.RemoteVersion,
+                        BackupPath = firstBackupPath,
+                        MergeReport = merged.MergeReport,
+                        AffectedFiles = pushed.AffectedFiles,
+                        Message = pushed.Outcome == SyncOutcome.Success
+                            ? merged.Message
+                            : $"{merged.Message}。ただし Push に失敗しました: {pushed.Message}",
+                    }, true);
+                }
+                _logger.LogInformation("マージ後の Push が競合しました。やり直します ({Attempt}/{Max})", attempt, MaxMergeAttempts);
+                last = pushed;
             }
-            _logger.LogInformation("マージ後の Push が競合しました。やり直します ({Attempt}/{Max})", attempt, MaxMergeAttempts);
-            last = pushed;
+            return (last!, true);
         }
-        return last!;
+    }
+
+    private void RestoreBaseline(string stateKey, DatabaseSummary? previous)
+    {
+        try
+        {
+            if (previous is null) _baseSummaries.Delete(stateKey);
+            else _baseSummaries.Save(stateKey, previous);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "祖先の要約を元に戻せませんでした。次の同期で取り直します");
+            try { _baseSummaries.Delete(stateKey); } catch { /* 次の同期で取り直す */ }
+        }
     }
 
     /// <summary>

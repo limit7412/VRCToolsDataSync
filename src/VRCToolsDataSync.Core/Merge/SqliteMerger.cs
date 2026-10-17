@@ -206,7 +206,13 @@ public static class SqliteMerger
         // 変えていない行まで編集されたように見えるため。列が減ったなど古い列で
         // 求められない場合は、祖先なしで合わせる。
         var hashColumns = localColumns;
-        if (baseline is not null)
+        if (created)
+        {
+            // 同期先に無くて作ったテーブルは空なので、祖先と比べると手元で変えていない
+            // 行が足されない。祖先なしで手元の全行を写す。
+            baseline = null;
+        }
+        else if (baseline is not null)
         {
             if (baseline.Columns is null
                 || !baseline.Columns.All(c => localColumns.Contains(c, StringComparer.Ordinal)))
@@ -238,8 +244,7 @@ public static class SqliteMerger
         var source = $"{Local}.{Quote(table)}";
         var rowIdAlias = FindRowIdAlias(connection, table);
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
-        // 同期先に無くて作ったテーブルは空なので、手元の全行を候補にする。
-        var sinceRowId = !created && baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
+        var sinceRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
         if (sinceRowId > 0
             && !string.Equals(
                 HashRowKey(connection, Local, table, rule.KeyColumns, sinceRowId),

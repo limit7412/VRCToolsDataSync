@@ -37,6 +37,13 @@ public sealed class PullMergeOptions
     public bool DryRun { get; init; }
 
     public bool SkipBackup { get; init; }
+
+    /// <summary>
+    /// マージが済み、ローカルを置き換える直前に呼ぶ。引数は土台にした同期先の version と、
+    /// その版の要約 (取れなければ null)。呼び出し側は、置き換えた後のローカルに合う
+    /// 同期履歴と祖先の要約を、ここで先に保存する。例外を投げればローカルは置き換えない。
+    /// </summary>
+    public Action<long, DatabaseSummary?>? BeforeReplaceLocal { get; init; }
 }
 
 public sealed class PushOptions

@@ -445,6 +445,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
                 backupPath = _backup.CreateSnapshot(Key, filesToBackup);
             }
+            options.BeforeReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
             DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
             DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
             AtomicFile.Copy(hostPath, _paths.SqliteFile);

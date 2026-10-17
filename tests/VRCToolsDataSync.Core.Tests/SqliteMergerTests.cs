@@ -307,6 +307,21 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.DoesNotContain("usr_d|d0", Rows(host, "SELECT user_id, memo FROM memos"));
     }
 
+    [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
+    public void CreatedKeyedTableCopiesAllRows()
+    {
+        var (host, local, _) = Arrange();
+        Exec(local, """
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 0), ('avtr_b', '2026-10-01T00:00:00Z', 0);
+            """);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(2, Rows(host, "SELECT avatar_id FROM usr0123abcd_avatar_history").Count);
+    }
+
     [Fact(DisplayName = "列が食い違えば中止し、同期先の写しには何も書かない")]
     public void AbortsOnColumnMismatch()
     {
