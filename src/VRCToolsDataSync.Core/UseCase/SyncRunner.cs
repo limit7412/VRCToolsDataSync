@@ -286,7 +286,9 @@ public sealed class SyncRunner
                 }
                 if (dryRun || merged.Outcome != SyncOutcome.Success || !merged.RemoteVersion.HasValue)
                 {
-                    return (merged, attempt > 1);
+                    // 2 周目以降はバックアップを取らないが、ローカルは 1 周目で置き換えて
+                    // いる。操作前の状態を戻せるよう、最初のバックアップを結果に残す。
+                    return (WithBackupPath(merged, firstBackupPath), attempt > 1);
                 }
                 firstBackupPath ??= merged.BackupPath;
 
@@ -310,16 +312,24 @@ public sealed class SyncRunner
             }
             // 送り直しが上限まで競合した。ローカルは既にマージ結果で置き換えているので、
             // 操作前の状態を戻せるよう、最初のバックアップを結果に残す。
-            return (new SyncResult
-            {
-                Outcome = last!.Outcome,
-                RemoteVersion = last.RemoteVersion,
-                BackupPath = firstBackupPath,
-                AffectedFiles = last.AffectedFiles,
-                Message = last.Message,
-            }, true);
+            return (WithBackupPath(last!, firstBackupPath), true);
         }
     }
+
+    /// <summary>結果のバックアップの場所を、取ってあれば最初のバックアップに差し替える。</summary>
+    private static SyncResult WithBackupPath(SyncResult result, string? backupPath)
+        => backupPath is null
+            ? result
+            : new SyncResult
+            {
+                Outcome = result.Outcome,
+                Message = result.Message,
+                RemoteVersion = result.RemoteVersion,
+                LastPulledVersion = result.LastPulledVersion,
+                BackupPath = backupPath,
+                AffectedFiles = result.AffectedFiles,
+                MergeReport = result.MergeReport,
+            };
 
     private void RestoreBaseline(string stateKey, DatabaseSummary? previous)
     {
