@@ -21,7 +21,8 @@ public static class MergeProfiles
         Rules = new MergeTableRule[]
         {
             // VRChat のログから作る履歴。UNIQUE 制約の列をそのままキーにする。
-            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" }, OrderColumn: "created_at"),
+            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" }, OrderColumn: "created_at",
+                GrowingColumns: new[] { "time" }),
             new("gamelog_join_leave", MergeTableKind.AppendOnly, new[] { "created_at", "type", "display_name" }, OrderColumn: "created_at"),
             new("gamelog_portal_spawn", MergeTableKind.AppendOnly, new[] { "created_at", "display_name" }, OrderColumn: "created_at"),
             new("gamelog_video_play", MergeTableKind.AppendOnly, new[] { "created_at", "video_url" }, OrderColumn: "created_at"),
@@ -36,7 +37,12 @@ public static class MergeProfiles
             new(UserPrefix + "feed_avatar", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "avatar_name" }, OrderColumn: "created_at"),
             new(UserPrefix + "feed_online_offline", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
             new(UserPrefix + "friend_log_history", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
-            new(UserPrefix + "notifications", MergeTableKind.AppendOnly, new[] { "id" }),
+            new(UserPrefix + "notifications", MergeTableKind.AppendOnly, new[] { "id" },
+                GrowingColumns: new[] { "expired" }),
+
+            // 新しい形式の通知。VRCX は同じ id の行を上書きし、既読や期限を書き換え、
+            // 利用者の操作で消す。追加専用ではないので、キー付きとして扱う。
+            new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at"),
 
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),

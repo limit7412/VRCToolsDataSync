@@ -204,6 +204,7 @@ public static class SqliteMerger
     /// 追加専用のテーブルに、手元にしか無い行を足す。前回の同期の後に手元で増えた行
     /// (rowid が前回の最大値より大きいもの) だけを候補にする。それより前の行は前回の
     /// 同期で同期先にも渡っているので、全件を突き合わせる必要が無い。
+    /// <see cref="MergeTableRule.GrowingColumns"/> だけは既存行も見て、大きい方の値を残す。
     /// </summary>
     private static TableMergeReport MergeAppendOnly(
         SqliteConnection connection, string table, MergeTableRule rule,
@@ -234,6 +235,18 @@ public static class SqliteMerger
             command.Parameters.AddWithValue("$since", sinceRowId);
             inserted = command.ExecuteNonQuery();
         }
+
+        // 既存行に後から書き込まれる列 (滞在時間など) は、大きい方を残す。値は増える
+        // 方向にしか変わらないので、祖先と比べなくても新しい方が分かる。書き込みは
+        // 前回の同期より前の行にも起きるので、ここは全行を突き合わせる。
+        long updated = 0;
+        foreach (var column in rule.GrowingColumns ?? Array.Empty<string>())
+        {
+            var c = Quote(column);
+            updated += Execute(connection,
+                $"UPDATE {target} AS h SET {c} = l.{c} FROM {source} AS l " +
+                $"WHERE {match} AND l.{c} IS NOT NULL AND (h.{c} IS NULL OR l.{c} > h.{c})");
+        }
         Execute(connection, $"DROP INDEX main.{index}");
 
         var renumbered = inserted > 0
@@ -241,7 +254,7 @@ public static class SqliteMerger
                          && rowIdAlias is not null
                          && RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId);
 
-        return new TableMergeReport(table, inserted, 0, 0, renumbered, created);
+        return new TableMergeReport(table, inserted, updated, 0, renumbered, created);
     }
 
     /// <summary>
@@ -476,10 +489,11 @@ public static class SqliteMerger
         return Convert.ToInt64(command.ExecuteScalar());
     }
 
-    private static void Execute(SqliteConnection connection, string sql)
+    /// <summary>SQL を実行し、変わった行数を返す。</summary>
+    private static long Execute(SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
         command.CommandText = sql;
-        command.ExecuteNonQuery();
+        return command.ExecuteNonQuery();
     }
 }

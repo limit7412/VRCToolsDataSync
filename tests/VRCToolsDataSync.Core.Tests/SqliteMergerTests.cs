@@ -123,6 +123,48 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Equal(2, Rows(host, "SELECT id FROM gamelog_location").Count);
     }
 
+    [Fact(DisplayName = "後から書き込まれた滞在時間は、大きい方を残す")]
+    public void GrowingColumnsKeepLarger()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, """
+            INSERT INTO gamelog_location (created_at, location, time) VALUES ('2026-10-02T00:00:00Z', 'wrld_b:1', 0);
+            """);
+        File.Delete(local);
+        File.Copy(host, local);
+        baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        // 手元はワールドを出たときに滞在時間を書き込んだ。同期先は書き込んでいない。
+        Exec(local, "UPDATE gamelog_location SET time = 3600000 WHERE location = 'wrld_b:1'");
+        // 同期先の方が長い滞在時間を持つ行は、そのまま残る。
+        Exec(host, "UPDATE gamelog_location SET time = 5000 WHERE location = 'wrld_a:1'");
+        Exec(local, "UPDATE gamelog_location SET time = 1000 WHERE location = 'wrld_a:1'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1|5000", "wrld_b:1|3600000" },
+            Rows(host, "SELECT location, time FROM gamelog_location ORDER BY id"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "gamelog_location").Updated);
+    }
+
+    [Fact(DisplayName = "新しい形式の通知は、手元で既読にしたものを伝える")]
+    public void NotificationsV2PropagateSeen()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, seen) VALUES ('not_a', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', 0);
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        Exec(local, "UPDATE usr0123abcd_notifications_v2 SET seen = 1 WHERE id = 'not_a'");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "1" }, Rows(host, "SELECT seen FROM usr0123abcd_notifications_v2"));
+    }
+
     [Fact(DisplayName = "メモは前回の同期時点と比べ、変えた側の内容を残す")]
     public void KeyedThreeWay()
     {
