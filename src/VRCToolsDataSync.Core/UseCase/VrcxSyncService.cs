@@ -87,25 +87,46 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
             pushedSummary = DatabaseSummary.Compute(staged.LocalPath, MergeProfiles.Vrcx, out var summaryReason);
             if (pushedSummary is null) _logger.LogInformation("送る写しの要約を取れませんでした: {Reason}", summaryReason);
-            // 通常の Push は前回の version の次を取る (違っていれば競合として止まる)。
-            // 強制 Push は他の PC の更新を上書きするので、取る version は決まらない。
-            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary, replace ? null : (existing?.Version ?? 0) + 1);
-            if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
+            // 通常の Push は前回の version の次を取る (違っていれば競合として止まる)。非常用の
+            // 強制 Push は他の PC の更新を上書きするので、その間に他の PC が進めていればより
+            // 後の version を取る。それでも、同期先が予定の版そのものなら自分の送信ではないと
+            // 分かるので、予定として同じ値を控える。
+            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary, (existing?.Version ?? 0) + 1);
+            try
             {
-                _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
+                if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
+                {
+                    _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
+                }
+                else
+                {
+                    SyncTransfer.Commit(staged, ManifestFileKeys.StorageKeyOf(snapshot), replace);
+                    affected.Add(SnapshotKey);
+                }
             }
-            else
+            catch
             {
-                SyncTransfer.Commit(staged, ManifestFileKeys.StorageKeyOf(snapshot), replace);
-                affected.Add(SnapshotKey);
+                // manifest を更新する前に失敗した。送信は反映されていないので、記録は要らない。
+                // 残すと、同期先が進んだときに反映されたか分からない記録として扱われ、マージが止まる。
+                options.NotCommitted?.Invoke();
+                throw;
             }
             files.Add(snapshot);
         }
 
         if (File.Exists(_paths.SettingsJsonFile))
         {
-            var (settingsFile, sent) = SyncTransfer.Send(
-                storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey, replace);
+            (ManifestFile settingsFile, bool sent) result;
+            try
+            {
+                result = SyncTransfer.Send(storage, remoteFiles, _paths.SettingsJsonFile, SettingsKey, replace);
+            }
+            catch
+            {
+                options.NotCommitted?.Invoke();
+                throw;
+            }
+            var (settingsFile, sent) = result;
             if (sent)
             {
                 affected.Add(SettingsKey);
@@ -133,6 +154,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
             // ダウンロードを誘発してしまう。
             _logger.LogInformation("VRCX Push: 変更なし version={Version}", existing!.Version);
+            options.NotCommitted?.Invoke();
             return new SyncResult
             {
                 Outcome = SyncOutcome.Success,
@@ -154,7 +176,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-                LastForcedVersion = forced ? version : existing?.LastForcedVersion,
+                // 無ければ 0 を書く。null は、この項目を知らない古い版のツールが書いたことを表す。
+                LastForcedVersion = forced ? version : existing?.LastForcedVersion ?? 0,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
@@ -175,7 +198,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             _logger.LogInformation(
                 "VRCX Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
                 ex.ExpectedVersion, ex.ActualVersion);
-            options.CommitFailed?.Invoke();
+            options.NotCommitted?.Invoke();
             return new SyncResult
             {
                 Outcome = SyncOutcome.ConflictDetected,
@@ -315,19 +338,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
         var pulledSummary = DatabaseSummary.Compute(staging.SourceOf(_paths.SqliteFile), MergeProfiles.Vrcx, out var summaryReason);
         if (pulledSummary is null) _logger.LogInformation("取り出した写しの要約を取れませんでした: {Reason}", summaryReason);
 
-        // (3) ここから先はローカルを書き換える。その前に、取得と要約の間に VRCX が起動して
-        //     書き込んでいないかを確かめる。
-        ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
-        if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
-        {
-            return new SyncResult
-            {
-                Outcome = SyncOutcome.Aborted,
-                RemoteVersion = entry.Version,
-                Message = "Pull の間に VRCX の DB が書き換えられたため、差し替える前に中止しました。" +
-                          "VRCX を終了してからやり直してください。",
-            };
-        }
+        // (3) バックアップを取る。ここまではローカルを書き換えない。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
@@ -341,6 +352,21 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
             if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
+        }
+
+        // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップの間に
+        //     VRCX が起動して書き込んでいないかを確かめる。DB が大きいほどこの間は長い。
+        ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
+        if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = entry.Version,
+                BackupPath = backupPath,
+                Message = "Pull の間に VRCX の DB が書き換えられたため、差し替える前に中止しました。" +
+                          "VRCX を終了してからやり直してください。",
+            };
         }
 
         // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
@@ -488,6 +514,19 @@ public sealed class VrcxSyncService : IMergeableSyncService
                          && entry.Version > pushedVersion
                          && (baseline is null || baseline.RemoteVersion < pushedVersion))
                 {
+                    if (entry.LastForcedVersion is null)
+                    {
+                        // この項目を知らない古い版のツールが書いた版。その後に強制 Push があったかを
+                        // 確かめられないので、送った写しを祖先にできない。
+                        return new SyncResult
+                        {
+                            Outcome = SyncOutcome.Aborted,
+                            RemoteVersion = entry.Version,
+                            Message = $"同期先の版 {entry.Version} を書いた PC のツールが古く、前回の Push (版 {pushedVersion}) の後に強制 Push があったかを確かめられません。" +
+                                      "送った変更を二重に数えたり失ったりしないよう、自動マージを中止しました。" +
+                                      "すべての PC でツールを更新したうえで、同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                        };
+                    }
                     if (entry.LastForcedVersion is long forcedVersion && forcedVersion > pushedVersion)
                     {
                         // 送った版の後に別の PC が強制 Push で上書きした。その版は送った内容を
@@ -509,6 +548,19 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         "同期先の版 {Remote} は自分が送った版 {Pushed} より後なので、送った写しの要約を祖先にします",
                         entry.Version, pushedVersion);
                     baseline = ownPush.Summary;
+                }
+                else if (ownPush is { Committed: false, PlannedVersion: null, Summary: not null })
+                {
+                    // 予定の版を控えない版のツールが送った後に止まった記録。反映されたかを
+                    // 版で見分けられないので、同期先の写しが違えば止める。
+                    return new SyncResult
+                    {
+                        Outcome = SyncOutcome.Aborted,
+                        RemoteVersion = entry.Version,
+                        Message = "前回の Push が同期先に反映されたか分からないまま、同期先が進んでいます。" +
+                                  "送った変更を二重に数えないよう、自動マージを中止しました。" +
+                                  "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                    };
                 }
                 else if (ownPush is { Committed: false, PlannedVersion: long plannedVersion }
                          && (baseline is null || baseline.RemoteVersion < plannedVersion))

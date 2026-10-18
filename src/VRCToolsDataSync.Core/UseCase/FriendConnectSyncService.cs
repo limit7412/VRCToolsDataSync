@@ -152,7 +152,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-                LastForcedVersion = forced ? version : existing?.LastForcedVersion,
+                LastForcedVersion = forced ? version : existing?.LastForcedVersion ?? 0,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
@@ -322,20 +322,7 @@ public sealed class FriendConnectSyncService : ISyncService
             ? null
             : DatabaseSummary.Compute(staging.SourceOf(_paths.DbV11File), TrackedDatabase.Profile, out _);
 
-        // (3) ここから先はローカルを書き換える。その前に、取得と要約の間に Friend Connect が
-        //     起動して書き込んでいないかを確かめる。
-        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
-        if (DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File) != localFingerprint)
-        {
-            return new SyncResult
-            {
-                Outcome = SyncOutcome.Aborted,
-                RemoteVersion = entry.Version,
-                Message = "Pull の間に Friend Connect の DB が書き換えられたため、差し替える前に中止しました。" +
-                          "Friend Connect を終了してからやり直してください。",
-            };
-        }
-
+        // (3) バックアップを取る。ここまではローカルを書き換えない。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
@@ -363,6 +350,21 @@ public sealed class FriendConnectSyncService : ISyncService
             backupPath = _backup.CreateSnapshot(
                 Key, filesToBackup, dirsToBackup,
                 shouldBackupFile: path => !PullStaging.IsIncomingFile(path));
+        }
+
+        // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップの間に
+        //     Friend Connect が起動して書き込んでいないかを確かめる。
+        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+        if (DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File) != localFingerprint)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = entry.Version,
+                BackupPath = backupPath,
+                Message = "Pull の間に Friend Connect の DB が書き換えられたため、差し替える前に中止しました。" +
+                          "Friend Connect を終了してからやり直してください。",
+            };
         }
 
         // WAL/SHM を消すのは、その DB の本体を差し替えるか削除するとき。残したままだと

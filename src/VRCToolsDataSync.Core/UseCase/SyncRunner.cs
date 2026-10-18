@@ -126,9 +126,9 @@ public sealed class SyncRunner
                 BeforeCommit = (sha256, summary, planned) =>
                     TrySavePushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
                 AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
-                // 反映できなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
+                // 反映しなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
                 // 分からない記録として扱われ、マージが止まる。
-                CommitFailed = () => _baseSummaries.DiscardUncommittedPushed(stateKey),
+                NotCommitted = () => _baseSummaries.DiscardUncommittedPushed(stateKey),
             });
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)

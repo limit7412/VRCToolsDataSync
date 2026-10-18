@@ -114,10 +114,12 @@ public sealed class PushOptions
     public Action<string, long>? AfterCommit { get; init; }
 
     /// <summary>
-    /// 送った写しを manifest へ反映できなかった (他の PC が先に更新していた) ときに呼ぶ。
-    /// 呼び出し側は <see cref="BeforeCommit"/> で控えた記録を捨てる。
+    /// manifest を更新せずに終わったとき (他の PC が先に更新していた、manifest の更新より前に
+    /// 送信が失敗した、送るものが無かった) に呼ぶ。呼び出し側は <see cref="BeforeCommit"/> で
+    /// 控えた記録を捨てる。manifest の更新そのものが失敗した場合は、反映されたか分からないので
+    /// 呼ばない。
     /// </summary>
-    public Action? CommitFailed { get; init; }
+    public Action? NotCommitted { get; init; }
 }
 
 public sealed class PullOptions
