@@ -617,6 +617,31 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "Push の後に手元の DB が書き換わっても、基準の要約は送った写しのもの")]
+    public void PushRecordsSummaryOfSentSnapshot()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        AddLocation(a, "2026-10-02T12:00:00Z");
+        // 送った直後 (同期履歴を保存する前) に VRCX が行を足した状態を、送る写しを取った
+        // 後、manifest を保存する前に手元へ書き込んで作る。
+        _storage.OnBeforeSaveManifest = () => AddLocation(a, "2026-10-03T00:00:00Z");
+        try
+        {
+            Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        }
+        finally
+        {
+            _storage.OnBeforeSaveManifest = null;
+        }
+
+        // 基準は送った写し (3 行) のまま。手元の 4 行目は未送信の変更として見つかる。
+        var baseline = store.Load(key)!;
+        var current = DatabaseSummary.Compute(a.Paths.SqliteFile, MergeProfiles.Vrcx, out _)!;
+        Assert.Contains("gamelog_location", current.FindChangedTables(baseline));
+    }
+
     [Fact(DisplayName = "保存まで済んで印だけが残っていれば、本体が変わっていても印を消して進む")]
     public void MergeClearsStaleRecordWhenAlreadySaved()
     {

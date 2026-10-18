@@ -76,10 +76,15 @@ public sealed class VrcxSyncService : IMergeableSyncService
         // WAL を統合したスナップショットを作ってから送る。ローカルフォルダなら
         // 同期先の一時ファイルへ直接 VACUUM し、S3 互換なら一時ファイル経由で
         // アップロードする (どちらを使うかは同期先の実装が決める)。
+        DatabaseSummary? pushedSummary;
         using (var staged = storage.BeginUpload())
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
+            // 次に比べる基準は、送る写しそのものから取る。送った後に手元の DB から取ると、
+            // その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
+            pushedSummary = DatabaseSummary.Compute(staged.LocalPath, MergeProfiles.Vrcx, out var summaryReason);
+            if (pushedSummary is null) _logger.LogInformation("送る写しの要約を取れませんでした: {Reason}", summaryReason);
             options.BeforeCommit?.Invoke(snapshot.Sha256);
             if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
@@ -129,6 +134,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 Outcome = SyncOutcome.Success,
                 RemoteVersion = existing.Version,
                 Message = "前回の Push から変更がないため、同期先はそのままです",
+                PushedSummary = pushedSummary,
             };
         }
 
@@ -179,6 +185,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             Outcome = SyncOutcome.Success,
             RemoteVersion = nextVersion,
             AffectedFiles = affected,
+            PushedSummary = pushedSummary,
         };
     }
 

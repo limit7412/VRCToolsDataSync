@@ -129,7 +129,7 @@ public sealed class SyncRunner
                 // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
                 // 等を巻き戻してしまう。
                 _store.SaveToolStateOnly(settings);
-                RecordBaseSummary(service, stateKey, result.RemoteVersion.Value);
+                RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.PushedSummary);
             }
             return result;
         }
@@ -555,7 +555,11 @@ public sealed class SyncRunner
     /// いないのに「手元に変更がある」と判定し続ける。
     /// </para>
     /// </summary>
-    private void RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion)
+    /// <param name="pushed">
+    /// Push が送った写しから取った要約。あればそれを保存する。送った後の手元の DB から
+    /// 取ると、その間にツールが書き込んだ未送信の変更が基準に混ざるため。
+    /// </param>
+    private void RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion, DatabaseSummary? pushed = null)
     {
         // Push か Pull が済み、ローカルと同期先がそろった。中断したマージの印は要らない。
         TryClearMergePending(stateKey);
@@ -563,9 +567,8 @@ public sealed class SyncRunner
         try
         {
             string? reason = "DB がありません";
-            var summary = File.Exists(tracked.Path)
-                ? DatabaseSummary.Compute(tracked.Path, tracked.Profile, out reason)
-                : null;
+            var summary = pushed
+                ?? (File.Exists(tracked.Path) ? DatabaseSummary.Compute(tracked.Path, tracked.Profile, out reason) : null);
             if (summary is null)
             {
                 _baseSummaries.Delete(stateKey);

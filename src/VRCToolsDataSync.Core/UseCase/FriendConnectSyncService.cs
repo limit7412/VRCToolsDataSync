@@ -92,11 +92,11 @@ public sealed class FriendConnectSyncService : ISyncService
         var files = new List<ManifestFile>();
         var affected = new List<string>();
 
-        files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace));
+        files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace, out var pushedSummary));
 
         if (File.Exists(_paths.DbFile))
         {
-            files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace));
+            files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace, out _));
         }
         // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
         // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
@@ -138,6 +138,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 Outcome = SyncOutcome.Success,
                 RemoteVersion = existing.Version,
                 Message = "前回の Push から変更がないため、同期先はそのままです",
+                PushedSummary = pushedSummary,
             };
         }
 
@@ -194,6 +195,7 @@ public sealed class FriendConnectSyncService : ISyncService
             Outcome = SyncOutcome.Success,
             RemoteVersion = nextVersion,
             AffectedFiles = affected,
+            PushedSummary = pushedSummary,
         };
     }
 
@@ -395,18 +397,25 @@ public sealed class FriendConnectSyncService : ISyncService
         };
     }
 
-    /// <summary>SQLite を WAL 統合済みのスナップショットにして送る。</summary>
+    /// <summary>
+    /// SQLite を WAL 統合済みのスナップショットにして送る。<see cref="TrackedDatabase"/> の
+    /// DB なら、次に比べる基準にする要約を送る写しから取って <paramref name="summary"/> に返す。
+    /// </summary>
     private ManifestFile PushSqlite(
         ISyncStorage storage,
         string sourceDb,
         string key,
         IReadOnlyList<ManifestFile> remoteFiles,
         List<string> affected,
-        bool replace)
+        bool replace,
+        out DatabaseSummary? summary)
     {
         using var staged = storage.BeginUpload();
         SqliteSnapshot.Create(sourceDb, staged.LocalPath);
         var described = SyncTransfer.Describe(staged.LocalPath, key);
+        summary = string.Equals(sourceDb, TrackedDatabase.Path, StringComparison.Ordinal)
+            ? DatabaseSummary.Compute(staged.LocalPath, TrackedDatabase.Profile, out _)
+            : null;
         if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
         {
             _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
