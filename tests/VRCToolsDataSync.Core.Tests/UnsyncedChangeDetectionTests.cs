@@ -164,6 +164,24 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.Success, result.Outcome);
     }
 
+    [Fact(DisplayName = "マージの後、要約だけ保存して止まっていても、手元の変更を守る")]
+    public void StartupPullComparesWithNewerBaseline()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        // マージ結果で置き換え、要約を保存した後、同期履歴を保存する前に止まった状態を作る。
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var newer = store.Load(key)!;
+        newer.RemoteVersion += 1;
+        store.Save(key, newer);
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+    }
+
     [Fact(DisplayName = "明示的な Pull は、手元に変更があっても上書きする")]
     public void ExplicitPullStillOverwrites()
     {

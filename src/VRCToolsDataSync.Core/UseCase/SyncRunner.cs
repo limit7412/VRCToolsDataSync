@@ -416,7 +416,11 @@ public sealed class SyncRunner
         {
             if (!File.Exists(tracked.Path)) return Array.Empty<string>();
             var baseline = _baseSummaries.Load(stateKey);
-            if (baseline is null || baseline.RemoteVersion != lastPulledVersion)
+            // 要約の方が同期履歴より新しいのは、マージ結果で置き換えた後、要約を保存して
+            // 同期履歴を保存する前に止まった場合だけである。ローカルはその要約の版に手元の
+            // 変更を足したものなので、要約と比べれば手元の変更を見つけられる。
+            var interruptedMerge = baseline is not null && baseline.RemoteVersion > lastPulledVersion;
+            if (baseline is null || (baseline.RemoteVersion != lastPulledVersion && !interruptedMerge))
             {
                 _logger.LogInformation("前回の同期時点の要約が無いか、同期履歴と合わないため、手元の変更を確かめられません ({Tool})", service.ToolKey);
                 return Array.Empty<string>();

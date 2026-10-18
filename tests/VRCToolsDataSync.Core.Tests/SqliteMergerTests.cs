@@ -418,6 +418,21 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("memos", report.AbortReason);
     }
 
+    [Fact(DisplayName = "履歴のテーブルでも、増えた列の値が両方で違えば上書きせずに中止する")]
+    public void AbortsWhenAddedColumnDiffersInAppendOnly()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE gamelog_location ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(local, "UPDATE gamelog_location SET extra = 'x' WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("gamelog_location", report.AbortReason);
+    }
+
     [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
     public void CreatedKeyedTableCopiesAllRows()
     {

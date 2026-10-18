@@ -230,6 +230,16 @@ public static class SqliteMerger
             }
         }
 
+        if (baseline is not null && rule.ValueColumns is null && hashColumns.Count < localColumns.Count
+            && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns) is { } differing)
+        {
+            // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
+            // 古い列だけで合わせると、手元で変えた新しい列の値を同期先の値で上書きしうる。
+            // 追加専用のテーブルも既存行は書き換えないので、同じく上書きになる。
+            report.AbortReason = $"テーブル {table} の新しい列の値が同期先と手元で違い (キー {differing})、どちらの変更か判断できないため自動マージを中止しました";
+            return null;
+        }
+
         return rule.Kind == MergeTableKind.AppendOnly
             ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report)
             : MergeKeyed(connection, table, rule, localColumns, hashColumns, baseline, created, report);
@@ -383,20 +393,11 @@ public static class SqliteMerger
     /// 両方が別々に変えたキーは、編集時刻の新しい方を残す。編集時刻が無ければ
     /// 同期先の内容を残す。
     /// </summary>
-    private static TableMergeReport? MergeKeyed(
+    private static TableMergeReport MergeKeyed(
         SqliteConnection connection, string table, MergeTableRule rule,
         IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
         TableSummary? baseline, bool created, MergeReport report)
     {
-        if (rule.ValueColumns is null && hashColumns.Count < columns.Count
-            && FindKeyWithDifferentAddedColumns(connection, table, rule, columns, hashColumns) is { } differing)
-        {
-            // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
-            // 古い列だけで比べると、手元で変えた新しい列の値を同期先の値で上書きしうる。
-            report.AbortReason = $"テーブル {table} の新しい列の値が同期先と手元で違い (キー {differing})、どちらの変更か判断できないため自動マージを中止しました";
-            return null;
-        }
-
         var local = ReadKeyedRows(connection, Local, table, rule, hashColumns);
         var host = ReadKeyedRows(connection, "main", table, rule, hashColumns);
         var ancestor = baseline is { Kind: MergeTableKind.Keyed, Rows: { } rows }
