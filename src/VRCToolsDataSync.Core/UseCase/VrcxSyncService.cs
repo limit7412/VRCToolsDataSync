@@ -554,7 +554,15 @@ public sealed class VrcxSyncService : IMergeableSyncService
             var info = new FileInfo(file);
             return info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
         }
-        return $"{Of(path)}|{Of(path + "-wal")}";
+        static string OfWal(string file)
+        {
+            // WAL 方式の本体を読み取り専用で開くだけでも、WAL が無ければ空の WAL ができる。
+            // 写しを取る自分の読み取りで作られた空の WAL を、VRCX の書き込みと見ないよう、
+            // 中身の無い WAL は無いものとして扱う。書き込みがあれば長さが変わる。
+            var info = new FileInfo(file);
+            return info.Exists && info.Length > 0 ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
+        }
+        return $"{Of(path)}|{OfWal(path + "-wal")}";
     }
 
     /// <summary>

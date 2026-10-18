@@ -553,21 +553,65 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.True(Assert.Single(report.Tables, t => t.Table == "usr0123abcd_feed_gps").Created);
     }
 
-    [Fact(DisplayName = "同期先に無くて作った履歴のテーブルには、手元の全行を写す")]
-    public void CreatedTableCopiesAllRows()
+    [Fact(DisplayName = "祖先にあったテーブルが同期先から消えていて、手元が変わっていなければ作り直さない")]
+    public void FollowsHostTableDeletionWhenLocalUnchanged()
     {
-        var feed = """
+        var (host, local, _) = Arrange();
+        Exec(local, """
             CREATE TABLE usr0123abcd_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
             INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-01T00:00:00Z', 'usr_x', 'wrld_a:1');
-            """;
+            """);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name = 'usr0123abcd_feed_gps'"));
+        Assert.False(Assert.Single(report.Tables, t => t.Table == "usr0123abcd_feed_gps").Created);
+    }
+
+    [Fact(DisplayName = "祖先にあったテーブルが同期先から消えていて、手元が変わっていれば中止する")]
+    public void AbortsWhenHostDeletedTableThatLocalChanged()
+    {
         var (host, local, _) = Arrange();
-        Exec(local, feed);
+        Exec(local, """
+            CREATE TABLE usr0123abcd_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-01T00:00:00Z', 'usr_x', 'wrld_a:1');
+            """);
         var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
         Exec(local, "INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-02T00:00:00Z', 'usr_x', 'wrld_b:1')");
 
-        Merge(host, local, baseline);
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
 
-        Assert.Equal(2, Rows(host, "SELECT id FROM usr0123abcd_feed_gps").Count);
+        Assert.False(report.Succeeded);
+        Assert.Contains("usr0123abcd_feed_gps", report.AbortReason);
+        Assert.Contains("消えています", report.AbortReason);
+        Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name = 'usr0123abcd_feed_gps'"));
+    }
+
+    [Fact(DisplayName = "同じキーの行が 3 行以上あっても、並びが違うだけなら新しい列の値を同じと見る")]
+    public void AddedColumnsOnDuplicateKeysIgnoreRowOrder()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE favorite_world ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(host, """
+            INSERT INTO favorite_world (created_at, world_id, group_name, extra) VALUES
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'x'),
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'y'),
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'z');
+            """);
+        Exec(local, """
+            INSERT INTO favorite_world (created_at, world_id, group_name, extra) VALUES
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'z'),
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'y'),
+                ('2026-10-02T00:00:00Z', 'wrld_b', 'g1', 'x');
+            """);
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.True(report.Succeeded, report.AbortReason);
+        Assert.Equal(3, Rows(host, "SELECT extra FROM favorite_world WHERE world_id = 'wrld_b'").Count);
     }
 
     [Fact(DisplayName = "前回の同期の後に列が増えても、変えていない行を編集されたとは見ない")]
@@ -753,8 +797,8 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name LIKE 'vrctds_%'"));
     }
 
-    [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
-    public void CreatedKeyedTableCopiesAllRows()
+    [Fact(DisplayName = "祖先にあったキー付きのテーブルが同期先から消えていて、手元が変わっていなければ作り直さない")]
+    public void FollowsHostKeyedTableDeletionWhenLocalUnchanged()
     {
         var (host, local, _) = Arrange();
         Exec(local, """
@@ -762,6 +806,21 @@ public sealed class SqliteMergerTests : IDisposable
             INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 0), ('avtr_b', '2026-10-01T00:00:00Z', 0);
             """);
         var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name = 'usr0123abcd_avatar_history'"));
+        Assert.False(Assert.Single(report.Tables, t => t.Table == "usr0123abcd_avatar_history").Created);
+    }
+
+    [Fact(DisplayName = "祖先に無く同期先にも無いキー付きのテーブルは、手元の全行を写す")]
+    public void CreatedKeyedTableCopiesAllRows()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, """
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 0), ('avtr_b', '2026-10-01T00:00:00Z', 0);
+            """);
 
         Merge(host, local, baseline);
 

@@ -214,6 +214,21 @@ public static class SqliteMerger
         var hostColumns = ListColumns(connection, "main", table);
         if (hostColumns.Count == 0)
         {
+            if (baseline is not null)
+            {
+                // 前回の同期時点にはあったテーブルが同期先から消えている。新しいテーブルとして
+                // 作り直すと、同期先での削除を次の Push で取り消してしまう。手元が前回から
+                // 変わっていなければ削除に従い、変わっていれば中止する。
+                var local = DatabaseSummary.SummarizeTable(connection, Local, table, rule, localColumns);
+                if (!baseline.HasSameContent(local))
+                {
+                    report.AbortReason = $"テーブル {table} が同期先から消えていますが、前回の同期の後に手元で変わっているか、" +
+                                         "変わっていないことを確かめられません。同期先のテーブルを消した PC と手元のどちらを正とするか決めてから、" +
+                                         "Push か Pull をしてください";
+                    return null;
+                }
+                return new TableMergeReport(table, 0, 0, 0, false, false);
+            }
             // 同期先に無いテーブル (この PC でだけ使った VRChat アカウントの分など) は、
             // 手元の定義で作ってから行を足す。
             CopyTableDefinition(connection, table);

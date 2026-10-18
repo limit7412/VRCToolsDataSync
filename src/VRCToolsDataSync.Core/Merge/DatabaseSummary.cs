@@ -92,19 +92,29 @@ public sealed class DatabaseSummary
                 return null;
             }
 
-            var tableSummary = rule.Kind switch
-            {
-                MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, "main", table, rule),
-                MergeTableKind.Keyed => SummarizeKeyed(connection, table, rule, columns),
-                MergeTableKind.Watched => SummarizeWatched(connection, table, rule, columns),
-                _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
-            };
-            tableSummary.Columns = columns;
-            summary.Tables[table] = tableSummary;
+            summary.Tables[table] = SummarizeTable(connection, "main", table, rule, columns);
         }
 
         reason = null;
         return summary;
+    }
+
+    /// <summary>
+    /// テーブル 1 つの要約を取る。マージでは、同期先に無いテーブルが手元で変わったかを
+    /// 祖先と比べるために、ATTACH した手元の DB からも取る。
+    /// </summary>
+    internal static TableSummary SummarizeTable(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+    {
+        var tableSummary = rule.Kind switch
+        {
+            MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, schema, table, rule),
+            MergeTableKind.Keyed => SummarizeKeyed(connection, schema, table, rule, columns),
+            MergeTableKind.Watched => SummarizeWatched(connection, schema, table, rule, columns),
+            _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
+        };
+        tableSummary.Columns = columns.ToList();
+        return tableSummary;
     }
 
     /// <summary>
@@ -203,7 +213,7 @@ public sealed class DatabaseSummary
         // 変わらないことがある。末尾の行のキーも残して、入れ替わりを拾う。
         summary.LastRowHash = summary.MaxRowId == 0
             ? null
-            : DigestRows(connection, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
+            : DigestRows(connection, schema, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
         if (rule.GrowingColumns is { Count: > 0 })
         {
             // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
@@ -265,15 +275,15 @@ public sealed class DatabaseSummary
     }
 
     private static TableSummary SummarizeKeyed(
-        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
     {
-        var rows = ReadKeyedRows(connection, "main", table, rule, columns);
+        var rows = ReadKeyedRows(connection, schema, table, rule, columns);
         return new TableSummary
         {
             Kind = MergeTableKind.Keyed,
             RowCount = rows.Count,
             Rows = rows.ToDictionary(r => r.Key, r => r.Value.Hash, StringComparer.Ordinal),
-            Counters = rule.CounterColumns is { Count: > 0 } ? ReadCounters(connection, table, rule) : null,
+            Counters = rule.CounterColumns is { Count: > 0 } ? ReadCounters(connection, schema, table, rule) : null,
         };
     }
 
@@ -282,13 +292,13 @@ public sealed class DatabaseSummary
     /// と同じ形) ごとに読む。整数でない値は残さない。
     /// </summary>
     private static Dictionary<string, Dictionary<string, long>> ReadCounters(
-        SqliteConnection connection, string table, MergeTableRule rule)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule)
     {
         var counters = rule.CounterColumns!;
         var selected = rule.KeyColumns.Concat(counters).ToList();
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM main.{Quote(table)}" +
+            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)}" +
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
@@ -337,7 +347,8 @@ public sealed class DatabaseSummary
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
-        var rows = new Dictionary<string, KeyedRow>(StringComparer.Ordinal);
+        var keyValuesByKey = new Dictionary<string, object?[]>(StringComparer.Ordinal);
+        var hashesByKey = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var keyCount = rule.KeyColumns.Count;
         while (reader.Read())
         {
@@ -350,13 +361,23 @@ public sealed class DatabaseSummary
             }
             var value = new StringBuilder();
             for (var i = keyCount; i < selected.Count; i++) AppendValue(value, reader, i);
-            // キーが重複するテーブル (UNIQUE 制約の無い favorite_* など) では、
-            // 同じキーの行をまとめて一つの値として扱う。行の順序に左右されないよう、
-            // ハッシュを並べ替えてから束ねる。
-            var hash = Hash(value.ToString());
-            rows[key.ToString()] = rows.TryGetValue(key.ToString(), out var existing)
-                ? existing with { Hash = Combine(existing.Hash, hash) }
-                : new KeyedRow(keyValues, hash);
+            var keyText = key.ToString();
+            if (!hashesByKey.TryGetValue(keyText, out var hashes))
+            {
+                hashes = new List<string>(1);
+                hashesByKey[keyText] = hashes;
+                keyValuesByKey[keyText] = keyValues;
+            }
+            hashes.Add(Hash(value.ToString()));
+        }
+
+        // キーが重複するテーブル (UNIQUE 制約の無い favorite_* など) では、同じキーの行を
+        // まとめて一つの値として扱う。rowid の順は PC ごとに違いうるので、行のハッシュを
+        // 並べ替えてから束ねる。2 行ずつ順に束ねると 3 行以上で順序に左右される。
+        var rows = new Dictionary<string, KeyedRow>(StringComparer.Ordinal);
+        foreach (var (keyText, hashes) in hashesByKey)
+        {
+            rows[keyText] = new KeyedRow(keyValuesByKey[keyText], CombineUnordered(hashes));
         }
         return rows;
     }
@@ -366,11 +387,19 @@ public sealed class DatabaseSummary
         => rule.ValueColumns
            ?? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList();
 
-    private static string Combine(string a, string b)
-        => string.CompareOrdinal(a, b) <= 0 ? Hash(a + b) : Hash(b + a);
+    /// <summary>
+    /// 行のハッシュの多重集合を、順序に依らない一つのハッシュにする。1 行なら
+    /// そのハッシュのまま (重複の無いテーブルの要約を変えないため)。
+    /// </summary>
+    private static string CombineUnordered(List<string> hashes)
+    {
+        if (hashes.Count == 1) return hashes[0];
+        hashes.Sort(StringComparer.Ordinal);
+        return Hash(string.Concat(hashes));
+    }
 
     private static TableSummary SummarizeWatched(
-        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
     {
         var ignored = rule.IgnoredColumns ?? Array.Empty<string>();
         var selected = columns.Where(c => !ignored.Contains(c, StringComparer.Ordinal)).ToList();
@@ -379,7 +408,7 @@ public sealed class DatabaseSummary
             return new TableSummary { Kind = MergeTableKind.Watched, Digest = Hash(string.Empty) };
         }
 
-        var (count, digest) = DigestRows(connection, table, selected, string.Join(", ", selected.Select(Quote)));
+        var (count, digest) = DigestRows(connection, schema, table, selected, string.Join(", ", selected.Select(Quote)));
         return new TableSummary
         {
             Kind = MergeTableKind.Watched,
@@ -390,9 +419,9 @@ public sealed class DatabaseSummary
 
     /// <summary>指定した列の内容を、<paramref name="orderBy"/> の順に読んでハッシュにする。</summary>
     private static (long Count, string Digest) DigestRows(
-        SqliteConnection connection, string table, IReadOnlyList<string> columns, string orderBy)
+        SqliteConnection connection, string schema, string table, IReadOnlyList<string> columns, string orderBy)
         => DigestQuery(connection, columns.Count,
-            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(table)} ORDER BY {orderBy}");
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} ORDER BY {orderBy}");
 
     /// <summary>
     /// rowid が <paramref name="rowId"/> の行のキーのハッシュを返す。行が無ければ null。

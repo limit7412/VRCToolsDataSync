@@ -447,6 +447,27 @@ public sealed class SyncRunner
         var saved = _baseSummaries.Load(stateKey);
         var aside = pending.AsideSuffix is null ? Array.Empty<string>() : VrcxSyncService.FindAsideFiles(tracked.Path, pending.AsideSuffix);
         var current = FileHasher.Sha256(tracked.Path);
+        // 置き換えた後と見る判定を先にする。マージ結果が元の本体と同じ内容になる (同期先の本体が
+        // 手元と同じで、手元の WAL にマージの対象外の変更しか無い) と、2 つの記録は同じ値になる。
+        // そのとき退けた WAL を戻すと、置き換えが済んでいた場合に、マージで同期先の値に
+        // 揃えたはずの対象外のテーブルへ手元の変更が戻り、次の Push で送り直される。
+        // 置き換えが済んでいなくても本体はマージ結果と同じなので、済んだものとして進めてよい。
+        if (string.Equals(current, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            // 置き換えた後、要約と同期履歴を保存する前に止まった。その保存をここで終える。
+            _logger.LogInformation("前回のマージは置き換えた後に止まっていました。祖先と同期履歴をそろえます ({Tool})", service.ToolKey);
+            if (pending.Summary is not null) pending.Summary.RemoteVersion = pending.RemoteVersion;
+            if (dryRun) return (null, pending.Summary, pending.RemoteVersion);
+            if (pending.Summary is null) _baseSummaries.Delete(stateKey);
+            else _baseSummaries.Save(stateKey, pending.Summary);
+            state.LastPulledVersion = pending.RemoteVersion;
+            state.LastPulledAt = DateTimeOffset.Now;
+            settings.ToolState[stateKey] = state;
+            _store.SaveToolStateOnly(settings);
+            if (pending.AsideSuffix is not null) VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
+            TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
         if (string.Equals(current, pending.LocalSha256, StringComparison.OrdinalIgnoreCase))
         {
             // 置き換える前に止まった。ローカルは元のままなので、祖先も同期履歴もそのままでよい。
@@ -465,22 +486,6 @@ public sealed class SyncRunner
                               "それでも進まなければ、退けたファイルの中身が要らないことを確かめて消してください",
                 }, null, null);
             }
-            TryClearMergePending(stateKey);
-            return (null, null, null);
-        }
-        if (string.Equals(current, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
-        {
-            // 置き換えた後、要約と同期履歴を保存する前に止まった。その保存をここで終える。
-            _logger.LogInformation("前回のマージは置き換えた後に止まっていました。祖先と同期履歴をそろえます ({Tool})", service.ToolKey);
-            if (pending.Summary is not null) pending.Summary.RemoteVersion = pending.RemoteVersion;
-            if (dryRun) return (null, pending.Summary, pending.RemoteVersion);
-            if (pending.Summary is null) _baseSummaries.Delete(stateKey);
-            else _baseSummaries.Save(stateKey, pending.Summary);
-            state.LastPulledVersion = pending.RemoteVersion;
-            state.LastPulledAt = DateTimeOffset.Now;
-            settings.ToolState[stateKey] = state;
-            _store.SaveToolStateOnly(settings);
-            if (pending.AsideSuffix is not null) VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
             TryClearMergePending(stateKey);
             return (null, null, null);
         }

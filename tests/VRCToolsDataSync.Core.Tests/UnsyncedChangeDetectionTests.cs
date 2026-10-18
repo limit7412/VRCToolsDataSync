@@ -493,7 +493,7 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
     /// 置き換える前に止まった記録を残す。<paramref name="pendingSummary"/> が null なら
     /// 保存済みの要約と同じ版への記録にする。退けた名前の末尾を返す。
     /// </summary>
-    private string ArrangeAsideWal(Machine b, BaseSummaryStore store, string key, DatabaseSummary? pendingSummary)
+    private string ArrangeAsideWal(Machine b, BaseSummaryStore store, string key, DatabaseSummary? pendingSummary, bool mergedSameAsLocal = false)
     {
         var db = b.Paths.SqliteFile;
         // WAL を読んでいる別の接続を開いたままにしておくと、書いた接続を閉じても書き戻されない。
@@ -516,8 +516,44 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         const string suffix = ".vrctds-aside-test";
         File.Move(asideWal, db + "-wal" + suffix, overwrite: true);
         var summary = pendingSummary ?? store.Load(key)!;
-        store.SavePendingReplace(key, new MergePendingState(summary, summary.RemoteVersion, FileHasher.Sha256(db), "0", suffix));
+        var localSha256 = FileHasher.Sha256(db);
+        store.SavePendingReplace(key, new MergePendingState(
+            summary, summary.RemoteVersion, localSha256, mergedSameAsLocal ? localSha256 : "0", suffix));
         return suffix;
+    }
+
+    [Fact(DisplayName = "VRCX を閉じた後の WAL 方式の DB (WAL ファイル無し) でもマージできる")]
+    public void MergesWalModeDatabaseWithoutWalFile()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var db = b.Paths.SqliteFile;
+        // 接続を閉じると WAL は本体へ書き戻されて消え、本体に WAL 方式の印だけが残る。
+        Exec(db, "PRAGMA journal_mode=WAL");
+        Assert.False(File.Exists(db + "-wal"));
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        // 写しを取る読み取りで空の WAL ができるが、それを VRCX の書き込みとは見ない。
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(2, CountLocations(db));
+    }
+
+    [Fact(DisplayName = "置き換えの前後で本体が同じ内容なら、退けた WAL を戻さずに置き換え後として済ませる")]
+    public void MergeDoesNotRestoreAsideWalWhenMergedEqualsLocal()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, pendingSummary: null, mergedSameAsLocal: true);
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 退けた WAL の行は戻らず、同期先の 2 行だけになる。
+        Assert.Equal(2, CountLocations(db));
+        Assert.False(File.Exists(db + "-wal" + suffix));
+        Assert.False(store.IsMergePending(key));
     }
 
     [Fact(DisplayName = "WAL を退けた後に置き換える前で止まっていれば、退けた WAL を戻してからマージする")]
