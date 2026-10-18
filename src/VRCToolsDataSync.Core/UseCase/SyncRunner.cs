@@ -108,6 +108,14 @@ public sealed class SyncRunner
         lock (PushLock)
         {
             var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
+            // 前回のマージが置き換えの前後で止まっていれば、送る前にそろえる。置き換える前に
+            // 退けた WAL が残っていれば戻してから送る。戻せなければ送らない。強制 Push は
+            // その状態から抜け出す手段なので、ここでは止めない。
+            if (!force && !reuploadAll)
+            {
+                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false);
+                if (recovered.Abort is not null) return recovered.Abort;
+            }
             var result = service.Push(new PushOptions
             {
                 Storage = storage,
@@ -120,6 +128,13 @@ public sealed class SyncRunner
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
             {
+                // 要約を先に保存する。同期履歴だけが進んで要約が無いと、次の起動時 Pull が
+                // 手元の変更を確かめられずに上書きする。要約が先なら、同期履歴の保存前に
+                // 止まっても、要約の版が同期履歴より新しいことから中断と分かる。
+                if (!RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.SyncedSummary))
+                {
+                    return WithMessage(result, "送信は済みましたが、同期時点の要約を保存できなかったため、同期履歴は進めていません。次の同期でそろいます");
+                }
                 state.LastPushedVersion = result.RemoteVersion.Value;
                 state.LastPushedAt = DateTimeOffset.Now;
                 state.LastPulledVersion = result.RemoteVersion.Value;
@@ -129,7 +144,6 @@ public sealed class SyncRunner
                 // SyncRunner) からの Push が、ユーザが GUI で変更した AutoSyncEnabled
                 // 等を巻き戻してしまう。
                 _store.SaveToolStateOnly(settings);
-                RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.PushedSummary);
             }
             return result;
         }
@@ -190,13 +204,17 @@ public sealed class SyncRunner
 
         if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
         {
+            // Push と同じく、要約を先に保存する。
+            if (!RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.SyncedSummary))
+            {
+                return WithMessage(result, "取り込みは済みましたが、同期時点の要約を保存できなかったため、同期履歴は進めていません。次の同期でそろいます");
+            }
             state ??= new ToolSyncState();
             state.LastPulledVersion = result.RemoteVersion.Value;
             state.LastPulledAt = DateTimeOffset.Now;
             settings.ToolState[stateKey] = state;
             // Push と同じ理由で SaveToolStateOnly を使う。
             _store.SaveToolStateOnly(settings);
-            RecordBaseSummary(service, stateKey, result.RemoteVersion.Value);
         }
         return result;
     }
@@ -550,40 +568,57 @@ public sealed class SyncRunner
     /// 同期を終えた時点の DB の要約を、次に比べる基準として残す。
     /// <para>
     /// 失敗しても例外は投げない。要約は同期の結果に影響しない付加情報で、これが
-    /// 原因で成功した同期をエラー扱いにするわけにはいかないため。ただし古い要約は
-    /// 消す。残すと、今回の同期より前の状態を基準に比べることになり、変わって
-    /// いないのに「手元に変更がある」と判定し続ける。
+    /// 原因で成功した同期をエラー扱いにするわけにはいかないため。要約を取れなかった
+    /// (DB が無い、読めない) ときは古い要約を消す。残すと、今回の同期より前の状態を
+    /// 基準に比べることになり、変わっていないのに「手元に変更がある」と判定し続ける。
+    /// 保存に失敗したときは古い要約を残し、偽を返す。呼び出し側は同期履歴を進めない
+    /// ので、古い要約と古い同期履歴の組で手元の変更を見つけられる。
     /// </para>
     /// </summary>
-    /// <param name="pushed">
-    /// Push が送った写しから取った要約。あればそれを保存する。送った後の手元の DB から
-    /// 取ると、その間にツールが書き込んだ未送信の変更が基準に混ざるため。
+    /// <param name="synced">
+    /// 送った写しか取り出した写しから取った要約。あればそれを保存する。同期した後の
+    /// 手元の DB から取ると、その間にツールが書き込んだ未送信の変更が基準に混ざるため。
     /// </param>
-    private void RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion, DatabaseSummary? pushed = null)
+    /// <returns>要約を保存したか、要約が要らなくて消したら真。保存に失敗したら偽。</returns>
+    private bool RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion, DatabaseSummary? synced)
     {
         // Push か Pull が済み、ローカルと同期先がそろった。中断したマージの印は要らない。
         TryClearMergePending(stateKey);
-        if (service.TrackedDatabase is not { } tracked) return;
+        if (service.TrackedDatabase is not { } tracked) return true;
         try
         {
             string? reason = "DB がありません";
-            var summary = pushed
+            var summary = synced
                 ?? (File.Exists(tracked.Path) ? DatabaseSummary.Compute(tracked.Path, tracked.Profile, out reason) : null);
             if (summary is null)
             {
                 _baseSummaries.Delete(stateKey);
                 _logger.LogInformation("同期時点の要約を取れませんでした ({Tool}): {Reason}", service.ToolKey, reason);
-                return;
+                return true;
             }
             summary.RemoteVersion = remoteVersion;
             _baseSummaries.Save(stateKey, summary);
+            return true;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "同期時点の要約の保存に失敗しました ({Tool})", service.ToolKey);
-            try { _baseSummaries.Delete(stateKey); } catch { /* 次の同期で取り直す */ }
+            return false;
         }
     }
+
+    private static SyncResult WithMessage(SyncResult result, string note)
+        => new()
+        {
+            Outcome = result.Outcome,
+            Message = result.Message is null ? note : $"{result.Message}。{note}",
+            RemoteVersion = result.RemoteVersion,
+            LastPulledVersion = result.LastPulledVersion,
+            BackupPath = result.BackupPath,
+            AffectedFiles = result.AffectedFiles,
+            MergeReport = result.MergeReport,
+            SyncedSummary = result.SyncedSummary,
+        };
 
     /// <summary>
     /// 前回の同期の後に手元の DB で変わったテーブルを返す。比べる基準が無い場合や

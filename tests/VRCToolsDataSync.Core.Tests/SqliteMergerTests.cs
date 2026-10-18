@@ -636,6 +636,41 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("gamelog_location", report.AbortReason);
     }
 
+    [Fact(DisplayName = "比べる列を固定した規則でも、前回の同期の後に増えた列の値が違えば中止する")]
+    public void AbortsWhenAddedColumnDiffersOnFixedColumnRule()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE favorite_world ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(local, "UPDATE favorite_world SET extra = 'x' WHERE world_id = 'wrld_a'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("favorite_world", report.AbortReason);
+        Assert.Contains("新しい列", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "id を振り直す行に同じキーの行が複数あれば、記録を残せないので中止する")]
+    public void AbortsWhenRenumberedRowsHaveDuplicateKeys()
+    {
+        var (host, local, baseline) = Arrange();
+        const string create = "CREATE TABLE usr0123abcd_feed_bio (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, bio TEXT)";
+        Exec(host, create);
+        Exec(local, create);
+        Exec(host, """
+            INSERT INTO usr0123abcd_feed_bio (created_at, user_id, display_name, bio) VALUES ('2026-10-03T00:00:00Z', 'usr_a', 'A', 'x');
+            INSERT INTO usr0123abcd_feed_bio (created_at, user_id, display_name, bio) VALUES ('2026-10-03T00:00:00Z', 'usr_a', 'A', 'x');
+            """);
+        Exec(local, "INSERT INTO usr0123abcd_feed_bio (created_at, user_id, display_name, bio) VALUES ('2026-10-02T00:00:00Z', 'usr_b', 'B', 'y')");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("同じキー", report.AbortReason);
+    }
+
     [Fact(DisplayName = "履歴のテーブルでも、列が増えた後に同期先が消した行の新しい列を手元で変えていれば中止する")]
     public void AbortsWhenAddedColumnSetOnRowDeletedByHostInAppendOnly()
     {

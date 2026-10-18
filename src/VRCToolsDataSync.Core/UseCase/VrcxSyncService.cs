@@ -134,7 +134,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 Outcome = SyncOutcome.Success,
                 RemoteVersion = existing.Version,
                 Message = "前回の Push から変更がないため、同期先はそのままです",
-                PushedSummary = pushedSummary,
+                SyncedSummary = pushedSummary,
             };
         }
 
@@ -185,7 +185,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             Outcome = SyncOutcome.Success,
             RemoteVersion = nextVersion,
             AffectedFiles = affected,
-            PushedSummary = pushedSummary,
+            SyncedSummary = pushedSummary,
         };
     }
 
@@ -295,6 +295,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
+        // 次に比べる基準は、取り出した写しそのものから取る。差し替えた後に手元の DB から
+        // 取ると、その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
+        var pulledSummary = DatabaseSummary.Compute(staging.SourceOf(_paths.SqliteFile), MergeProfiles.Vrcx, out var summaryReason);
+        if (pulledSummary is null) _logger.LogInformation("取り出した写しの要約を取れませんでした: {Reason}", summaryReason);
+
         // (3) ここから先はローカルを書き換える。
         string? backupPath = null;
         if (!options.SkipBackup)
@@ -345,6 +350,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             RemoteVersion = entry.Version,
             BackupPath = backupPath,
             AffectedFiles = affected,
+            SyncedSummary = pulledSummary,
         };
     }
 

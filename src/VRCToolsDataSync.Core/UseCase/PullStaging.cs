@@ -120,6 +120,23 @@ internal sealed class PullStaging : IDisposable
     }
 
     /// <summary>
+    /// <paramref name="targetPath"/> へ差し替える予定の、取り出したファイルの場所。手元が
+    /// 既に同じ内容で取得を省いた場合は <paramref name="targetPath"/> そのもの。差し替える
+    /// 前に、差し替え後の内容 (同期先の内容) を読むのに使う。
+    /// </summary>
+    public string SourceOf(string targetPath)
+    {
+        foreach (var staged in _staged)
+        {
+            if (string.Equals(staged.TargetPath, targetPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return staged.StagingPath;
+            }
+        }
+        return targetPath;
+    }
+
+    /// <summary>
     /// 取り出したファイルを目的の場所へ移す。
     /// <para>
     /// ファイル間で不可分ではない。途中で失敗した場合は、どこまで反映したかを

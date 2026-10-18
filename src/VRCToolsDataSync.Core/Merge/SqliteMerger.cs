@@ -253,7 +253,9 @@ public static class SqliteMerger
             hashColumns = baseline.Columns;
         }
 
-        if (baseline is not null && rule.ValueColumns is null && hashColumns.Count < localColumns.Count
+        // 比べる列を固定した規則 (favorite_* など) でも、祖先に無い列は見る。固定した列だけで
+        // 合わせると、手元で変えた新しい列の値が同期先の行で置き換わる。
+        if (baseline is not null && hashColumns.Count < localColumns.Count
             && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns, baseline) is { } differing)
         {
             // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
@@ -359,8 +361,15 @@ public static class SqliteMerger
             keptDigest = rule.GrowingColumns is { Count: > 0 } && keptMaxRowId > 0
                 ? DigestGrowing(connection, "main", table, rule, keptMaxRowId.Value, moves)
                 : null;
-            tailRows = HashRowsByKey(connection, "main", table, rule, movedHostRows)
+            tailRows = HashRowsByKey(connection, "main", table, rule, movedHostRows, out var duplicated)
                 .ToDictionary(r => r.Key, r => r.Value.GrowingHash, StringComparer.Ordinal);
+            if (duplicated)
+            {
+                // 移った行はキーで記録するので、同じキーの行が複数あると 1 行しか残せず、
+                // 次のマージで残りを手元の追加と見誤る。
+                report.AbortReason = $"テーブル {table} で、id を振り直す行に同じキーの行が複数あり、振り直した記録を要約に残せないため自動マージを中止しました";
+                return null;
+            }
         }
 
         // 既存行に後から書き込まれる列 (滞在時間など) は、大きい方を残す。値は増える
@@ -397,7 +406,12 @@ public static class SqliteMerger
         IReadOnlyDictionary<string, string> tailRows, long sinceRowId, string matched)
     {
         var localTail = HashRowsByKey(connection, Local, table, rule,
-            $"rowid > {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
+            $"rowid > {sinceRowId.ToString(CultureInfo.InvariantCulture)}", out var duplicated);
+        if (duplicated)
+        {
+            // 同じキーの行が複数あると、どれが移った祖先の行か見分けられない。
+            return $"テーブル {table} で、前回の同期の後の行に同じキーの行が複数あり、振り直しで移った祖先の行を見分けられないため自動マージを中止しました";
+        }
         foreach (var (keyHash, growingHash) in tailRows)
         {
             if (!localTail.TryGetValue(keyHash, out var mine))
@@ -618,8 +632,8 @@ public static class SqliteMerger
         IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns, TableSummary baseline)
     {
         var added = columns.Where(c => !hashColumns.Contains(c, StringComparer.Ordinal)).ToList();
-        var local = ReadKeyedRows(connection, Local, table, rule, added);
-        var host = ReadKeyedRows(connection, "main", table, rule, added);
+        var local = ReadKeyedRows(connection, Local, table, rule, added, exactColumns: true);
+        var host = ReadKeyedRows(connection, "main", table, rule, added, exactColumns: true);
         foreach (var (key, mine) in local)
         {
             if (host.TryGetValue(key, out var theirs) && mine.Hash != theirs.Hash) return key;
@@ -683,7 +697,7 @@ public static class SqliteMerger
         if (baseline.TailRows is not { Count: > 0 } tail) return null;
         // 移った祖先の行は rowid では分からないので、キーで手元の行を探す。手元に無い行は
         // ExcludeRenumberedAncestorRows が別に中止する。
-        var localTail = HashRowsByKey(connection, Local, table, rule, $"rowid > {max}");
+        var localTail = HashRowsByKey(connection, Local, table, rule, $"rowid > {max}", out _);
         matched = CollectMatchedRowIds(connection, table, rule, $"> {max}");
         try
         {

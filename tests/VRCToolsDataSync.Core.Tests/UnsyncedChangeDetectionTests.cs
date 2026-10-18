@@ -642,6 +642,78 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Contains("gamelog_location", current.FindChangedTables(baseline));
     }
 
+    [Fact(DisplayName = "通常の Push の前にも、退けた WAL を戻してから送る")]
+    public void PushRestoresAsideWalBeforeSending()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+
+        var result = Push(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.False(File.Exists(db + "-wal" + suffix));
+        Assert.False(store.IsMergePending(key));
+        // 戻した WAL の行も送られている。
+        Assert.Equal(SyncOutcome.Success, a.Runner.Pull(a.Service, a.Settings, _storage, skipBackup: false).Outcome);
+        Assert.Equal(3, CountLocations(a.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "通常の Push でも、退けた WAL を戻せなければ印を残して送らない")]
+    public void PushAbortsWhenAsideWalCannotBeRestored()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+        File.WriteAllBytes(db + "-wal", Array.Empty<byte>());
+
+        var result = Push(b);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.True(File.Exists(db + "-wal" + suffix));
+        Assert.True(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "Pull の基準の要約は、取り出した写しから取る")]
+    public void PullRecordsSummaryOfFetchedSnapshot()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.NotNull(result.SyncedSummary);
+        // 取り出した写しは A が送ったものなので、A の DB の要約と同じ内容になる。
+        var remote = DatabaseSummary.Compute(a.Paths.SqliteFile, MergeProfiles.Vrcx, out _)!;
+        Assert.Empty(result.SyncedSummary!.FindChangedTables(remote));
+    }
+
+    [Fact(DisplayName = "要約を保存できなければ、同期履歴を進めずに古い基準を残す")]
+    public void PushKeepsStateWhenSummaryCannotBeSaved()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var baseDir = Path.Combine(_root, "a", "base");
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        // 要約のファイルの場所にフォルダを置き、保存を失敗させる。
+        var summaryPath = Directory.GetFiles(baseDir, "*.json").Single();
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        AddLocation(a, "2026-10-03T00:00:00Z");
+
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Contains("要約を保存できなかった", result.Message);
+        Assert.Equal(pulledBefore, a.Settings.ToolState[key].LastPulledVersion);
+    }
+
     [Fact(DisplayName = "保存まで済んで印だけが残っていれば、本体が変わっていても印を消して進む")]
     public void MergeClearsStaleRecordWhenAlreadySaved()
     {

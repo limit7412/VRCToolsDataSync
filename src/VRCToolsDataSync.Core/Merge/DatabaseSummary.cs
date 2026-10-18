@@ -215,11 +215,14 @@ public sealed class DatabaseSummary
     /// <summary>
     /// <paramref name="whereSql"/> を満たす行を、キーのハッシュから rowid と
     /// <see cref="MergeTableRule.GrowingColumns"/> の内容のハッシュへ写す。振り直しで
-    /// rowid が変わった祖先の行を、次のマージでキーで見分けるのに使う。
+    /// rowid が変わった祖先の行を、次のマージでキーで見分けるのに使う。同じキーの行が
+    /// 複数あれば <paramref name="duplicated"/> を真にする (後の行で上書きされる)。
     /// </summary>
     internal static Dictionary<string, (long RowId, string GrowingHash)> HashRowsByKey(
-        SqliteConnection connection, string schema, string table, MergeTableRule rule, string whereSql)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, string whereSql,
+        out bool duplicated)
     {
+        duplicated = false;
         var growing = rule.GrowingColumns ?? Array.Empty<string>();
         var selected = rule.KeyColumns.Concat(growing).ToList();
         using var command = connection.CreateCommand();
@@ -237,7 +240,9 @@ public sealed class DatabaseSummary
             values.Clear();
             for (var i = 0; i < keyCount; i++) AppendValue(key, reader, i + 1);
             for (var i = keyCount; i < selected.Count; i++) AppendValue(values, reader, i + 1);
-            rows[Hash(key.ToString())] = (reader.GetInt64(0), Hash(values.ToString()));
+            var keyHash = Hash(key.ToString());
+            if (rows.ContainsKey(keyHash)) duplicated = true;
+            rows[keyHash] = (reader.GetInt64(0), Hash(values.ToString()));
         }
         return rows;
     }
@@ -313,10 +318,17 @@ public sealed class DatabaseSummary
     /// キー付きのテーブルを読み、キー (型付きで文字列にしたもの) から行へ写す。
     /// 要約とマージで同じハッシュを使うため、両方がここを通る。
     /// </summary>
+    /// <param name="exactColumns">
+    /// 真なら、規則の <see cref="MergeTableRule.ValueColumns"/> に関わらず <paramref name="columns"/>
+    /// のうちキー以外の列をそのまま比べる。前回の同期の後に増えた列だけを比べるのに使う。
+    /// </param>
     internal static Dictionary<string, KeyedRow> ReadKeyedRows(
-        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns,
+        bool exactColumns = false)
     {
-        var valueColumns = ValueColumnsOf(rule, columns);
+        var valueColumns = exactColumns
+            ? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList()
+            : ValueColumnsOf(rule, columns);
         var selected = rule.KeyColumns.Concat(valueColumns).ToList();
 
         using var command = connection.CreateCommand();

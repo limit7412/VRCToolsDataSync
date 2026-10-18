@@ -137,11 +137,12 @@ public sealed class SyncResult
     public MergeReport? MergeReport { get; init; }
 
     /// <summary>
-    /// Push で実際に送った DB の写しの要約。次に比べる基準はこれから保存する。送った後に
-    /// 手元の DB から取ると、その間にツールが書き込んだ未送信の変更が基準に混ざり、
-    /// 次の起動時 Pull がその変更を見落として上書きする。
+    /// Push で実際に送った DB の写し、または Pull で取り出して手元に置いた写しの要約。
+    /// 次に比べる基準はこれから保存する。同期した後に手元の DB から取ると、その間に
+    /// ツールが書き込んだ未送信の変更が基準に混ざり、次の起動時 Pull がその変更を
+    /// 見落として上書きする。
     /// </summary>
-    public DatabaseSummary? PushedSummary { get; init; }
+    public DatabaseSummary? SyncedSummary { get; init; }
 }
 
 public enum SyncOutcome
