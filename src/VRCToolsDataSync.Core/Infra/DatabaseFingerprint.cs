@@ -23,4 +23,14 @@ public static class DatabaseFingerprint
         }
         return $"{OfMain(path)}|{OfWal(path + "-wal")}";
     }
+
+    /// <summary>
+    /// SQLite ではない普通のファイル (設定の JSON など) の状態。無ければ "-"。同期で
+    /// 差し替えるファイルは、DB と同じように処理の前後で比べる。
+    /// </summary>
+    public static string OfFile(string path)
+    {
+        var info = new FileInfo(path);
+        return info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
+    }
 }

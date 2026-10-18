@@ -908,6 +908,76 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "Pull の取得中に VRCX の設定だけが書き換えられても、差し替える前に中止する")]
+    public void PullAbortsWhenSettingsChangedDuringFetch()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var settings = b.Paths.SettingsJsonFile;
+        _storage.OnDownload = _ => File.WriteAllText(settings, "{\"changedWhileFetching\":true}");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("書き換えられた", result.Message);
+        Assert.Equal("{\"changedWhileFetching\":true}", File.ReadAllText(settings));
+        Assert.Equal(0, Scalar(b.Paths.SqliteFile, "SELECT count(*) FROM gamelog_location WHERE created_at = '2026-10-02T00:00:00Z'"));
+    }
+
+    [Fact(DisplayName = "dry-run のマージは、別の PC が取った予定の版の記録も消さない")]
+    public void DryRunMergeKeepsUncommittedPushRecord()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        var first = Push(a);
+        Assert.Equal(SyncOutcome.Success, first.Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        store.SavePushed(key, new PushedRecord("0", store.Load(key), PlannedVersion: first.RemoteVersion!.Value + 1));
+
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 120");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+
+        var dryRun = a.Runner.Merge(a.Service, a.Settings, _storage, dryRun: true);
+
+        Assert.True(dryRun.Outcome == SyncOutcome.Success, dryRun.Message);
+        Assert.NotNull(store.LoadPushed(key));
+        Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+
+        // 本番のマージでは消す。
+        Assert.True(Push(a).Outcome == SyncOutcome.Success);
+        Assert.Null(store.LoadPushed(key));
+    }
+
+    [Fact(DisplayName = "送った写しの記録を控えられなければ、送る前に Push を中止する")]
+    public void PushAbortsWhenPushedRecordCannotBeSaved()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var versionBefore = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version;
+        AddLocation(a, "2026-10-02T12:00:00Z");
+        // 記録のファイルの場所にフォルダを置き、書けなくする。
+        store.SavePushed(key, new PushedRecord("0"));
+        var pushedPath = Directory.GetFiles(store.RootDirectory, "*.pushed").Single();
+        File.Delete(pushedPath);
+        Directory.CreateDirectory(pushedPath);
+
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("記録を控えられない", result.Message);
+        Assert.Equal(versionBefore, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が

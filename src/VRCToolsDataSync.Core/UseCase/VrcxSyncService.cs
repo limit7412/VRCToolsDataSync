@@ -91,7 +91,23 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // 強制 Push は他の PC の更新を上書きするので、その間に他の PC が進めていればより
             // 後の version を取る。それでも、同期先が予定の版そのものなら自分の送信ではないと
             // 分かるので、予定として同じ値を控える。
-            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary, (existing?.Version ?? 0) + 1);
+            try
+            {
+                options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary, (existing?.Version ?? 0) + 1);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 送った写しの記録を控えられないまま送ると、要約の保存にも失敗したときに、
+                // 次のマージが送った内容を見分けられず、送った変更を二重に足す。送る前にやめる。
+                _logger.LogWarning(ex, "送った写しの記録を控えられないため、Push を中止します");
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    RemoteVersion = existing?.Version,
+                    Message = $"送った写しの記録を控えられないため、Push を中止しました: {ex.Message}。" +
+                              "ディスクの空き容量と、同期履歴のフォルダへの書き込み権限を確かめてください",
+                };
+            }
             try
             {
                 if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
@@ -226,8 +242,9 @@ public sealed class VrcxSyncService : IMergeableSyncService
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
         // ここから差し替えまでの間 (取得と要約で長くなりうる) に VRCX が起動して書き込むと、
-        // その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。
-        var localFingerprint = FingerprintDatabase(_paths.SqliteFile);
+        // その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。設定の JSON も
+        // 差し替えるので、DB と一緒に見る。
+        var localFingerprint = FingerprintPullTargets();
 
         var storage = options.Storage;
         var manifest = new ManifestStore(storage).Load();
@@ -357,14 +374,14 @@ public sealed class VrcxSyncService : IMergeableSyncService
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップの間に
         //     VRCX が起動して書き込んでいないかを確かめる。DB が大きいほどこの間は長い。
         ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
-        if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
+        if (FingerprintPullTargets() != localFingerprint)
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.Aborted,
                 RemoteVersion = entry.Version,
                 BackupPath = backupPath,
-                Message = "Pull の間に VRCX の DB が書き換えられたため、差し替える前に中止しました。" +
+                Message = "Pull の間に VRCX の DB か設定が書き換えられたため、差し替える前に中止しました。" +
                           "VRCX を終了してからやり直してください。",
             };
         }
@@ -568,8 +585,10 @@ public sealed class VrcxSyncService : IMergeableSyncService
                     if (entry.Version == plannedVersion)
                     {
                         // 取る予定だった版を別の PC が取った。送信は反映されなかったので、記録は要らない。
+                        // dry-run は手元に何も書かないので、消す予定として知らせるだけにする。
                         _logger.LogInformation("前回の送信は反映されていませんでした (版 {Version} は別の PC のもの)", plannedVersion);
-                        options.DiscardOwnPush?.Invoke();
+                        if (options.DryRun) _logger.LogInformation("dry-run のため、前回の送信の記録はまだ消しません");
+                        else options.DiscardOwnPush?.Invoke();
                     }
                     else if (entry.Version > plannedVersion)
                     {
@@ -677,6 +696,10 @@ public sealed class VrcxSyncService : IMergeableSyncService
 
     /// <summary>本体と WAL の大きさと更新時刻。書き換えられたかを見分けるのに使う。</summary>
     private static string FingerprintDatabase(string path) => DatabaseFingerprint.Of(path);
+
+    /// <summary>Pull が差し替えるファイル (DB 本体と WAL、設定の JSON) の状態。</summary>
+    private string FingerprintPullTargets()
+        => DatabaseFingerprint.Of(_paths.SqliteFile) + "|" + DatabaseFingerprint.OfFile(_paths.SettingsJsonFile);
 
     /// <summary>
     /// SQLite の本体ファイルを <paramref name="source"/> で置き換える。WAL/SHM は消さずに

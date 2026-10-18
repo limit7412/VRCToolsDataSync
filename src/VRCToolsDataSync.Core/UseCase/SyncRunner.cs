@@ -123,8 +123,10 @@ public sealed class SyncRunner
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
                 LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
+                // 控えられなければ送らない (サービス側が中止する)。送った後に要約の保存にも
+                // 失敗すると、次のマージが送った内容を見分けられない。
                 BeforeCommit = (sha256, summary, planned) =>
-                    TrySavePushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
+                    _baseSummaries.SavePushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
                 AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
                 // 反映しなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
                 // 分からない記録として扱われ、マージが止まる。
@@ -350,7 +352,8 @@ public sealed class SyncRunner
                         Storage = storage,
                         Baseline = baseline,
                         OwnPush = _baseSummaries.LoadPushed(stateKey),
-                        DiscardOwnPush = () => _baseSummaries.DeletePushed(stateKey),
+                        // dry-run は手元に何も書かない。記録も消さない。
+                        DiscardOwnPush = dryRun ? null : () => _baseSummaries.DeletePushed(stateKey),
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
@@ -534,19 +537,6 @@ public sealed class SyncRunner
                 AffectedFiles = result.AffectedFiles,
                 MergeReport = result.MergeReport,
             };
-
-    private void TrySavePushed(string stateKey, PushedRecord record)
-    {
-        try
-        {
-            _baseSummaries.SavePushed(stateKey, record);
-        }
-        catch (Exception ex)
-        {
-            // 控えられなくても、送った後に止まらない限り使わない。
-            _logger.LogWarning(ex, "送った写しの記録を控えられませんでした");
-        }
-    }
 
     private void TryMarkPushedCommitted(string stateKey, string sha256, long version)
     {

@@ -206,7 +206,7 @@ public sealed class FriendConnectSyncService : ISyncService
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
         // ここから差し替えまでの間 (取得と要約で長くなりうる) に Friend Connect が起動して
         // 書き込むと、その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。
-        var localFingerprint = DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File);
+        var localFingerprint = FingerprintPullTargets();
 
         var storage = options.Storage;
         var manifest = new ManifestStore(storage).Load();
@@ -355,14 +355,14 @@ public sealed class FriendConnectSyncService : ISyncService
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップの間に
         //     Friend Connect が起動して書き込んでいないかを確かめる。
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
-        if (DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File) != localFingerprint)
+        if (FingerprintPullTargets() != localFingerprint)
         {
             return new SyncResult
             {
                 Outcome = SyncOutcome.Aborted,
                 RemoteVersion = entry.Version,
                 BackupPath = backupPath,
-                Message = "Pull の間に Friend Connect の DB が書き換えられたため、差し替える前に中止しました。" +
+                Message = "Pull の間に Friend Connect の DB か設定が書き換えられたため、差し替える前に中止しました。" +
                           "Friend Connect を終了してからやり直してください。",
             };
         }
@@ -577,4 +577,9 @@ public sealed class FriendConnectSyncService : ISyncService
             File.Delete(path);
         }
     }
+
+    /// <summary>Pull が差し替えるファイル (2 つの DB 本体と WAL、設定の JSON) の状態。</summary>
+    private string FingerprintPullTargets()
+        => DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File)
+           + "|" + DatabaseFingerprint.OfFile(_paths.ConfigJsonFile);
 }
