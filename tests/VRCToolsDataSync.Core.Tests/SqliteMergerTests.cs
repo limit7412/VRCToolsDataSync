@@ -436,6 +436,25 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("memos", report.AbortReason);
     }
 
+    [Theory(DisplayName = "前回の同期の後に列が増え、片方だけがキーを消していれば、上書きせずに中止する")]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AbortsWhenAddedColumnAndOneSideDeleted(bool hostDeletes)
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE memos ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        // 残った側は新しい列だけを変えたので、古い列だけでは変えていないように見える。
+        Exec(hostDeletes ? host : local, "DELETE FROM memos WHERE user_id = 'usr_a'");
+        Exec(hostDeletes ? local : host, "UPDATE memos SET extra = 'x' WHERE user_id = 'usr_a'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("memos", report.AbortReason);
+    }
+
     [Fact(DisplayName = "履歴のテーブルでも、増えた列の値が両方で違えば上書きせずに中止する")]
     public void AbortsWhenAddedColumnDiffersInAppendOnly()
     {

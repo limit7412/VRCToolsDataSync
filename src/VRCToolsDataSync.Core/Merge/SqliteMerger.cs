@@ -232,11 +232,13 @@ public static class SqliteMerger
         }
 
         if (baseline is not null && rule.ValueColumns is null && hashColumns.Count < localColumns.Count
-            && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns) is { } differing)
+            && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns, baseline.Rows) is { } differing)
         {
             // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
             // 古い列だけで合わせると、手元で変えた新しい列の値を同期先の値で上書きしうる。
             // 追加専用のテーブルも既存行は書き換えないので、同じく上書きになる。
+            // 片方が消したキーも、もう片方が新しい列だけを変えていれば、古い列だけでは
+            // 変えていないように見えて削除が勝ち、その変更が失われる。
             report.AbortReason = $"テーブル {table} の新しい列の値が同期先と手元で違い (キー {differing})、どちらの変更か判断できないため自動マージを中止しました";
             return null;
         }
@@ -450,11 +452,15 @@ public static class SqliteMerger
 
     /// <summary>
     /// 祖先の要約の後に増えた列だけを比べ、手元と同期先の両方にあって値が違うキーを
-    /// 1 つ返す。無ければ null。
+    /// 1 つ返す。祖先にあって片方だけが消したキー (<paramref name="ancestorRows"/> が
+    /// あるキー付きのテーブルのみ) も、残った側で新しい列が足したときの値から変わって
+    /// いれば返す。古い列だけでは変えていないように見え、削除が勝ってしまうため。
+    /// 無ければ null。
     /// </summary>
     private static string? FindKeyWithDifferentAddedColumns(
         SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns)
+        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
+        IReadOnlyDictionary<string, string>? ancestorRows)
     {
         var added = columns.Where(c => !hashColumns.Contains(c, StringComparer.Ordinal)).ToList();
         var local = ReadKeyedRows(connection, Local, table, rule, added);
@@ -463,7 +469,37 @@ public static class SqliteMerger
         {
             if (host.TryGetValue(key, out var theirs) && mine.Hash != theirs.Hash) return key;
         }
+        foreach (var key in ancestorRows?.Keys ?? Enumerable.Empty<string>())
+        {
+            if (local.TryGetValue(key, out var kept) == host.ContainsKey(key)) continue;
+            var schema = kept is not null ? Local : "main";
+            kept ??= host[key];
+            if (HasSetAddedColumns(connection, schema, table, rule, added, kept.KeyValues)) return key;
+        }
         return null;
+    }
+
+    /// <summary>
+    /// そのキーの行で、増えた列のどれかが列を足したときの値 (既定値か NULL) から
+    /// 変わっているかを返す。変わっていなければ、残った側も新しい列には触れていない。
+    /// </summary>
+    private static bool HasSetAddedColumns(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule,
+        IReadOnlyList<string> added, object?[] keyValues)
+    {
+        var defaults = new Dictionary<string, string?>(StringComparer.Ordinal);
+        using (var info = connection.CreateCommand())
+        {
+            info.CommandText = $"SELECT name, dflt_value FROM pragma_table_info({Literal(table)}, {Literal(schema)})";
+            using var reader = info.ExecuteReader();
+            while (reader.Read()) defaults[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
+        }
+        using var command = connection.CreateCommand();
+        var changed = added.Select(c => $"{Quote(c)} IS NOT ({defaults.GetValueOrDefault(c) ?? "NULL"})");
+        command.CommandText =
+            $"SELECT count(*) FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({string.Join(" OR ", changed)})";
+        return (long)command.ExecuteScalar()! > 0;
     }
 
     /// <summary>両方が別々に変えたキーで、手元の内容を採るかを決める。</summary>
