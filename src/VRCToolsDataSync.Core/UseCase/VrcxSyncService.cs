@@ -578,13 +578,18 @@ public sealed class VrcxSyncService : IMergeableSyncService
 
     private static IEnumerable<string> SidecarsOf(string database) => new[] { database + "-wal", database + "-shm" };
 
+    /// <summary><see cref="ReplaceDatabase"/> が脇へ退けたまま残っている WAL/SHM の場所。</summary>
+    internal static string[] FindAsideFiles(string database, string asideSuffix)
+        => SidecarsOf(database).Select(p => p + asideSuffix).Where(File.Exists).ToArray();
+
     /// <summary>
     /// <see cref="ReplaceDatabase"/> が脇へ退けたまま残った WAL/SHM を、本体の隣へ戻す。
     /// 置き換える前に止まったとき用。本体の隣に同じ名前のファイルが既にあれば、その後に
-    /// VRCX が作ったものなので上書きせず、退けた方を残して知らせる。
+    /// VRCX が作ったものなので上書きせず、退けた方を残して偽を返す。全部戻せれば真。
     /// </summary>
-    internal static void RestoreAsideFiles(string database, string asideSuffix, ILogger logger)
+    internal static bool RestoreAsideFiles(string database, string asideSuffix, ILogger logger)
     {
+        var restored = true;
         foreach (var path in SidecarsOf(database))
         {
             var aside = path + asideSuffix;
@@ -592,11 +597,13 @@ public sealed class VrcxSyncService : IMergeableSyncService
             if (File.Exists(path))
             {
                 logger.LogWarning("退けた {Aside} を戻す先に別のファイルがあるため、そのまま残しました", aside);
+                restored = false;
                 continue;
             }
             File.Move(aside, path);
             logger.LogInformation("前回のマージが退けた {Path} を戻しました", path);
         }
+        return restored;
     }
 
     /// <summary><see cref="ReplaceDatabase"/> が脇へ退けたまま残った WAL/SHM を消す。置き換えた後に止まったとき用。</summary>

@@ -308,7 +308,8 @@ public static class SqliteMerger
         // 同期先にある行は足さない。突き合わせは、手元の写しの索引を使って同期先を順に読む
         // (CollectMatchedRowIds)。
         var matched = CollectMatchedRowIds(connection, table, rule, $"> {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
-        if (sinceRowId > 0 && baseline!.TailRows is { Count: > 0 } tail
+        // 移った祖先の行は、前回の最大 rowid が 0 (足した行が同期先の全行より古かった) でもある。
+        if (baseline?.TailRows is { Count: > 0 } tail
             && ExcludeRenumberedAncestorRows(connection, table, rule, tail, sinceRowId, matched) is { } tailProblem)
         {
             Execute(connection, $"DROP TABLE {matched}");
@@ -558,7 +559,19 @@ public static class SqliteMerger
             host.TryGetValue(key, out var theirs);
             ancestor.TryGetValue(key, out var original);
 
-            if (mine?.Hash == theirs?.Hash) continue;   // 同じ内容 (両方に無いことも含む)
+            if (mine?.Hash == theirs?.Hash)
+            {
+                // 同じ内容 (両方に無いことも含む)。ただし累計の列は、祖先から双方が同じだけ
+                // 延ばした結果かもしれないので、祖先の値があれば双方の増分を足す。
+                if (mine is not null && mine.Hash != original && rule.CounterColumns is { Count: > 0 }
+                    && baseline?.Counters?.GetValueOrDefault(key) is { } ancestorCounters
+                    && ReadCombinedValues(connection, table, rule, mine.KeyValues, ancestorCounters) is { } sum)
+                {
+                    WriteValues(connection, table, rule, mine.KeyValues, sum);
+                    updated++;
+                }
+                continue;
+            }
             if (mine?.Hash == original) continue;       // 手元は変えていない。同期先のまま
 
             var conflict = theirs?.Hash != original;    // 同期先も変えている
@@ -580,11 +593,10 @@ public static class SqliteMerger
                 else if (theirs is null) inserted++;
                 else updated++;
             }
-            if (combined is not null
-                && WriteValues(connection, table, rule, mine!.KeyValues, combined) > 0
-                && !takeLocal)
+            if (combined is not null)
             {
-                updated++;
+                WriteValues(connection, table, rule, mine!.KeyValues, combined);
+                if (!takeLocal) updated++;
             }
         }
 
@@ -611,7 +623,7 @@ public static class SqliteMerger
         {
             if (host.TryGetValue(key, out var theirs) && mine.Hash != theirs.Hash) return key;
         }
-        if (baseline is { Kind: MergeTableKind.AppendOnly, MaxRowId: > 0 })
+        if (baseline is { Kind: MergeTableKind.AppendOnly } && (baseline.MaxRowId > 0 || baseline.TailRows is { Count: > 0 }))
         {
             return FindAncestorRowDeletedByHost(connection, table, rule, added, baseline);
         }
@@ -766,7 +778,8 @@ public static class SqliteMerger
     /// 大きい方、<see cref="MergeTableRule.ShrinkingColumns"/> は小さい方の値を取る。
     /// <see cref="MergeTableRule.CounterColumns"/> は祖先の値 (<paramref name="ancestorCounters"/>)
     /// に双方の増分を足す。祖先の値が無ければ大きい方を取る。
-    /// NULL は値が無いものとして扱う。合成する列が無ければ null を返す。
+    /// NULL は値が無いものとして扱う。合成する列が無いか、合成した値がどれも両方の値と
+    /// 同じで書く必要が無ければ null を返す。
     /// </summary>
     private static Dictionary<string, object?>? ReadCombinedValues(
         SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues,
@@ -778,9 +791,10 @@ public static class SqliteMerger
         if (growing.Count == 0 && shrinking.Count == 0 && counters.Count == 0) return null;
 
         var names = growing.Concat(shrinking).ToList();
+        var all = names.Concat(counters).ToList();
         var expressions = growing.Select(c => Pick(c, ">"))
             .Concat(shrinking.Select(c => Pick(c, "<")))
-            .Concat(counters.SelectMany(c => new[] { $"l.{Quote(c)}", $"h.{Quote(c)}" }));
+            .Concat(all.SelectMany(c => new[] { $"l.{Quote(c)}", $"h.{Quote(c)}" }));
         using var command = connection.CreateCommand();
         var keys = new List<string>();
         for (var i = 0; i < rule.KeyColumns.Count; i++)
@@ -797,15 +811,21 @@ public static class SqliteMerger
         using var reader = command.ExecuteReader();
         if (!reader.Read()) return null;
         var values = new Dictionary<string, object?>(StringComparer.Ordinal);
-        for (var i = 0; i < names.Count; i++) values[names[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-        for (var i = 0; i < counters.Count; i++)
+        for (var i = 0; i < all.Count; i++)
         {
-            var mine = reader.IsDBNull(names.Count + 2 * i) ? null : reader.GetValue(names.Count + 2 * i);
-            var theirs = reader.IsDBNull(names.Count + 2 * i + 1) ? null : reader.GetValue(names.Count + 2 * i + 1);
-            values[counters[i]] = AddCounter(mine, theirs,
-                ancestorCounters is not null && ancestorCounters.TryGetValue(counters[i], out var a) ? a : null);
+            var mine = At(names.Count + 2 * i);
+            var theirs = At(names.Count + 2 * i + 1);
+            var value = i < names.Count
+                ? At(i)
+                : AddCounter(mine, theirs,
+                    ancestorCounters is not null && ancestorCounters.TryGetValue(all[i], out var a) ? a : null);
+            // 両方の値と同じなら、どちらの行を残しても書く必要が無い。
+            if (Equals(value, mine) && Equals(value, theirs)) continue;
+            values[all[i]] = value;
         }
-        return values;
+        return values.Count == 0 ? null : values;
+
+        object? At(int i) => reader.IsDBNull(i) ? null : reader.GetValue(i);
 
         static string Pick(string column, string op)
         {

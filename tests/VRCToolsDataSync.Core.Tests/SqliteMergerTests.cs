@@ -152,11 +152,12 @@ public sealed class SqliteMergerTests : IDisposable
     /// 競合した状態を作る。返すのは、先に進んだ同期先 (host) と、マージ結果の手元 (local)、
     /// 縮めた祖先の要約。同期先は振り直しで後ろへ移った行 wrld_host:1 を消している。
     /// </summary>
-    private (string Host, string Local, DatabaseSummary Baseline) ArrangeRenumberedRetry(string? localBeforeMerge = null)
+    private (string Host, string Local, DatabaseSummary Baseline) ArrangeRenumberedRetry(
+        string? localBeforeMerge = null, string localCreatedAt = "2026-10-02T00:00:00Z")
     {
         var (host, local, baseline) = Arrange();
         Exec(host, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_host:1')");
-        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+        Exec(local, $"INSERT INTO gamelog_location (created_at, location) VALUES ('{localCreatedAt}', 'wrld_local:1')");
         if (localBeforeMerge is not null) Exec(local, localBeforeMerge);
         var nextRemote = Path.Combine(_root, "next-remote.sqlite3");
         File.Copy(host, nextRemote);
@@ -179,6 +180,19 @@ public sealed class SqliteMergerTests : IDisposable
 
         Assert.Equal(
             new[] { "wrld_a:1", "wrld_local:1" },
+            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
+    [Fact(DisplayName = "足した行が同期先の全行より古く残った行が無くても、移った祖先の行を戻さない")]
+    public void RenumberedAncestorRowIsNotReinsertedWhenNothingKept()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry(localCreatedAt: "2026-09-30T00:00:00Z");
+        Assert.Equal(0, baseline.Tables["gamelog_location"].MaxRowId);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_local:1", "wrld_a:1" },
             Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
     }
 
@@ -374,6 +388,23 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Equal(
             new[] { "avtr_a|2026-10-01T00:00:00Z|600", "avtr_b|2026-10-03T00:00:00Z|450" },
             Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+    }
+
+    [Fact(DisplayName = "着用時間が両方で同じ値まで延びていても、双方の増分を足す")]
+    public void AvatarHistoryAddsBothIncrementsWhenEqual()
+    {
+        var (host, local, baseline) = ArrangeAvatarHistory();
+        const string same = "UPDATE usr0123abcd_avatar_history SET time = 150 WHERE avatar_id = 'avtr_a'";
+        Exec(host, same);
+        Exec(local, same);
+
+        var report = Merge(host, local, baseline);
+
+        // a: 100 + 50 + 50。
+        Assert.Equal(
+            new[] { "avtr_a|2026-10-01T00:00:00Z|200", "avtr_b|2026-10-03T00:00:00Z|450" },
+            Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+        Assert.Equal(2, report.Tables.Single(t => t.Table == "usr0123abcd_avatar_history").Updated);
     }
 
     [Fact(DisplayName = "祖先の要約に着用時間が無ければ、長い方を残す")]

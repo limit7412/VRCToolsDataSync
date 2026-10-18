@@ -416,31 +416,27 @@ public sealed class SyncRunner
             return (null, null, null);
         }
         var saved = _baseSummaries.Load(stateKey);
-        if (state.LastPulledVersion == pending.RemoteVersion
-            && (pending.Summary is null ? saved is null : saved?.RemoteVersion == pending.RemoteVersion))
-        {
-            // 要約と同期履歴の保存まで済んでいて、印を消すところだけ失敗していた。
-            // 本体のハッシュは、その後の VRCX の書き込みで変わっていてもよい。
-            _logger.LogInformation("前回のマージの印だけが残っていました ({Tool})", service.ToolKey);
-            if (!dryRun)
-            {
-                if (pending.AsideSuffix is not null) VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
-                TryClearMergePending(stateKey);
-            }
-            return (null, null, null);
-        }
+        var aside = pending.AsideSuffix is null ? Array.Empty<string>() : VrcxSyncService.FindAsideFiles(tracked.Path, pending.AsideSuffix);
         var current = FileHasher.Sha256(tracked.Path);
         if (string.Equals(current, pending.LocalSha256, StringComparison.OrdinalIgnoreCase))
         {
             // 置き換える前に止まった。ローカルは元のままなので、祖先も同期履歴もそのままでよい。
             // ただし WAL/SHM を脇へ退けた後なら、本体に書き戻されていない変更がそこに残って
-            // いるので、戻してから進む。
+            // いるので、戻してから進む。戻せなければ、その変更を見失わないよう印を残して止める。
+            // 既に保存まで済んでいた場合も、本体が変わっていなければ同じ扱いでよい。
             _logger.LogInformation("前回のマージは置き換える前に止まっていました ({Tool})", service.ToolKey);
-            if (!dryRun)
+            if (dryRun) return (null, null, null);
+            if (pending.AsideSuffix is not null && !VrcxSyncService.RestoreAsideFiles(tracked.Path, pending.AsideSuffix, _logger))
             {
-                if (pending.AsideSuffix is not null) VrcxSyncService.RestoreAsideFiles(tracked.Path, pending.AsideSuffix, _logger);
-                TryClearMergePending(stateKey);
+                return (new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    Message = "前回のマージが退けた WAL を戻せません (" + string.Join(", ", aside) + ")。" +
+                              "戻す先に別のファイルがあります。VRCX を終了してからもう一度実行してください。" +
+                              "それでも進まなければ、退けたファイルの中身が要らないことを確かめて消してください",
+                }, null, null);
             }
+            TryClearMergePending(stateKey);
             return (null, null, null);
         }
         if (string.Equals(current, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
@@ -459,12 +455,28 @@ public sealed class SyncRunner
             TryClearMergePending(stateKey);
             return (null, null, null);
         }
+        if (aside.Length == 0
+            && state.LastPulledVersion == pending.RemoteVersion
+            && (pending.Summary is null ? saved is null : saved?.RemoteVersion == pending.RemoteVersion))
+        {
+            // 要約と同期履歴の保存まで済んでいて、印を消すところだけ失敗していた。
+            // 本体のハッシュは、その後の VRCX の書き込みで変わっていてもよい。退けた WAL が
+            // 残っていれば、同じ版へのマージが置き換える前に止まった可能性もあるので、この
+            // 判定はしない。
+            _logger.LogInformation("前回のマージの印だけが残っていました ({Tool})", service.ToolKey);
+            if (!dryRun) TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
+        var message = "前回のマージがローカルの置き換えの前後で止まり、その後に DB が書き換えられています。" +
+                      "置き換えが済んだかを見分けられないため、自動マージを中止しました。";
+        if (aside.Length > 0)
+        {
+            message += "退けた WAL (" + string.Join(", ", aside) + ") も残っていますが、本体が変わっているので戻せません。";
+        }
         return (new SyncResult
         {
             Outcome = SyncOutcome.Aborted,
-            Message = "前回のマージがローカルの置き換えの前後で止まり、その後に DB が書き換えられています。" +
-                      "置き換えが済んだかを見分けられないため、自動マージを中止しました。" +
-                      "バックアップを確かめたうえで、Pull で同期先に合わせるか、強制 Push で手元を送ってください",
+            Message = message + "バックアップを確かめたうえで、Pull で同期先に合わせるか、強制 Push で手元を送ってください",
         }, null, null);
     }
 
