@@ -377,4 +377,57 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
             SyncRunner.MergeLockTimeout = previous;
         }
     }
+
+    [Fact(DisplayName = "別のプロセスがマージ中なら、Push も見送る")]
+    public void PushWaitsForOtherProcess()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var root = Path.Combine(_root, "b", "base");
+        Directory.CreateDirectory(root);
+        var remoteVersion = new ManifestStore(_storage).Load().Tools[VrcxSyncService.Key].Version;
+        var previous = SyncRunner.MergeLockTimeout;
+        SyncRunner.MergeLockTimeout = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            using (new FileStream(Path.Combine(root, $"merge-{VrcxSyncService.Key}.lock"),
+                       FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                var result = Push(b);
+
+                Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+                Assert.Equal(remoteVersion, new ManifestStore(_storage).Load().Tools[VrcxSyncService.Key].Version);
+            }
+        }
+        finally
+        {
+            SyncRunner.MergeLockTimeout = previous;
+        }
+    }
+
+    [Fact(DisplayName = "マージの印が残っていれば、要約が無くても起動時 Pull は上書きを見送る")]
+    public void StartupPullKeepsLocalWhenMergePending()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        store.Delete(key);
+        store.MarkMergePending(key);
+
+        var result = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
+    }
+
+    [Fact(DisplayName = "マージが済めば、マージの印は残らない")]
+    public void MergeClearsPendingMark()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        Assert.False(store.IsMergePending(SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key)));
+    }
 }

@@ -64,6 +64,10 @@ public sealed class SyncRunner
         // 土台にしてしまう。lock は同じスレッドからなら入り直せる。
         lock (PushLock)
         {
+            // Push の間に別プロセスがローカルを置き換えると、送った内容と記録する要約が
+            // 食い違う。マージや Pull と同じ錠前で、スナップショットから要約の保存までを守る。
+            using var localLock = AcquireLocalLock(service.ToolKey);
+            if (!localLock.IsHeld) return LocalLockBusy();
             var result = PushOnce(service, settings, storage, force, reuploadAll);
 
             // リモートの方が新しくて止まった Push は、マージが有効ならマージしてから送り直す。
@@ -207,11 +211,43 @@ public sealed class SyncRunner
     /// PushLock はこのプロセスの中でしか効かないので、常駐の GUI と CLI が同じ DB を同時に
     /// 置き換えないよう、要約の置き場所にツールごとの錠前ファイルを置く。
     /// </summary>
-    private CrossSessionFileLock AcquireLocalLock(string toolKey)
+    /// <remarks>
+    /// Push からマージへ、マージから Push へと入れ子で取るので、このプロセスの中では
+    /// 入り直せるようにする。呼び出しは必ず PushLock の中なので、表は PushLock で守られる。
+    /// </remarks>
+    private LocalLock AcquireLocalLock(string toolKey)
     {
+        var path = Path.Combine(_baseSummaries.RootDirectory, $"merge-{toolKey}.lock");
+        if (HeldLocalLocks.TryGetValue(path, out var held))
+        {
+            HeldLocalLocks[path] = (held.Lock, held.Count + 1);
+            return new LocalLock(path, isHeld: true);
+        }
         Directory.CreateDirectory(_baseSummaries.RootDirectory);
-        return CrossSessionFileLock.Acquire(
-            Path.Combine(_baseSummaries.RootDirectory, $"merge-{toolKey}.lock"), MergeLockTimeout);
+        var acquired = CrossSessionFileLock.Acquire(path, MergeLockTimeout);
+        if (!acquired.IsHeld) return new LocalLock(path, isHeld: false);
+        HeldLocalLocks[path] = (acquired, 1);
+        return new LocalLock(path, isHeld: true);
+    }
+
+    private static readonly Dictionary<string, (CrossSessionFileLock Lock, int Count)> HeldLocalLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class LocalLock(string path, bool isHeld) : IDisposable
+    {
+        public bool IsHeld { get; } = isHeld;
+
+        public void Dispose()
+        {
+            if (!IsHeld || !HeldLocalLocks.TryGetValue(path, out var held)) return;
+            if (held.Count > 1)
+            {
+                HeldLocalLocks[path] = (held.Lock, held.Count - 1);
+                return;
+            }
+            HeldLocalLocks.Remove(path);
+            held.Lock.Dispose();
+        }
     }
 
     private static SyncResult LocalLockBusy() => new()
@@ -267,10 +303,18 @@ public sealed class SyncRunner
                 var previousBaseline = _baseSummaries.Load(stateKey);
                 var previousPulledVersion = state.LastPulledVersion;
                 var previousPulledAt = state.LastPulledAt;
-                // 同期履歴と別の時点の要約は祖先に使えない。祖先なしの 2-way にする。
-                var baseline = previousBaseline?.RemoteVersion == previousPulledVersion ? previousBaseline : null;
+                // 同期履歴より古い要約は祖先に使えない。祖先なしの 2-way にする。新しい要約は、
+                // 前回のマージで置き換えた後、同期履歴を保存する前に止まったときのもので、
+                // 今のローカルの祖先として正しい。
+                var baseline = previousBaseline is not null && previousBaseline.RemoteVersion >= previousPulledVersion
+                    ? previousBaseline
+                    : null;
 
                 var committed = false;
+                // 置き換えから要約と同期履歴の保存までの間に止まっても分かるよう、先に印を付ける。
+                // 前の中断の印が残っていれば、それは消さない。
+                var wasPending = _baseSummaries.IsMergePending(stateKey);
+                if (!dryRun) _baseSummaries.MarkMergePending(stateKey);
                 SyncResult merged;
                 try
                 {
@@ -292,11 +336,15 @@ public sealed class SyncRunner
                             state.LastPulledAt = DateTimeOffset.Now;
                             settings.ToolState[stateKey] = state;
                             _store.SaveToolStateOnly(settings);
+                            _baseSummaries.ClearMergePending(stateKey);
                         },
                     });
                 }
                 catch
                 {
+                    // 置き換える前に失敗したなら、ローカルは元のままなので印は要らない。
+                    // 置き換えた後なら印を残し、次の同期で手元の変更を守る。
+                    if (!committed && !wasPending && !dryRun) TryClearMergePending(stateKey);
                     // そろえている途中で失敗した。要約と同期履歴が食い違わないよう元へ戻す。
                     // ローカルはマージ結果のままだが、手元に未 Push の変更があるものとして
                     // 扱われるので、次の同期で同期先の変更を上書きすることはない。
@@ -310,6 +358,7 @@ public sealed class SyncRunner
                     }
                     throw;
                 }
+                if (!committed && !wasPending && !dryRun) TryClearMergePending(stateKey);
                 if (dryRun || merged.Outcome != SyncOutcome.Success || !merged.RemoteVersion.HasValue)
                 {
                     // 2 周目以降はバックアップを取らないが、ローカルは 1 周目で置き換えて
@@ -357,6 +406,19 @@ public sealed class SyncRunner
                 MergeReport = result.MergeReport,
             };
 
+    private void TryClearMergePending(string stateKey)
+    {
+        try
+        {
+            _baseSummaries.ClearMergePending(stateKey);
+        }
+        catch (Exception ex)
+        {
+            // 残っても、次の同期で手元の変更があるものとして扱われるだけで済む。
+            _logger.LogWarning(ex, "マージの印を消せませんでした");
+        }
+    }
+
     private void RestoreBaseline(string stateKey, DatabaseSummary? previous)
     {
         try
@@ -382,6 +444,8 @@ public sealed class SyncRunner
     /// </summary>
     private void RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion)
     {
+        // Push か Pull が済み、ローカルと同期先がそろった。中断したマージの印は要らない。
+        TryClearMergePending(stateKey);
         if (service.TrackedDatabase is not { } tracked) return;
         try
         {
@@ -415,6 +479,12 @@ public sealed class SyncRunner
         try
         {
             if (!File.Exists(tracked.Path)) return Array.Empty<string>();
+            if (_baseSummaries.IsMergePending(stateKey))
+            {
+                // マージ結果で置き換えた後、要約か同期履歴を保存し終える前に止まった。
+                // 要約が当てにならないので、比べずに手元の変更があるものとして扱う。
+                return new[] { "前回のマージが途中で止まりました" };
+            }
             var baseline = _baseSummaries.Load(stateKey);
             // 要約の方が同期履歴より新しいのは、マージ結果で置き換えた後、要約を保存して
             // 同期履歴を保存する前に止まった場合だけである。ローカルはその要約の版に手元の

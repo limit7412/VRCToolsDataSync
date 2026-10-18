@@ -96,6 +96,27 @@ public sealed class BaseSummaryStore
     }
 
     /// <summary>
+    /// マージ結果でローカルを置き換えようとしていることを記録する。置き換えた後に
+    /// 要約と同期履歴を保存し終えるまで残し、途中で止まったことを次回に分かるようにする。
+    /// 記録が残っている間、ローカルには未 Push の変更があるものとして扱う。
+    /// </summary>
+    public void MarkMergePending(string stateKey)
+    {
+        Directory.CreateDirectory(RootDirectory);
+        File.WriteAllText(PendingPathOf(stateKey), DateTimeOffset.Now.ToString("O"));
+    }
+
+    public void ClearMergePending(string stateKey)
+    {
+        var path = PendingPathOf(stateKey);
+        if (File.Exists(path)) File.Delete(path);
+    }
+
+    public bool IsMergePending(string stateKey) => File.Exists(PendingPathOf(stateKey));
+
+    private string PendingPathOf(string stateKey) => PathOf(stateKey) + ".merging";
+
+    /// <summary>
     /// 要約ごとのロックファイルを排他で開く。他のプロセスが開いていれば、閉じるまで待つ。
     /// ロックファイルは消さずに残す。消すと、待っていた側が別のファイルを作って
     /// 同時にロックを得てしまう。
