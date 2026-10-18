@@ -336,7 +336,9 @@ public sealed class SyncRunner
                             state.LastPulledAt = DateTimeOffset.Now;
                             settings.ToolState[stateKey] = state;
                             _store.SaveToolStateOnly(settings);
-                            _baseSummaries.ClearMergePending(stateKey);
+                            // ここまで保存できれば、印が残っても手元の変更があるものとして
+                            // 扱われるだけなので、消せなくても失敗にしない。
+                            TryClearMergePending(stateKey);
                         },
                     });
                 }

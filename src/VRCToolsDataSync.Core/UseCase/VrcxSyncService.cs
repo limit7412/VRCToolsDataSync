@@ -403,11 +403,25 @@ public sealed class VrcxSyncService : IMergeableSyncService
             //     ファイルを開いたままにしないため。
             var localPath = Path.Combine(work, "local.sqlite3");
             SqliteSnapshot.Create(_paths.SqliteFile, localPath);
+            // 写しを取った後に VRCX が DB を書き換えたら、置き換えで失われる。置き換えの
+            // 直前に比べられるよう、今のファイルの状態を控えておく。
+            var localFingerprint = FingerprintDatabase(_paths.SqliteFile);
 
             // (3) 写しどうしでマージする。手元の DB にはまだ触れない。
             //     マージ後の祖先にするため、土台の要約をマージの前に取っておく。
-            var hostBaseline = DatabaseSummary.Compute(hostPath, MergeProfiles.Vrcx, out _);
+            var hostBaseline = DatabaseSummary.Compute(hostPath, MergeProfiles.Vrcx, out var hostReason);
             if (hostBaseline is not null) hostBaseline.RemoteVersion = entry.Version;
+            else if (!options.DryRun)
+            {
+                // 要約が無いと、置き換えた後のローカルに祖先が無くなり、次の同期で手元の
+                // 変更を見分けられない。置き換える前にやめる。
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    RemoteVersion = entry.Version,
+                    Message = $"同期先の DB を要約できないため、マージを中止しました: {hostReason}",
+                };
+            }
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, options.Baseline, options.DryRun);
             if (hostBaseline is not null && report.Succeeded)
             {
@@ -453,6 +467,18 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // Pull が別プロセスのマージを待ちきれずに VRCX を起動した場合など)。動いている
             // DB を置き換えないよう、置き換えの直前にもう一度確かめる。
             ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
+            if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
+            {
+                // 写しを取った後に VRCX が起動して DB を書き換え、もう終了している。
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    RemoteVersion = entry.Version,
+                    BackupPath = backupPath,
+                    Message = "マージの間に VRCX の DB が書き換えられたため、置き換えずに中止しました。もう一度実行してください",
+                    MergeReport = report,
+                };
+            }
             ReplaceDatabase(hostPath, _paths.SqliteFile, _logger);
             options.AfterReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
 
@@ -471,6 +497,17 @@ public sealed class VrcxSyncService : IMergeableSyncService
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             try { Directory.Delete(work, recursive: true); } catch { /* best-effort cleanup */ }
         }
+    }
+
+    /// <summary>本体と WAL の大きさと更新時刻。書き換えられたかを見分けるのに使う。</summary>
+    private static string FingerprintDatabase(string path)
+    {
+        static string Of(string file)
+        {
+            var info = new FileInfo(file);
+            return info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
+        }
+        return $"{Of(path)}|{Of(path + "-wal")}";
     }
 
     /// <summary>
