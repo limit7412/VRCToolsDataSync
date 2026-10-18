@@ -401,11 +401,22 @@ public sealed class VrcxSyncService : IMergeableSyncService
 
             // (2) 手元の DB の写しを取る。WAL を統合するためと、マージ中に手元の
             //     ファイルを開いたままにしないため。
+            // 写しを取っている間か取った後に VRCX が DB を書き換えたら、その更新は写しに
+            // 入らず、置き換えで失われる。写しの前後でファイルの状態を控えて比べ、置き換えの
+            // 直前にもう一度比べる。
             var localPath = Path.Combine(work, "local.sqlite3");
-            SqliteSnapshot.Create(_paths.SqliteFile, localPath);
-            // 写しを取った後に VRCX が DB を書き換えたら、置き換えで失われる。置き換えの
-            // 直前に比べられるよう、今のファイルの状態を控えておく。
             var localFingerprint = FingerprintDatabase(_paths.SqliteFile);
+            SqliteSnapshot.Create(_paths.SqliteFile, localPath);
+            if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
+            {
+                return new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    RemoteVersion = entry.Version,
+                    Message = "手元の DB の写しを取る間に VRCX の DB が書き換えられたため、マージを中止しました。" +
+                              "VRCX を終了してからやり直してください。",
+                };
+            }
 
             // (3) 写しどうしでマージする。手元の DB にはまだ触れない。
             //     マージ後の祖先にするため、土台の要約をマージの前に取っておく。

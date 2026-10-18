@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 using static VRCToolsDataSync.Core.Merge.DatabaseSummary;
 
@@ -421,10 +422,11 @@ public static class SqliteMerger
             var takeLocal = !conflict
                 || ResolveConflict(connection, table, rule, mine, theirs, key, report);
 
-            // 両方が書き換えていたら、単調に変わる列はどちらの行を残すかに関わらず合成する。
-            // 置き換えると同期先の値が消えるので、合成した値は置き換えの前に読んでおく。
+            // 両方が書き換えていたら、単調に変わる列と累計の列はどちらの行を残すかに関わらず
+            // 合成する。置き換えると同期先の値が消えるので、合成した値は置き換えの前に読んでおく。
             var combined = conflict && mine is not null && theirs is not null
-                ? ReadCombinedValues(connection, table, rule, mine.KeyValues)
+                ? ReadCombinedValues(connection, table, rule, mine.KeyValues,
+                    baseline?.Counters?.GetValueOrDefault(key))
                 : null;
 
             if (takeLocal)
@@ -493,18 +495,23 @@ public static class SqliteMerger
     /// <summary>
     /// 手元と同期先の同じキーの行から、<see cref="MergeTableRule.GrowingColumns"/> は
     /// 大きい方、<see cref="MergeTableRule.ShrinkingColumns"/> は小さい方の値を取る。
+    /// <see cref="MergeTableRule.CounterColumns"/> は祖先の値 (<paramref name="ancestorCounters"/>)
+    /// に双方の増分を足す。祖先の値が無ければ大きい方を取る。
     /// NULL は値が無いものとして扱う。合成する列が無ければ null を返す。
     /// </summary>
     private static Dictionary<string, object?>? ReadCombinedValues(
-        SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues)
+        SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues,
+        IReadOnlyDictionary<string, long>? ancestorCounters)
     {
         var growing = rule.GrowingColumns ?? Array.Empty<string>();
         var shrinking = rule.ShrinkingColumns ?? Array.Empty<string>();
-        if (growing.Count == 0 && shrinking.Count == 0) return null;
+        var counters = rule.CounterColumns ?? Array.Empty<string>();
+        if (growing.Count == 0 && shrinking.Count == 0 && counters.Count == 0) return null;
 
         var names = growing.Concat(shrinking).ToList();
         var expressions = growing.Select(c => Pick(c, ">"))
-            .Concat(shrinking.Select(c => Pick(c, "<")));
+            .Concat(shrinking.Select(c => Pick(c, "<")))
+            .Concat(counters.SelectMany(c => new[] { $"l.{Quote(c)}", $"h.{Quote(c)}" }));
         using var command = connection.CreateCommand();
         var keys = new List<string>();
         for (var i = 0; i < rule.KeyColumns.Count; i++)
@@ -522,6 +529,13 @@ public static class SqliteMerger
         if (!reader.Read()) return null;
         var values = new Dictionary<string, object?>(StringComparer.Ordinal);
         for (var i = 0; i < names.Count; i++) values[names[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+        for (var i = 0; i < counters.Count; i++)
+        {
+            var mine = reader.IsDBNull(names.Count + 2 * i) ? null : reader.GetValue(names.Count + 2 * i);
+            var theirs = reader.IsDBNull(names.Count + 2 * i + 1) ? null : reader.GetValue(names.Count + 2 * i + 1);
+            values[counters[i]] = AddCounter(mine, theirs,
+                ancestorCounters is not null && ancestorCounters.TryGetValue(counters[i], out var a) ? a : null);
+        }
         return values;
 
         static string Pick(string column, string op)
@@ -530,6 +544,29 @@ public static class SqliteMerger
             return $"CASE WHEN l.{c} IS NULL THEN h.{c} WHEN h.{c} IS NULL THEN l.{c} " +
                    $"WHEN l.{c} {op} h.{c} THEN l.{c} ELSE h.{c} END";
         }
+    }
+
+    /// <summary>
+    /// 累計の列を合成する。祖先の値があれば、祖先に双方の増分を足す。減っていた側の
+    /// 増分は 0 とみなす。祖先の値が無いか、整数でない値があれば大きい方を取り、
+    /// 数値でなければ同期先の値を残す。
+    /// </summary>
+    internal static object? AddCounter(object? mine, object? theirs, long? ancestor)
+    {
+        if (mine is null) return theirs;
+        if (theirs is null) return mine;
+        if (mine is long l && theirs is long h)
+        {
+            if (ancestor is not { } a) return Math.Max(l, h);
+            return a + Math.Max(0, l - a) + Math.Max(0, h - a);
+        }
+        if (mine is long or double && theirs is long or double)
+        {
+            return Convert.ToDouble(mine, CultureInfo.InvariantCulture) >= Convert.ToDouble(theirs, CultureInfo.InvariantCulture)
+                ? mine
+                : theirs;
+        }
+        return theirs;
     }
 
     /// <summary>同期先のそのキーの行に値を書き、書き換わった行数を返す。</summary>

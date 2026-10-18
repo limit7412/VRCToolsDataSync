@@ -48,10 +48,10 @@ public static class MergeProfiles
                 GrowingColumns: new[] { "seen" }, ShrinkingColumns: new[] { "expires_at" }),
 
             // 着用したアバターの履歴。VRCX はアバターごとに 1 行を持ち、着け直すと
-            // created_at を書き換え、着用時間 (time) は累計に足していく。どちらも増える
-            // 方向にしか変わらないので、両方の PC で書き換えていたら大きい方を残す。
+            // created_at を書き換え、着用時間 (time) は累計に足していく。両方の PC で
+            // 書き換えていたら、created_at は新しい方を残し、time は双方の増分を足す。
             new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at",
-                GrowingColumns: new[] { "created_at", "time" }),
+                GrowingColumns: new[] { "created_at" }, CounterColumns: new[] { "time" }),
 
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),

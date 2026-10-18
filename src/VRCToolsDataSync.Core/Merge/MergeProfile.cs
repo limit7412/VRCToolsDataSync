@@ -52,13 +52,18 @@ public enum MergeTableKind
 /// ワールドを出たときに gamelog_location の滞在時間 (time) を書き込み、通知を期限切れに
 /// したときに expired を 1 にする。どちらも値が増える方向にしか変わらない。
 /// <see cref="MergeTableKind.Keyed"/> では、両方が同じキーを書き換えていたときに、
-/// どちらの行を残してもこの列は大きい方の値にする。既読の印や累計の着用時間のように、
-/// 編集時刻を更新せずに書き換わる列を、もう一方の編集で巻き戻さないため。
+/// どちらの行を残してもこの列は大きい方の値にする。既読の印のように、編集時刻を
+/// 更新せずに書き換わる列を、もう一方の編集で巻き戻さないため。
 /// </param>
 /// <param name="ShrinkingColumns">
 /// <see cref="MergeTableKind.Keyed"/> で、両方が同じキーを書き換えていたときに小さい方の
 /// 値を残す列。NULL は値が無いものとして扱う。VRCX は通知を期限切れにするとき、
 /// 期限 (expires_at) をその時刻に早める。
+/// </param>
+/// <param name="CounterColumns">
+/// <see cref="MergeTableKind.Keyed"/> で、各 PC が自分の使った分を足していく累計の列。
+/// 両方が同じキーを書き換えていたら、祖先の値に双方の増分を足した値にする。大きい方を
+/// 残すと、少ない側の PC で足した分が失われる。祖先の値が要約に無ければ大きい方を残す。
 /// </param>
 public sealed record MergeTableRule(
     string NamePattern,
@@ -70,7 +75,8 @@ public sealed record MergeTableRule(
     IReadOnlyList<string>? IgnoredColumns = null,
     string? OrderColumn = null,
     IReadOnlyList<string>? GrowingColumns = null,
-    IReadOnlyList<string>? ShrinkingColumns = null)
+    IReadOnlyList<string>? ShrinkingColumns = null,
+    IReadOnlyList<string>? CounterColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 

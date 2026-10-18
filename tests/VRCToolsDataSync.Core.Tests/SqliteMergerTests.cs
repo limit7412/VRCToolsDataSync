@@ -248,8 +248,31 @@ public sealed class SqliteMergerTests : IDisposable
             Rows(host, "SELECT id, message, seen, expires_at FROM usr0123abcd_notifications_v2 ORDER BY id"));
     }
 
-    [Fact(DisplayName = "アバターの着用履歴は、両方で延びた着用時間の大きい方を残す")]
-    public void AvatarHistoryKeepsLongerTime()
+    [Fact(DisplayName = "アバターの着用時間は、両方で延びていたら祖先に双方の増分を足す")]
+    public void AvatarHistoryAddsBothIncrements()
+    {
+        var (host, local, baseline) = ArrangeAvatarHistory();
+        Merge(host, local, baseline);
+
+        // a: 100 + 400 + 100、b: 100 + 300 + 50。着け直した b の created_at は新しい方。
+        Assert.Equal(
+            new[] { "avtr_a|2026-10-01T00:00:00Z|600", "avtr_b|2026-10-03T00:00:00Z|450" },
+            Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+    }
+
+    [Fact(DisplayName = "祖先の要約に着用時間が無ければ、長い方を残す")]
+    public void AvatarHistoryKeepsLongerTimeWithoutAncestorValue()
+    {
+        var (host, local, baseline) = ArrangeAvatarHistory();
+        baseline.Tables["usr0123abcd_avatar_history"].Counters = null;   // 値を残していなかった頃の要約
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "avtr_a|2026-10-01T00:00:00Z|500", "avtr_b|2026-10-03T00:00:00Z|400" },
+            Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+    }
+
+    private (string Host, string Local, DatabaseSummary Baseline) ArrangeAvatarHistory()
     {
         var (host, local, _) = Arrange();
         const string create = """
@@ -259,7 +282,7 @@ public sealed class SqliteMergerTests : IDisposable
         Exec(host, create);
         Exec(local, create);
         var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
-        // a: 着け直さずに両方で延びた (手元の方が長い)。
+        // a: 着け直さずに両方で延びた。
         // b: 同期先で着け直し、手元では着用時間が延びた。
         Exec(local, """
             UPDATE usr0123abcd_avatar_history SET time = 500 WHERE avatar_id = 'avtr_a';
@@ -269,12 +292,7 @@ public sealed class SqliteMergerTests : IDisposable
             UPDATE usr0123abcd_avatar_history SET time = 200 WHERE avatar_id = 'avtr_a';
             UPDATE usr0123abcd_avatar_history SET created_at = '2026-10-03T00:00:00Z', time = 150 WHERE avatar_id = 'avtr_b';
             """);
-
-        Merge(host, local, baseline);
-
-        Assert.Equal(
-            new[] { "avtr_a|2026-10-01T00:00:00Z|500", "avtr_b|2026-10-03T00:00:00Z|400" },
-            Rows(host, "SELECT avatar_id, created_at, time FROM usr0123abcd_avatar_history ORDER BY avatar_id"));
+        return (host, local, baseline);
     }
 
     [Fact(DisplayName = "メモは前回の同期時点と比べ、変えた側の内容を残す")]
