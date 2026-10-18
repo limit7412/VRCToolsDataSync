@@ -144,10 +144,11 @@ public sealed class DatabaseSummary
             }
             entry.MaxRowId = kept;
             entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule.KeyColumns, kept);
-            // 後から書き換わる列のハッシュも、縮めた範囲で取り直す。
-            entry.Digest = rule.GrowingColumns is { Count: > 0 } && kept > 0
-                ? DigestGrowing(connection, "main", table.Table, rule, kept)
-                : null;
+            // 後から書き換わる列のハッシュと、縮めた範囲から外れた祖先の行は、マージが
+            // 合成する前の同期先の値で取ってある。マージ結果から取ると手元の書き換えが
+            // 祖先に混ざり、次のマージでその書き換えを見分けられない。
+            entry.Digest = table.KeptDigest;
+            entry.TailRows = table.TailRows;
         }
     }
 
@@ -209,6 +210,36 @@ public sealed class DatabaseSummary
             summary.Digest = DigestGrowing(connection, schema, table, rule, summary.MaxRowId);
         }
         return summary;
+    }
+
+    /// <summary>
+    /// <paramref name="whereSql"/> を満たす行を、キーのハッシュから rowid と
+    /// <see cref="MergeTableRule.GrowingColumns"/> の内容のハッシュへ写す。振り直しで
+    /// rowid が変わった祖先の行を、次のマージでキーで見分けるのに使う。
+    /// </summary>
+    internal static Dictionary<string, (long RowId, string GrowingHash)> HashRowsByKey(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, string whereSql)
+    {
+        var growing = rule.GrowingColumns ?? Array.Empty<string>();
+        var selected = rule.KeyColumns.Concat(growing).ToList();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT rowid, {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} WHERE {whereSql}";
+        using var reader = command.ExecuteReader();
+
+        var rows = new Dictionary<string, (long, string)>(StringComparer.Ordinal);
+        var keyCount = rule.KeyColumns.Count;
+        var key = new StringBuilder();
+        var values = new StringBuilder();
+        while (reader.Read())
+        {
+            key.Clear();
+            values.Clear();
+            for (var i = 0; i < keyCount; i++) AppendValue(key, reader, i + 1);
+            for (var i = keyCount; i < selected.Count; i++) AppendValue(values, reader, i + 1);
+            rows[Hash(key.ToString())] = (reader.GetInt64(0), Hash(values.ToString()));
+        }
+        return rows;
     }
 
     /// <summary>
@@ -455,6 +486,13 @@ public sealed class TableSummary
 
     /// <summary><see cref="MergeTableKind.AppendOnly"/>: rowid が最大の行のキーのハッシュ。</summary>
     public string? LastRowHash { get; set; }
+
+    /// <summary>
+    /// <see cref="MergeTableKind.AppendOnly"/> で、マージの振り直しで <see cref="MaxRowId"/> より
+    /// 後ろへ移った祖先の行。キーのハッシュから、後から書き換わる列の内容のハッシュへ。
+    /// rowid では手元で足した行と見分けられないので、キーで見分ける。
+    /// </summary>
+    public Dictionary<string, string>? TailRows { get; set; }
 
     public bool HasSameContent(TableSummary other)
     {

@@ -147,6 +147,78 @@ public sealed class SqliteMergerTests : IDisposable
             Rows(nextRemote, "SELECT location FROM gamelog_location ORDER BY id"));
     }
 
+    /// <summary>
+    /// 手元の古い行を足して id を振り直し、その結果で手元を置き換えた直後に Push が
+    /// 競合した状態を作る。返すのは、先に進んだ同期先 (host) と、マージ結果の手元 (local)、
+    /// 縮めた祖先の要約。同期先は振り直しで後ろへ移った行 wrld_host:1 を消している。
+    /// </summary>
+    private (string Host, string Local, DatabaseSummary Baseline) ArrangeRenumberedRetry(string? localBeforeMerge = null)
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_host:1')");
+        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+        if (localBeforeMerge is not null) Exec(local, localBeforeMerge);
+        var nextRemote = Path.Combine(_root, "next-remote.sqlite3");
+        File.Copy(host, nextRemote);
+        var hostBaseline = DatabaseSummary.Compute(host, MergeProfiles.Vrcx, out _)!;
+
+        var report = Merge(host, local, baseline);
+        Assert.True(report.Tables.Single(t => t.Table == "gamelog_location").Renumbered);
+        DatabaseSummary.TrimRenumbered(hostBaseline, host, MergeProfiles.Vrcx, report);
+
+        Exec(nextRemote, "DELETE FROM gamelog_location WHERE location = 'wrld_host:1'");
+        return (nextRemote, host, hostBaseline);
+    }
+
+    [Fact(DisplayName = "振り直しで後ろへ移った祖先の行を、同期先が消していれば手元の追加として戻さない")]
+    public void RenumberedAncestorRowIsNotReinserted()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry();
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1", "wrld_local:1" },
+            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
+    [Fact(DisplayName = "振り直しで後ろへ移った祖先の行を手元で消していれば、中止する")]
+    public void RenumberedAncestorRowDeletedLocallyAborts()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry();
+        Exec(local, "DELETE FROM gamelog_location WHERE location = 'wrld_host:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("手元で", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "振り直しで後ろへ移った祖先の行の滞在時間を手元で書き込み、同期先が消していれば中止する")]
+    public void RenumberedAncestorRowRewrittenLocallyAborts()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry();
+        Exec(local, "UPDATE gamelog_location SET time = 1000 WHERE location = 'wrld_host:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("同期先で", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "縮めた祖先の滞在時間のハッシュは合成前の同期先の値なので、手元の書き込みを見失わない")]
+    public void TrimmedDigestExcludesLocalRewrite()
+    {
+        // 振り直しの前に、手元で wrld_a:1 の滞在時間を書き込んでいた。
+        var (host, local, baseline) = ArrangeRenumberedRetry("UPDATE gamelog_location SET time = 1000 WHERE location = 'wrld_a:1'");
+        Exec(host, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("同期先で", report.AbortReason);
+    }
+
     [Fact(DisplayName = "手元で途中の履歴を消していたら、消した行を戻さずに中止する")]
     public void AppendOnlyAbortsOnLocalDeletion()
     {

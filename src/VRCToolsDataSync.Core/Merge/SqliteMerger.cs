@@ -54,9 +54,17 @@ public sealed class MergeReport
 /// 振り直したとき、元の rowid のまま残った行の rowid の最大値。これより大きい rowid の
 /// 行は入れ直したので、土台にした版の rowid とは対応しない。
 /// </param>
+/// <param name="KeptMaxRowId">振り直しの後も元の rowid のまま残った行の、rowid の最大値。</param>
+/// <param name="KeptDigest">
+/// 残った行のキーと後から書き換わる列のハッシュ。マージが合成する前の同期先の値で取る。
+/// </param>
+/// <param name="TailRows">
+/// 振り直しで後ろへ移った同期先の行。キーのハッシュから、後から書き換わる列の内容の
+/// ハッシュへ。これも合成する前の値で取る。
+/// </param>
 public sealed record TableMergeReport(
     string Table, long Inserted, long Updated, long Deleted, bool Renumbered, bool Created,
-    long KeptMaxRowId = 0);
+    long KeptMaxRowId = 0, string? KeptDigest = null, Dictionary<string, string>? TailRows = null);
 
 /// <summary>両方で別々に編集されていたキー。どちらを残したかを記録する。</summary>
 /// <param name="Table">テーブル名。</param>
@@ -288,6 +296,13 @@ public static class SqliteMerger
         // 同期先にある行は足さない。突き合わせは、手元の写しの索引を使って同期先を順に読む
         // (CollectMatchedRowIds)。
         var matched = CollectMatchedRowIds(connection, table, rule, $"> {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
+        if (sinceRowId > 0 && baseline!.TailRows is { Count: > 0 } tail
+            && ExcludeRenumberedAncestorRows(connection, table, rule, tail, sinceRowId, matched) is { } tailProblem)
+        {
+            Execute(connection, $"DROP TABLE {matched}");
+            report.AbortReason = tailProblem;
+            return null;
+        }
         var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
         long inserted;
         using (var command = connection.CreateCommand())
@@ -302,6 +317,27 @@ public static class SqliteMerger
         }
         Execute(connection, $"DROP TABLE {matched}");
 
+        // 足した行が同期先の既存の行より古ければ、後で id を振り直す。振り直した後の祖先に
+        // 使う値は、後から書き込まれる列を合成する前にここで取る。合成した後に取ると
+        // 手元の書き換えが祖先に混ざり、次のマージでその書き換えを見分けられない。
+        var oldestAdded = inserted > 0 && rule.OrderColumn is not null && rowIdAlias is not null
+            ? FindInterleave(connection, table, rule.OrderColumn, hostMaxRowId)
+            : null;
+        long? keptMaxRowId = null;
+        string? keptDigest = null;
+        Dictionary<string, string>? tailRows = null;
+        if (oldestAdded is not null)
+        {
+            keptMaxRowId = FindKeptMaxRowId(connection, table, rule.OrderColumn!, oldestAdded);
+            keptDigest = rule.GrowingColumns is { Count: > 0 } && keptMaxRowId > 0
+                ? DigestGrowing(connection, "main", table, rule, keptMaxRowId.Value)
+                : null;
+            tailRows = HashRowsByKey(connection, "main", table, rule,
+                    $"rowid > {keptMaxRowId.Value.ToString(CultureInfo.InvariantCulture)} " +
+                    $"AND rowid <= {hostMaxRowId.ToString(CultureInfo.InvariantCulture)}")
+                .ToDictionary(r => r.Key, r => r.Value.GrowingHash, StringComparer.Ordinal);
+        }
+
         // 既存行に後から書き込まれる列 (滞在時間など) は、大きい方を残す。値は増える
         // 方向にしか変わらないので、祖先と比べなくても新しい方が分かる。書き込みは
         // 前回の同期より前の行にも起きるので、ここは全行を突き合わせる。
@@ -314,11 +350,44 @@ public static class SqliteMerger
                 $"WHERE {match} AND l.{c} IS NOT NULL AND (h.{c} IS NULL OR l.{c} > h.{c})");
         }
 
-        var keptMaxRowId = inserted > 0 && rule.OrderColumn is not null && rowIdAlias is not null
-            ? RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId)
-            : null;
+        if (oldestAdded is not null)
+        {
+            Renumber(connection, table, rule.OrderColumn!, rowIdAlias!, columns, oldestAdded);
+        }
 
-        return new TableMergeReport(table, inserted, updated, 0, keptMaxRowId is not null, created, keptMaxRowId ?? 0);
+        return new TableMergeReport(table, inserted, updated, 0, keptMaxRowId is not null, created,
+            keptMaxRowId ?? 0, keptDigest, tailRows);
+    }
+
+    /// <summary>
+    /// 振り直しで <see cref="TableSummary.MaxRowId"/> より後ろへ移った祖先の行
+    /// (<see cref="TableSummary.TailRows"/>) を、手元の写しの rowid が
+    /// <paramref name="sinceRowId"/> より大きい行からキーで探す。手元に無ければ手元で消して
+    /// いて、同期先に無くて手元で後から書き換わる列を変えていれば同期先の削除と手元の
+    /// 書き換えの競合なので、どちらも理由を返す。見つかった行は祖先の行なので、足す候補
+    /// から外すため <paramref name="matched"/> に加える。
+    /// </summary>
+    private static string? ExcludeRenumberedAncestorRows(
+        SqliteConnection connection, string table, MergeTableRule rule,
+        IReadOnlyDictionary<string, string> tailRows, long sinceRowId, string matched)
+    {
+        var localTail = HashRowsByKey(connection, Local, table, rule,
+            $"rowid > {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
+        foreach (var (keyHash, growingHash) in tailRows)
+        {
+            if (!localTail.TryGetValue(keyHash, out var mine))
+            {
+                return $"手元でテーブル {table} の行が消されています。消した行を同期先から戻さないよう、自動マージを中止しました";
+            }
+            var rid = mine.RowId.ToString(CultureInfo.InvariantCulture);
+            var hostHas = ScalarLong(connection, $"SELECT count(*) FROM {matched} WHERE rid = {rid}") > 0;
+            if (!hostHas && !string.Equals(mine.GrowingHash, growingHash, StringComparison.Ordinal))
+            {
+                return $"同期先でテーブル {table} の行が消されていて、手元ではその行の値 (滞在時間など) が書き換えられています。自動マージを中止しました";
+            }
+            Execute(connection, $"INSERT OR IGNORE INTO {matched} (rid) VALUES ({rid})");
+        }
+        return null;
     }
 
     /// <summary>
@@ -370,18 +439,10 @@ public static class SqliteMerger
     }
 
     /// <summary>
-    /// 足した行の中に、同期先の既存の行より古い出来事があれば、その時点以降の行を
-    /// 出来事の順に入れ直して id を振り直す。
-    /// <para>
-    /// 入れ直すのは、足した行のうち最も古い出来事以降の行だけである。それより前の行は
-    /// id の順と出来事の順が既に揃っており、入れ直した行には残った行より大きい id が
-    /// 振られるので、全体として順序が揃う。
-    /// </para>
+    /// 足した行の中に、同期先の既存の行より古い出来事があれば、足した行の中で最も古い
+    /// 出来事の時刻を返す。無ければ null。
     /// </summary>
-    /// <returns>振り直したら、元の rowid のまま残った行の rowid の最大値。振り直さなければ null。</returns>
-    private static long? RenumberIfInterleaved(
-        SqliteConnection connection, string table, string orderColumn, string rowIdAlias,
-        IReadOnlyList<string> columns, long hostMaxRowId)
+    private static string? FindInterleave(SqliteConnection connection, string table, string orderColumn, long hostMaxRowId)
     {
         var target = $"main.{Quote(table)}";
         var order = Quote(orderColumn);
@@ -399,12 +460,33 @@ public static class SqliteMerger
             command.Parameters.AddWithValue("$max", hostMaxRowId);
             newestExisting = command.ExecuteScalar() as string;
         }
-        if (oldestAdded is null || newestExisting is null
-            || string.CompareOrdinal(oldestAdded, newestExisting) >= 0)
-        {
-            return null;
-        }
+        return oldestAdded is null || newestExisting is null || string.CompareOrdinal(oldestAdded, newestExisting) >= 0
+            ? null
+            : oldestAdded;
+    }
 
+    /// <summary>振り直しの後も元の rowid のまま残る行 (<paramref name="from"/> より古い出来事) の rowid の最大値。</summary>
+    private static long FindKeptMaxRowId(SqliteConnection connection, string table, string orderColumn, string from)
+    {
+        var order = Quote(orderColumn);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT coalesce(max(rowid), 0) FROM main.{Quote(table)} WHERE {order} < $from OR {order} IS NULL";
+        command.Parameters.AddWithValue("$from", from);
+        return (long)command.ExecuteScalar()!;
+    }
+
+    /// <summary>
+    /// <paramref name="from"/> 以降の出来事の行を、出来事の順に id を振り直す。
+    /// VRCX は id の大きい行を「最新」として扱うため、古い出来事を後から足すと最新として
+    /// 表示されてしまう。
+    /// </summary>
+    private static void Renumber(
+        SqliteConnection connection, string table, string orderColumn, string rowIdAlias,
+        IReadOnlyList<string> columns, string from)
+    {
+        var target = $"main.{Quote(table)}";
+        var order = Quote(orderColumn);
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
         const string work = "temp.vrctds_renumber";
         using (var command = connection.CreateCommand())
@@ -412,20 +494,18 @@ public static class SqliteMerger
             command.CommandText =
                 $"CREATE TABLE {work} AS SELECT {insertColumns} FROM {target} " +
                 $"WHERE {order} >= $from ORDER BY {order}, {Quote(rowIdAlias)}";
-            command.Parameters.AddWithValue("$from", oldestAdded);
+            command.Parameters.AddWithValue("$from", from);
             command.ExecuteNonQuery();
         }
         using (var command = connection.CreateCommand())
         {
             command.CommandText = $"DELETE FROM {target} WHERE {order} >= $from";
-            command.Parameters.AddWithValue("$from", oldestAdded);
+            command.Parameters.AddWithValue("$from", from);
             command.ExecuteNonQuery();
         }
-        var keptMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
         Execute(connection,
             $"INSERT INTO {target} ({insertColumns}) SELECT {insertColumns} FROM {work} ORDER BY rowid");
         Execute(connection, $"DROP TABLE {work}");
-        return keptMaxRowId;
     }
 
     /// <summary>

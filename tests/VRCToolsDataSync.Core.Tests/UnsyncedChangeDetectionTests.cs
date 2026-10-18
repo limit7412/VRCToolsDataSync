@@ -475,13 +475,29 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.NotEqual(999, store.Load(key)!.RemoteVersion);
     }
 
+    [Fact(DisplayName = "保存まで済んで印だけが残っていれば、本体が変わっていても印を消して進む")]
+    public void MergeClearsStaleRecordWhenAlreadySaved()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var saved = store.Load(key)!;
+        store.SavePendingReplace(key, new MergePendingState(saved, saved.RemoteVersion, "0", "1"));
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.False(store.IsMergePending(key));
+    }
+
     [Fact(DisplayName = "止まったマージの記録とローカルがどちらも合わなければ、マージを中止する")]
     public void MergeAbortsWhenInterruptedStateIsUnknown()
     {
         var (_, b) = ArrangeRemoteNewer();
         var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
         var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
-        store.SavePendingReplace(key, new MergePendingState(store.Load(key), 1, "0", "1"));
+        store.SavePendingReplace(key, new MergePendingState(new DatabaseSummary { RemoteVersion = 999 }, 999, "0", "1"));
 
         var result = b.Runner.Merge(b.Service, b.Settings, _storage);
 

@@ -415,6 +415,16 @@ public sealed class SyncRunner
         {
             return (null, null, null);
         }
+        var saved = _baseSummaries.Load(stateKey);
+        if (state.LastPulledVersion == pending.RemoteVersion
+            && (pending.Summary is null ? saved is null : saved?.RemoteVersion == pending.RemoteVersion))
+        {
+            // 要約と同期履歴の保存まで済んでいて、印を消すところだけ失敗していた。
+            // 本体のハッシュは、その後の VRCX の書き込みで変わっていてもよい。
+            _logger.LogInformation("前回のマージの印だけが残っていました ({Tool})", service.ToolKey);
+            if (!dryRun) TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
         var current = FileHasher.Sha256(tracked.Path);
         if (string.Equals(current, pending.LocalSha256, StringComparison.OrdinalIgnoreCase))
         {
