@@ -206,6 +206,50 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("同期先で", report.AbortReason);
     }
 
+    [Fact(DisplayName = "振り直しで後ろへ移った祖先の行の新しい列を手元で変え、同期先が消していれば中止する")]
+    public void AbortsWhenAddedColumnSetOnRenumberedRowDeletedByHost()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry();
+        const string addColumn = "ALTER TABLE gamelog_location ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(local, "UPDATE gamelog_location SET extra = 'x' WHERE location = 'wrld_host:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("新しい列", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "振り直しで後ろへ移った祖先の行の新しい列に触れていなければ、同期先の削除のまま続ける")]
+    public void ContinuesWhenAddedColumnUntouchedOnRenumberedRowDeletedByHost()
+    {
+        var (host, local, baseline) = ArrangeRenumberedRetry();
+        const string addColumn = "ALTER TABLE gamelog_location ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1", "wrld_local:1" },
+            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
+    [Fact(DisplayName = "振り直しで後ろへ移る同期先の行が上限を超えれば、要約を膨らませずに中止する")]
+    public void AbortsWhenRenumberedTailExceedsLimit()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_host:1')");
+        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false, maxRenumberedTailRows: 0);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("上限", report.AbortReason);
+        Assert.Equal(new[] { "wrld_a:1", "wrld_host:1" }, Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
     [Fact(DisplayName = "縮めた祖先の滞在時間のハッシュは合成前の同期先の値なので、手元の書き込みを見失わない")]
     public void TrimmedDigestExcludesLocalRewrite()
     {

@@ -422,15 +422,25 @@ public sealed class SyncRunner
             // 要約と同期履歴の保存まで済んでいて、印を消すところだけ失敗していた。
             // 本体のハッシュは、その後の VRCX の書き込みで変わっていてもよい。
             _logger.LogInformation("前回のマージの印だけが残っていました ({Tool})", service.ToolKey);
-            if (!dryRun) TryClearMergePending(stateKey);
+            if (!dryRun)
+            {
+                if (pending.AsideSuffix is not null) VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
+                TryClearMergePending(stateKey);
+            }
             return (null, null, null);
         }
         var current = FileHasher.Sha256(tracked.Path);
         if (string.Equals(current, pending.LocalSha256, StringComparison.OrdinalIgnoreCase))
         {
             // 置き換える前に止まった。ローカルは元のままなので、祖先も同期履歴もそのままでよい。
+            // ただし WAL/SHM を脇へ退けた後なら、本体に書き戻されていない変更がそこに残って
+            // いるので、戻してから進む。
             _logger.LogInformation("前回のマージは置き換える前に止まっていました ({Tool})", service.ToolKey);
-            if (!dryRun) TryClearMergePending(stateKey);
+            if (!dryRun)
+            {
+                if (pending.AsideSuffix is not null) VrcxSyncService.RestoreAsideFiles(tracked.Path, pending.AsideSuffix, _logger);
+                TryClearMergePending(stateKey);
+            }
             return (null, null, null);
         }
         if (string.Equals(current, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
@@ -445,6 +455,7 @@ public sealed class SyncRunner
             state.LastPulledAt = DateTimeOffset.Now;
             settings.ToolState[stateKey] = state;
             _store.SaveToolStateOnly(settings);
+            if (pending.AsideSuffix is not null) VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
             TryClearMergePending(stateKey);
             return (null, null, null);
         }

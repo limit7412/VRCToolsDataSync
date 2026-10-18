@@ -97,8 +97,16 @@ public static class SqliteMerger
     /// (同期先に残っていれば戻ってくる)。
     /// </param>
     /// <param name="dryRun">true なら結果を数えるだけで、最後に取り消す。</param>
+    /// <summary>
+    /// 振り直しで後ろへ移る同期先の行 (<see cref="TableSummary.TailRows"/>) の数の上限。
+    /// 移った行は 1 行ずつ要約に残すので、手元で足す行より新しい同期先の行が多すぎると
+    /// 要約が大きくなり、読み書きのたびに時間と記憶を食う。超えたら中止する。
+    /// </summary>
+    public const int DefaultMaxRenumberedTailRows = 100_000;
+
     public static MergeReport Merge(
-        string hostPath, string localPath, MergeProfile profile, DatabaseSummary? baseline, bool dryRun)
+        string hostPath, string localPath, MergeProfile profile, DatabaseSummary? baseline, bool dryRun,
+        int maxRenumberedTailRows = DefaultMaxRenumberedTailRows)
     {
         var report = new MergeReport();
         if (!profile.SupportsMerge)
@@ -130,7 +138,7 @@ public static class SqliteMerger
             var commit = false;
             try
             {
-                MergeTables(connection, profile, baseline, report);
+                MergeTables(connection, profile, baseline, report, maxRenumberedTailRows);
                 if (report.Succeeded && FindIntegrityProblem(connection) is { } problem)
                 {
                     report.AbortReason = problem;
@@ -175,14 +183,16 @@ public static class SqliteMerger
     }
 
     private static void MergeTables(
-        SqliteConnection connection, MergeProfile profile, DatabaseSummary? baseline, MergeReport report)
+        SqliteConnection connection, MergeProfile profile, DatabaseSummary? baseline, MergeReport report,
+        int maxRenumberedTailRows)
     {
         foreach (var table in ListTables(connection, Local))
         {
             var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
             if (rule is null || rule.Kind == MergeTableKind.Watched) continue;
 
-            var tableReport = MergeTable(connection, table, rule, baseline?.Tables.GetValueOrDefault(table), report);
+            var tableReport = MergeTable(
+                connection, table, rule, baseline?.Tables.GetValueOrDefault(table), report, maxRenumberedTailRows);
             if (tableReport is null) return;
             report.Tables.Add(tableReport);
         }
@@ -190,7 +200,8 @@ public static class SqliteMerger
 
     /// <summary>テーブル 1 つを合わせる。中止すべき問題があれば理由を記録して null を返す。</summary>
     private static TableMergeReport? MergeTable(
-        SqliteConnection connection, string table, MergeTableRule rule, TableSummary? baseline, MergeReport report)
+        SqliteConnection connection, string table, MergeTableRule rule, TableSummary? baseline, MergeReport report,
+        int maxRenumberedTailRows)
     {
         var localColumns = ListColumns(connection, Local, table);
         if (FindMissingColumns(rule, localColumns) is { Count: > 0 } missing)
@@ -255,7 +266,7 @@ public static class SqliteMerger
         }
 
         return rule.Kind == MergeTableKind.AppendOnly
-            ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report)
+            ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report, maxRenumberedTailRows)
             : MergeKeyed(connection, table, rule, localColumns, hashColumns, baseline, created, report);
     }
 
@@ -267,7 +278,8 @@ public static class SqliteMerger
     /// </summary>
     private static TableMergeReport? MergeAppendOnly(
         SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, TableSummary? baseline, bool created, MergeReport report)
+        IReadOnlyList<string> columns, TableSummary? baseline, bool created, MergeReport report,
+        int maxRenumberedTailRows)
     {
         var target = $"main.{Quote(table)}";
         var source = $"{Local}.{Quote(table)}";
@@ -329,6 +341,17 @@ public static class SqliteMerger
         if (oldestAdded is not null)
         {
             keptMaxRowId = FindKeptMaxRowId(connection, table, rule.OrderColumn!, oldestAdded);
+            var tailCount = ScalarLong(connection,
+                $"SELECT count(*) FROM {target} WHERE rowid > {keptMaxRowId.Value.ToString(CultureInfo.InvariantCulture)} " +
+                $"AND rowid <= {hostMaxRowId.ToString(CultureInfo.InvariantCulture)}");
+            if (tailCount > maxRenumberedTailRows)
+            {
+                // 移った行は要約に 1 行ずつ残す。手元で足す行より新しい同期先の行が何十万と
+                // あると、要約が何十 MB にもなって以後の同期のたびに重くなる。
+                report.AbortReason = $"テーブル {table} で、手元で足す履歴より新しい行が同期先に {tailCount} 行あり、" +
+                                     $"id を振り直した記録を要約に残せる上限 ({maxRenumberedTailRows} 行) を超えるため自動マージを中止しました";
+                return null;
+            }
             keptDigest = rule.GrowingColumns is { Count: > 0 } && keptMaxRowId > 0
                 ? DigestGrowing(connection, "main", table, rule, keptMaxRowId.Value)
                 : null;
@@ -590,7 +613,7 @@ public static class SqliteMerger
         }
         if (baseline is { Kind: MergeTableKind.AppendOnly, MaxRowId: > 0 })
         {
-            return FindAncestorRowDeletedByHost(connection, table, rule, added, baseline.MaxRowId);
+            return FindAncestorRowDeletedByHost(connection, table, rule, added, baseline);
         }
         foreach (var key in baseline.Rows?.Keys ?? Enumerable.Empty<string>())
         {
@@ -618,23 +641,51 @@ public static class SqliteMerger
     }
 
     /// <summary>
-    /// 追加専用のテーブルで、祖先の rowid の範囲にある手元の行のうち、同期先に同じキーの
-    /// 行が無く、増えた列が足したときの値から変わっているものを探す。そのキーを返す。
+    /// 追加専用のテーブルで、祖先の行のうち手元にあって同期先に同じキーの行が無く、増えた
+    /// 列が足したときの値から変わっているものを探す。そのキーを返す。祖先の行は rowid が
+    /// <see cref="TableSummary.MaxRowId"/> 以下のものと、振り直しでそれより後ろへ移った
+    /// <see cref="TableSummary.TailRows"/> のもの。
     /// </summary>
     private static string? FindAncestorRowDeletedByHost(
-        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> added, long maxRowId)
+        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> added, TableSummary baseline)
     {
-        var matched = CollectMatchedRowIds(connection, table, rule, $"<= {maxRowId.ToString(CultureInfo.InvariantCulture)}");
+        var max = baseline.MaxRowId.ToString(CultureInfo.InvariantCulture);
+        var keyExpression = string.Join(" || '|' || ", rule.KeyColumns.Select(k => $"coalesce(l.{Quote(k)}, '')"));
+        var matched = CollectMatchedRowIds(connection, table, rule, $"<= {max}");
         try
         {
             using var command = connection.CreateCommand();
             command.CommandText =
-                $"SELECT {string.Join(" || '|' || ", rule.KeyColumns.Select(k => $"coalesce(l.{Quote(k)}, '')"))} " +
-                $"FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
+                $"SELECT {keyExpression} FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
                 $"AND l.rowid NOT IN (SELECT rid FROM {matched}) " +
                 $"AND ({AddedColumnsSet(connection, Local, table, added, "l")}) LIMIT 1";
-            command.Parameters.AddWithValue("$max", maxRowId);
-            return command.ExecuteScalar() is { } key and not DBNull ? Convert.ToString(key, CultureInfo.InvariantCulture) : null;
+            command.Parameters.AddWithValue("$max", baseline.MaxRowId);
+            if (command.ExecuteScalar() is { } key and not DBNull) return Convert.ToString(key, CultureInfo.InvariantCulture);
+        }
+        finally
+        {
+            Execute(connection, $"DROP TABLE {matched}");
+        }
+
+        if (baseline.TailRows is not { Count: > 0 } tail) return null;
+        // 移った祖先の行は rowid では分からないので、キーで手元の行を探す。手元に無い行は
+        // ExcludeRenumberedAncestorRows が別に中止する。
+        var localTail = HashRowsByKey(connection, Local, table, rule, $"rowid > {max}");
+        matched = CollectMatchedRowIds(connection, table, rule, $"> {max}");
+        try
+        {
+            foreach (var keyHash in tail.Keys)
+            {
+                if (!localTail.TryGetValue(keyHash, out var mine)) continue;
+                var rid = mine.RowId.ToString(CultureInfo.InvariantCulture);
+                if (ScalarLong(connection, $"SELECT count(*) FROM {matched} WHERE rid = {rid}") > 0) continue;
+                using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"SELECT {keyExpression} FROM {Local}.{Quote(table)} AS l WHERE l.rowid = {rid} " +
+                    $"AND ({AddedColumnsSet(connection, Local, table, added, "l")})";
+                if (command.ExecuteScalar() is { } key and not DBNull) return Convert.ToString(key, CultureInfo.InvariantCulture);
+            }
+            return null;
         }
         finally
         {

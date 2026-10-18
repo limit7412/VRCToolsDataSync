@@ -475,6 +475,45 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.NotEqual(999, store.Load(key)!.RemoteVersion);
     }
 
+    [Fact(DisplayName = "WAL を退けた後に置き換える前で止まっていれば、退けた WAL を戻してからマージする")]
+    public void MergeRestoresAsideWalWhenReplaceDidNotHappen()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        // 本体に書き戻されていない行を持つ WAL を作る。WAL を読んでいる別の接続を開いたままに
+        // しておくと、書いた接続を閉じても書き戻されない。
+        var frozen = Path.Combine(_root, "frozen.sqlite3");
+        var asideWal = Path.Combine(_root, "aside-wal");
+        Exec(db, "PRAGMA journal_mode=WAL");
+        using (var holder = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = db, Pooling = false }.ToString()))
+        {
+            holder.Open();
+            using (var read = holder.CreateCommand())
+            {
+                read.CommandText = "SELECT count(*) FROM gamelog_location";
+                read.ExecuteScalar();
+            }
+            File.Copy(db, frozen, overwrite: true);
+            Exec(db, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_x:1')");
+            File.Copy(db + "-wal", asideWal, overwrite: true);
+        }
+        File.Copy(frozen, db, overwrite: true);
+        const string suffix = ".vrctds-aside-test";
+        File.Move(asideWal, db + "-wal" + suffix, overwrite: true);
+        store.SavePendingReplace(key, new MergePendingState(
+            new DatabaseSummary { RemoteVersion = 999 }, 999, FileHasher.Sha256(db), "0", suffix));
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        // 戻した WAL の行が取り込まれ、同期先の 2 行と合わせて 3 行になる。
+        Assert.Equal(3, CountLocations(db));
+        Assert.False(File.Exists(db + "-wal" + suffix));
+        Assert.False(store.IsMergePending(key));
+    }
+
     [Fact(DisplayName = "保存まで済んで印だけが残っていれば、本体が変わっていても印を消して進む")]
     public void MergeClearsStaleRecordWhenAlreadySaved()
     {

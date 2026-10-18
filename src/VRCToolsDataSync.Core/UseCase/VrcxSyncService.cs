@@ -476,10 +476,13 @@ public sealed class VrcxSyncService : IMergeableSyncService
             }
             // 置き換えた後に止まっても祖先を復旧できるよう、置き換える前後の本体のハッシュを
             // 呼び出し側に渡す。読むのに時間がかかるので、書き換えの確認より前に取る。
+            // WAL/SHM を退ける名前も記録に残す。退けた後、本体を置き換える前に止まると、
+            // 本体は元のままで WAL だけが無い。次回に戻せるよう、名前を先に決めておく。
+            var asideSuffix = AsideSuffix();
             var pending = options.BeforeReplaceLocal is null
                 ? null
                 : new MergePendingState(report.HostBaseline, entry.Version,
-                    FileHasher.Sha256(_paths.SqliteFile), FileHasher.Sha256(hostPath));
+                    FileHasher.Sha256(_paths.SqliteFile), FileHasher.Sha256(hostPath), asideSuffix);
             // マージには時間がかかることがあり、その間に VRCX が起動されうる (起動時の自動
             // Pull が別プロセスのマージを待ちきれずに VRCX を起動した場合など)。動いている
             // DB を置き換えないよう、置き換えの直前にもう一度確かめる。
@@ -497,7 +500,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 };
             }
             if (pending is not null) options.BeforeReplaceLocal!(pending);
-            ReplaceDatabase(hostPath, _paths.SqliteFile, _logger);
+            ReplaceDatabase(hostPath, _paths.SqliteFile, _logger, asideSuffix);
             options.AfterReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
 
             return new SyncResult
@@ -534,13 +537,13 @@ public sealed class VrcxSyncService : IMergeableSyncService
     /// いない変更が残っていることがあり、先に消すと、置き換えに失敗したときに本体は
     /// 古いまま WAL の変更だけが失われるため。
     /// </summary>
-    internal static void ReplaceDatabase(string source, string destination, ILogger logger)
+    internal static void ReplaceDatabase(string source, string destination, ILogger logger, string? asideSuffix = null)
     {
-        var suffix = ".vrctds-aside-" + Guid.NewGuid().ToString("N");
+        var suffix = asideSuffix ?? AsideSuffix();
         var moved = new List<(string Original, string Aside)>();
         try
         {
-            foreach (var path in new[] { destination + "-wal", destination + "-shm" })
+            foreach (var path in SidecarsOf(destination))
             {
                 if (!File.Exists(path)) continue;
                 var aside = path + suffix;
@@ -568,6 +571,40 @@ public sealed class VrcxSyncService : IMergeableSyncService
         foreach (var (_, aside) in moved)
         {
             try { File.Delete(aside); } catch { /* best-effort cleanup */ }
+        }
+    }
+
+    private static string AsideSuffix() => ".vrctds-aside-" + Guid.NewGuid().ToString("N");
+
+    private static IEnumerable<string> SidecarsOf(string database) => new[] { database + "-wal", database + "-shm" };
+
+    /// <summary>
+    /// <see cref="ReplaceDatabase"/> が脇へ退けたまま残った WAL/SHM を、本体の隣へ戻す。
+    /// 置き換える前に止まったとき用。本体の隣に同じ名前のファイルが既にあれば、その後に
+    /// VRCX が作ったものなので上書きせず、退けた方を残して知らせる。
+    /// </summary>
+    internal static void RestoreAsideFiles(string database, string asideSuffix, ILogger logger)
+    {
+        foreach (var path in SidecarsOf(database))
+        {
+            var aside = path + asideSuffix;
+            if (!File.Exists(aside)) continue;
+            if (File.Exists(path))
+            {
+                logger.LogWarning("退けた {Aside} を戻す先に別のファイルがあるため、そのまま残しました", aside);
+                continue;
+            }
+            File.Move(aside, path);
+            logger.LogInformation("前回のマージが退けた {Path} を戻しました", path);
+        }
+    }
+
+    /// <summary><see cref="ReplaceDatabase"/> が脇へ退けたまま残った WAL/SHM を消す。置き換えた後に止まったとき用。</summary>
+    internal static void DeleteAsideFiles(string database, string asideSuffix)
+    {
+        foreach (var path in SidecarsOf(database))
+        {
+            try { File.Delete(path + asideSuffix); } catch { /* best-effort cleanup */ }
         }
     }
 

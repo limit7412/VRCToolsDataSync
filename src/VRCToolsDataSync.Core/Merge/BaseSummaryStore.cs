@@ -191,9 +191,12 @@ public sealed class BaseSummaryStore
 /// ローカルをマージ結果で置き換える直前の記録。置き換えた後に保存する祖先の要約と、
 /// 置き換える前のローカルの本体、置き換え後の本体それぞれの SHA-256 を持つ。次回は、
 /// 今の本体がどちらと同じかで、置き換えが済んだかを見分ける。
+/// <paramref name="AsideSuffix"/> は置き換えのときに WAL/SHM を脇へ退ける名前の末尾。置き換える前に
+/// 止まっていたら、退けた WAL を戻すのに使う。
 /// </summary>
 public sealed record MergePendingState(
     DatabaseSummary? Summary,
     long RemoteVersion,
     string LocalSha256,
-    string MergedSha256);
+    string MergedSha256,
+    string? AsideSuffix = null);
