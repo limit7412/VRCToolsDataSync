@@ -470,6 +470,36 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("gamelog_location", report.AbortReason);
     }
 
+    [Fact(DisplayName = "履歴のテーブルでも、列が増えた後に同期先が消した行の新しい列を手元で変えていれば中止する")]
+    public void AbortsWhenAddedColumnSetOnRowDeletedByHostInAppendOnly()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE gamelog_location ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(host, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+        Exec(local, "UPDATE gamelog_location SET extra = 'x' WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("gamelog_location", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "履歴のテーブルで列が増えても、同期先が消した行の新しい列に触れていなければ続ける")]
+    public void ContinuesWhenAddedColumnUntouchedOnRowDeletedByHostInAppendOnly()
+    {
+        var (host, local, baseline) = Arrange();
+        const string addColumn = "ALTER TABLE gamelog_location ADD COLUMN extra TEXT";
+        Exec(host, addColumn);
+        Exec(local, addColumn);
+        Exec(host, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.True(report.Succeeded, report.AbortReason);
+    }
+
     [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
     public void CreatedKeyedTableCopiesAllRows()
     {

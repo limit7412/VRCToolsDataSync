@@ -232,7 +232,7 @@ public static class SqliteMerger
         }
 
         if (baseline is not null && rule.ValueColumns is null && hashColumns.Count < localColumns.Count
-            && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns, baseline.Rows) is { } differing)
+            && FindKeyWithDifferentAddedColumns(connection, table, rule, localColumns, hashColumns, baseline) is { } differing)
         {
             // 前回の同期の後に増えた列は祖先に無いので、どちらが変えたか分からない。
             // 古い列だけで合わせると、手元で変えた新しい列の値を同期先の値で上書きしうる。
@@ -452,15 +452,16 @@ public static class SqliteMerger
 
     /// <summary>
     /// 祖先の要約の後に増えた列だけを比べ、手元と同期先の両方にあって値が違うキーを
-    /// 1 つ返す。祖先にあって片方だけが消したキー (<paramref name="ancestorRows"/> が
-    /// あるキー付きのテーブルのみ) も、残った側で新しい列が足したときの値から変わって
-    /// いれば返す。古い列だけでは変えていないように見え、削除が勝ってしまうため。
+    /// 1 つ返す。祖先にあって片方だけが消したキーも、残った側で新しい列が足したときの
+    /// 値から変わっていれば返す。古い列だけでは変えていないように見え、削除が勝って
+    /// しまうため。追加専用のテーブルは要約にキーを残さないので、祖先の rowid の範囲に
+    /// ある手元の行のうち、同期先に無いものを見る (手元で消した場合は
+    /// <see cref="WasDeletedLocally"/> で別に中止する)。
     /// 無ければ null。
     /// </summary>
     private static string? FindKeyWithDifferentAddedColumns(
         SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
-        IReadOnlyDictionary<string, string>? ancestorRows)
+        IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns, TableSummary baseline)
     {
         var added = columns.Where(c => !hashColumns.Contains(c, StringComparer.Ordinal)).ToList();
         var local = ReadKeyedRows(connection, Local, table, rule, added);
@@ -469,7 +470,11 @@ public static class SqliteMerger
         {
             if (host.TryGetValue(key, out var theirs) && mine.Hash != theirs.Hash) return key;
         }
-        foreach (var key in ancestorRows?.Keys ?? Enumerable.Empty<string>())
+        if (baseline is { Kind: MergeTableKind.AppendOnly, MaxRowId: > 0 })
+        {
+            return FindAncestorRowDeletedByHost(connection, table, rule, added, baseline.MaxRowId);
+        }
+        foreach (var key in baseline.Rows?.Keys ?? Enumerable.Empty<string>())
         {
             if (local.TryGetValue(key, out var kept) == host.ContainsKey(key)) continue;
             var schema = kept is not null ? Local : "main";
@@ -487,6 +492,35 @@ public static class SqliteMerger
         SqliteConnection connection, string schema, string table, MergeTableRule rule,
         IReadOnlyList<string> added, object?[] keyValues)
     {
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT count(*) FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({AddedColumnsSet(connection, schema, table, added, null)})";
+        return (long)command.ExecuteScalar()! > 0;
+    }
+
+    /// <summary>
+    /// 追加専用のテーブルで、祖先の rowid の範囲にある手元の行のうち、同期先に同じキーの
+    /// 行が無く、増えた列が足したときの値から変わっているものを探す。そのキーを返す。
+    /// </summary>
+    private static string? FindAncestorRowDeletedByHost(
+        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> added, long maxRowId)
+    {
+        var sameKey = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT {string.Join(" || '|' || ", rule.KeyColumns.Select(k => $"coalesce(l.{Quote(k)}, '')"))} " +
+            $"FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
+            $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(table)} AS h WHERE {sameKey}) " +
+            $"AND ({AddedColumnsSet(connection, Local, table, added, "l")}) LIMIT 1";
+        command.Parameters.AddWithValue("$max", maxRowId);
+        return command.ExecuteScalar() is { } key and not DBNull ? Convert.ToString(key, CultureInfo.InvariantCulture) : null;
+    }
+
+    /// <summary>増えた列のどれかが、列を足したときの値 (既定値か NULL) から変わっている条件。</summary>
+    private static string AddedColumnsSet(
+        SqliteConnection connection, string schema, string table, IReadOnlyList<string> added, string? alias)
+    {
         var defaults = new Dictionary<string, string?>(StringComparer.Ordinal);
         using (var info = connection.CreateCommand())
         {
@@ -494,12 +528,8 @@ public static class SqliteMerger
             using var reader = info.ExecuteReader();
             while (reader.Read()) defaults[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
         }
-        using var command = connection.CreateCommand();
-        var changed = added.Select(c => $"{Quote(c)} IS NOT ({defaults.GetValueOrDefault(c) ?? "NULL"})");
-        command.CommandText =
-            $"SELECT count(*) FROM {Quote(schema)}.{Quote(table)} " +
-            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({string.Join(" OR ", changed)})";
-        return (long)command.ExecuteScalar()! > 0;
+        var prefix = alias is null ? string.Empty : alias + ".";
+        return string.Join(" OR ", added.Select(c => $"{prefix}{Quote(c)} IS NOT ({defaults.GetValueOrDefault(c) ?? "NULL"})"));
     }
 
     /// <summary>両方が別々に変えたキーで、手元の内容を採るかを決める。</summary>
