@@ -153,10 +153,11 @@ public sealed class SqliteMergerTests : IDisposable
     /// 縮めた祖先の要約。同期先は振り直しで後ろへ移った行 wrld_host:1 を消している。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) ArrangeRenumberedRetry(
-        string? localBeforeMerge = null, string localCreatedAt = "2026-10-02T00:00:00Z")
+        string? localBeforeMerge = null, string localCreatedAt = "2026-10-02T00:00:00Z", string? hostBeforeMerge = null)
     {
         var (host, local, baseline) = Arrange();
         Exec(host, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_host:1')");
+        if (hostBeforeMerge is not null) Exec(host, hostBeforeMerge);
         Exec(local, $"INSERT INTO gamelog_location (created_at, location) VALUES ('{localCreatedAt}', 'wrld_local:1')");
         if (localBeforeMerge is not null) Exec(local, localBeforeMerge);
         var nextRemote = Path.Combine(_root, "next-remote.sqlite3");
@@ -193,6 +194,24 @@ public sealed class SqliteMergerTests : IDisposable
 
         Assert.Equal(
             new[] { "wrld_local:1", "wrld_a:1" },
+            Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
+    [Fact(DisplayName = "同期先の rowid が出来事の順と食い違っていても、入れ直す祖先の行を記録して戻さない")]
+    public void RenumberedAncestorRowBelowKeptMaxRowIdIsNotReinserted()
+    {
+        // 同期先では wrld_host:1 (10-03) の後に、それより古い wrld_host:0 (10-01 12:00) が入った。
+        // 手元の wrld_local:1 (10-02) を足すと、残る行の最大 rowid は wrld_host:0 の 3 で、
+        // rowid 2 の wrld_host:1 がそれより前にあるのに入れ直される。
+        var (host, local, baseline) = ArrangeRenumberedRetry(
+            hostBeforeMerge: "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-01T12:00:00Z', 'wrld_host:0')");
+        Assert.Equal(3, baseline.Tables["gamelog_location"].MaxRowId);
+        Assert.Single(baseline.Tables["gamelog_location"].TailRows!);
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1", "wrld_host:0", "wrld_local:1" },
             Rows(host, "SELECT location FROM gamelog_location ORDER BY id"));
     }
 

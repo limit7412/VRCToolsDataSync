@@ -115,6 +115,7 @@ public sealed class SyncRunner
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
                 LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
+                BeforeCommit = sha256 => TrySavePushedSha256(stateKey, sha256),
             });
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
@@ -325,6 +326,7 @@ public sealed class SyncRunner
                     {
                         Storage = storage,
                         Baseline = baseline,
+                        OwnPushSha256 = _baseSummaries.LoadPushedSha256(stateKey),
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
@@ -411,10 +413,19 @@ public sealed class SyncRunner
         ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun)
     {
         var pending = _baseSummaries.LoadPendingReplace(stateKey);
-        if (pending is null || service.TrackedDatabase is not { } tracked || !File.Exists(tracked.Path))
+        if (pending is null)
         {
+            if (!dryRun && _baseSummaries.IsMergePending(stateKey))
+            {
+                // 時刻だけの印は、置き換えの直前の記録を書く前に止まった印。置き換えは
+                // 始まっていないので、ローカルは元のまま。残すと、置き換える前に中止する
+                // マージが続く限り消えず、起動時 Pull が手元の変更ありと見続ける。
+                _logger.LogInformation("前回のマージは置き換えの記録を書く前に止まっていました ({Tool})", service.ToolKey);
+                TryClearMergePending(stateKey);
+            }
             return (null, null, null);
         }
+        if (service.TrackedDatabase is not { } tracked || !File.Exists(tracked.Path)) return (null, null, null);
         var saved = _baseSummaries.Load(stateKey);
         var aside = pending.AsideSuffix is null ? Array.Empty<string>() : VrcxSyncService.FindAsideFiles(tracked.Path, pending.AsideSuffix);
         var current = FileHasher.Sha256(tracked.Path);
@@ -494,6 +505,19 @@ public sealed class SyncRunner
                 AffectedFiles = result.AffectedFiles,
                 MergeReport = result.MergeReport,
             };
+
+    private void TrySavePushedSha256(string stateKey, string sha256)
+    {
+        try
+        {
+            _baseSummaries.SavePushedSha256(stateKey, sha256);
+        }
+        catch (Exception ex)
+        {
+            // 控えられなくても、送った後に止まらない限り使わない。
+            _logger.LogWarning(ex, "送った写しのハッシュを控えられませんでした");
+        }
+    }
 
     private void TryClearMergePending(string stateKey)
     {

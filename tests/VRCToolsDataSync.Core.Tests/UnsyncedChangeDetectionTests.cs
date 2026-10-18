@@ -65,6 +65,19 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         command.ExecuteNonQuery();
     }
 
+    private static long Scalar(string path, string sql)
+    {
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (long)command.ExecuteScalar()!;
+    }
+
     private static long CountLocations(string path)
     {
         using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
@@ -558,6 +571,50 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Contains("退けた WAL", result.Message);
         Assert.True(File.Exists(db + "-wal" + suffix));
         Assert.True(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "記録の無い印は置き換える前の印なので、置き換える前に中止するマージでも消す")]
+    public void MergeClearsBareMarkWhenAbortingBeforeReplace()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        store.MarkMergePending(key);
+        // 手元で履歴を消しているので、マージは置き換える前に中止する。
+        Exec(b.Paths.SqliteFile, "DELETE FROM gamelog_location WHERE created_at = '2026-10-01T00:00:00Z'");
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "Push の後に同期履歴を保存する前に止まっても、送った内容との再マージで累計を二重に足さない")]
+    public void RemergeAfterInterruptedPushDoesNotDoubleCount()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        // 送った後、同期履歴と要約を保存する前に止まった状態に戻す。
+        store.Save(key, before);
+        a.Settings.ToolState[key].LastPulledVersion = pulledBefore;
+
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
     [Fact(DisplayName = "保存まで済んで印だけが残っていれば、本体が変わっていても印を消して進む")]

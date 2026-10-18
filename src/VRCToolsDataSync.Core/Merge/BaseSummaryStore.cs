@@ -156,6 +156,27 @@ public sealed class BaseSummaryStore
     private string PendingPathOf(string stateKey) => PathOf(stateKey) + ".merging";
 
     /// <summary>
+    /// 最後に送った DB の写しの SHA-256 を控える。送った後に同期履歴を保存する前に
+    /// 止まっても、次のマージで同期先が自分の送ったものだと見分けられる。古い値が残って
+    /// いても、同期先の写しがそれと同じなら内容も同じなので、祖先にして差し支えない。
+    /// </summary>
+    public void SavePushedSha256(string stateKey, string sha256)
+    {
+        Directory.CreateDirectory(RootDirectory);
+        File.WriteAllText(PushedPathOf(stateKey), sha256);
+    }
+
+    public string? LoadPushedSha256(string stateKey)
+    {
+        var path = PushedPathOf(stateKey);
+        if (!File.Exists(path)) return null;
+        var text = File.ReadAllText(path).Trim();
+        return text.Length == 0 ? null : text;
+    }
+
+    private string PushedPathOf(string stateKey) => PathOf(stateKey) + ".pushed";
+
+    /// <summary>
     /// 要約ごとのロックファイルを排他で開く。他のプロセスが開いていれば、閉じるまで待つ。
     /// ロックファイルは消さずに残す。消すと、待っていた側が別のファイルを作って
     /// 同時にロックを得てしまう。

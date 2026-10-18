@@ -342,9 +342,12 @@ public static class SqliteMerger
         if (oldestAdded is not null)
         {
             keptMaxRowId = FindKeptMaxRowId(connection, table, rule.OrderColumn!, oldestAdded);
-            var tailCount = ScalarLong(connection,
-                $"SELECT count(*) FROM {target} WHERE rowid > {keptMaxRowId.Value.ToString(CultureInfo.InvariantCulture)} " +
-                $"AND rowid <= {hostMaxRowId.ToString(CultureInfo.InvariantCulture)}");
+            // 後ろへ移るのは、振り直しが入れ直す行 (出来事が足した行の最古以降のもの) のうち
+            // 同期先にあったもの。同期先の rowid と出来事の順が既に食い違っていれば、残る行の
+            // 最大 rowid より小さい rowid の行も移るので、rowid の範囲では選ばない。
+            var moves = $"{Quote(rule.OrderColumn!)} >= {Literal(oldestAdded)}";
+            var movedHostRows = $"rowid <= {hostMaxRowId.ToString(CultureInfo.InvariantCulture)} AND {moves}";
+            var tailCount = ScalarLong(connection, $"SELECT count(*) FROM {target} WHERE {movedHostRows}");
             if (tailCount > maxRenumberedTailRows)
             {
                 // 移った行は要約に 1 行ずつ残す。手元で足す行より新しい同期先の行が何十万と
@@ -354,11 +357,9 @@ public static class SqliteMerger
                 return null;
             }
             keptDigest = rule.GrowingColumns is { Count: > 0 } && keptMaxRowId > 0
-                ? DigestGrowing(connection, "main", table, rule, keptMaxRowId.Value)
+                ? DigestGrowing(connection, "main", table, rule, keptMaxRowId.Value, moves)
                 : null;
-            tailRows = HashRowsByKey(connection, "main", table, rule,
-                    $"rowid > {keptMaxRowId.Value.ToString(CultureInfo.InvariantCulture)} " +
-                    $"AND rowid <= {hostMaxRowId.ToString(CultureInfo.InvariantCulture)}")
+            tailRows = HashRowsByKey(connection, "main", table, rule, movedHostRows)
                 .ToDictionary(r => r.Key, r => r.Value.GrowingHash, StringComparer.Ordinal);
         }
 

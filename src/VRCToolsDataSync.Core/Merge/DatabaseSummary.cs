@@ -245,15 +245,18 @@ public sealed class DatabaseSummary
     /// <summary>
     /// rowid が <paramref name="maxRowId"/> 以下の行について、キーと
     /// <see cref="MergeTableRule.GrowingColumns"/> の内容を rowid の順にハッシュにする。
-    /// 要約とマージで同じ方法で求めるため、両方がここを通る。
+    /// 要約とマージで同じ方法で求めるため、両方がここを通る。<paramref name="excludeSql"/>
+    /// を満たす行は除く (振り直しで後ろへ移る行を、移す前に除いて取るのに使う)。
     /// </summary>
     internal static string DigestGrowing(
-        SqliteConnection connection, string schema, string table, MergeTableRule rule, long maxRowId)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, long maxRowId,
+        string? excludeSql = null)
     {
         var columns = rule.KeyColumns.Concat(rule.GrowingColumns ?? Array.Empty<string>()).ToList();
+        var exclude = excludeSql is null ? "" : $" AND NOT ({excludeSql})";
         return DigestQuery(connection, columns.Count,
             $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
-            $"WHERE rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)} ORDER BY rowid").Digest;
+            $"WHERE rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)}{exclude} ORDER BY rowid").Digest;
     }
 
     private static TableSummary SummarizeKeyed(

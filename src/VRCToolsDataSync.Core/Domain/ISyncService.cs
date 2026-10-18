@@ -33,6 +33,14 @@ public sealed class PullMergeOptions
     /// <summary>前回同期した時点の要約。無ければ 2-way のマージになる。</summary>
     public DatabaseSummary? Baseline { get; init; }
 
+    /// <summary>
+    /// 自分が最後に送った DB の写しの SHA-256。同期先の写しがこれと同じなら、同期先は
+    /// 自分の送った内容そのものなので、<see cref="Baseline"/> の代わりに同期先の要約を
+    /// 祖先にする。送った後に同期履歴を保存する前に止まった場合に、同じ変更を同期先と
+    /// 手元の両方の変更と見て二重に足さないため。
+    /// </summary>
+    public string? OwnPushSha256 { get; init; }
+
     /// <summary>true なら結果を数えるだけで、ローカルには何も書かない。</summary>
     public bool DryRun { get; init; }
 
@@ -84,6 +92,13 @@ public sealed class PushOptions
     public bool ReuploadAll { get; init; }
 
     public long? LastPulledVersion { get; init; }
+
+    /// <summary>
+    /// 送る DB の写しの SHA-256 が決まったら、同期先へ反映する前に呼ばれる。送った後、
+    /// 同期履歴を保存する前に止まっても、次の同期で同期先の内容が自分の送ったものだと
+    /// 見分けられるよう、呼び出し側が控える。
+    /// </summary>
+    public Action<string>? BeforeCommit { get; init; }
 }
 
 public sealed class PullOptions

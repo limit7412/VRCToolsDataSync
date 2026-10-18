@@ -80,6 +80,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
+            options.BeforeCommit?.Invoke(snapshot.Sha256);
             if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
                 _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
@@ -433,7 +434,16 @@ public sealed class VrcxSyncService : IMergeableSyncService
                     Message = $"同期先の DB を要約できないため、マージを中止しました: {hostReason}",
                 };
             }
-            var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, options.Baseline, options.DryRun);
+            var baseline = options.Baseline;
+            if (options.OwnPushSha256 is not null
+                && string.Equals(remoteSnapshot.Sha256, options.OwnPushSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                // 同期先は自分が送った写しそのもの。手元との違いはすべて送った後の手元の変更
+                // なので、同期先を祖先にする。
+                _logger.LogInformation("同期先の DB は自分が送ったものなので、それを祖先にします");
+                baseline = hostBaseline;
+            }
+            var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, baseline, options.DryRun);
             if (hostBaseline is not null && report.Succeeded)
             {
                 DatabaseSummary.TrimRenumbered(hostBaseline, hostPath, MergeProfiles.Vrcx, report);
@@ -483,6 +493,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 ? null
                 : new MergePendingState(report.HostBaseline, entry.Version,
                     FileHasher.Sha256(_paths.SqliteFile), FileHasher.Sha256(hostPath), asideSuffix);
+            // 記録の保存には時間がかかりうるので、書き換えの確認より前に済ませる。
+            if (pending is not null) options.BeforeReplaceLocal!(pending);
             // マージには時間がかかることがあり、その間に VRCX が起動されうる (起動時の自動
             // Pull が別プロセスのマージを待ちきれずに VRCX を起動した場合など)。動いている
             // DB を置き換えないよう、置き換えの直前にもう一度確かめる。
@@ -499,7 +511,6 @@ public sealed class VrcxSyncService : IMergeableSyncService
                     MergeReport = report,
                 };
             }
-            if (pending is not null) options.BeforeReplaceLocal!(pending);
             ReplaceDatabase(hostPath, _paths.SqliteFile, _logger, asideSuffix);
             options.AfterReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
 
