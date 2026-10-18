@@ -77,6 +77,23 @@ public sealed class DatabaseSummaryTests : IDisposable
         Assert.DoesNotContain("cache_world", baseline.Tables.Keys);
     }
 
+    [Fact(DisplayName = "列を残していない古い要約と列を持つ要約は、内容が同じでも違いとして扱う")]
+    public void OldSummaryWithoutColumnsIsTreatedAsChanged()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+        baseline.Tables["memos"].Columns = null;
+        baseline.Tables["gamelog_location"].Columns = null;
+
+        var current = Summarize(path, MergeProfiles.Vrcx);
+        Assert.Equal(new[] { "gamelog_location", "memos" }, current.FindChangedTables(baseline));
+
+        // 双方が古い要約なら、従来どおり内容だけを比べる。
+        current.Tables["memos"].Columns = null;
+        current.Tables["gamelog_location"].Columns = null;
+        Assert.Empty(current.FindChangedTables(baseline));
+    }
+
     [Fact(DisplayName = "VRCX: 履歴の追加とメモの編集とお気に入りの削除を、それぞれ拾う")]
     public void VrcxDetectsChanges()
     {

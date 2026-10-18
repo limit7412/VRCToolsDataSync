@@ -45,6 +45,13 @@ internal sealed class PullStaging : IDisposable
     }
 
     private readonly List<StagedFile> _staged = new();
+
+    /// <summary>
+    /// 取得を省いたファイルのうち、同期先の内容を読むために残した写し。目的地から写しへ。
+    /// 差し替えには使わない。
+    /// </summary>
+    private readonly Dictionary<string, string> _copies = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly ILogger _logger;
 
     public PullStaging(ILogger logger)
@@ -53,18 +60,39 @@ internal sealed class PullStaging : IDisposable
     }
 
     /// <summary>
-    /// manifest のエントリを同期先から取り出す。手元が既に同じ内容なら何もしない。
+    /// manifest のエントリを同期先から取り出す。手元が既に同じ内容なら取得しない。
     /// この時点ではローカルの既存ファイルには一切触れない。
+    /// <para>
+    /// <paramref name="keepCopyWhenUnchanged"/> を指定すると、取得しない場合も手元の
+    /// ファイルの写しを隣に作り、<see cref="SourceOf"/> がそれを返す。SQLite の本体は
+    /// ハッシュが同期先と同じでも、隣の WAL にまだ本体へ書き戻していない手元の変更を
+    /// 持ちうる。本体をそのまま開くと WAL ごと読むので、同期先の内容を読むには
+    /// WAL を伴わない写しが要る。
+    /// </para>
     /// </summary>
     /// <returns>同期先にそのキーが無ければ false。</returns>
-    public bool Fetch(ISyncStorage storage, ManifestFile remote, string targetPath)
+    public bool Fetch(ISyncStorage storage, ManifestFile remote, string targetPath, bool keepCopyWhenUnchanged = false)
     {
         if (!string.IsNullOrEmpty(remote.Sha256)
             && File.Exists(targetPath)
             && string.Equals(FileHasher.Sha256(targetPath), remote.Sha256, StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogInformation("取得を省略 (内容が同じ): {Key}", remote.RelativePath);
-            return true;
+            if (!keepCopyWhenUnchanged)
+            {
+                _logger.LogInformation("取得を省略 (内容が同じ): {Key}", remote.RelativePath);
+                return true;
+            }
+            // ハッシュを取ってから写すまでの間にツールが WAL を本体へ書き戻すと、写しは
+            // 同期先と違う内容になる。写した後にもう一度確かめ、違っていれば取得する。
+            var copyPath = targetPath + IncomingMarker + Guid.NewGuid().ToString("N");
+            File.Copy(targetPath, copyPath, overwrite: true);
+            if (string.Equals(FileHasher.Sha256(copyPath), remote.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                _copies[targetPath] = copyPath;
+                _logger.LogInformation("取得を省略 (内容が同じ): {Key}", remote.RelativePath);
+                return true;
+            }
+            try { File.Delete(copyPath); } catch { /* best-effort cleanup */ }
         }
 
         var directory = Path.GetDirectoryName(targetPath);
@@ -120,10 +148,14 @@ internal sealed class PullStaging : IDisposable
     }
 
     /// <summary>
-    /// <paramref name="targetPath"/> へ差し替える予定の、取り出したファイルの場所。手元が
-    /// 既に同じ内容で取得を省いた場合は <paramref name="targetPath"/> そのもの。差し替える
-    /// 前に、差し替え後の内容 (同期先の内容) を読むのに使う。
+    /// <paramref name="targetPath"/> の同期先の内容を持つファイルの場所。取り出したファイルか、
+    /// 取得を省いたときに残した写し (<see cref="Fetch"/> の keepCopyWhenUnchanged)。
+    /// 差し替える前に、差し替え後の内容を読むのに使う。
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// 写しを残さずに取得を省いたか、取り出していない。手元のファイルを代わりに返すと、
+    /// WAL に残る手元の変更まで同期先の内容として読んでしまう。
+    /// </exception>
     public string SourceOf(string targetPath)
     {
         foreach (var staged in _staged)
@@ -133,7 +165,8 @@ internal sealed class PullStaging : IDisposable
                 return staged.StagingPath;
             }
         }
-        return targetPath;
+        if (_copies.TryGetValue(targetPath, out var copyPath)) return copyPath;
+        throw new InvalidOperationException($"同期先の内容を持つ写しがありません: {targetPath}");
     }
 
     /// <summary>
@@ -169,21 +202,43 @@ internal sealed class PullStaging : IDisposable
             }
             applied.Add(staged.TargetPath);
             affected.Add(staged.TargetPath);
+            DeleteSidecars(staged.StagingPath);
         }
         _staged.Clear();
     }
 
-    /// <summary>差し替えていない取り出し済みファイルを片付ける。</summary>
+    /// <summary>差し替えていない取り出し済みファイルと、読むために残した写しを片付ける。</summary>
     public void Dispose()
     {
         foreach (var staged in _staged)
         {
-            if (File.Exists(staged.StagingPath))
-            {
-                try { File.Delete(staged.StagingPath); } catch { /* best-effort cleanup */ }
-            }
+            DeleteQuietly(staged.StagingPath);
+            DeleteSidecars(staged.StagingPath);
         }
         _staged.Clear();
+        foreach (var copyPath in _copies.Values)
+        {
+            DeleteQuietly(copyPath);
+            DeleteSidecars(copyPath);
+        }
+        _copies.Clear();
+    }
+
+    /// <summary>
+    /// 取り出した SQLite を差し替える前に読むと、WAL 方式の本体では隣に -wal と -shm が
+    /// できる。本体を移した後に残ると、取り出し中の目印の付いたごみになる。
+    /// </summary>
+    private static void DeleteSidecars(string path)
+    {
+        DeleteQuietly(path + "-wal");
+        DeleteQuietly(path + "-shm");
+        DeleteQuietly(path + "-journal");
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        if (!File.Exists(path)) return;
+        try { File.Delete(path); } catch { /* best-effort cleanup */ }
     }
 
     private sealed record StagedFile(string StagingPath, string TargetPath, ManifestFile Remote);

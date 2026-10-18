@@ -261,7 +261,9 @@ public sealed class VrcxSyncService : IMergeableSyncService
         //     途中で失敗しても手元のデータは元のまま残る。
         using var staging = new PullStaging(_logger);
 
-        if (!staging.Fetch(storage, remoteSnapshot, _paths.SqliteFile))
+        // 本体が同期先と同じでも写しを残す。要約は手元の本体ではなく、WAL を伴わない
+        // 同期先の内容から取る。
+        if (!staging.Fetch(storage, remoteSnapshot, _paths.SqliteFile, keepCopyWhenUnchanged: true))
         {
             return new SyncResult
             {
@@ -295,8 +297,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
-        // 次に比べる基準は、取り出した写しそのものから取る。差し替えた後に手元の DB から
-        // 取ると、その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
+        // 次に比べる基準は、同期先の内容の写しから取る。手元の DB から取ると、本体が
+        // 同期先と同じでも WAL に残る未送信の変更が基準に混ざり、次の同期で失われる。
         var pulledSummary = DatabaseSummary.Compute(staging.SourceOf(_paths.SqliteFile), MergeProfiles.Vrcx, out var summaryReason);
         if (pulledSummary is null) _logger.LogInformation("取り出した写しの要約を取れませんでした: {Reason}", summaryReason);
 

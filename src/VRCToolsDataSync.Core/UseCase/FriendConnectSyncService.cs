@@ -282,7 +282,9 @@ public sealed class FriendConnectSyncService : ISyncService
         // manifest が要求するファイルはすべて揃わなければ Pull を成功にしない。
         // 欠けたまま成功にすると LastPulledVersion だけ進み、以後の起動時 Pull は
         // この version を最新とみなして省略するため、差異が固定される。
-        var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File)
+        // db_1.1 は本体が同期先と同じでも写しを残す。要約は手元の本体ではなく、WAL を
+        // 伴わない同期先の内容から取る。
+        var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File, keepCopyWhenUnchanged: true)
             ?? FetchOptional(staging, storage, remoteDb, _paths.DbFile)
             ?? FetchOptional(staging, storage, remoteConfig, _paths.ConfigJsonFile)
             ?? _directories
@@ -310,8 +312,8 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         // (3) ここから先はローカルを書き換える。
-        // 次に比べる基準は、取り出した写しそのものから取る。差し替えた後に手元の DB から
-        // 取ると、その間に Friend Connect が書き込んだ未送信の変更が基準に混ざる。
+        // 次に比べる基準は、同期先の内容の写しから取る。手元の DB から取ると、本体が
+        // 同期先と同じでも WAL に残る未送信の変更が基準に混ざり、次の同期で失われる。
         var pulledSummary = remoteDbV11 is null
             ? null
             : DatabaseSummary.Compute(staging.SourceOf(_paths.DbV11File), TrackedDatabase.Profile, out _);
@@ -482,10 +484,11 @@ public sealed class FriendConnectSyncService : ISyncService
         PullStaging staging,
         ISyncStorage storage,
         ManifestFile? remote,
-        string targetPath)
+        string targetPath,
+        bool keepCopyWhenUnchanged = false)
     {
         if (remote is null) return null;
-        return staging.Fetch(storage, remote, targetPath) ? null : remote.RelativePath;
+        return staging.Fetch(storage, remote, targetPath, keepCopyWhenUnchanged) ? null : remote.RelativePath;
     }
 
     /// <summary>フォルダの中身を取り出す。見つからないキーがあればその名前を返す。</summary>

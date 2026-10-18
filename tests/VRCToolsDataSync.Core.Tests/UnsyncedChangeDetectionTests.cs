@@ -694,6 +694,79 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Empty(result.SyncedSummary!.FindChangedTables(remote));
     }
 
+    [Fact(DisplayName = "本体が同期先と同じで取得を省いても、要約は WAL に残る手元の変更を含めない")]
+    public void PullSummarizesRemoteCopyWhenFetchIsSkipped()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var db = b.Paths.SqliteFile;
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+
+        // 同期先の本体を WAL 方式の印が付いたものに差し替え、B へ取り込ませる。VACUUM INTO で
+        // 作る写しはロールバック方式なので、そのままでは WAL を伴う本体と同じ内容にならない。
+        var walMode = File.ReadAllBytes(db);
+        walMode[18] = 2;
+        walMode[19] = 2;
+        var sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(walMode)).ToLowerInvariant();
+        var blobKey = BlobKeys.FromSha256(sha);
+        _storage.Seed(blobKey, walMode);
+        var manifest = _storage.LoadManifest().Manifest;
+        var entry = manifest.Tools[VrcxSyncService.Key];
+        var snapshot = entry.Files.Single(f => f.RelativePath == "vrcx/latest.sqlite3");
+        snapshot.Sha256 = sha;
+        snapshot.BlobKey = blobKey;
+        snapshot.Size = walMode.Length;
+        entry.Version++;
+        _storage.SeedManifest(manifest);
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Assert.Equal(sha, FileHasher.Sha256(db));
+        var remote = DatabaseSummary.Compute(db, MergeProfiles.Vrcx, out _)!;
+
+        // 同期先では本体はそのままで版だけが進み、B では本体へ書き戻していない行が WAL に残る。
+        entry.Version++;
+        _storage.SeedManifest(manifest);
+        // 行が WAL にあることは、ここでは数えない。接続を閉じると WAL が本体へ書き戻され、
+        // 本体が同期先と違う内容になる。
+        AddWalOnlyLocation(db, "2026-10-03T00:00:00Z");
+        Assert.Equal(sha, FileHasher.Sha256(db));
+        Assert.True(File.Exists(db + "-wal"));
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.DoesNotContain(db, result.AffectedFiles);
+        Assert.NotNull(result.SyncedSummary);
+        Assert.Empty(result.SyncedSummary!.FindChangedTables(remote));
+        Assert.Equal(2, result.SyncedSummary.Tables["gamelog_location"].RowCount);
+        var saved = new BaseSummaryStore(Path.Combine(_root, "b", "base")).Load(key)!;
+        Assert.Equal(2, saved.Tables["gamelog_location"].RowCount);
+        Assert.Empty(Directory.GetFiles(b.Paths.RootDirectory, "*" + PullStaging.IncomingMarker + "*").Select(Path.GetFileName));
+    }
+
+    /// <summary>
+    /// 本体を変えずに、行の追加を WAL だけに残す。本体は WAL 方式の印が付いている必要がある。
+    /// </summary>
+    private void AddWalOnlyLocation(string db, string createdAt)
+    {
+        var frozen = Path.Combine(_root, "frozen-main.sqlite3");
+        var wal = Path.Combine(_root, "frozen-wal");
+        using (var holder = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = db, Pooling = false }.ToString()))
+        {
+            holder.Open();
+            using (var read = holder.CreateCommand())
+            {
+                read.CommandText = "SELECT count(*) FROM gamelog_location";
+                read.ExecuteScalar();
+            }
+            File.Copy(db, frozen, overwrite: true);
+            Exec(db, $"INSERT INTO gamelog_location (created_at, location) VALUES ('{createdAt}', 'wrld_x:1')");
+            File.Copy(db + "-wal", wal, overwrite: true);
+        }
+        File.Copy(frozen, db, overwrite: true);
+        File.Move(wal, db + "-wal", overwrite: true);
+        File.Delete(frozen);
+    }
+
     [Fact(DisplayName = "要約を保存できなければ、同期履歴を進めずに古い基準を残す")]
     public void PushKeepsStateWhenSummaryCannotBeSaved()
     {

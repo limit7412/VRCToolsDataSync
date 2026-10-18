@@ -514,9 +514,11 @@ public sealed class TableSummary
         if (Kind != other.Kind || RowCount != other.RowCount) return false;
         // 列が増えたテーブルは、内容が変わったものとして扱う。追加専用の要約や列を絞った
         // キー付きの要約は既知の列しか見ないので、増えた列だけを書き換えても気付けない。
-        // 列を残していない古い要約とは比べない。
-        if (Columns is not null && other.Columns is not null
-            && !Columns.SequenceEqual(other.Columns, StringComparer.Ordinal))
+        // 列を残していない古い要約と列を持つ要約は、列が同じか確かめられないので違うものとして
+        // 扱う。同じとみなすと、古い要約の後で増えた列だけを手元で書き換えた場合に
+        // 気付けない。双方が古い要約なら、従来どおり内容だけを比べる。
+        if ((Columns is null) != (other.Columns is null)) return false;
+        if (Columns is not null && !Columns.SequenceEqual(other.Columns!, StringComparer.Ordinal))
         {
             return false;
         }
