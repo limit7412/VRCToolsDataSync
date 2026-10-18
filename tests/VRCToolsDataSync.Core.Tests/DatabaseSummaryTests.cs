@@ -108,6 +108,23 @@ public sealed class DatabaseSummaryTests : IDisposable
             Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
     }
 
+    [Fact(DisplayName = "VRCX: 履歴のテーブルに列が増えたら、変更として拾う")]
+    public void VrcxDetectsAddedColumnInAppendOnly()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+
+        // 増えた列だけを既存行に書いても、追加専用の要約の行数やハッシュは変わらない。
+        Exec(path, """
+            ALTER TABLE gamelog_location ADD COLUMN note TEXT;
+            UPDATE gamelog_location SET note = 'n';
+            """);
+
+        Assert.Equal(
+            new[] { "gamelog_location" },
+            Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
+    }
+
     [Fact(DisplayName = "VRCX: 新しい形式の通知の追加と既読を拾う")]
     public void VrcxDetectsNotificationsV2()
     {

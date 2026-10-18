@@ -443,6 +443,14 @@ public sealed class TableSummary
     public bool HasSameContent(TableSummary other)
     {
         if (Kind != other.Kind || RowCount != other.RowCount) return false;
+        // 列が増えたテーブルは、内容が変わったものとして扱う。追加専用の要約や列を絞った
+        // キー付きの要約は既知の列しか見ないので、増えた列だけを書き換えても気付けない。
+        // 列を残していない古い要約とは比べない。
+        if (Columns is not null && other.Columns is not null
+            && !Columns.SequenceEqual(other.Columns, StringComparer.Ordinal))
+        {
+            return false;
+        }
         return Kind switch
         {
             MergeTableKind.AppendOnly => MaxRowId == other.MaxRowId
