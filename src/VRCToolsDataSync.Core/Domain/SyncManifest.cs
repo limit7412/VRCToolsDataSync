@@ -38,6 +38,13 @@ public sealed class ToolManifestEntry
     public string MachineName { get; set; } = string.Empty;
     public DateTimeOffset UpdatedAt { get; set; }
     public List<ManifestFile> Files { get; set; } = new();
+
+    /// <summary>
+    /// 競合の検査を通さずに上書きした (強制 Push の) 最後の version。通常の Push は前の
+    /// エントリの値を引き継ぐ。ある版より後の版がその版の内容を取り込んでいると言えるのは、
+    /// その版の後に上書きが無い (この値がその版以下か無い) ときだけである。
+    /// </summary>
+    public long? LastForcedVersion { get; set; }
 }
 
 public sealed class ManifestFile

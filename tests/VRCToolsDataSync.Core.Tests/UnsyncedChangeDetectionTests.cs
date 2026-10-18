@@ -686,6 +686,57 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(170, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "送った版の後に別の PC が強制 Push で上書きしていれば、送った写しを祖先にせず中止する")]
+    public void MergeAbortsWhenLaterVersionWasForcedAfterOwnPush()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
+
+        // B は A の送った内容を取り込まずに、祖先由来の 120 を強制 Push で上書きする。
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 120");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Push(b.Service, b.Settings, _storage, force: true).Outcome);
+
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.ConflictDetected, result.Outcome);
+        Assert.Contains("強制 Push", result.Message);
+        Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "Pull の取得中に VRCX が DB を書き換えていれば、差し替える前に中止する")]
+    public void PullAbortsWhenDatabaseChangedDuringFetch()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var db = b.Paths.SqliteFile;
+        _storage.OnDownload = _ => AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("書き換えられた", result.Message);
+        // 取得中に足した行は残り、同期先の 2 行目は取り込まれていない。
+        Assert.Equal(1, Scalar(db, "SELECT count(*) FROM gamelog_location WHERE created_at = '2026-10-03T00:00:00Z'"));
+        Assert.Equal(0, Scalar(db, "SELECT count(*) FROM gamelog_location WHERE created_at = '2026-10-02T00:00:00Z'"));
+        Assert.Empty(Directory.GetFiles(b.Paths.RootDirectory, "*" + PullStaging.IncomingMarker + "*").Select(Path.GetFileName));
+    }
+
     [Fact(DisplayName = "反映されたか分からない送信の後に同期先が予定の版を越えていれば、マージを中止する")]
     public void MergeAbortsWhenUncommittedPushMayBeIncludedInLaterVersion()
     {

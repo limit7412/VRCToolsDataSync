@@ -122,9 +122,16 @@ internal sealed class FakeSyncStorage : ISyncStorage
         return staged;
     }
 
+    /// <summary>
+    /// <see cref="TryDownload"/> の直前に呼ばれる。取得の間にツールがローカルの DB を
+    /// 書き換える状況を作る。
+    /// </summary>
+    public Action<string>? OnDownload { get; set; }
+
     public bool TryDownload(string key, string localPath)
     {
         if (!_objects.TryGetValue(key, out var entry)) return false;
+        OnDownload?.Invoke(key);
         File.WriteAllBytes(localPath, entry.Content);
         return true;
     }

@@ -145,12 +145,16 @@ public sealed class VrcxSyncService : IMergeableSyncService
         long nextVersion;
         try
         {
+            // 競合の検査を通さない上書き (強制 Push) は、前の版の内容を取り込んでいない。
+            // その版を manifest に残し、後の版がどの版まで取り込んでいるかを見分けられるようにする。
+            var forced = options.ForceOverwriteOnConflict || replace;
             ToolManifestEntry BuildEntry(long version) => new()
             {
                 Version = version,
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
+                LastForcedVersion = forced ? version : existing?.LastForcedVersion,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
@@ -198,6 +202,9 @@ public sealed class VrcxSyncService : IMergeableSyncService
     public SyncResult Pull(PullOptions options)
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
+        // ここから差し替えまでの間 (取得と要約で長くなりうる) に VRCX が起動して書き込むと、
+        // その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。
+        var localFingerprint = FingerprintDatabase(_paths.SqliteFile);
 
         var storage = options.Storage;
         var manifest = new ManifestStore(storage).Load();
@@ -308,7 +315,19 @@ public sealed class VrcxSyncService : IMergeableSyncService
         var pulledSummary = DatabaseSummary.Compute(staging.SourceOf(_paths.SqliteFile), MergeProfiles.Vrcx, out var summaryReason);
         if (pulledSummary is null) _logger.LogInformation("取り出した写しの要約を取れませんでした: {Reason}", summaryReason);
 
-        // (3) ここから先はローカルを書き換える。
+        // (3) ここから先はローカルを書き換える。その前に、取得と要約の間に VRCX が起動して
+        //     書き込んでいないかを確かめる。
+        ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
+        if (FingerprintDatabase(_paths.SqliteFile) != localFingerprint)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = entry.Version,
+                Message = "Pull の間に VRCX の DB が書き換えられたため、差し替える前に中止しました。" +
+                          "VRCX を終了してからやり直してください。",
+            };
+        }
         string? backupPath = null;
         if (!options.SkipBackup)
         {
@@ -469,6 +488,20 @@ public sealed class VrcxSyncService : IMergeableSyncService
                          && entry.Version > pushedVersion
                          && (baseline is null || baseline.RemoteVersion < pushedVersion))
                 {
+                    if (entry.LastForcedVersion is long forcedVersion && forcedVersion > pushedVersion)
+                    {
+                        // 送った版の後に別の PC が強制 Push で上書きした。その版は送った内容を
+                        // 取り込んでいないので、送った写しを祖先にすると送った変更が消える。
+                        // 古い要約を祖先にすると二重に足す。どちらも避けるため止める。
+                        return new SyncResult
+                        {
+                            Outcome = SyncOutcome.Aborted,
+                            RemoteVersion = entry.Version,
+                            Message = $"前回の Push (版 {pushedVersion}) の後に別の PC が強制 Push (版 {forcedVersion}) で同期先を上書きしています。" +
+                                      "送った変更が同期先に残っているか分からないため、自動マージを中止しました。" +
+                                      "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                        };
+                    }
                     // 送った版の後に別の PC が版を進めた。その版は送った内容を取り込んでいるので、
                     // 送った写しの要約を祖先にする。それより前の要約を祖先にすると、送った変更を
                     // 同期先と手元の両方の変更と見て二重に足す。
@@ -591,23 +624,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
     }
 
     /// <summary>本体と WAL の大きさと更新時刻。書き換えられたかを見分けるのに使う。</summary>
-    private static string FingerprintDatabase(string path)
-    {
-        static string Of(string file)
-        {
-            var info = new FileInfo(file);
-            return info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
-        }
-        static string OfWal(string file)
-        {
-            // WAL 方式の本体を読み取り専用で開くだけでも、WAL が無ければ空の WAL ができる。
-            // 写しを取る自分の読み取りで作られた空の WAL を、VRCX の書き込みと見ないよう、
-            // 中身の無い WAL は無いものとして扱う。書き込みがあれば長さが変わる。
-            var info = new FileInfo(file);
-            return info.Exists && info.Length > 0 ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
-        }
-        return $"{Of(path)}|{OfWal(path + "-wal")}";
-    }
+    private static string FingerprintDatabase(string path) => DatabaseFingerprint.Of(path);
 
     /// <summary>
     /// SQLite の本体ファイルを <paramref name="source"/> で置き換える。WAL/SHM は消さずに

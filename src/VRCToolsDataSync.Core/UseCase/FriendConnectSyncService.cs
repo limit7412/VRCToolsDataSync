@@ -145,12 +145,14 @@ public sealed class FriendConnectSyncService : ISyncService
         long nextVersion;
         try
         {
+            var forced = options.ForceOverwriteOnConflict || replace;
             ToolManifestEntry BuildEntry(long version) => new()
             {
                 Version = version,
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
+                LastForcedVersion = forced ? version : existing?.LastForcedVersion,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
@@ -202,6 +204,9 @@ public sealed class FriendConnectSyncService : ISyncService
     public SyncResult Pull(PullOptions options)
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+        // ここから差し替えまでの間 (取得と要約で長くなりうる) に Friend Connect が起動して
+        // 書き込むと、その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。
+        var localFingerprint = DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File);
 
         var storage = options.Storage;
         var manifest = new ManifestStore(storage).Load();
@@ -311,12 +316,25 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        // (3) ここから先はローカルを書き換える。
         // 次に比べる基準は、同期先の内容の写しから取る。手元の DB から取ると、本体が
         // 同期先と同じでも WAL に残る未送信の変更が基準に混ざり、次の同期で失われる。
         var pulledSummary = remoteDbV11 is null
             ? null
             : DatabaseSummary.Compute(staging.SourceOf(_paths.DbV11File), TrackedDatabase.Profile, out _);
+
+        // (3) ここから先はローカルを書き換える。その前に、取得と要約の間に Friend Connect が
+        //     起動して書き込んでいないかを確かめる。
+        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+        if (DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File) != localFingerprint)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = entry.Version,
+                Message = "Pull の間に Friend Connect の DB が書き換えられたため、差し替える前に中止しました。" +
+                          "Friend Connect を終了してからやり直してください。",
+            };
+        }
 
         string? backupPath = null;
         if (!options.SkipBackup)
