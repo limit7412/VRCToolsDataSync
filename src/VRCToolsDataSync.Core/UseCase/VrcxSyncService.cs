@@ -409,6 +409,10 @@ public sealed class VrcxSyncService : IMergeableSyncService
             var hostBaseline = DatabaseSummary.Compute(hostPath, MergeProfiles.Vrcx, out _);
             if (hostBaseline is not null) hostBaseline.RemoteVersion = entry.Version;
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, options.Baseline, options.DryRun);
+            if (hostBaseline is not null && report.Succeeded)
+            {
+                DatabaseSummary.TrimRenumbered(hostBaseline, hostPath, MergeProfiles.Vrcx, report);
+            }
             report.HostBaseline = hostBaseline;
             _logger.LogInformation("VRCX マージ: {Report}", report.Describe());
             if (!report.Succeeded)
@@ -445,8 +449,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
                 backupPath = _backup.CreateSnapshot(Key, filesToBackup);
             }
-            options.BeforeReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
             ReplaceDatabase(hostPath, _paths.SqliteFile, _logger);
+            options.AfterReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
 
             return new SyncResult
             {

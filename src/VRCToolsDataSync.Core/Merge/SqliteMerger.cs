@@ -49,8 +49,13 @@ public sealed class MergeReport
 /// <param name="Deleted">手元で消されていたので消したキー。</param>
 /// <param name="Renumbered">出来事の順に id を振り直したか。</param>
 /// <param name="Created">同期先に無かったので、手元の定義で作ったか。</param>
+/// <param name="KeptMaxRowId">
+/// 振り直したとき、元の rowid のまま残った行の rowid の最大値。これより大きい rowid の
+/// 行は入れ直したので、土台にした版の rowid とは対応しない。
+/// </param>
 public sealed record TableMergeReport(
-    string Table, long Inserted, long Updated, long Deleted, bool Renumbered, bool Created);
+    string Table, long Inserted, long Updated, long Deleted, bool Renumbered, bool Created,
+    long KeptMaxRowId = 0);
 
 /// <summary>両方で別々に編集されていたキー。どちらを残したかを記録する。</summary>
 /// <param name="Table">テーブル名。</param>
@@ -287,12 +292,11 @@ public static class SqliteMerger
         }
         Execute(connection, $"DROP INDEX main.{index}");
 
-        var renumbered = inserted > 0
-                         && rule.OrderColumn is not null
-                         && rowIdAlias is not null
-                         && RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId);
+        var keptMaxRowId = inserted > 0 && rule.OrderColumn is not null && rowIdAlias is not null
+            ? RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId)
+            : null;
 
-        return new TableMergeReport(table, inserted, updated, 0, renumbered, created);
+        return new TableMergeReport(table, inserted, updated, 0, keptMaxRowId is not null, created, keptMaxRowId ?? 0);
     }
 
     /// <summary>
@@ -323,7 +327,8 @@ public static class SqliteMerger
     /// 振られるので、全体として順序が揃う。
     /// </para>
     /// </summary>
-    private static bool RenumberIfInterleaved(
+    /// <returns>振り直したら、元の rowid のまま残った行の rowid の最大値。振り直さなければ null。</returns>
+    private static long? RenumberIfInterleaved(
         SqliteConnection connection, string table, string orderColumn, string rowIdAlias,
         IReadOnlyList<string> columns, long hostMaxRowId)
     {
@@ -346,7 +351,7 @@ public static class SqliteMerger
         if (oldestAdded is null || newestExisting is null
             || string.CompareOrdinal(oldestAdded, newestExisting) >= 0)
         {
-            return false;
+            return null;
         }
 
         var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
@@ -365,10 +370,11 @@ public static class SqliteMerger
             command.Parameters.AddWithValue("$from", oldestAdded);
             command.ExecuteNonQuery();
         }
+        var keptMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
         Execute(connection,
             $"INSERT INTO {target} ({insertColumns}) SELECT {insertColumns} FROM {work} ORDER BY rowid");
         Execute(connection, $"DROP TABLE {work}");
-        return true;
+        return keptMaxRowId;
     }
 
     /// <summary>

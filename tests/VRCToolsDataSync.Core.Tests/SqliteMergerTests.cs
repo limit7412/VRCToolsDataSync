@@ -125,6 +125,28 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Contains("gamelog_location", report.AbortReason);
     }
 
+    [Fact(DisplayName = "id を振り直したマージの後も、土台の版の要約を縮めれば次のマージの祖先に使える")]
+    public void TrimmedBaselineSurvivesRenumber()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-03T00:00:00Z', 'wrld_host:1')");
+        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+        var nextRemote = Path.Combine(_root, "next-remote.sqlite3");
+        File.Copy(host, nextRemote);
+        var hostBaseline = DatabaseSummary.Compute(host, MergeProfiles.Vrcx, out _)!;
+
+        var report = Merge(host, local, baseline);
+        DatabaseSummary.TrimRenumbered(hostBaseline, host, MergeProfiles.Vrcx, report);
+
+        // マージ結果で手元を置き換えた後、Push が競合して、同期先が先に進んだ版とやり直す。
+        Exec(nextRemote, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-04T00:00:00Z', 'wrld_next:1')");
+        Merge(nextRemote, host, hostBaseline);
+
+        Assert.Equal(
+            new[] { "wrld_a:1", "wrld_local:1", "wrld_host:1", "wrld_next:1" },
+            Rows(nextRemote, "SELECT location FROM gamelog_location ORDER BY id"));
+    }
+
     [Fact(DisplayName = "手元で途中の履歴を消していたら、消した行を戻さずに中止する")]
     public void AppendOnlyAbortsOnLocalDeletion()
     {

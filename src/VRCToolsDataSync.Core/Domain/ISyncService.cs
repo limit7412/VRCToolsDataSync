@@ -39,11 +39,16 @@ public sealed class PullMergeOptions
     public bool SkipBackup { get; init; }
 
     /// <summary>
-    /// マージが済み、ローカルを置き換える直前に呼ぶ。引数は土台にした同期先の version と、
+    /// ローカルをマージ結果で置き換えた直後に呼ぶ。引数は土台にした同期先の version と、
     /// その版の要約 (取れなければ null)。呼び出し側は、置き換えた後のローカルに合う
-    /// 同期履歴と祖先の要約を、ここで先に保存する。例外を投げればローカルは置き換えない。
+    /// 同期履歴と祖先の要約をここで保存する。
+    /// <para>
+    /// 置き換えより後に呼ぶのは、間で落ちたときに同期履歴だけが進まないようにするため。
+    /// 同期履歴が進んで DB が古いままだと、次の Push が同期先の変更を古い DB で上書きする。
+    /// 逆に DB だけが新しいなら、手元に未 Push の変更があるものとして扱われ、上書きされない。
+    /// </para>
     /// </summary>
-    public Action<long, DatabaseSummary?>? BeforeReplaceLocal { get; init; }
+    public Action<long, DatabaseSummary?>? AfterReplaceLocal { get; init; }
 }
 
 public sealed class PushOptions

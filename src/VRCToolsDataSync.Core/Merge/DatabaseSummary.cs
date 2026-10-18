@@ -108,6 +108,48 @@ public sealed class DatabaseSummary
     }
 
     /// <summary>
+    /// 土台にした版の要約 <paramref name="summary"/> を、マージで id を振り直したテーブル
+    /// について、振り直しの後も元の rowid のまま残った行だけの要約に縮める。
+    /// <para>
+    /// この要約は、マージ結果で置き換えたローカルの祖先になる。振り直したテーブルでは
+    /// 土台の版の末尾の rowid に手元から足した行が入るので、そのままでは次のマージが
+    /// 手元で行を消したと見誤る。縮めた範囲より後の行は、次のマージで足す候補に戻るが、
+    /// キーで突き合わせるので二重にはならない。
+    /// </para>
+    /// </summary>
+    public static void TrimRenumbered(DatabaseSummary summary, string mergedPath, MergeProfile profile, MergeReport report)
+    {
+        var renumbered = report.Tables
+            .Where(t => t.Renumbered && summary.Tables.ContainsKey(t.Table))
+            .ToList();
+        if (renumbered.Count == 0) return;
+
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = mergedPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        foreach (var table in renumbered)
+        {
+            var rule = profile.Rules.First(r => r.Matches(table.Table));
+            var kept = table.KeptMaxRowId;
+            var entry = summary.Tables[table.Table];
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"SELECT count(*) FROM main.{Quote(table.Table)} WHERE rowid <= $max";
+                command.Parameters.AddWithValue("$max", kept);
+                entry.RowCount = (long)command.ExecuteScalar()!;
+            }
+            entry.MaxRowId = kept;
+            entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule.KeyColumns, kept);
+            // 後から書き換わる列のハッシュは全行のものなので、縮めた範囲には合わない。
+            entry.Digest = null;
+        }
+    }
+
+    /// <summary>
     /// 規則が前提にしている列のうち、テーブルに無いものを返す。編集時刻の列は要約には
     /// 使わないが、3-way のマージで使うので、ここで欠けていないことを確かめる。
     /// </summary>

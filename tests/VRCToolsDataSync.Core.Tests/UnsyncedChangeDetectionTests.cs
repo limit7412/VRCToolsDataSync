@@ -333,4 +333,30 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
             SyncRunner.MergeLockTimeout = previous;
         }
     }
+
+    [Fact(DisplayName = "別のプロセスがマージ中なら、Pull も見送って手元を置き換えない")]
+    public void PullWaitsForOtherProcess()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var root = Path.Combine(_root, "b", "base");
+        Directory.CreateDirectory(root);
+        var before = CountLocations(b.Paths.SqliteFile);
+        var previous = SyncRunner.MergeLockTimeout;
+        SyncRunner.MergeLockTimeout = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            using (new FileStream(Path.Combine(root, $"merge-{VrcxSyncService.Key}.lock"),
+                       FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: true);
+
+                Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+                Assert.Equal(before, CountLocations(b.Paths.SqliteFile));
+            }
+        }
+        finally
+        {
+            SyncRunner.MergeLockTimeout = previous;
+        }
+    }
 }

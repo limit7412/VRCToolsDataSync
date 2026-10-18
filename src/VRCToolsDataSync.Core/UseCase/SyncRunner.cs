@@ -141,6 +141,34 @@ public sealed class SyncRunner
         // ローカルが既に最新と分かっているリモート (LastPulledVersion>=Version) の
         // Pull を抑止する。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
         // false を使い、従来通り上書き Pull を行う。
+        SyncResult result;
+        lock (PushLock)
+        {
+            // Pull もローカルの DB を置き換えるので、別プロセスのマージと重ならないようにする。
+            using var localLock = AcquireLocalLock(service.ToolKey);
+            if (!localLock.IsHeld) return LocalLockBusy();
+            result = PullLocked(service, settings, storage, skipBackup, skipIfNotNewer);
+        }
+
+        // 起動時の自動 Pull が手元の変更を守って見送った場合、マージが有効なら
+        // 上書きの代わりにマージする。
+        if (result.Outcome == SyncOutcome.LocalChangesPending
+            && settings.IsMergeEnabled(service.ToolKey)
+            && service is IMergeableSyncService mergeable)
+        {
+            _logger.LogInformation("手元に未 Push の変更があるのでマージします ({Tool})", service.ToolKey);
+            return Merge(mergeable, settings, storage, skipBackup);
+        }
+        return result;
+    }
+
+    private SyncResult PullLocked(
+        ISyncService service,
+        SyncSettings settings,
+        ISyncStorage storage,
+        bool skipBackup,
+        bool skipIfNotNewer)
+    {
         var state = ResolveState(settings, storage, service.ToolKey, out var stateKey);
         var result = service.Pull(new PullOptions
         {
@@ -165,24 +193,32 @@ public sealed class SyncRunner
             _store.SaveToolStateOnly(settings);
             RecordBaseSummary(service, stateKey, result.RemoteVersion.Value);
         }
-
-        // 起動時の自動 Pull が手元の変更を守って見送った場合、マージが有効なら
-        // 上書きの代わりにマージする。
-        if (result.Outcome == SyncOutcome.LocalChangesPending
-            && settings.IsMergeEnabled(service.ToolKey)
-            && service is IMergeableSyncService mergeable)
-        {
-            _logger.LogInformation("手元に未 Push の変更があるのでマージします ({Tool})", service.ToolKey);
-            return Merge(mergeable, settings, storage, skipBackup);
-        }
         return result;
     }
 
     /// <summary>Push を競合で取り直す回数の上限。</summary>
     private const int MaxMergeAttempts = 3;
 
-    /// <summary>別プロセスのマージが終わるのを待つ上限。テストで短くする。</summary>
+    /// <summary>別プロセスのマージや Pull が終わるのを待つ上限。テストで短くする。</summary>
     internal static TimeSpan MergeLockTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// ローカルの DB を置き換える操作 (マージと Pull) を、プロセスをまたいで直列にする錠前を取る。
+    /// PushLock はこのプロセスの中でしか効かないので、常駐の GUI と CLI が同じ DB を同時に
+    /// 置き換えないよう、要約の置き場所にツールごとの錠前ファイルを置く。
+    /// </summary>
+    private CrossSessionFileLock AcquireLocalLock(string toolKey)
+    {
+        Directory.CreateDirectory(_baseSummaries.RootDirectory);
+        return CrossSessionFileLock.Acquire(
+            Path.Combine(_baseSummaries.RootDirectory, $"merge-{toolKey}.lock"), MergeLockTimeout);
+    }
+
+    private static SyncResult LocalLockBusy() => new()
+    {
+        Outcome = SyncOutcome.Aborted,
+        Message = "別のプロセスがマージか Pull をしているため、見送りました",
+    };
 
     /// <summary>
     /// 同期先の最新に手元の変更を足してローカルに置き、続けて Push する。
@@ -219,20 +255,9 @@ public sealed class SyncRunner
     {
         lock (PushLock)
         {
-            // PushLock はこのプロセスの中でしか効かない。常駐の GUI と CLI の merge が
-            // 同じローカル DB を同時に置き換えないよう、プロセスをまたぐ錠前も取る。
             // 取れなければ、相手の途中の DB を土台にしないようマージを見送る。
-            Directory.CreateDirectory(_baseSummaries.RootDirectory);
-            using var crossProcessLock = CrossSessionFileLock.Acquire(
-                Path.Combine(_baseSummaries.RootDirectory, $"merge-{service.ToolKey}.lock"), MergeLockTimeout);
-            if (!crossProcessLock.IsHeld)
-            {
-                return (new SyncResult
-                {
-                    Outcome = SyncOutcome.Aborted,
-                    Message = "別のプロセスがマージ中のため、マージを見送りました",
-                }, false);
-            }
+            using var localLock = AcquireLocalLock(service.ToolKey);
+            if (!localLock.IsHeld) return (LocalLockBusy(), false);
 
             SyncResult? last = null;
             string? firstBackupPath = null;
@@ -256,10 +281,10 @@ public sealed class SyncRunner
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
-                        BeforeReplaceLocal = (remoteVersion, hostBaseline) =>
+                        AfterReplaceLocal = (remoteVersion, hostBaseline) =>
                         {
                             // 置き換えた後のローカルは、土台にした版に手元の変更を足したもの
-                            // になる。祖先の要約と同期履歴を、置き換えの前にその版へそろえる。
+                            // になる。祖先の要約と同期履歴をその版へそろえる。
                             committed = true;
                             if (hostBaseline is null) _baseSummaries.Delete(stateKey);
                             else _baseSummaries.Save(stateKey, hostBaseline);
@@ -272,8 +297,9 @@ public sealed class SyncRunner
                 }
                 catch
                 {
-                    // そろえた後でローカルを置き換えられなかった。ローカルは元のままなので、
-                    // 祖先の要約と同期履歴も元へ戻す。
+                    // そろえている途中で失敗した。要約と同期履歴が食い違わないよう元へ戻す。
+                    // ローカルはマージ結果のままだが、手元に未 Push の変更があるものとして
+                    // 扱われるので、次の同期で同期先の変更を上書きすることはない。
                     if (committed)
                     {
                         RestoreBaseline(stateKey, previousBaseline);
