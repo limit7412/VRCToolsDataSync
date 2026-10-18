@@ -553,6 +553,47 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.True(Assert.Single(report.Tables, t => t.Table == "usr0123abcd_feed_gps").Created);
     }
 
+    [Fact(DisplayName = "祖先にあったテーブルが手元から消えていて、同期先が変わっていなければ同期先からも消す")]
+    public void FollowsLocalTableDeletionWhenHostUnchanged()
+    {
+        var (host, local, _) = Arrange();
+        const string feed = """
+            CREATE TABLE usr0123abcd_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-01T00:00:00Z', 'usr_x', 'wrld_a:1');
+            """;
+        Exec(host, feed);
+        Exec(local, feed);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        Exec(local, "DROP TABLE usr0123abcd_feed_gps");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name = 'usr0123abcd_feed_gps'"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "usr0123abcd_feed_gps").Deleted);
+    }
+
+    [Fact(DisplayName = "祖先にあったテーブルが手元から消えていて、同期先が変わっていれば中止する")]
+    public void AbortsWhenLocalDeletedTableThatHostChanged()
+    {
+        var (host, local, _) = Arrange();
+        const string feed = """
+            CREATE TABLE usr0123abcd_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-01T00:00:00Z', 'usr_x', 'wrld_a:1');
+            """;
+        Exec(host, feed);
+        Exec(local, feed);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        Exec(local, "DROP TABLE usr0123abcd_feed_gps");
+        Exec(host, "INSERT INTO usr0123abcd_feed_gps (created_at, user_id, location) VALUES ('2026-10-02T00:00:00Z', 'usr_x', 'wrld_b:1')");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("usr0123abcd_feed_gps", report.AbortReason);
+        Assert.Contains("手元から消えています", report.AbortReason);
+        Assert.Equal(2, Rows(host, "SELECT id FROM usr0123abcd_feed_gps").Count);
+    }
+
     [Fact(DisplayName = "祖先にあったテーブルが同期先から消えていて、手元が変わっていなければ作り直さない")]
     public void FollowsHostTableDeletionWhenLocalUnchanged()
     {

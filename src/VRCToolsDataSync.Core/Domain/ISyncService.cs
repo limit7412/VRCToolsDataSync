@@ -42,6 +42,12 @@ public sealed class PullMergeOptions
     /// </summary>
     public PushedRecord? OwnPush { get; init; }
 
+    /// <summary>
+    /// <see cref="OwnPush"/> が反映されなかったと分かったときに呼ぶ。呼び出し側は記録を捨てる。
+    /// 残すと、同期先がさらに進んだときに反映されたか分からない記録として扱われ、マージが止まる。
+    /// </summary>
+    public Action? DiscardOwnPush { get; init; }
+
     /// <summary>true なら結果を数えるだけで、ローカルには何も書かない。</summary>
     public bool DryRun { get; init; }
 
@@ -95,17 +101,23 @@ public sealed class PushOptions
     public long? LastPulledVersion { get; init; }
 
     /// <summary>
-    /// 送る DB の写しを同期先へ書き込む直前に呼ぶ。引数は写しの SHA-256 と、その要約。
-    /// 送った後に同期履歴を保存する前に止まっても、次のマージで同期先に送った内容が
-    /// 入っていると見分けるために控える。
+    /// 送る DB の写しを同期先へ書き込む直前に呼ぶ。引数は写しの SHA-256 と、その要約と、
+    /// manifest で取る予定の version (強制 Push では決まらないので null)。送った後に同期履歴を
+    /// 保存する前に止まっても、次のマージで同期先に送った内容が入っていると見分けるために控える。
     /// </summary>
-    public Action<string, DatabaseSummary?>? BeforeCommit { get; init; }
+    public Action<string, DatabaseSummary?, long?>? BeforeCommit { get; init; }
 
     /// <summary>
     /// 送った写しの manifest への反映が済んだ直後に呼ぶ。引数は写しの SHA-256 と、
     /// 反映した version。
     /// </summary>
     public Action<string, long>? AfterCommit { get; init; }
+
+    /// <summary>
+    /// 送った写しを manifest へ反映できなかった (他の PC が先に更新していた) ときに呼ぶ。
+    /// 呼び出し側は <see cref="BeforeCommit"/> で控えた記録を捨てる。
+    /// </summary>
+    public Action? CommitFailed { get; init; }
 }
 
 public sealed class PullOptions

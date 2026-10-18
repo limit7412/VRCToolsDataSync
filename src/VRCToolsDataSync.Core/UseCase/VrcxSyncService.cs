@@ -87,7 +87,9 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
             pushedSummary = DatabaseSummary.Compute(staged.LocalPath, MergeProfiles.Vrcx, out var summaryReason);
             if (pushedSummary is null) _logger.LogInformation("送る写しの要約を取れませんでした: {Reason}", summaryReason);
-            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary);
+            // 通常の Push は前回の version の次を取る (違っていれば競合として止まる)。
+            // 強制 Push は他の PC の更新を上書きするので、取る version は決まらない。
+            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary, replace ? null : (existing?.Version ?? 0) + 1);
             if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
                 _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
@@ -169,6 +171,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             _logger.LogInformation(
                 "VRCX Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
                 ex.ExpectedVersion, ex.ActualVersion);
+            options.CommitFailed?.Invoke();
             return new SyncResult
             {
                 Outcome = SyncOutcome.ConflictDetected,
@@ -473,6 +476,30 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         "同期先の版 {Remote} は自分が送った版 {Pushed} より後なので、送った写しの要約を祖先にします",
                         entry.Version, pushedVersion);
                     baseline = ownPush.Summary;
+                }
+                else if (ownPush is { Committed: false, PlannedVersion: long plannedVersion }
+                         && (baseline is null || baseline.RemoteVersion < plannedVersion))
+                {
+                    if (entry.Version == plannedVersion)
+                    {
+                        // 取る予定だった版を別の PC が取った。送信は反映されなかったので、記録は要らない。
+                        _logger.LogInformation("前回の送信は反映されていませんでした (版 {Version} は別の PC のもの)", plannedVersion);
+                        options.DiscardOwnPush?.Invoke();
+                    }
+                    else if (entry.Version > plannedVersion)
+                    {
+                        // 反映の直後に止まって反映済みの記録を書けなかったか、反映されずに別の PC が
+                        // 版を 2 つ以上進めたか、見分けられない。古い要約を祖先にすると、反映されていた
+                        // 場合に送った変更を二重に足すので、止める。
+                        return new SyncResult
+                        {
+                            Outcome = SyncOutcome.Aborted,
+                            RemoteVersion = entry.Version,
+                            Message = $"前回の Push (版 {plannedVersion}) が同期先に反映されたか分からないまま、同期先が版 {entry.Version} まで進んでいます。" +
+                                      "送った変更を二重に数えないよう、自動マージを中止しました。" +
+                                      "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                        };
+                    }
                 }
             }
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, baseline, options.DryRun);

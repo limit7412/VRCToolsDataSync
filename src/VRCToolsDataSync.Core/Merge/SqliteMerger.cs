@@ -186,7 +186,8 @@ public static class SqliteMerger
         SqliteConnection connection, MergeProfile profile, DatabaseSummary? baseline, MergeReport report,
         int maxRenumberedTailRows)
     {
-        foreach (var table in ListTables(connection, Local))
+        var localTables = ListTables(connection, Local);
+        foreach (var table in localTables)
         {
             var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
             if (rule is null || rule.Kind == MergeTableKind.Watched) continue;
@@ -195,6 +196,29 @@ public static class SqliteMerger
                 connection, table, rule, baseline?.Tables.GetValueOrDefault(table), report, maxRenumberedTailRows);
             if (tableReport is null) return;
             report.Tables.Add(tableReport);
+        }
+        if (baseline is null) return;
+
+        // 前回の同期時点にはあって手元から消えたテーブル。手元のテーブルだけを見ると、
+        // 同期先のテーブルがそのまま残り、置き換えと Push で手元の削除が取り消される。
+        // 同期先が前回から変わっていなければ削除に従い、変わっていれば中止する。
+        foreach (var (table, ancestor) in baseline.Tables)
+        {
+            if (localTables.Contains(table, StringComparer.Ordinal)) continue;
+            var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
+            if (rule is null || rule.Kind == MergeTableKind.Watched) continue;
+            var hostColumns = ListColumns(connection, "main", table);
+            if (hostColumns.Count == 0) continue;
+            var host = DatabaseSummary.SummarizeTable(connection, "main", table, rule, hostColumns);
+            if (!ancestor.HasSameContent(host))
+            {
+                report.AbortReason = $"テーブル {table} が手元から消えていますが、同期先では前回の同期の後に変わっているか、" +
+                                     "変わっていないことを確かめられません。手元でテーブルを消した理由と同期先の変更のどちらを正とするか決めてから、" +
+                                     "Push か Pull をしてください";
+                return;
+            }
+            Execute(connection, $"DROP TABLE main.{Quote(table)}");
+            report.Tables.Add(new TableMergeReport(table, 0, 0, host.RowCount, false, false));
         }
     }
 

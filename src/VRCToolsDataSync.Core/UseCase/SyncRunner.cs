@@ -123,8 +123,12 @@ public sealed class SyncRunner
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
                 LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
-                BeforeCommit = (sha256, summary) => TrySavePushed(stateKey, new PushedRecord(sha256, summary)),
+                BeforeCommit = (sha256, summary, planned) =>
+                    TrySavePushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
                 AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
+                // 反映できなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
+                // 分からない記録として扱われ、マージが止まる。
+                CommitFailed = () => _baseSummaries.DiscardUncommittedPushed(stateKey),
             });
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
@@ -346,6 +350,7 @@ public sealed class SyncRunner
                         Storage = storage,
                         Baseline = baseline,
                         OwnPush = _baseSummaries.LoadPushed(stateKey),
+                        DiscardOwnPush = () => _baseSummaries.DeletePushed(stateKey),
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,

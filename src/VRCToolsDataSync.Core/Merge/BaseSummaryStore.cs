@@ -222,6 +222,15 @@ public sealed class BaseSummaryStore
         if (File.Exists(path)) File.Delete(path);
     }
 
+    /// <summary>
+    /// manifest へ反映できなかった送信の記録を捨てる。反映済みの記録は、要約を保存できる
+    /// まで次のマージの祖先に要るので残す。
+    /// </summary>
+    public void DiscardUncommittedPushed(string stateKey)
+    {
+        if (LoadPushed(stateKey) is { Committed: false }) DeletePushed(stateKey);
+    }
+
     private string PushedPathOf(string stateKey) => PathOf(stateKey) + ".pushed";
 
     /// <summary>
@@ -265,17 +274,24 @@ public sealed class BaseSummaryStore
 /// </summary>
 /// <summary>
 /// 最後に送った DB の写しの記録。<paramref name="Sha256"/> は写しのハッシュ、
-/// <paramref name="Summary"/> はその要約。manifest への反映が済めば <paramref name="Committed"/> と、
-/// 反映した <paramref name="Version"/> を持つ。送った後に要約を保存する前に止まった場合、
-/// 同期先の写しがこの写しそのものか、この版より後の版なら、同期先には送った変更が
-/// 入っているので、この要約を祖先にする。前回の同期時点の古い要約を祖先にすると、送った
-/// 変更を同期先と手元の両方の変更と見て二重に足す。
+/// <paramref name="Summary"/> はその要約、<paramref name="PlannedVersion"/> は manifest で
+/// 取る予定の version。manifest への反映が済めば <paramref name="Committed"/> と、反映した
+/// <paramref name="Version"/> を持つ。送った後に要約を保存する前に止まった場合、同期先の写しが
+/// この写しそのものか、この版より後の版なら、同期先には送った変更が入っているので、
+/// この要約を祖先にする。前回の同期時点の古い要約を祖先にすると、送った変更を同期先と
+/// 手元の両方の変更と見て二重に足す。
+/// <para>
+/// 反映の直後に止まると、反映済みの記録を書けない。そのとき同期先の版が予定の版を越えて
+/// いれば、送った変更が入っているかを見分けられないので、マージは中止する。予定の版を
+/// 別の PC が取っていれば、反映されなかったと分かるので記録を捨てる。
+/// </para>
 /// </summary>
 public sealed record PushedRecord(
     string Sha256,
     DatabaseSummary? Summary = null,
     long? Version = null,
-    bool Committed = false);
+    bool Committed = false,
+    long? PlannedVersion = null);
 
 public sealed record MergePendingState(
     DatabaseSummary? Summary,
