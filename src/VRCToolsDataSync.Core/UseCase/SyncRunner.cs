@@ -300,8 +300,11 @@ public sealed class SyncRunner
             for (var attempt = 1; attempt <= MaxMergeAttempts; attempt++)
             {
                 var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
-                var previousBaseline = _baseSummaries.Load(stateKey);
-                var previousPulledVersion = state.LastPulledVersion;
+                // 前回のマージが置き換えの前後で止まっていれば、先に祖先をそろえる。
+                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun);
+                if (recovered.Abort is not null) return (WithBackupPath(recovered.Abort, firstBackupPath), attempt > 1);
+                var previousBaseline = recovered.Baseline ?? _baseSummaries.Load(stateKey);
+                var previousPulledVersion = recovered.PulledVersion ?? state.LastPulledVersion;
                 var previousPulledAt = state.LastPulledAt;
                 // 同期履歴より古い要約は祖先に使えない。祖先なしの 2-way にする。新しい要約は、
                 // 前回のマージで置き換えた後、同期履歴を保存する前に止まったときのもので、
@@ -325,6 +328,7 @@ public sealed class SyncRunner
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
+                        BeforeReplaceLocal = pending => _baseSummaries.SavePendingReplace(stateKey, pending),
                         AfterReplaceLocal = (remoteVersion, hostBaseline) =>
                         {
                             // 置き換えた後のローカルは、土台にした版に手元の変更を足したもの
@@ -391,6 +395,56 @@ public sealed class SyncRunner
             // 操作前の状態を戻せるよう、最初のバックアップを結果に残す。
             return (WithBackupPath(last!, firstBackupPath), true);
         }
+    }
+
+    /// <summary>
+    /// 前回のマージがローカルの置き換えの前後で止まっていれば、祖先と同期履歴を今の
+    /// ローカルに合わせる。置き換えが済んだかは、今の本体の SHA-256 が記録のどちらと
+    /// 同じかで見分ける。どちらとも違えば、その後に DB が書き換えられていて判断できない
+    /// ので、中止の結果を返す。
+    /// </summary>
+    /// <returns>
+    /// 中止の結果か、dry-run で保存せずに使う祖先と同期履歴の版。記録が無いか、保存まで
+    /// 済ませたなら、すべて null。
+    /// </returns>
+    private (SyncResult? Abort, DatabaseSummary? Baseline, long? PulledVersion) ResolveInterruptedReplace(
+        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun)
+    {
+        var pending = _baseSummaries.LoadPendingReplace(stateKey);
+        if (pending is null || service.TrackedDatabase is not { } tracked || !File.Exists(tracked.Path))
+        {
+            return (null, null, null);
+        }
+        var current = FileHasher.Sha256(tracked.Path);
+        if (string.Equals(current, pending.LocalSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            // 置き換える前に止まった。ローカルは元のままなので、祖先も同期履歴もそのままでよい。
+            _logger.LogInformation("前回のマージは置き換える前に止まっていました ({Tool})", service.ToolKey);
+            if (!dryRun) TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
+        if (string.Equals(current, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            // 置き換えた後、要約と同期履歴を保存する前に止まった。その保存をここで終える。
+            _logger.LogInformation("前回のマージは置き換えた後に止まっていました。祖先と同期履歴をそろえます ({Tool})", service.ToolKey);
+            if (pending.Summary is not null) pending.Summary.RemoteVersion = pending.RemoteVersion;
+            if (dryRun) return (null, pending.Summary, pending.RemoteVersion);
+            if (pending.Summary is null) _baseSummaries.Delete(stateKey);
+            else _baseSummaries.Save(stateKey, pending.Summary);
+            state.LastPulledVersion = pending.RemoteVersion;
+            state.LastPulledAt = DateTimeOffset.Now;
+            settings.ToolState[stateKey] = state;
+            _store.SaveToolStateOnly(settings);
+            TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
+        return (new SyncResult
+        {
+            Outcome = SyncOutcome.Aborted,
+            Message = "前回のマージがローカルの置き換えの前後で止まり、その後に DB が書き換えられています。" +
+                      "置き換えが済んだかを見分けられないため、自動マージを中止しました。" +
+                      "バックアップを確かめたうえで、Pull で同期先に合わせるか、強制 Push で手元を送ってください",
+        }, null, null);
     }
 
     /// <summary>結果のバックアップの場所を、取ってあれば最初のバックアップに差し替える。</summary>

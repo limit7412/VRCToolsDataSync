@@ -474,6 +474,12 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
                 backupPath = _backup.CreateSnapshot(Key, filesToBackup);
             }
+            // 置き換えた後に止まっても祖先を復旧できるよう、置き換える前後の本体のハッシュを
+            // 呼び出し側に渡す。読むのに時間がかかるので、書き換えの確認より前に取る。
+            var pending = options.BeforeReplaceLocal is null
+                ? null
+                : new MergePendingState(report.HostBaseline, entry.Version,
+                    FileHasher.Sha256(_paths.SqliteFile), FileHasher.Sha256(hostPath));
             // マージには時間がかかることがあり、その間に VRCX が起動されうる (起動時の自動
             // Pull が別プロセスのマージを待ちきれずに VRCX を起動した場合など)。動いている
             // DB を置き換えないよう、置き換えの直前にもう一度確かめる。
@@ -490,6 +496,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                     MergeReport = report,
                 };
             }
+            if (pending is not null) options.BeforeReplaceLocal!(pending);
             ReplaceDatabase(hostPath, _paths.SqliteFile, _logger);
             options.AfterReplaceLocal?.Invoke(entry.Version, report.HostBaseline);
 

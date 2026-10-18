@@ -49,6 +49,13 @@ public sealed class PullMergeOptions
     /// </para>
     /// </summary>
     public Action<long, DatabaseSummary?>? AfterReplaceLocal { get; init; }
+
+    /// <summary>
+    /// ローカルをマージ結果で置き換える直前に呼ぶ。呼び出し側は引数を保留として残し、
+    /// <see cref="AfterReplaceLocal"/> の保存が終わる前に止まっても、次回に置き換えが
+    /// 済んだかを見分けて祖先を復旧できるようにする。例外を投げれば置き換えない。
+    /// </summary>
+    public Action<MergePendingState>? BeforeReplaceLocal { get; init; }
 }
 
 public sealed class PushOptions

@@ -525,6 +525,33 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.DoesNotContain("wrld_a:1", Rows(host, "SELECT location FROM gamelog_location"));
     }
 
+    [Fact(DisplayName = "列を残していない古い形式の要約では、祖先なしにせず中止する")]
+    public void AbortsWhenBaselineLacksColumns()
+    {
+        var (host, local, baseline) = Arrange();
+        foreach (var table in baseline.Tables.Values) table.Columns = null;
+        Exec(local, "DELETE FROM memos WHERE user_id = 'usr_d'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("古い形式", report.AbortReason);
+        // 祖先なしで合わせると、手元で消した usr_d が同期先から戻る。
+        Assert.Contains("usr_d|d0", Rows(host, "SELECT user_id, memo FROM memos"));
+    }
+
+    [Fact(DisplayName = "突き合わせの一時的な索引を、結果の DB に空きページとして残さない")]
+    public void LeavesNoFreePagesInResult()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "0" }, Rows(host, "PRAGMA freelist_count"));
+        Assert.Empty(Rows(host, "SELECT name FROM sqlite_master WHERE name LIKE 'vrctds_%'"));
+    }
+
     [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
     public void CreatedKeyedTableCopiesAllRows()
     {

@@ -209,8 +209,8 @@ public static class SqliteMerger
 
         // キー付きの内容ハッシュは、要約を取ったときの列で求める。前回の同期の後に
         // VRCX の更新で列が増えると、今の列で求めたハッシュは祖先と必ず食い違い、
-        // 変えていない行まで編集されたように見えるため。列が減ったなど古い列で
-        // 求められない場合は、祖先なしで合わせる。
+        // 変えていない行まで編集されたように見えるため。古い列で求められない場合は、
+        // 祖先なしにせず中止する。祖先なしで合わせると、手元で消した行が同期先から戻る。
         var hashColumns = localColumns;
         if (created)
         {
@@ -220,15 +220,18 @@ public static class SqliteMerger
         }
         else if (baseline is not null)
         {
-            if (baseline.Columns is null
-                || !baseline.Columns.All(c => localColumns.Contains(c, StringComparer.Ordinal)))
+            if (baseline.Columns is null)
             {
-                baseline = null;
+                // 列を残していない古い形式の要約。Push か Pull をすると今の形式で取り直される。
+                report.AbortReason = $"前回の同期時点の要約が古い形式のため、テーブル {table} を祖先と比べられません。一度 Push か Pull をすると要約が取り直されます";
+                return null;
             }
-            else
+            if (!baseline.Columns.All(c => localColumns.Contains(c, StringComparer.Ordinal)))
             {
-                hashColumns = baseline.Columns;
+                report.AbortReason = $"テーブル {table} の列が前回の同期時点から減っているため、祖先と比べられません";
+                return null;
             }
+            hashColumns = baseline.Columns;
         }
 
         if (baseline is not null && rule.ValueColumns is null && hashColumns.Count < localColumns.Count
@@ -282,12 +285,9 @@ public static class SqliteMerger
         }
         var hostMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
 
-        // キーで突き合わせるための索引。VRCX の feed には索引が無く、数百万行を
-        // 索引なしで突き合わせると終わらない。最後に消すので、結果の DB には残らない。
-        var index = Quote("vrctds_merge_" + table);
-        Execute(connection,
-            $"CREATE INDEX main.{index} ON {Quote(table)} ({string.Join(", ", rule.KeyColumns.Select(Quote))})");
-
+        // 同期先にある行は足さない。突き合わせは、手元の写しの索引を使って同期先を順に読む
+        // (CollectMatchedRowIds)。
+        var matched = CollectMatchedRowIds(connection, table, rule, $"> {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
         var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
         long inserted;
         using (var command = connection.CreateCommand())
@@ -295,11 +295,12 @@ public static class SqliteMerger
             command.CommandText =
                 $"INSERT INTO {target} ({insertColumns}) " +
                 $"SELECT {insertColumns} FROM {source} AS l " +
-                $"WHERE l.rowid > $since AND NOT EXISTS (SELECT 1 FROM {target} AS h WHERE {match}) " +
+                $"WHERE l.rowid > $since AND l.rowid NOT IN (SELECT rid FROM {matched}) " +
                 $"ORDER BY l.rowid";
             command.Parameters.AddWithValue("$since", sinceRowId);
             inserted = command.ExecuteNonQuery();
         }
+        Execute(connection, $"DROP TABLE {matched}");
 
         // 既存行に後から書き込まれる列 (滞在時間など) は、大きい方を残す。値は増える
         // 方向にしか変わらないので、祖先と比べなくても新しい方が分かる。書き込みは
@@ -312,7 +313,6 @@ public static class SqliteMerger
                 $"UPDATE {target} AS h SET {c} = l.{c} FROM {source} AS l " +
                 $"WHERE {match} AND l.{c} IS NOT NULL AND (h.{c} IS NULL OR l.{c} > h.{c})");
         }
-        Execute(connection, $"DROP INDEX main.{index}");
 
         var keptMaxRowId = inserted > 0 && rule.OrderColumn is not null && rowIdAlias is not null
             ? RenumberIfInterleaved(connection, table, rule.OrderColumn, rowIdAlias, columns, hostMaxRowId)
@@ -353,13 +353,20 @@ public static class SqliteMerger
         {
             return false;
         }
-        var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
-        using var command = connection.CreateCommand();
-        command.CommandText =
-            $"SELECT count(*) FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
-            $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(table)} AS h WHERE {match})";
-        command.Parameters.AddWithValue("$max", baseline.MaxRowId);
-        return (long)command.ExecuteScalar()! > 0;
+        var matched = CollectMatchedRowIds(connection, table, rule, $"<= {baseline.MaxRowId.ToString(CultureInfo.InvariantCulture)}");
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT count(*) FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
+                $"AND l.rowid NOT IN (SELECT rid FROM {matched})";
+            command.Parameters.AddWithValue("$max", baseline.MaxRowId);
+            return (long)command.ExecuteScalar()! > 0;
+        }
+        finally
+        {
+            Execute(connection, $"DROP TABLE {matched}");
+        }
     }
 
     /// <summary>
@@ -537,15 +544,49 @@ public static class SqliteMerger
     private static string? FindAncestorRowDeletedByHost(
         SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> added, long maxRowId)
     {
-        var sameKey = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
-        using var command = connection.CreateCommand();
-        command.CommandText =
-            $"SELECT {string.Join(" || '|' || ", rule.KeyColumns.Select(k => $"coalesce(l.{Quote(k)}, '')"))} " +
-            $"FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
-            $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(table)} AS h WHERE {sameKey}) " +
-            $"AND ({AddedColumnsSet(connection, Local, table, added, "l")}) LIMIT 1";
-        command.Parameters.AddWithValue("$max", maxRowId);
-        return command.ExecuteScalar() is { } key and not DBNull ? Convert.ToString(key, CultureInfo.InvariantCulture) : null;
+        var matched = CollectMatchedRowIds(connection, table, rule, $"<= {maxRowId.ToString(CultureInfo.InvariantCulture)}");
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"SELECT {string.Join(" || '|' || ", rule.KeyColumns.Select(k => $"coalesce(l.{Quote(k)}, '')"))} " +
+                $"FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
+                $"AND l.rowid NOT IN (SELECT rid FROM {matched}) " +
+                $"AND ({AddedColumnsSet(connection, Local, table, added, "l")}) LIMIT 1";
+            command.Parameters.AddWithValue("$max", maxRowId);
+            return command.ExecuteScalar() is { } key and not DBNull ? Convert.ToString(key, CultureInfo.InvariantCulture) : null;
+        }
+        finally
+        {
+            Execute(connection, $"DROP TABLE {matched}");
+        }
+    }
+
+    /// <summary>
+    /// 手元の写しの行のうち、rowid が <paramref name="localRowIdCondition"/> を満たし、同期先に
+    /// 同じキーの行があるものの rowid を一時テーブルに集めて、その名前を返す。
+    /// <para>
+    /// VRCX の feed には索引が無く、数百万行を索引なしで突き合わせると終わらない。索引は
+    /// 捨てる側の写しに作り、同期先を順に読んで写しを引く。同期先 (マージ結果) に索引を
+    /// 作ると、消しても使っていたページが空きとして残り、置き換えた後のローカルと
+    /// バックアップがその分だけ大きくなるため。
+    /// </para>
+    /// </summary>
+    private static string CollectMatchedRowIds(
+        SqliteConnection connection, string table, MergeTableRule rule, string localRowIdCondition)
+    {
+        var keys = string.Join(", ", rule.KeyColumns.Select(Quote));
+        Execute(connection, $"CREATE INDEX IF NOT EXISTS {Local}.{Quote("vrctds_merge_" + table)} ON {Quote(table)} ({keys})");
+        var matched = Quote("vrctds_matched_" + table);
+        var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+        Execute(connection, $"DROP TABLE IF EXISTS temp.{matched}");
+        Execute(connection, $"CREATE TEMP TABLE {matched} (rid INTEGER PRIMARY KEY)");
+        // CROSS JOIN は結合の順序を固定する。同期先を外側にして、写しの索引で引かせる。
+        Execute(connection,
+            $"INSERT OR IGNORE INTO temp.{matched} (rid) SELECT l.rowid " +
+            $"FROM main.{Quote(table)} AS h CROSS JOIN {Local}.{Quote(table)} AS l ON {match} " +
+            $"WHERE l.rowid {localRowIdCondition}");
+        return $"temp.{matched}";
     }
 
     /// <summary>増えた列のどれかが、列を足したときの値 (既定値か NULL) から変わっている条件。</summary>

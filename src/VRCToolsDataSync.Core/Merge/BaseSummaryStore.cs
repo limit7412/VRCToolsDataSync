@@ -106,6 +106,45 @@ public sealed class BaseSummaryStore
         File.WriteAllText(PendingPathOf(stateKey), DateTimeOffset.Now.ToString("O"));
     }
 
+    /// <summary>
+    /// 置き換えの直前の記録を印のファイルに書く。印は立ったままになる。置き換えた後、
+    /// 要約と同期履歴を保存する前に止まっても、次回に祖先を復旧できるようにする。
+    /// </summary>
+    public void SavePendingReplace(string stateKey, MergePendingState pending)
+    {
+        Directory.CreateDirectory(RootDirectory);
+        var path = PendingPathOf(stateKey);
+        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temp, JsonSerializer.Serialize(pending, JsonOptions));
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                try { File.Delete(temp); } catch { /* best-effort cleanup */ }
+            }
+        }
+    }
+
+    /// <summary>印のファイルに置き換えの直前の記録があれば返す。印だけか、読めなければ null。</summary>
+    public MergePendingState? LoadPendingReplace(string stateKey)
+    {
+        var path = PendingPathOf(stateKey);
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var text = File.ReadAllText(path);
+            return text.TrimStart().StartsWith('{') ? JsonSerializer.Deserialize<MergePendingState>(text, JsonOptions) : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     public void ClearMergePending(string stateKey)
     {
         var path = PendingPathOf(stateKey);
@@ -147,3 +186,14 @@ public sealed class BaseSummaryStore
         return Path.Combine(RootDirectory, name + ".json");
     }
 }
+
+/// <summary>
+/// ローカルをマージ結果で置き換える直前の記録。置き換えた後に保存する祖先の要約と、
+/// 置き換える前のローカルの本体、置き換え後の本体それぞれの SHA-256 を持つ。次回は、
+/// 今の本体がどちらと同じかで、置き換えが済んだかを見分ける。
+/// </summary>
+public sealed record MergePendingState(
+    DatabaseSummary? Summary,
+    long RemoteVersion,
+    string LocalSha256,
+    string MergedSha256);

@@ -418,6 +418,78 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
     }
 
+    /// <summary>
+    /// B がマージ結果でローカルを置き換えた直後に止まった状態を作る。B の祖先と同期履歴は
+    /// 置き換える前の版のまま、印には置き換え後の要約と本体のハッシュが残っている。
+    /// その後 A が、B が取り込んだ行を消して Push する。
+    /// </summary>
+    private (Machine A, Machine B, BaseSummaryStore Store, string Key) ArrangeInterruptedAfterReplace()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
+
+        Assert.Equal(SyncOutcome.Success, b.Runner.Merge(b.Service, b.Settings, _storage).Outcome);
+        var after = store.Load(key)!;
+        store.SavePendingReplace(key, new MergePendingState(after, after.RemoteVersion, "0", FileHasher.Sha256(b.Paths.SqliteFile)));
+        store.Save(key, before);
+        b.Settings.ToolState[key].LastPulledVersion = pulledBefore;
+
+        // B のマージは Push まで行うので、A は一度取り込んでから消して Push する。
+        Assert.Equal(SyncOutcome.Success, a.Runner.Pull(a.Service, a.Settings, _storage, skipBackup: false).Outcome);
+        Exec(a.Paths.SqliteFile, "DELETE FROM gamelog_location WHERE created_at = '2026-10-02T00:00:00Z'");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        return (a, b, store, key);
+    }
+
+    [Fact(DisplayName = "置き換えた後に止まったマージの祖先を復旧し、取り込んだ行を手元の追加と見ない")]
+    public void MergeRecoversBaselineAfterInterruptedReplace()
+    {
+        var (_, b, store, key) = ArrangeInterruptedAfterReplace();
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        // 復旧した祖先で比べれば、A が消した行は手元の追加ではないので戻らない。
+        Assert.Equal(1, CountLocations(b.Paths.SqliteFile));
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "置き換える前に止まったマージの記録は、祖先を変えずに消す")]
+    public void MergeClearsRecordWhenReplaceDidNotHappen()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        store.SavePendingReplace(key, new MergePendingState(
+            new DatabaseSummary { RemoteVersion = 999 }, 999, FileHasher.Sha256(b.Paths.SqliteFile), "0"));
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(3, CountLocations(b.Paths.SqliteFile));
+        Assert.False(store.IsMergePending(key));
+        Assert.NotEqual(999, store.Load(key)!.RemoteVersion);
+    }
+
+    [Fact(DisplayName = "止まったマージの記録とローカルがどちらも合わなければ、マージを中止する")]
+    public void MergeAbortsWhenInterruptedStateIsUnknown()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        store.SavePendingReplace(key, new MergePendingState(store.Load(key), 1, "0", "1"));
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("置き換え", result.Message);
+        Assert.True(store.IsMergePending(key));
+    }
+
     [Fact(DisplayName = "マージが済めば、マージの印は残らない")]
     public void MergeClearsPendingMark()
     {
