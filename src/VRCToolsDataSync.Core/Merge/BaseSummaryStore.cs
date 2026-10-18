@@ -73,6 +73,9 @@ public sealed class BaseSummaryStore
         {
             File.WriteAllText(temp, JsonSerializer.Serialize(summary, JsonOptions));
             File.Move(temp, path, overwrite: true);
+            // 要約を保存できたなら、送った写しの記録は要らない。要約は送った写しか、それより
+            // 後の同期先の版のものなので、次のマージの祖先はこちらで足りる。
+            DeletePushed(stateKey);
         }
         finally
         {
@@ -156,22 +159,67 @@ public sealed class BaseSummaryStore
     private string PendingPathOf(string stateKey) => PathOf(stateKey) + ".merging";
 
     /// <summary>
-    /// 最後に送った DB の写しの SHA-256 を控える。送った後に同期履歴を保存する前に
-    /// 止まっても、次のマージで同期先が自分の送ったものだと見分けられる。古い値が残って
-    /// いても、同期先の写しがそれと同じなら内容も同じなので、祖先にして差し支えない。
+    /// 最後に送った DB の写しの記録 (<see cref="PushedRecord"/>) を控える。送った後に要約と
+    /// 同期履歴を保存する前に止まっても、次のマージで同期先に自分の送った内容が入っていると
+    /// 見分け、送った写しの要約を祖先にできる。要約を保存できれば (<see cref="Save"/>)
+    /// この記録は要らなくなるので消す。
     /// </summary>
-    public void SavePushedSha256(string stateKey, string sha256)
+    public void SavePushed(string stateKey, PushedRecord record)
     {
         Directory.CreateDirectory(RootDirectory);
-        File.WriteAllText(PushedPathOf(stateKey), sha256);
+        var path = PushedPathOf(stateKey);
+        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temp, JsonSerializer.Serialize(record, JsonOptions));
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                try { File.Delete(temp); } catch { /* best-effort cleanup */ }
+            }
+        }
     }
 
-    public string? LoadPushedSha256(string stateKey)
+    /// <summary>
+    /// 送った写しの manifest への反映が済んだことを記録に書き足す。記録の写しが
+    /// <paramref name="sha256"/> と違えば (別の送信の記録なら) 何もしない。
+    /// </summary>
+    public void MarkPushedCommitted(string stateKey, string sha256, long version)
+    {
+        var record = LoadPushed(stateKey);
+        if (record is null || !string.Equals(record.Sha256, sha256, StringComparison.OrdinalIgnoreCase)) return;
+        SavePushed(stateKey, record with { Version = version, Committed = true });
+    }
+
+    /// <summary>
+    /// 送った写しの記録を読む。無ければ null。以前の版が書いた SHA-256 だけの記録は、
+    /// 写しのハッシュだけを持つ記録として読む。
+    /// </summary>
+    public PushedRecord? LoadPushed(string stateKey)
     {
         var path = PushedPathOf(stateKey);
         if (!File.Exists(path)) return null;
         var text = File.ReadAllText(path).Trim();
-        return text.Length == 0 ? null : text;
+        if (text.Length == 0) return null;
+        if (!text.StartsWith('{')) return new PushedRecord(text);
+        try
+        {
+            var record = JsonSerializer.Deserialize<PushedRecord>(text, JsonOptions);
+            return record is { Sha256.Length: > 0 } ? record : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    public void DeletePushed(string stateKey)
+    {
+        var path = PushedPathOf(stateKey);
+        if (File.Exists(path)) File.Delete(path);
     }
 
     private string PushedPathOf(string stateKey) => PathOf(stateKey) + ".pushed";
@@ -215,6 +263,20 @@ public sealed class BaseSummaryStore
 /// <paramref name="AsideSuffix"/> は置き換えのときに WAL/SHM を脇へ退ける名前の末尾。置き換える前に
 /// 止まっていたら、退けた WAL を戻すのに使う。
 /// </summary>
+/// <summary>
+/// 最後に送った DB の写しの記録。<paramref name="Sha256"/> は写しのハッシュ、
+/// <paramref name="Summary"/> はその要約。manifest への反映が済めば <paramref name="Committed"/> と、
+/// 反映した <paramref name="Version"/> を持つ。送った後に要約を保存する前に止まった場合、
+/// 同期先の写しがこの写しそのものか、この版より後の版なら、同期先には送った変更が
+/// 入っているので、この要約を祖先にする。前回の同期時点の古い要約を祖先にすると、送った
+/// 変更を同期先と手元の両方の変更と見て二重に足す。
+/// </summary>
+public sealed record PushedRecord(
+    string Sha256,
+    DatabaseSummary? Summary = null,
+    long? Version = null,
+    bool Committed = false);
+
 public sealed record MergePendingState(
     DatabaseSummary? Summary,
     long RemoteVersion,

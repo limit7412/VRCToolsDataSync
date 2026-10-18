@@ -77,15 +77,17 @@ public sealed class VrcxSyncService : IMergeableSyncService
         // 同期先の一時ファイルへ直接 VACUUM し、S3 互換なら一時ファイル経由で
         // アップロードする (どちらを使うかは同期先の実装が決める)。
         DatabaseSummary? pushedSummary;
+        string snapshotSha256;
         using (var staged = storage.BeginUpload())
         {
             SqliteSnapshot.Create(_paths.SqliteFile, staged.LocalPath);
             var snapshot = SyncTransfer.Describe(staged.LocalPath, SnapshotKey);
+            snapshotSha256 = snapshot.Sha256;
             // 次に比べる基準は、送る写しそのものから取る。送った後に手元の DB から取ると、
             // その間に VRCX が書き込んだ未送信の変更が基準に混ざる。
             pushedSummary = DatabaseSummary.Compute(staged.LocalPath, MergeProfiles.Vrcx, out var summaryReason);
             if (pushedSummary is null) _logger.LogInformation("送る写しの要約を取れませんでした: {Reason}", summaryReason);
-            options.BeforeCommit?.Invoke(snapshot.Sha256);
+            options.BeforeCommit?.Invoke(snapshot.Sha256, pushedSummary);
             if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, snapshot))
             {
                 _logger.LogInformation("VRCX スナップショットの送信を省略 (内容が同じ)");
@@ -179,6 +181,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
+        options.AfterCommit?.Invoke(snapshotSha256, nextVersion);
         _logger.LogInformation("VRCX Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
         {
@@ -450,13 +453,27 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 };
             }
             var baseline = options.Baseline;
-            if (options.OwnPushSha256 is not null
-                && string.Equals(remoteSnapshot.Sha256, options.OwnPushSha256, StringComparison.OrdinalIgnoreCase))
+            if (options.OwnPush is { } ownPush)
             {
-                // 同期先は自分が送った写しそのもの。手元との違いはすべて送った後の手元の変更
-                // なので、同期先を祖先にする。
-                _logger.LogInformation("同期先の DB は自分が送ったものなので、それを祖先にします");
-                baseline = hostBaseline;
+                if (string.Equals(remoteSnapshot.Sha256, ownPush.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    // 同期先は自分が送った写しそのもの。手元との違いはすべて送った後の手元の変更
+                    // なので、同期先を祖先にする。
+                    _logger.LogInformation("同期先の DB は自分が送ったものなので、それを祖先にします");
+                    baseline = hostBaseline;
+                }
+                else if (ownPush is { Committed: true, Version: long pushedVersion, Summary: not null }
+                         && entry.Version > pushedVersion
+                         && (baseline is null || baseline.RemoteVersion < pushedVersion))
+                {
+                    // 送った版の後に別の PC が版を進めた。その版は送った内容を取り込んでいるので、
+                    // 送った写しの要約を祖先にする。それより前の要約を祖先にすると、送った変更を
+                    // 同期先と手元の両方の変更と見て二重に足す。
+                    _logger.LogInformation(
+                        "同期先の版 {Remote} は自分が送った版 {Pushed} より後なので、送った写しの要約を祖先にします",
+                        entry.Version, pushedVersion);
+                    baseline = ownPush.Summary;
+                }
             }
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, baseline, options.DryRun);
             if (hostBaseline is not null && report.Succeeded)

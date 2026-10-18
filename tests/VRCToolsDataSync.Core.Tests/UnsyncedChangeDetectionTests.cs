@@ -642,15 +642,63 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         var before = store.Load(key)!;
         var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
         Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
-        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
-        // 送った後、同期履歴と要約を保存する前に止まった状態に戻す。
-        store.Save(key, before);
-        a.Settings.ToolState[key].LastPulledVersion = pulledBefore;
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
 
         var result = Push(a);
 
         Assert.Equal(SyncOutcome.Success, result.Outcome);
         Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "送った後に止まり、別の PC がその上に版を進めても、送った変更を二重に足さない")]
+    public void RemergeAfterInterruptedPushUsesPushedSummaryForLaterVersion()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
+
+        // 別の PC が A の送った内容を取り込み、着用時間を 20 足して次の版を送る。
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 170");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+
+        var result = Push(a);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 祖先を送る前の 100 にすると、A の +50 と B の +20 を別々の増分と見て 220 になる。
+        Assert.Equal(170, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    /// <summary>
+    /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
+    /// 要約の保存で消えているので、送った写しの内容から作り直す。
+    /// </summary>
+    private void RewindToInterruptedPush(
+        Machine a, BaseSummaryStore store, string key, DatabaseSummary before, long pulledBefore, long pushedVersion)
+    {
+        var pushedSummary = store.Load(key)!;
+        var snapshot = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Files
+            .Single(f => f.RelativePath == "vrcx/latest.sqlite3");
+        store.Save(key, before);
+        store.SavePushed(key, new PushedRecord(snapshot.Sha256, pushedSummary, pushedVersion, Committed: true));
+        a.Settings.ToolState[key].LastPulledVersion = pulledBefore;
     }
 
     [Fact(DisplayName = "Push の後に手元の DB が書き換わっても、基準の要約は送った写しのもの")]

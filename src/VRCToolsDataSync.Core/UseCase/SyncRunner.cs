@@ -123,7 +123,8 @@ public sealed class SyncRunner
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
                 LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
-                BeforeCommit = sha256 => TrySavePushedSha256(stateKey, sha256),
+                BeforeCommit = (sha256, summary) => TrySavePushed(stateKey, new PushedRecord(sha256, summary)),
+                AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
             });
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
@@ -344,7 +345,7 @@ public sealed class SyncRunner
                     {
                         Storage = storage,
                         Baseline = baseline,
-                        OwnPushSha256 = _baseSummaries.LoadPushedSha256(stateKey),
+                        OwnPush = _baseSummaries.LoadPushed(stateKey),
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
@@ -529,16 +530,28 @@ public sealed class SyncRunner
                 MergeReport = result.MergeReport,
             };
 
-    private void TrySavePushedSha256(string stateKey, string sha256)
+    private void TrySavePushed(string stateKey, PushedRecord record)
     {
         try
         {
-            _baseSummaries.SavePushedSha256(stateKey, sha256);
+            _baseSummaries.SavePushed(stateKey, record);
         }
         catch (Exception ex)
         {
             // 控えられなくても、送った後に止まらない限り使わない。
-            _logger.LogWarning(ex, "送った写しのハッシュを控えられませんでした");
+            _logger.LogWarning(ex, "送った写しの記録を控えられませんでした");
+        }
+    }
+
+    private void TryMarkPushedCommitted(string stateKey, string sha256, long version)
+    {
+        try
+        {
+            _baseSummaries.MarkPushedCommitted(stateKey, sha256, version);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "送った写しの反映を記録できませんでした");
         }
     }
 
