@@ -144,8 +144,10 @@ public sealed class DatabaseSummary
             }
             entry.MaxRowId = kept;
             entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule.KeyColumns, kept);
-            // 後から書き換わる列のハッシュは全行のものなので、縮めた範囲には合わない。
-            entry.Digest = null;
+            // 後から書き換わる列のハッシュも、縮めた範囲で取り直す。
+            entry.Digest = rule.GrowingColumns is { Count: > 0 } && kept > 0
+                ? DigestGrowing(connection, "main", table.Table, rule, kept)
+                : null;
         }
     }
 
@@ -201,12 +203,26 @@ public sealed class DatabaseSummary
         summary.LastRowHash = summary.MaxRowId == 0
             ? null
             : DigestRows(connection, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
-        if (rule.GrowingColumns is { Count: > 0 } growing)
+        if (rule.GrowingColumns is { Count: > 0 })
         {
             // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
-            summary.Digest = DigestRows(connection, table, rule.KeyColumns.Concat(growing).ToList(), "rowid").Digest;
+            summary.Digest = DigestGrowing(connection, schema, table, rule, summary.MaxRowId);
         }
         return summary;
+    }
+
+    /// <summary>
+    /// rowid が <paramref name="maxRowId"/> 以下の行について、キーと
+    /// <see cref="MergeTableRule.GrowingColumns"/> の内容を rowid の順にハッシュにする。
+    /// 要約とマージで同じ方法で求めるため、両方がここを通る。
+    /// </summary>
+    internal static string DigestGrowing(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, long maxRowId)
+    {
+        var columns = rule.KeyColumns.Concat(rule.GrowingColumns ?? Array.Empty<string>()).ToList();
+        return DigestQuery(connection, columns.Count,
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)} ORDER BY rowid").Digest;
     }
 
     private static TableSummary SummarizeKeyed(

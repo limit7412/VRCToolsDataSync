@@ -271,6 +271,15 @@ public static class SqliteMerger
             report.AbortReason = $"手元でテーブル {table} の行が消されています。消した行を同期先から戻さないよう、自動マージを中止しました";
             return null;
         }
+        if (sinceRowId > 0 && WasRewrittenLocallyAndDeletedByHost(connection, table, rule, baseline!))
+        {
+            // 同期先で消した行は、前回の同期より前の行なので足し直さない。その行の滞在時間
+            // などを手元で書き込んでいたら、黙って失われる。どの行を書き換えたかは要約から
+            // 分からないので、マージを中止する。
+            report.AbortReason = $"同期先でテーブル {table} の行が消されていて、手元では前回の同期より前の行の値 (滞在時間など) が書き換えられています。" +
+                                 "消された行の値かどうか分からないため、自動マージを中止しました";
+            return null;
+        }
         var hostMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
 
         // キーで突き合わせるための索引。VRCX の feed には索引が無く、数百万行を
@@ -329,6 +338,28 @@ public static class SqliteMerger
         command.CommandText = $"SELECT count(*) FROM {Local}.{Quote(table)} WHERE rowid <= $max";
         command.Parameters.AddWithValue("$max", baseline.MaxRowId);
         return (long)command.ExecuteScalar()! < baseline.RowCount;
+    }
+
+    /// <summary>
+    /// 前回の同期の時点にあった行のうち、手元で後から書き換わる列が変わり、かつ同期先で
+    /// 消された行があるかを調べる。書き換えた行の見分けは付かないので、両方が起きて
+    /// いれば真とする。後から書き換わる列が無い規則や、古い要約では偽。
+    /// </summary>
+    private static bool WasRewrittenLocallyAndDeletedByHost(
+        SqliteConnection connection, string table, MergeTableRule rule, TableSummary baseline)
+    {
+        if (rule.GrowingColumns is not { Count: > 0 } || baseline.Digest is null) return false;
+        if (string.Equals(DigestGrowing(connection, Local, table, rule, baseline.MaxRowId), baseline.Digest, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT count(*) FROM {Local}.{Quote(table)} AS l WHERE l.rowid <= $max " +
+            $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(table)} AS h WHERE {match})";
+        command.Parameters.AddWithValue("$max", baseline.MaxRowId);
+        return (long)command.ExecuteScalar()! > 0;
     }
 
     /// <summary>

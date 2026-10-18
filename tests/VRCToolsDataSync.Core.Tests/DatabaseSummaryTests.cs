@@ -108,6 +108,22 @@ public sealed class DatabaseSummaryTests : IDisposable
             Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
     }
 
+    [Fact(DisplayName = "VRCX: 古い形式のユーザー ID の接頭辞を持つテーブルも対象にする")]
+    public void VrcxMatchesLegacyUserPrefix()
+    {
+        var path = CreateVrcx();
+        // 古いアカウントの ID は英数字で、先頭が数字なら VRCX が _ を付ける。
+        Exec(path, """
+            CREATE TABLE _8YwQ1aBcDe_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            CREATE TABLE AbCdEfGhIj_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            """);
+
+        var summary = Summarize(path, MergeProfiles.Vrcx);
+
+        Assert.Contains("_8YwQ1aBcDe_feed_gps", summary.Tables.Keys);
+        Assert.Contains("AbCdEfGhIj_notifications_v2", summary.Tables.Keys);
+    }
+
     [Fact(DisplayName = "VRCX: 履歴のテーブルに列が増えたら、変更として拾う")]
     public void VrcxDetectsAddedColumnInAppendOnly()
     {

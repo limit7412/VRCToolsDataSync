@@ -500,6 +500,31 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.True(report.Succeeded, report.AbortReason);
     }
 
+    [Fact(DisplayName = "同期先が消した履歴の行の滞在時間を手元で書き込んでいれば、失わずに中止する")]
+    public void AbortsWhenHostDeletedRowLocalRewrote()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+        Exec(local, "UPDATE gamelog_location SET time = 3600000 WHERE location = 'wrld_a:1'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("gamelog_location", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "同期先が消した履歴の行に手元で触れていなければ、削除を伝える")]
+    public void HostDeletionWinsWhenLocalUntouched()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "DELETE FROM gamelog_location WHERE location = 'wrld_a:1'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.True(report.Succeeded);
+        Assert.DoesNotContain("wrld_a:1", Rows(host, "SELECT location FROM gamelog_location"));
+    }
+
     [Fact(DisplayName = "同期先に無くて作ったキー付きのテーブルには、手元の全行を写す")]
     public void CreatedKeyedTableCopiesAllRows()
     {

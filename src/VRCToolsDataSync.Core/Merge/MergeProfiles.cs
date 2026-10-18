@@ -11,8 +11,13 @@ namespace VRCToolsDataSync.Core.Merge;
 /// </summary>
 public static class MergeProfiles
 {
-    /// <summary>VRCX がユーザーごとに付けるテーブル名の接頭辞 (例: usr0123abcd..._feed_gps)。</summary>
-    private const string UserPrefix = "usr[0-9a-f]+_";
+    /// <summary>
+    /// VRCX がユーザーごとに付けるテーブル名の接頭辞。VRCX はユーザー ID から <c>-</c> と
+    /// <c>_</c> を除いたものを使い、先頭が数字なら <c>_</c> を付ける (index.js の
+    /// initUserTables)。今の ID は usr0123abcd... の形だが、古いアカウントの ID は
+    /// 8Yw... のような英数字なので、それも合わせる。
+    /// </summary>
+    private const string UserPrefix = "_?[0-9A-Za-z]+_";
 
     public static MergeProfile Vrcx { get; } = new()
     {
