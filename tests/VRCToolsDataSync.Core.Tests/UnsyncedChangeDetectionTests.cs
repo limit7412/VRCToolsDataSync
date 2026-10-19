@@ -1168,6 +1168,42 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(180, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "manifest の更新が毎回拒まれて止まった Push は、反映していない送信の記録を残さない")]
+    public void PushDiscardsPushedRecordWhenManifestSaveIsRejected()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        AddLocation(a, "2026-10-02T12:00:00Z");
+        // 保存の直前に毎回別の保存が割り込んで manifest のタグが変わり、条件付きの保存が拒まれ続ける。
+        var interrupting = false;
+        _storage.OnBeforeSaveManifest = () =>
+        {
+            if (interrupting) return;
+            interrupting = true;
+            try
+            {
+                var snapshot = _storage.LoadManifest();
+                Assert.True(_storage.TrySaveManifest(snapshot.Manifest, snapshot.VersionTag));
+            }
+            finally
+            {
+                interrupting = false;
+            }
+        };
+        try
+        {
+            Assert.Throws<SyncStorageConcurrencyException>(() => Push(a));
+        }
+        finally
+        {
+            _storage.OnBeforeSaveManifest = null;
+        }
+
+        Assert.Null(store.LoadPushed(key));
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が

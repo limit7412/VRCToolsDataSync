@@ -187,13 +187,17 @@ public static class SqliteMerger
         int maxRenumberedTailRows)
     {
         var localTables = ListTables(connection, Local);
+        // 要約を取ったときと規則が違えば、そのとき規則に無かったテーブルは要約に入っていない。
+        var ancestorRulesChanged = baseline is not null
+            && !string.Equals(baseline.RulesDigest, profile.RulesDigest, StringComparison.Ordinal);
         foreach (var table in localTables)
         {
             var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
             if (rule is null || rule.Kind == MergeTableKind.Watched) continue;
 
             var tableReport = MergeTable(
-                connection, table, rule, baseline?.Tables.GetValueOrDefault(table), report, maxRenumberedTailRows);
+                connection, table, rule, baseline?.Tables.GetValueOrDefault(table), ancestorRulesChanged, report,
+                maxRenumberedTailRows);
             if (tableReport is null) return;
             report.Tables.Add(tableReport);
         }
@@ -224,8 +228,8 @@ public static class SqliteMerger
 
     /// <summary>テーブル 1 つを合わせる。中止すべき問題があれば理由を記録して null を返す。</summary>
     private static TableMergeReport? MergeTable(
-        SqliteConnection connection, string table, MergeTableRule rule, TableSummary? baseline, MergeReport report,
-        int maxRenumberedTailRows)
+        SqliteConnection connection, string table, MergeTableRule rule, TableSummary? baseline, bool ancestorRulesChanged,
+        MergeReport report, int maxRenumberedTailRows)
     {
         var localColumns = ListColumns(connection, Local, table);
         if (FindMissingColumns(rule, localColumns) is { Count: > 0 } missing)
@@ -263,6 +267,20 @@ public static class SqliteMerger
         {
             report.AbortReason = $"テーブル {table} の列が同期先と手元で違います";
             return null;
+        }
+        if (!created && baseline is null && ancestorRulesChanged)
+        {
+            // 前回の要約を取った版のツールは、このテーブルを規則に持っていなかった。祖先が無いまま
+            // 合わせると、手元で消した行を同期先から戻す。内容が同じなら合わせるものが無い。
+            var local = DatabaseSummary.SummarizeTable(connection, Local, table, rule, localColumns);
+            var host = DatabaseSummary.SummarizeTable(connection, "main", table, rule, hostColumns);
+            if (!local.HasSameContent(host))
+            {
+                report.AbortReason = $"テーブル {table} は前回の同期時点の要約に無く (要約を取った版のツールはこのテーブルを対象にしていません)、" +
+                                     "同期先と手元で内容が違うため、祖先なしでは手元の削除を見分けられません。" +
+                                     "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください";
+                return null;
+            }
         }
 
         // キー付きの内容ハッシュは、要約を取ったときの列で求める。前回の同期の後に
@@ -619,9 +637,9 @@ public static class SqliteMerger
                 // 延ばした結果かもしれないので、祖先の値があれば双方の増分を足す。
                 if (mine is not null && mine.Hash != original && rule.CounterColumns is { Count: > 0 }
                     && baseline?.Counters?.GetValueOrDefault(key) is { } ancestorCounters
-                    && ReadCombinedValues(connection, table, rule, mine.KeyValues, ancestorCounters) is { } sum)
+                    && ReadCombinedValues(connection, table, rule, mine.KeyValues, ancestorCounters) is { } sum
+                    && WriteValues(connection, table, rule, mine.KeyValues, sum) > 0)
                 {
-                    WriteValues(connection, table, rule, mine.KeyValues, sum);
                     updated++;
                 }
                 continue;
@@ -649,8 +667,9 @@ public static class SqliteMerger
             }
             if (combined is not null)
             {
-                WriteValues(connection, table, rule, mine!.KeyValues, combined);
-                if (!takeLocal) updated++;
+                // 同期先の行を残し、合成した値も同期先と同じなら、何も書き換えていない。
+                var written = WriteValues(connection, table, rule, mine!.KeyValues, combined);
+                if (!takeLocal && written > 0) updated++;
             }
         }
 

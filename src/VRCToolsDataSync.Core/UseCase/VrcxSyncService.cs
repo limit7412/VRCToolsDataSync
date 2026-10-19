@@ -207,6 +207,14 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 ? manifestStore.OverwriteToolEntry(Key, BuildEntry)
                 : manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, BuildEntry);
         }
+        catch (SyncStorageConcurrencyException)
+        {
+            // 条件付きの保存が毎回拒まれた。manifest には一度も反映していないので、送信の
+            // 記録は要らない。残すと、他の PC が予定の版の先まで進めたときに反映されたか
+            // 分からない記録として扱われ、マージが止まり続ける。
+            options.NotCommitted?.Invoke();
+            throw;
+        }
         catch (ToolEntryChangedException ex)
         {
             // 送信の可否を判断してから manifest を保存するまでの間に、他の PC が

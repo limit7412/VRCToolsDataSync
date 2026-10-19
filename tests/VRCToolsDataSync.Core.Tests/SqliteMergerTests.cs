@@ -397,6 +397,73 @@ public sealed class SqliteMergerTests : IDisposable
             Rows(host, "SELECT id, message, seen, expires_at FROM usr0123abcd_notifications_v2 ORDER BY id"));
     }
 
+    [Fact(DisplayName = "同期先の行を残し、合成した値も同期先と同じなら、更新に数えない")]
+    public void ConflictKeptHostRowWithSameCombinedValuesCountsNoUpdate()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            INSERT INTO usr0123abcd_notifications_v2 (id, created_at, updated_at, expires_at, message, seen) VALUES ('not_a', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', '2026-11-01T00:00:00Z', 'm0', 0);
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        // 手元は既読にしただけ。同期先は新しい内容を受け取り、既読にもした。
+        Exec(local, "UPDATE usr0123abcd_notifications_v2 SET seen = 1 WHERE id = 'not_a'");
+        Exec(host, "UPDATE usr0123abcd_notifications_v2 SET updated_at = '2026-10-06T00:00:00Z', message = 'm1', seen = 1 WHERE id = 'not_a'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "not_a|m1|1" }, Rows(host, "SELECT id, message, seen FROM usr0123abcd_notifications_v2"));
+        Assert.Equal(0, report.Tables.Single(t => t.Table == "usr0123abcd_notifications_v2").Updated);
+    }
+
+    [Fact(DisplayName = "規則に加える前の要約に無いテーブルは、同期先と手元で内容が違えば中止する")]
+    public void AbortsWhenAncestorFromOlderRulesLacksTable()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_notes (user_id TEXT PRIMARY KEY, display_name TEXT, note TEXT, created_at TEXT);
+            INSERT INTO usr0123abcd_notes VALUES ('usr_a', 'A', 'note a', '2026-10-01T00:00:00Z');
+            INSERT INTO usr0123abcd_notes VALUES ('usr_b', 'B', 'note b', '2026-10-01T00:00:00Z');
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        // 規則に notes が無かった版のツールが取った要約。
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        baseline.Tables.Remove("usr0123abcd_notes");
+        baseline.RulesDigest = "older";
+        Exec(local, "DELETE FROM usr0123abcd_notes WHERE user_id = 'usr_a'");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.Vrcx, baseline, dryRun: false);
+
+        // 祖先なしで合わせると、手元で消したメモが同期先から戻る。
+        Assert.False(report.Succeeded);
+        Assert.Contains("usr0123abcd_notes", report.AbortReason);
+        Assert.Equal(2, Rows(host, "SELECT user_id FROM usr0123abcd_notes").Count);
+    }
+
+    [Fact(DisplayName = "規則に加える前の要約に無いテーブルでも、同期先と手元で内容が同じなら合わせる")]
+    public void MergesWhenAncestorFromOlderRulesLacksUnchangedTable()
+    {
+        var (host, local, _) = Arrange();
+        const string create = """
+            CREATE TABLE usr0123abcd_notes (user_id TEXT PRIMARY KEY, display_name TEXT, note TEXT, created_at TEXT);
+            INSERT INTO usr0123abcd_notes VALUES ('usr_a', 'A', 'note a', '2026-10-01T00:00:00Z');
+            """;
+        Exec(host, create);
+        Exec(local, create);
+        var baseline = DatabaseSummary.Compute(local, MergeProfiles.Vrcx, out _)!;
+        baseline.Tables.Remove("usr0123abcd_notes");
+        baseline.RulesDigest = "older";
+        Exec(local, "INSERT INTO gamelog_location (created_at, location) VALUES ('2026-10-02T00:00:00Z', 'wrld_local:1')");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.True(report.Succeeded);
+        Assert.Equal(1, Rows(host, "SELECT location FROM gamelog_location WHERE location = 'wrld_local:1'").Count);
+    }
+
     [Fact(DisplayName = "アバターの着用時間は、両方で延びていたら祖先に双方の増分を足す")]
     public void AvatarHistoryAddsBothIncrements()
     {

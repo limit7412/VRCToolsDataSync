@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
@@ -92,6 +94,25 @@ public sealed class MergeProfile
     public required string ToolKey { get; init; }
 
     public required IReadOnlyList<MergeTableRule> Rules { get; init; }
+
+    private string? _rulesDigest;
+
+    /// <summary>
+    /// 規則一式を表すハッシュ。要約に残し、要約を取ったときと今とで規則が同じかを見分ける。
+    /// 規則に無いテーブルは要約に入らないので、規則を増やした後の最初のマージでは、
+    /// 前回の要約にそのテーブルの祖先が無い。
+    /// </summary>
+    public string RulesDigest => _rulesDigest ??= ComputeRulesDigest();
+
+    private string ComputeRulesDigest()
+    {
+        static string Columns(IReadOnlyList<string>? columns) => columns is null ? "-" : string.Join(",", columns);
+        var text = string.Join("\n", Rules.Select(r => string.Join("|",
+            r.NamePattern, r.Kind.ToString(), Columns(r.KeyColumns), Columns(r.ValueColumns),
+            r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
+            Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns))));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
+    }
 
     /// <summary>
     /// 行を書き込むマージを許すか。false のツールは要約による検知だけを行う。

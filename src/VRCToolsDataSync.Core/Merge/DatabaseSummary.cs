@@ -25,6 +25,13 @@ public sealed class DatabaseSummary
     /// <summary>DB のスキーマの版 (<see cref="MergeProfile.CheckSchema"/> が返したもの)。</summary>
     public string SchemaVersion { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 要約を取ったときの規則一式 (<see cref="MergeProfile.RulesDigest"/>)。無ければ、
+    /// この項目を知らない版のツールが取った要約。今の規則と違えば、規則に無かった
+    /// テーブルの祖先がこの要約に無い。
+    /// </summary>
+    public string? RulesDigest { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 
     /// <summary>
@@ -77,6 +84,7 @@ public sealed class DatabaseSummary
         var summary = new DatabaseSummary
         {
             SchemaVersion = version,
+            RulesDigest = profile.RulesDigest,
             CreatedAt = DateTimeOffset.Now,
         };
 
