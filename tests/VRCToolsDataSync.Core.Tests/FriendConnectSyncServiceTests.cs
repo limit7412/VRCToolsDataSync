@@ -48,6 +48,8 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
 
         var b = PathsOf("b");
         CreateDb(b.DbV11File, "old");
+        // Windows では、プールに残った接続が本体を掴んだままだと Pull が開けない。
+        SqliteConnection.ClearAllPools();
         var added = Path.Combine(b.ThumbnailsDirectory, "added.webp");
         storage.OnDownload = _ => WriteFile(added, "added");
 
