@@ -484,7 +484,19 @@ public sealed class SyncRunner
             // いるので、戻してから進む。戻せなければ、その変更を見失わないよう印を残して止める。
             // 既に保存まで済んでいた場合も、本体が変わっていなければ同じ扱いでよい。
             _logger.LogInformation("前回のマージは置き換える前に止まっていました ({Tool})", service.ToolKey);
-            if (dryRun) return (null, null, null);
+            if (dryRun)
+            {
+                // dry-run は手元に書き込まないので、退けた WAL を戻せない。戻さずに進むと、
+                // WAL にしか無い手元の変更を含まない本体から写しを取り、変更の件数を少なく報告する。
+                if (aside.Length == 0) return (null, null, null);
+                return (new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    Message = "前回のマージが退けた WAL (" + string.Join(", ", aside) + ") が残っています。" +
+                              "dry-run は手元に書き込まないので戻せず、戻さずに比べると手元の変更を少なく数えます。" +
+                              "dry-run を付けずにマージするか、Push か Pull をして戻してから、もう一度お試しください",
+                }, null, null);
+            }
             if (pending.AsideSuffix is not null && !VrcxSyncService.RestoreAsideFiles(tracked.Path, pending.AsideSuffix, _logger))
             {
                 return (new SyncResult

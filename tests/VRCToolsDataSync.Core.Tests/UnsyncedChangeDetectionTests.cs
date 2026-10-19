@@ -978,6 +978,69 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(versionBefore, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
     }
 
+    [Fact(DisplayName = "ユーザー別の notes テーブルの変更も検知し、マージで残す")]
+    public void StartupPullKeepsUnsyncedUserNotes()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_notes (user_id TEXT PRIMARY KEY, display_name TEXT, note TEXT, created_at TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        Exec(b.Paths.SqliteFile, "INSERT INTO usr0123abcd_notes VALUES ('usr_x', 'X', 'local note', '2026-10-03T00:00:00Z')");
+
+        var startup = StartupPull(b);
+
+        Assert.Equal(SyncOutcome.LocalChangesPending, startup.Outcome);
+        Assert.Contains("usr0123abcd_notes", startup.Message);
+
+        b.Settings.MergeVrcx = true;
+        var merged = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.True(merged.Outcome == SyncOutcome.Success, merged.Message);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.Equal(1, Scalar(b.Paths.SqliteFile, "SELECT count(*) FROM usr0123abcd_notes WHERE note = 'local note'"));
+    }
+
+    [Fact(DisplayName = "古いツールが書いた版 (強制 Push の版が無い) の上に通常の Push をしても、無いままにする")]
+    public void NormalPushKeepsUnknownForcedVersion()
+    {
+        var (a, _) = ArrangeRemoteNewer();
+        var manifest = _storage.LoadManifest().Manifest;
+        manifest.Tools[VrcxSyncService.Key].LastForcedVersion = null;
+        _storage.SeedManifest(manifest);
+        AddLocation(a, "2026-10-03T00:00:00Z");
+
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+
+        // 0 にすると、古いツールの強制 Push があったかを後から確かめられなくなる。
+        Assert.Null(_storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].LastForcedVersion);
+    }
+
+    [Fact(DisplayName = "退けた WAL が残っていれば、dry-run のマージは戻せないので中止する")]
+    public void DryRunMergeAbortsWhenAsideWalRemains()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage, dryRun: true);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("退けた WAL", result.Message);
+        Assert.True(File.Exists(db + "-wal" + suffix));
+        Assert.True(store.IsMergePending(key));
+        Assert.Equal(1, CountLocations(db));
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が

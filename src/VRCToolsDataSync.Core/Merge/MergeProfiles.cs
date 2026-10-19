@@ -60,6 +60,9 @@ public static class MergeProfiles
 
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),
+            // VRChat 側に保存するユーザーのメモの写し。VRCX は addUserNote で同じ user_id の行を
+            // 上書きし、deleteUserNote で消す (memos.js)。created_at は VRChat が付けた時刻。
+            new(UserPrefix + "notes", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "created_at"),
             new("world_memos", MergeTableKind.Keyed, new[] { "world_id" }, EditedAtColumn: "edited_at"),
             new("avatar_memos", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "edited_at"),
             new("avatar_tags", MergeTableKind.Keyed, new[] { "avatar_id", "tag" }),

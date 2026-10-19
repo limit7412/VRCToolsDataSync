@@ -152,7 +152,8 @@ public sealed class FriendConnectSyncService : ISyncService
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-                LastForcedVersion = forced ? version : existing?.LastForcedVersion ?? 0,
+                // 初めての項目は 0。前の項目の null (古い版のツールが書いた) も引き継ぐ。
+                LastForcedVersion = forced ? version : existing is null ? 0 : existing.LastForcedVersion,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
