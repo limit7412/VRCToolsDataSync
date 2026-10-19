@@ -48,7 +48,12 @@ public static class DatabaseFingerprint
         var entries = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
             .Where(file => exclude is null || !exclude(file))
             .Select(file => $"{Path.GetRelativePath(path, file)}|{OfFile(file)}")
-            .OrderBy(entry => entry, StringComparer.Ordinal);
+            .OrderBy(entry => entry, StringComparer.Ordinal)
+            .ToList();
+        // 数えるファイルが一つも無いフォルダは、無いフォルダと同じ値にする。Pull の取り出しは
+        // 無かったフォルダを作ってから取得中のファイルを置くので、ここで区別すると初回の
+        // Pull が「取得の間に書き換えられた」と見て必ず中止してしまう。
+        if (entries.Count == 0) return "-";
         var text = string.Join("\n", entries);
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }

@@ -62,6 +62,32 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
         Assert.Equal("old", ReadDb(b.DbV11File));
     }
 
+    [Fact]
+    public void FirstPullFetchesDirectoryThatDoesNotExistLocally()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        WriteFile(Path.Combine(a.NotesDirectory, "note.md"), "note-a");
+        WriteFile(Path.Combine(a.ThumbnailsDirectory, "a.webp"), "thumb-a");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+
+        // b には notes も thumbnails もまだ無い。取り出しがフォルダを作っても
+        // 「取得の間に書き換えられた」と見ない。
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+        Assert.False(Directory.Exists(b.NotesDirectory));
+        Assert.False(Directory.Exists(b.ThumbnailsDirectory));
+
+        var result = Pull(ServiceOf("b"), storage);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal("note-a", File.ReadAllText(Path.Combine(b.NotesDirectory, "note.md")));
+        Assert.Equal("thumb-a", File.ReadAllText(Path.Combine(b.ThumbnailsDirectory, "a.webp")));
+        Assert.Equal("v11", ReadDb(b.DbV11File));
+    }
+
     private static void CreateDb(string path, string value)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
