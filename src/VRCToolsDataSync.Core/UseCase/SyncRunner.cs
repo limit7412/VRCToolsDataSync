@@ -126,7 +126,7 @@ public sealed class SyncRunner
                 // 控えられなければ送らない (サービス側が中止する)。送った後に要約の保存にも
                 // 失敗すると、次のマージが送った内容を見分けられない。
                 BeforeCommit = (sha256, summary, planned) =>
-                    _baseSummaries.SavePushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
+                    _baseSummaries.BeginPushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
                 AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
                 // 反映しなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
                 // 分からない記録として扱われ、マージが止まる。
@@ -352,8 +352,9 @@ public sealed class SyncRunner
                         Storage = storage,
                         Baseline = baseline,
                         OwnPush = _baseSummaries.LoadPushed(stateKey),
-                        // dry-run は手元に何も書かない。記録も消さない。
-                        DiscardOwnPush = dryRun ? null : () => _baseSummaries.DeletePushed(stateKey),
+                        // dry-run は手元に何も書かない。記録も消さない。捨てる記録が前の反映済みの
+                        // 記録を抱えていれば、それが戻る。
+                        DiscardOwnPush = dryRun ? null : () => _baseSummaries.DiscardUncommittedPushed(stateKey),
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,

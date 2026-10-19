@@ -184,14 +184,32 @@ public sealed class BaseSummaryStore
     }
 
     /// <summary>
+    /// 送信を始めるときの記録を控える。反映済みの記録が残っていれば (前回の Push の後に要約を
+    /// 保存できていない)、新しい記録の <see cref="PushedRecord.Previous"/> に抱えて残す。
+    /// 上書きして消すと、この送信が反映されなかったときに前の記録を失い、同期先が前回の版の
+    /// 先へ進んだ次のマージで古い祖先を使って送った変更を二重に足す。
+    /// </summary>
+    public void BeginPushed(string stateKey, PushedRecord record)
+    {
+        var previous = LoadPushed(stateKey) switch
+        {
+            { Committed: true } committed => committed,
+            { Committed: false, Previous: { } carried } => carried,
+            _ => null,
+        };
+        SavePushed(stateKey, record with { Previous = previous });
+    }
+
+    /// <summary>
     /// 送った写しの manifest への反映が済んだことを記録に書き足す。記録の写しが
-    /// <paramref name="sha256"/> と違えば (別の送信の記録なら) 何もしない。
+    /// <paramref name="sha256"/> と違えば (別の送信の記録なら) 何もしない。前の記録は、
+    /// この版がその内容を取り込んでいるので要らない。
     /// </summary>
     public void MarkPushedCommitted(string stateKey, string sha256, long version)
     {
         var record = LoadPushed(stateKey);
         if (record is null || !string.Equals(record.Sha256, sha256, StringComparison.OrdinalIgnoreCase)) return;
-        SavePushed(stateKey, record with { Version = version, Committed = true });
+        SavePushed(stateKey, record with { Version = version, Committed = true, Previous = null });
     }
 
     /// <summary>
@@ -228,7 +246,10 @@ public sealed class BaseSummaryStore
     /// </summary>
     public void DiscardUncommittedPushed(string stateKey)
     {
-        if (LoadPushed(stateKey) is { Committed: false }) DeletePushed(stateKey);
+        // 捨てる記録が前の反映済みの記録を抱えていれば、それを戻す。
+        if (LoadPushed(stateKey) is not { Committed: false } record) return;
+        if (record.Previous is { } previous) SavePushed(stateKey, previous);
+        else DeletePushed(stateKey);
     }
 
     private string PushedPathOf(string stateKey) => PathOf(stateKey) + ".pushed";
@@ -285,13 +306,19 @@ public sealed class BaseSummaryStore
 /// いれば、送った変更が入っているかを見分けられないので、マージは中止する。予定の版を
 /// 別の PC が取っていれば、反映されなかったと分かるので記録を捨てる。
 /// </para>
+/// <para>
+/// <paramref name="Previous"/> は、この送信を始めたときに残っていた反映済みの記録。前回の
+/// Push が反映された後に要約を保存できないまま、次の Push を始めた場合に残る。この送信が
+/// 反映されなければ、前の記録が次のマージの祖先に要るので、捨てずに戻す。
+/// </para>
 /// </summary>
 public sealed record PushedRecord(
     string Sha256,
     DatabaseSummary? Summary = null,
     long? Version = null,
     bool Committed = false,
-    long? PlannedVersion = null);
+    long? PlannedVersion = null,
+    PushedRecord? Previous = null);
 
 public sealed record MergePendingState(
     DatabaseSummary? Summary,

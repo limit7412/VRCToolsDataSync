@@ -524,7 +524,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 };
             }
             var baseline = options.Baseline;
-            if (options.OwnPush is { } ownPush)
+            // 送った写しの記録から祖先を決める。マージを中止するなら、その結果を返す。
+            SyncResult? ResolveOwnPush(PushedRecord ownPush)
             {
                 if (string.Equals(remoteSnapshot.Sha256, ownPush.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
@@ -595,6 +596,9 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         _logger.LogInformation("前回の送信は反映されていませんでした (版 {Version} は別の PC のもの)", plannedVersion);
                         if (options.DryRun) _logger.LogInformation("dry-run のため、前回の送信の記録はまだ消しません");
                         else options.DiscardOwnPush?.Invoke();
+                        // その前の Push の反映済みの記録を抱えていれば、同期先がその版の先へ
+                        // 進んでいるので、その記録で祖先を決め直す。
+                        if (ownPush.Previous is { } previous) return ResolveOwnPush(previous);
                     }
                     else if (entry.Version > plannedVersion)
                     {
@@ -611,6 +615,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         };
                     }
                 }
+                return null;
+            }
+            if (options.OwnPush is { } ownPushRecord && ResolveOwnPush(ownPushRecord) is { } ownPushAbort)
+            {
+                return ownPushAbort;
             }
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, baseline, options.DryRun);
             if (hostBaseline is not null && report.Succeeded)

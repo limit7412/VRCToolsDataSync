@@ -1088,6 +1088,86 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "反映済みの記録が残ったまま次の Push が失敗しても、前の記録を失わない")]
+    public void FailedPushRestoresPreviousCommittedRecord()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
+
+        // 内容を変えて強制 Push するが、送信が失敗する。
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        _storage.FailNextCommit = true;
+        Assert.Throws<SyncStorageException>(() => a.Runner.Push(a.Service, a.Settings, _storage, force: true));
+
+        var record = store.LoadPushed(key);
+        Assert.NotNull(record);
+        Assert.True(record!.Committed);
+        Assert.Equal(pushed.RemoteVersion, record.Version);
+
+        // 別の PC が送った版の上に版を進めても、戻した記録から送った写しを祖先にできる。
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 170");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+        var result = Push(a);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 祖先は送った 150。手元の +10 と B の +20 を足して 180 になる。古い 100 を祖先にすると 230。
+        Assert.Equal(180, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "予定の版を別の PC が取った記録を捨てるとき、抱えていた前の反映済みの記録で祖先を決め直す")]
+    public void MergeFallsBackToPreviousRecordWhenPlannedVersionWasTakenByOthers()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
+        // 次の Push が反映されないまま止まり、前の反映済みの記録を抱えた記録が残っている。
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        store.BeginPushed(key, new PushedRecord("0", store.Load(key), PlannedVersion: pushed.RemoteVersion + 1));
+        Assert.NotNull(store.LoadPushed(key)!.Previous);
+
+        // 別の PC が予定の版を取る。
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 170");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+
+        var result = Push(a);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(180, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が
