@@ -581,10 +581,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         entry.Version, pushedVersion);
                     baseline = ownPush.Summary;
                 }
-                else if (ownPush is { Committed: false, PlannedVersion: null, Summary: not null })
+                else if (ownPush is { Committed: false, PlannedVersion: null })
                 {
-                    // 予定の版を控えない版のツールが送った後に止まった記録。反映されたかを
-                    // 版で見分けられないので、同期先の写しが違えば止める。
+                    // 予定の版を控えない版のツールが送った後に止まった記録 (写しのハッシュだけの
+                    // 記録も含む)。反映されたかを版で見分けられず、要約も無ければ祖先にもできない
+                    // ので、同期先の写しが違えば止める。古い要約で続けると送った変更を二重に足す。
                     return new SyncResult
                     {
                         Outcome = SyncOutcome.Aborted,

@@ -1204,6 +1204,37 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
     }
 
+    [Fact(DisplayName = "以前の版が残した写しのハッシュだけの記録と同期先が違えば、祖先を決められないので中止する")]
+    public void MergeAbortsWhenLegacyShaOnlyRecordDoesNotMatchRemote()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        // 以前の版が書いた、写しのハッシュだけの記録。
+        store.SavePushed(key, new PushedRecord("0"));
+        File.WriteAllText(Directory.GetFiles(store.RootDirectory, "*.pushed").Single(), "0");
+
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 170");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.ConflictDetected, result.Outcome);
+        Assert.Contains("反映されたか分からない", result.Message);
+        Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が

@@ -363,7 +363,7 @@ public sealed class FriendConnectSyncService : ISyncService
                 Outcome = SyncOutcome.Aborted,
                 RemoteVersion = entry.Version,
                 BackupPath = backupPath,
-                Message = "Pull の間に Friend Connect の DB か設定が書き換えられたため、差し替える前に中止しました。" +
+                Message = "Pull の間に Friend Connect の DB か設定かメモ・サムネイルが書き換えられたため、差し替える前に中止しました。" +
                           "Friend Connect を終了してからやり直してください。",
             };
         }
@@ -579,8 +579,12 @@ public sealed class FriendConnectSyncService : ISyncService
         }
     }
 
-    /// <summary>Pull が差し替えるファイル (2 つの DB 本体と WAL、設定の JSON) の状態。</summary>
+    /// <summary>
+    /// Pull が差し替えるもの (2 つの DB 本体と WAL、設定の JSON、同期するフォルダの中身) の状態。
+    /// フォルダは、manifest に無いファイルを消すので、取得の間に増えたファイルも見る。
+    /// </summary>
     private string FingerprintPullTargets()
         => DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File)
-           + "|" + DatabaseFingerprint.OfFile(_paths.ConfigJsonFile);
+           + "|" + DatabaseFingerprint.OfFile(_paths.ConfigJsonFile)
+           + string.Concat(_directories.Select(d => "|" + DatabaseFingerprint.OfDirectory(d.LocalDirectory, PullStaging.IsIncomingFile)));
 }

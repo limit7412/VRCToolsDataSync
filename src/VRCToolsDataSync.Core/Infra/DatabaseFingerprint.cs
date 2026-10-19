@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace VRCToolsDataSync.Core.Infra;
 
 /// <summary>
@@ -32,5 +35,21 @@ public static class DatabaseFingerprint
     {
         var info = new FileInfo(path);
         return info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "-";
+    }
+
+    /// <summary>
+    /// フォルダの中の全ファイル (下の階層も含む) の名前と状態をまとめたハッシュ。無ければ "-"。
+    /// 同期で中身を差し替えるフォルダは、ファイルの増減も含めて処理の前後で比べる。
+    /// <paramref name="exclude"/> が真を返すファイル (取得の途中のファイルなど) は数えない。
+    /// </summary>
+    public static string OfDirectory(string path, Func<string, bool>? exclude = null)
+    {
+        if (!Directory.Exists(path)) return "-";
+        var entries = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
+            .Where(file => exclude is null || !exclude(file))
+            .Select(file => $"{Path.GetRelativePath(path, file)}|{OfFile(file)}")
+            .OrderBy(entry => entry, StringComparer.Ordinal);
+        var text = string.Join("\n", entries);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 }

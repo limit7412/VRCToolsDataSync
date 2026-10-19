@@ -37,6 +37,29 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
     private FriendConnectSyncService ServiceOf(string machine)
         => new(PathsOf(machine), new LocalBackup(Path.Combine(_root, machine, "backup")));
 
+    [Fact(DisplayName = "Pull の取得中にサムネイルだけが増えても、消す前に中止する")]
+    public void PullAbortsWhenThumbnailAddedDuringFetch()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        WriteFile(Path.Combine(a.ThumbnailsDirectory, "a.webp"), "thumb-a");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        var added = Path.Combine(b.ThumbnailsDirectory, "added.webp");
+        storage.OnDownload = _ => WriteFile(added, "added");
+
+        var result = Pull(ServiceOf("b"), storage);
+
+        // manifest に無いファイルとして消されずに残り、DB も差し替えていない。
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("書き換えられた", result.Message);
+        Assert.True(File.Exists(added));
+        Assert.Equal("old", ReadDb(b.DbV11File));
+    }
+
     private static void CreateDb(string path, string value)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
