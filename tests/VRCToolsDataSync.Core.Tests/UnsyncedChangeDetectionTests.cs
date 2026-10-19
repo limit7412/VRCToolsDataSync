@@ -1041,6 +1041,53 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(1, CountLocations(db));
     }
 
+    [Fact(DisplayName = "変更なしの Push でも、同期先と同じ写しの記録は要約の保存が済むまで残す")]
+    public void UnchangedPushKeepsCommittedRecordUntilSummaryIsSaved()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value);
+
+        // 要約を保存できない状態 (要約のファイルの場所にフォルダがある) で、同じ内容を強制 Push する。
+        var summaryPath = Directory.GetFiles(store.RootDirectory, "*.json").Single();
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        var unchanged = a.Runner.Push(a.Service, a.Settings, _storage, force: true);
+        Assert.Equal(SyncOutcome.Success, unchanged.Outcome);
+        Assert.Contains("要約を保存できなかった", unchanged.Message);
+
+        // 反映済みの記録が残っている。
+        var record = store.LoadPushed(key);
+        Assert.NotNull(record);
+        Assert.True(record!.Committed);
+        Assert.Equal(pushed.RemoteVersion, record.Version);
+
+        // 要約を保存できるようになれば、残した記録から送った写しを祖先にできる。
+        Directory.Delete(summaryPath);
+        store.Save(key, before);
+        store.SavePushed(key, record);
+        Assert.Equal(pulledBefore, a.Settings.ToolState[key].LastPulledVersion);
+        var result = Push(a);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 祖先を送る前の 100 にすると、手元の +50 と同期先の +50 を別々に見て 200 になる。
+        Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
     /// <summary>
     /// 送った後、要約と同期履歴を保存する前に止まった状態に戻す。送った写しの記録は、
     /// 要約の保存で消えているので、送った写しの内容から作り直す。<paramref name="committed"/> が

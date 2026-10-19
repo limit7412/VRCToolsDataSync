@@ -170,7 +170,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // 他 PC の LastPulledVersion が古くなり、中身が同じデータの
             // ダウンロードを誘発してしまう。
             _logger.LogInformation("VRCX Push: 変更なし version={Version}", existing!.Version);
-            options.NotCommitted?.Invoke();
+            // 同期先の今の版は、送ろうとした写しと同じ内容。前回の Push が反映された後に
+            // 要約の保存で止まっていた記録を、ここで消してはいけない。要約の保存が
+            // また失敗すると、次のマージが送った内容を見分けられず、送った変更を二重に足す。
+            // 反映済みの記録として残し、要約の保存が済めば消える。
+            options.AfterCommit?.Invoke(snapshotSha256, existing.Version);
             return new SyncResult
             {
                 Outcome = SyncOutcome.Success,
