@@ -184,21 +184,17 @@ public sealed class BaseSummaryStore
     }
 
     /// <summary>
-    /// 送信を始めるときの記録を控える。反映済みの記録が残っていれば (前回の Push の後に要約を
-    /// 保存できていない)、新しい記録の <see cref="PushedRecord.Previous"/> に抱えて残す。
-    /// 上書きして消すと、この送信が反映されなかったときに前の記録を失い、同期先が前回の版の
-    /// 先へ進んだ次のマージで古い祖先を使って送った変更を二重に足す。
+    /// 送信を始めるときの記録を控える。前の記録が残っていれば、新しい記録の
+    /// <see cref="PushedRecord.Previous"/> に抱えて残す。上書きして消すと、この送信が反映され
+    /// なかったときに前の記録を失い、次のマージで古い祖先を使って送った変更を二重に足す。
+    /// <para>
+    /// 反映したか分からない記録も抱える。その Push が実は反映されていて応答だけ失われた場合、
+    /// 記録を捨てると、同期先に入っている送った変更を次のマージで手元の変更と見る。反映されて
+    /// いたかは、戻した記録の予定の版と同期先の版を次のマージで比べて決める。
+    /// </para>
     /// </summary>
     public void BeginPushed(string stateKey, PushedRecord record)
-    {
-        var previous = LoadPushed(stateKey) switch
-        {
-            { Committed: true } committed => committed,
-            { Committed: false, Previous: { } carried } => carried,
-            _ => null,
-        };
-        SavePushed(stateKey, record with { Previous = previous });
-    }
+        => SavePushed(stateKey, record with { Previous = LoadPushed(stateKey) });
 
     /// <summary>
     /// 送った写しの manifest への反映が済んだことを記録に書き足す。記録の写しが
@@ -246,7 +242,7 @@ public sealed class BaseSummaryStore
     /// </summary>
     public void DiscardUncommittedPushed(string stateKey)
     {
-        // 捨てる記録が前の反映済みの記録を抱えていれば、それを戻す。
+        // 捨てる記録が前の記録を抱えていれば、それを戻す。
         if (LoadPushed(stateKey) is not { Committed: false } record) return;
         if (record.Previous is { } previous) SavePushed(stateKey, previous);
         else DeletePushed(stateKey);
@@ -294,7 +290,10 @@ public sealed class BaseSummaryStore
 /// 止まっていたら、退けた WAL を戻すのに使う。
 /// </summary>
 /// <summary>
-/// 最後に送った DB の写しの記録。<paramref name="Sha256"/> は写しのハッシュ、
+/// 最後に同期先とそろえた DB の写しの記録。ふつうは送った写しのもの。Pull で取り出した
+/// 写しに差し替えた後、要約を保存できなかったときは取り出した写しの記録 (反映済み) を残す。
+/// 古い要約を祖先にすると、取り込んだ内容を手元の変更と見て二重に足すため。
+/// <paramref name="Sha256"/> は写しのハッシュ、
 /// <paramref name="Summary"/> はその要約、<paramref name="PlannedVersion"/> は manifest で
 /// 取る予定の version。manifest への反映が済めば <paramref name="Committed"/> と、反映した
 /// <paramref name="Version"/> を持つ。送った後に要約を保存する前に止まった場合、同期先の写しが
@@ -307,9 +306,9 @@ public sealed class BaseSummaryStore
 /// 別の PC が取っていれば、反映されなかったと分かるので記録を捨てる。
 /// </para>
 /// <para>
-/// <paramref name="Previous"/> は、この送信を始めたときに残っていた反映済みの記録。前回の
-/// Push が反映された後に要約を保存できないまま、次の Push を始めた場合に残る。この送信が
-/// 反映されなければ、前の記録が次のマージの祖先に要るので、捨てずに戻す。
+/// <paramref name="Previous"/> は、この送信を始めたときに残っていた記録。前回の Push の後に
+/// 要約を保存できないまま、あるいは反映したか分からないまま、次の Push を始めた場合に残る。
+/// この送信が反映されなければ、前の記録が次のマージの祖先に要るので、捨てずに戻す。
 /// </para>
 /// </summary>
 public sealed record PushedRecord(

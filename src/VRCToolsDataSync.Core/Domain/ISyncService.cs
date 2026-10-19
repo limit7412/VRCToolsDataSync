@@ -164,6 +164,12 @@ public sealed class SyncResult
     /// 見落として上書きする。
     /// </summary>
     public DatabaseSummary? SyncedSummary { get; init; }
+
+    /// <summary>
+    /// <see cref="SyncedSummary"/> を取った写しの SHA-256。Pull で取り出した写しの要約を
+    /// 保存できなかったとき、その写しの記録を残すのに使う。
+    /// </summary>
+    public string? SyncedSha256 { get; init; }
 }
 
 public enum SyncOutcome

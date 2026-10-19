@@ -1131,6 +1131,98 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(180, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "反映したか分からない記録が残ったまま次の Push が失敗しても、その記録を失わない")]
+    public void FailedPushRestoresPreviousUncommittedRecord()
+    {
+        var a = CreateMachine("a");
+        a.Settings.MergeVrcx = true;
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        // 実際には反映されたが、応答が失われて反映済みの記録を書けなかった状態。
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, pushed.RemoteVersion!.Value, committed: false);
+
+        // 内容を変えて強制 Push するが、送信が失敗する。
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        _storage.FailNextCommit = true;
+        Assert.Throws<SyncStorageException>(() => a.Runner.Push(a.Service, a.Settings, _storage, force: true));
+
+        var record = store.LoadPushed(key);
+        Assert.NotNull(record);
+        Assert.False(record!.Committed);
+        Assert.Equal(pushed.RemoteVersion, record.PlannedVersion);
+
+        // 同期先は送った写しのままなので、戻した記録からそれを祖先にできる。
+        var result = Push(a);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 祖先は送った 150。手元の +10 で 160 になる。古い 100 を祖先にすると同期先の +50 も足して 210。
+        Assert.Equal(160, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "Pull の後に要約を保存できなくても、取り出した写しの記録を残して次のマージの祖先にする")]
+    public void PullKeepsPulledSnapshotRecordWhenSummaryCannotBeSaved()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // 要約を保存できない状態 (要約のファイルの場所にフォルダがある) で起動時 Pull を通す。
+        var summaryPath = Directory.GetFiles(store.RootDirectory, "*.json").Single();
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        var pull = StartupPull(b);
+        Assert.Equal(SyncOutcome.Success, pull.Outcome);
+        Assert.Contains("要約を保存できなかった", pull.Message);
+        Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
+
+        // 取り出した写しの記録が反映済みとして残る。
+        var record = store.LoadPushed(key);
+        Assert.NotNull(record);
+        Assert.True(record!.Committed);
+        Assert.Equal(pushed.RemoteVersion, record.Version);
+        Assert.NotNull(record.Summary);
+
+        // 古い要約と古い同期履歴のまま、手元で値を変えて Push する。起動時 Pull と同じく、
+        // 古い要約との違いを手元の変更と見てマージに回る。
+        Directory.Delete(summaryPath);
+        store.Save(key, before);
+        store.SavePushed(key, record);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        var result = Push(b);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 祖先は取り出した 150。手元の +10 で 160 になる。古い 100 を祖先にすると取り込んだ +50 も足して 210。
+        Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
     [Fact(DisplayName = "予定の版を別の PC が取った記録を捨てるとき、抱えていた前の反映済みの記録で祖先を決め直す")]
     public void MergeFallsBackToPreviousRecordWhenPlannedVersionWasTakenByOthers()
     {

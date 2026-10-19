@@ -214,6 +214,7 @@ public sealed class SyncRunner
             // Push と同じく、要約を先に保存する。
             if (!RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.SyncedSummary))
             {
+                KeepPulledSnapshotRecord(stateKey, result);
                 return WithMessage(result, "取り込みは済みましたが、同期時点の要約を保存できなかったため、同期履歴は進めていません。次の同期でそろいます");
             }
             state ??= new ToolSyncState();
@@ -633,6 +634,41 @@ public sealed class SyncRunner
         }
     }
 
+    /// <summary>
+    /// Pull で差し替えた後に要約を保存できなかったとき、取り出した写しの記録を残す。
+    /// <para>
+    /// 古い要約と古い同期履歴はそのまま残る。手元は取り出した版なので、次の起動時 Pull は古い
+    /// 要約との違いを手元の変更と見てマージに回す。そのマージが古い要約を祖先にすると、取り込んだ
+    /// 内容を手元と同期先の両方の変更と見て二重に足す (足し合わせる列なら値が増える)。
+    /// 取り出した写しの記録があれば、マージは送った写しと同じ扱いでその要約を祖先にする。
+    /// 記録も残せなければ古い要約を消し、祖先なしでマージさせる。
+    /// </para>
+    /// </summary>
+    private void KeepPulledSnapshotRecord(string stateKey, SyncResult result)
+    {
+        try
+        {
+            if (result.SyncedSummary is { } summary && !string.IsNullOrEmpty(result.SyncedSha256) && result.RemoteVersion is long version)
+            {
+                summary.RemoteVersion = version;
+                _baseSummaries.SavePushed(stateKey, new PushedRecord(result.SyncedSha256, summary, version, Committed: true, PlannedVersion: version));
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "取り出した写しの記録を残せませんでした");
+        }
+        try
+        {
+            _baseSummaries.Delete(stateKey);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "古い要約を消せませんでした。次のマージが古い祖先を使わないよう、Pull をやり直してください");
+        }
+    }
+
     private static SyncResult WithMessage(SyncResult result, string note)
         => new()
         {
@@ -644,6 +680,7 @@ public sealed class SyncRunner
             AffectedFiles = result.AffectedFiles,
             MergeReport = result.MergeReport,
             SyncedSummary = result.SyncedSummary,
+            SyncedSha256 = result.SyncedSha256,
         };
 
     /// <summary>

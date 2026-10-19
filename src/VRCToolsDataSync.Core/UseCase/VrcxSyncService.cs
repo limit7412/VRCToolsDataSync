@@ -435,6 +435,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             BackupPath = backupPath,
             AffectedFiles = affected,
             SyncedSummary = pulledSummary,
+            SyncedSha256 = remoteSnapshot.Sha256,
         };
     }
 
@@ -554,8 +555,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         {
                             Outcome = SyncOutcome.Aborted,
                             RemoteVersion = entry.Version,
-                            Message = $"同期先の版 {entry.Version} を書いた PC のツールが古く、前回の Push (版 {pushedVersion}) の後に強制 Push があったかを確かめられません。" +
-                                      "送った変更を二重に数えたり失ったりしないよう、自動マージを中止しました。" +
+                            Message = $"同期先の版 {entry.Version} を書いた PC のツールが古く、前回の同期 (版 {pushedVersion}) の後に強制 Push があったかを確かめられません。" +
+                                      "前回そろえた内容を二重に数えたり失ったりしないよう、自動マージを中止しました。" +
                                       "すべての PC でツールを更新したうえで、同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
                         };
                     }
@@ -568,8 +569,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
                         {
                             Outcome = SyncOutcome.Aborted,
                             RemoteVersion = entry.Version,
-                            Message = $"前回の Push (版 {pushedVersion}) の後に別の PC が強制 Push (版 {forcedVersion}) で同期先を上書きしています。" +
-                                      "送った変更が同期先に残っているか分からないため、自動マージを中止しました。" +
+                            Message = $"前回の同期 (版 {pushedVersion}) の後に別の PC が強制 Push (版 {forcedVersion}) で同期先を上書きしています。" +
+                                      "前回そろえた内容が同期先に残っているか分からないため、自動マージを中止しました。" +
                                       "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
                         };
                     }
@@ -577,7 +578,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                     // 送った写しの要約を祖先にする。それより前の要約を祖先にすると、送った変更を
                     // 同期先と手元の両方の変更と見て二重に足す。
                     _logger.LogInformation(
-                        "同期先の版 {Remote} は自分が送った版 {Pushed} より後なので、送った写しの要約を祖先にします",
+                        "同期先の版 {Remote} は前回そろえた版 {Pushed} より後なので、そのときの写しの要約を祖先にします",
                         entry.Version, pushedVersion);
                     baseline = ownPush.Summary;
                 }
