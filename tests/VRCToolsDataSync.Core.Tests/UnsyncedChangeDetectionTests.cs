@@ -1203,12 +1203,13 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
         Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
 
-        // 取り出した写しの記録が反映済みとして残る。
+        // 取り出した写しの記録が反映済みとして残る。記録があれば置き換えの記録は要らない。
         var record = store.LoadPushed(key);
         Assert.NotNull(record);
         Assert.True(record!.Committed);
         Assert.Equal(pushed.RemoteVersion, record.Version);
         Assert.NotNull(record.Summary);
+        Assert.False(store.IsMergePending(key));
 
         // 古い要約と古い同期履歴のまま、手元で値を変えて Push する。起動時 Pull と同じく、
         // 古い要約との違いを手元の変更と見てマージに回る。
@@ -1221,6 +1222,72 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
         // 祖先は取り出した 150。手元の +10 で 160 になる。古い 100 を祖先にすると取り込んだ +50 も足して 210。
         Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "Pull の後に要約も写しの記録も残せなければ、置き換えの記録を残して次のマージで祖先をそろえる")]
+    public void PullKeepsPendingReplaceRecordWhenNothingCanBeSaved()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // 要約と写しの記録のどちらの場所にもフォルダを置き、保存を失敗させる。
+        var summaryPath = Directory.GetFiles(store.RootDirectory, "*.json").Single();
+        var pushedPath = summaryPath + ".pushed";
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        Directory.CreateDirectory(pushedPath);
+        var pull = StartupPull(b);
+        Assert.Equal(SyncOutcome.Success, pull.Outcome);
+        Assert.Contains("要約を保存できなかった", pull.Message);
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
+
+        // 置き換えの記録だけが手掛かりなので残る。
+        Assert.Null(store.LoadPushed(key));
+        var pending = store.LoadPendingReplace(key);
+        Assert.NotNull(pending);
+        Assert.Equal(pushed.RemoteVersion, pending!.RemoteVersion);
+        Assert.Equal(FileHasher.Sha256(b.Paths.SqliteFile), pending.MergedSha256);
+
+        // 保存できるようになれば、次のマージが記録から差し替え後と見分けて祖先と同期履歴をそろえる。
+        Directory.Delete(summaryPath);
+        Directory.Delete(pushedPath);
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        // 置き換えの前後を見分けられずに中止せず、マージ結果を送って同期履歴が進む。
+        Assert.True(result.Outcome is SyncOutcome.Success or SyncOutcome.NothingToDo, result.Message);
+        Assert.True(b.Settings.ToolState[key].LastPulledVersion >= pushed.RemoteVersion);
+        Assert.Equal(b.Settings.ToolState[key].LastPulledVersion, store.Load(key)!.RemoteVersion);
+        Assert.False(store.IsMergePending(key));
+        Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "置き換えの記録を書いた後に置き換えずに中止したマージは、記録を消す")]
+    public void MergeClearsPendingReplaceRecordWhenAbortingAfterRecording()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var aborting = new ThrowingReplaceService(b.Service, b.Paths.SqliteFile, abortInstead: true);
+
+        var result = b.Runner.Merge(aborting, b.Settings, _storage);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.False(store.IsMergePending(key));
     }
 
     [Fact(DisplayName = "Pull が本体を差し替えた後に止まっても、次のマージは取り出した写しを祖先にする")]
@@ -1287,8 +1354,11 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.False(store.IsMergePending(key));
     }
 
-    /// <summary>置き換えの記録を書いた直後に、本体の差し替えで失敗するマージ。</summary>
-    private sealed class ThrowingReplaceService(IMergeableSyncService inner, string database) : IMergeableSyncService
+    /// <summary>
+    /// 置き換えの記録を書いた直後に、本体の差し替えで失敗するマージ。<paramref name="abortInstead"/> なら
+    /// 置き換える前の確認で中止した結果を返す。
+    /// </summary>
+    private sealed class ThrowingReplaceService(IMergeableSyncService inner, string database, bool abortInstead = false) : IMergeableSyncService
     {
         public string ToolKey => inner.ToolKey;
         public TrackedDatabase? TrackedDatabase => inner.TrackedDatabase;
@@ -1299,6 +1369,7 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         {
             options.BeforeReplaceLocal?.Invoke(new MergePendingState(
                 null, 999, FileHasher.Sha256(database), "0", ".vrctds-aside-test"));
+            if (abortInstead) return new SyncResult { Outcome = SyncOutcome.Aborted, Message = "置き換える前に中止" };
             throw new IOException("本体を差し替えられません");
         }
     }

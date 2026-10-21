@@ -135,6 +135,8 @@ public sealed class SyncRunner
 
             if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
             {
+                // Push が済み、ローカルと同期先がそろった。中断したマージの印は要らない。
+                TryClearMergePending(stateKey);
                 // 要約を先に保存する。同期履歴だけが進んで要約が無いと、次の起動時 Pull が
                 // 手元の変更を確かめられずに上書きする。要約が先なら、同期履歴の保存前に
                 // 止まっても、要約の版が同期履歴より新しいことから中断と分かる。
@@ -225,6 +227,11 @@ public sealed class SyncRunner
     /// <summary>
     /// 取り出した版へ要約と同期履歴をそろえる。Push と同じく、要約を先に保存する。
     /// 要約を保存できなければ同期履歴は進めず、取り出した写しの記録を残して偽を返す。
+    /// <para>
+    /// 本体を差し替える前に残した置き換えの記録は、要約を保存し終えるまで消さない。先に消すと、
+    /// 消してから保存するまでの間に止まったとき、本体は取り出した版なのに復旧の手掛かりが何も
+    /// 残らない。要約を保存できず写しの記録も残せなければ、置き換えの記録だけが手掛かりなので残す。
+    /// </para>
     /// </summary>
     private bool CommitPulled(
         ISyncService service, SyncSettings settings, string stateKey, ToolSyncState? state,
@@ -232,9 +239,10 @@ public sealed class SyncRunner
     {
         if (!RecordBaseSummary(service, stateKey, version, summary))
         {
-            KeepPulledSnapshotRecord(stateKey, version, summary, sha256);
+            if (KeepPulledSnapshotRecord(stateKey, version, summary, sha256)) TryClearMergePending(stateKey);
             return false;
         }
+        TryClearMergePending(stateKey);
         state ??= new ToolSyncState();
         state.LastPulledVersion = version;
         state.LastPulledAt = DateTimeOffset.Now;
@@ -634,8 +642,6 @@ public sealed class SyncRunner
     /// <returns>要約を保存したか、要約が要らなくて消したら真。保存に失敗したら偽。</returns>
     private bool RecordBaseSummary(ISyncService service, string stateKey, long remoteVersion, DatabaseSummary? synced)
     {
-        // Push か Pull が済み、ローカルと同期先がそろった。中断したマージの印は要らない。
-        TryClearMergePending(stateKey);
         if (service.TrackedDatabase is not { } tracked) return true;
         try
         {
@@ -669,7 +675,8 @@ public sealed class SyncRunner
     /// 記録も残せなければ古い要約を消し、祖先なしでマージさせる。
     /// </para>
     /// </summary>
-    private void KeepPulledSnapshotRecord(string stateKey, long version, DatabaseSummary? summary, string? sha256)
+    /// <returns>写しの記録を残せたら真。</returns>
+    private bool KeepPulledSnapshotRecord(string stateKey, long version, DatabaseSummary? summary, string? sha256)
     {
         try
         {
@@ -677,7 +684,7 @@ public sealed class SyncRunner
             {
                 summary.RemoteVersion = version;
                 _baseSummaries.SavePushed(stateKey, new PushedRecord(sha256, summary, version, Committed: true, PlannedVersion: version));
-                return;
+                return true;
             }
         }
         catch (Exception ex)
@@ -692,6 +699,7 @@ public sealed class SyncRunner
         {
             _logger.LogWarning(ex, "古い要約を消せませんでした。次のマージが古い祖先を使わないよう、Pull をやり直してください");
         }
+        return false;
     }
 
     private static SyncResult WithMessage(SyncResult result, string note)
