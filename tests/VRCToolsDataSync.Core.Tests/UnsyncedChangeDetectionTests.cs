@@ -538,6 +538,63 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(2, CountLocations(db));
     }
 
+    [Fact(DisplayName = "WAL を退けた後に置き換える前で止まっていれば、強制 Push も退けた WAL を戻してから送る")]
+    public void ForcePushRestoresAsideWalWhenReplaceDidNotHappen()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+
+        var result = b.Runner.Push(b.Service, b.Settings, _storage, force: true);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        // 戻した WAL の行を含む 2 行が送られる。
+        Assert.Equal(2, CountLocations(db));
+        Assert.False(File.Exists(db + "-wal" + suffix));
+        Assert.False(store.IsMergePending(key));
+        Assert.Equal(SyncOutcome.Success, a.Runner.Pull(a.Service, a.Settings, _storage, skipBackup: false).Outcome);
+        Assert.Equal(2, CountLocations(a.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "退けた WAL を戻せなければ、強制 Push も送らずに中止する")]
+    public void ForcePushAbortsWhenAsideWalCannotBeRestored()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        var suffix = ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+        File.WriteAllBytes(db + "-wal", Array.Empty<byte>());
+        var versionBefore = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version;
+
+        var result = b.Runner.Push(b.Service, b.Settings, _storage, force: true);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("退けた WAL", result.Message);
+        Assert.True(File.Exists(db + "-wal" + suffix));
+        Assert.Equal(versionBefore, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
+    }
+
+    [Fact(DisplayName = "置き換えの前後を見分けられない状態でも、強制 Push は手元の内容を送って抜け出せる")]
+    public void ForcePushProceedsWhenInterruptedStateIsUnknown()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var db = b.Paths.SqliteFile;
+        ArrangeAsideWal(b, store, key, new DatabaseSummary { RemoteVersion = 999 });
+        // 本体が書き換わり、置き換えの前後どちらの記録とも合わない。
+        AddLocation(b, "2026-10-04T00:00:00Z");
+        Assert.Equal(SyncOutcome.Aborted, b.Runner.Push(b.Service, b.Settings, _storage, force: false).Outcome);
+
+        var result = b.Runner.Push(b.Service, b.Settings, _storage, force: true);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.False(store.IsMergePending(key));
+    }
+
     [Fact(DisplayName = "置き換えの前後で本体が同じ内容なら、退けた WAL を戻さずに置き換え後として済ませる")]
     public void MergeDoesNotRestoreAsideWalWhenMergedEqualsLocal()
     {

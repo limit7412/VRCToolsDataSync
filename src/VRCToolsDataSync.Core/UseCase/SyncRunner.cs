@@ -109,13 +109,11 @@ public sealed class SyncRunner
         {
             var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
             // 前回のマージが置き換えの前後で止まっていれば、送る前にそろえる。置き換える前に
-            // 退けた WAL が残っていれば戻してから送る。戻せなければ送らない。強制 Push は
-            // その状態から抜け出す手段なので、ここでは止めない。
-            if (!force && !reuploadAll)
-            {
-                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false);
-                if (recovered.Abort is not null) return recovered.Abort;
-            }
+            // 退けた WAL が残っていれば戻してから送る。戻さずに送ると、WAL にしか無い手元の
+            // 変更を含まない本体が送られ、送った後に記録が消えて戻せなくなる。戻せなければ
+            // 送らない。置き換えの前後を見分けられない状態からは、強制 Push で抜け出せる。
+            var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false, force: force || reuploadAll);
+            if (recovered.Abort is not null) return recovered.Abort;
             var result = service.Push(new PushOptions
             {
                 Storage = storage,
@@ -471,8 +469,13 @@ public sealed class SyncRunner
     /// 中止の結果か、dry-run で保存せずに使う祖先と同期履歴の版。記録が無いか、保存まで
     /// 済ませたなら、すべて null。
     /// </returns>
+    /// <param name="force">
+    /// 強制 Push から呼ぶなら真。置き換えの前後を見分けられない状態は、利用者が手元の内容を
+    /// 正として送ると選んだのだから中止しない。退けた WAL を戻せない状態は、WAL にしか無い
+    /// 変更を失うので強制 Push でも中止する。
+    /// </param>
     private (SyncResult? Abort, DatabaseSummary? Baseline, long? PulledVersion) ResolveInterruptedReplace(
-        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun)
+        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun, bool force = false)
     {
         var pending = _baseSummaries.LoadPendingReplace(stateKey);
         if (pending is null)
@@ -555,6 +558,12 @@ public sealed class SyncRunner
             // 判定はしない。
             _logger.LogInformation("前回のマージの印だけが残っていました ({Tool})", service.ToolKey);
             if (!dryRun) TryClearMergePending(stateKey);
+            return (null, null, null);
+        }
+        if (force)
+        {
+            // 利用者が手元の内容を正として送ると選んだ。送った後に記録は消える。
+            _logger.LogWarning("前回のマージの置き換えの前後を見分けられませんが、強制 Push なので手元の内容をそのまま送ります ({Tool})", service.ToolKey);
             return (null, null, null);
         }
         var message = "前回のマージがローカルの置き換えの前後で止まり、その後に DB が書き換えられています。" +
