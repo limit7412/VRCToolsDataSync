@@ -1364,6 +1364,7 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
         var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
         var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
         Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
         File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":2}");
         var pushed = Push(a);
@@ -1375,11 +1376,18 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Throws<IOException>(() => StartupPull(b));
         Directory.Delete(b.Paths.SettingsJsonFile);
 
-        // 本体は取り出した版なので、要約と同期履歴もその版にそろっている。
+        // 本体は取り出した版なので、祖先の要約はその版にそろう。設定は残っているので、
+        // 同期履歴は進めない。
         Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
-        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
         Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
         Assert.False(store.IsMergePending(key));
+
+        // 次の起動時 Pull は、取り込んだ本体を手元の変更と見ずに残りの差し替えをやり直す。
+        var retried = StartupPull(b);
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
 
         // 手元で値を変えて Push しても、取り込んだ +50 を手元の変更とは見ない。
         // 前の版を祖先にマージすると、手元の +10 に取り込んだ +50 も足して 210 になる。
@@ -1388,6 +1396,74 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
 
         Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
         Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "Push の後に要約を保存できなくても、マージ無しの起動時 Pull と Push が送った写しの記録でそろえ直せる")]
+    public void SyncRecoversAfterPushSummarySaveFailureWithoutMerge()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+
+        // 要約を保存できない状態で Push する。反映は済み、同期履歴は進まない。
+        var summaryPath = Directory.GetFiles(store.RootDirectory, "*.json").Single();
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        Assert.Contains("要約を保存できなかった", pushed.Message);
+        Assert.Equal(pulledBefore, a.Settings.ToolState[key].LastPulledVersion);
+        Directory.Delete(summaryPath);
+
+        // 手元に変更が無ければ、起動時 Pull は送った写しの記録と比べて進み、同期履歴をそろえる。
+        var pull = StartupPull(a);
+        Assert.True(pull.Outcome == SyncOutcome.Success, pull.Message);
+        Assert.Equal(pushed.RemoteVersion, a.Settings.ToolState[key].LastPulledVersion);
+        Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
+        Assert.Null(store.LoadPushed(key));
+        Assert.Equal(2, CountLocations(a.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "Push の後に要約を保存できず手元に変更があっても、マージ無しの Push は自分の版と競合しない")]
+    public void PushDoesNotConflictWithOwnSnapshotAfterSummarySaveFailure()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var summaryPath = Directory.GetFiles(store.RootDirectory, "*.json").Single();
+        File.Delete(summaryPath);
+        Directory.CreateDirectory(summaryPath);
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        Directory.Delete(summaryPath);
+
+        // 手元で増えた履歴は、送った写しの記録と比べて見つかる。起動時 Pull は上書きしない。
+        AddLocation(a, "2026-10-03T00:00:00Z");
+        var pull = StartupPull(a);
+        Assert.Equal(SyncOutcome.LocalChangesPending, pull.Outcome);
+        Assert.Equal(3, CountLocations(a.Paths.SqliteFile));
+
+        // 同期先は自分が送った版なので、通常の Push で送れる。
+        var result = Push(a);
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(pushed.RemoteVersion + 1, result.RemoteVersion);
+        Assert.Equal(result.RemoteVersion, a.Settings.ToolState[key].LastPulledVersion);
+        Assert.Null(store.LoadPushed(key));
     }
 
     [Fact(DisplayName = "置き換えを始めた後にマージが例外で止まれば、置き換えの記録を残す")]

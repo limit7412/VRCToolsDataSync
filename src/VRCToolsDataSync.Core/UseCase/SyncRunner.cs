@@ -114,13 +114,22 @@ public sealed class SyncRunner
             // 送らない。置き換えの前後を見分けられない状態からは、強制 Push で抜け出せる。
             var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false, force: force || reuploadAll);
             if (recovered.Abort is not null) return recovered.Abort;
+            // 前回の Push が反映された後に要約を保存できていないと、同期履歴は送る前の版のまま。
+            // 反映済みの記録の版は自分が送った写しなので、その版までは取り込んだものとして扱う。
+            // そうしないと、要約の保存に一度失敗しただけで、以後の Push が同期先の自分の版と
+            // 競合し続ける。
+            var pulledVersion = state.LastPulledVersion;
+            if (_baseSummaries.LoadPushed(stateKey) is { Committed: true, Version: long syncedVersion } && syncedVersion > pulledVersion)
+            {
+                pulledVersion = syncedVersion;
+            }
             var result = service.Push(new PushOptions
             {
                 Storage = storage,
                 MachineName = settings.MachineName,
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
-                LastPulledVersion = state.LastPulledVersion == 0 ? null : state.LastPulledVersion,
+                LastPulledVersion = pulledVersion == 0 ? null : pulledVersion,
                 // 控えられなければ送らない (サービス側が中止する)。送った後に要約の保存にも
                 // 失敗すると、次のマージが送った内容を見分けられない。
                 BeforeCommit = (sha256, summary, planned) =>
@@ -210,8 +219,11 @@ public sealed class SyncRunner
             // 本体を差し替えた直後に止まっても、次回に差し替わったかを見分けて祖先をそろえられるよう、
             // マージと同じ記録を残す。要約を保存できれば RecordBaseSummary が消す。
             BeforeReplaceLocal = pending => _baseSummaries.SavePendingReplace(stateKey, pending),
-            // 本体を差し替えた後に残りの差し替えで止まったら、本体の版へそろえる。
-            AfterDatabaseReplaced = (version, summary, sha256) => CommitPulled(service, settings, stateKey, state, version, summary, sha256),
+            // 本体を差し替えた後に残りの差し替えで止まったら、祖先の要約だけを本体の版へそろえる。
+            // 同期履歴は進めない。進めると、次の起動時 Pull が取り込み済みと見て残りの差し替えを
+            // やり直さず、古い設定が残ったまま次の Push で同期先の新しい設定を上書きする。
+            AfterDatabaseReplaced = (version, summary, sha256) =>
+                CommitPulled(service, settings, stateKey, state, version, summary, sha256, advanceHistory: false),
         });
 
         if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue
@@ -230,10 +242,15 @@ public sealed class SyncRunner
     /// 消してから保存するまでの間に止まったとき、本体は取り出した版なのに復旧の手掛かりが何も
     /// 残らない。要約を保存できず写しの記録も残せなければ、置き換えの記録だけが手掛かりなので残す。
     /// </para>
+    /// <para>
+    /// <paramref name="advanceHistory"/> が偽なら要約だけを保存し、同期履歴は進めない。本体だけを
+    /// 差し替えて残りで止まったときに使う。要約の版が同期履歴より新しい状態になり、起動時 Pull は
+    /// その要約と比べて手元の変更を見つけ、無ければ残りの差し替えをやり直す。
+    /// </para>
     /// </summary>
     private bool CommitPulled(
         ISyncService service, SyncSettings settings, string stateKey, ToolSyncState? state,
-        long version, DatabaseSummary? summary, string? sha256)
+        long version, DatabaseSummary? summary, string? sha256, bool advanceHistory = true)
     {
         if (!RecordBaseSummary(service, stateKey, version, summary))
         {
@@ -241,6 +258,7 @@ public sealed class SyncRunner
             return false;
         }
         TryClearMergePending(stateKey);
+        if (!advanceHistory) return true;
         state ??= new ToolSyncState();
         state.LastPulledVersion = version;
         state.LastPulledAt = DateTimeOffset.Now;
@@ -742,9 +760,21 @@ public sealed class SyncRunner
                 return new[] { "前回のマージか Pull が途中で止まりました" };
             }
             var baseline = _baseSummaries.Load(stateKey);
+            // 送った写し (か、要約を保存できなかった Pull の写し) の記録が反映済みで、要約より
+            // 新しければ、ローカルはその写しに手元の変更を足したもの。要約の保存に失敗した後も
+            // 起動時 Pull が進めるよう、その写しの要約と比べる。
+            if (_baseSummaries.LoadPushed(stateKey) is { Committed: true, Version: long syncedVersion, Summary: { } syncedSummary }
+                && syncedVersion > lastPulledVersion
+                && (baseline is null || baseline.RemoteVersion < syncedVersion))
+            {
+                _logger.LogInformation("同期先とそろえた写しの記録 (版 {Version}) と比べます ({Tool})", syncedVersion, service.ToolKey);
+                syncedSummary.RemoteVersion = syncedVersion;
+                baseline = syncedSummary;
+            }
             // 要約の方が同期履歴より新しいのは、マージ結果で置き換えた後、要約を保存して
-            // 同期履歴を保存する前に止まった場合だけである。ローカルはその要約の版に手元の
-            // 変更を足したものなので、要約と比べれば手元の変更を見つけられる。
+            // 同期履歴を保存する前に止まった場合か、Pull が本体を差し替えた後に残りの差し替えで
+            // 止まった場合である。ローカルはその要約の版に手元の変更を足したものなので、
+            // 要約と比べれば手元の変更を見つけられる。
             var interruptedMerge = baseline is not null && baseline.RemoteVersion > lastPulledVersion;
             if (baseline is null || (baseline.RemoteVersion != lastPulledVersion && !interruptedMerge))
             {
