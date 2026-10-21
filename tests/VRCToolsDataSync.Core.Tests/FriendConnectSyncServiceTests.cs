@@ -88,6 +88,24 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
         Assert.Equal("v11", ReadDb(b.DbV11File));
     }
 
+    [Fact]
+    public void PullResultCarriesHashOfPulledSnapshot()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+
+        var result = Pull(ServiceOf("b"), storage);
+
+        // 要約を保存できなかったとき、取り出した写しの記録を残すのに要る。
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal(FileHasher.Sha256(b.DbV11File), result.SyncedSha256);
+    }
+
     private static void CreateDb(string path, string value)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

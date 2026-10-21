@@ -424,6 +424,7 @@ public sealed class FriendConnectSyncService : ISyncService
             BackupPath = backupPath,
             AffectedFiles = affected,
             SyncedSummary = pulledSummary,
+            SyncedSha256 = remoteDbV11?.Sha256,
         };
     }
 

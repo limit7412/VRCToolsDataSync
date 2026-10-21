@@ -1223,6 +1223,86 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "Pull が本体を差し替えた後に止まっても、次のマージは取り出した写しを祖先にする")]
+    public void MergeAfterPartiallyAppliedPullUsesPulledSnapshotAsBaseline()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":2}");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // 設定ファイルの場所にフォルダを置き、本体を差し替えた後の設定の差し替えで失敗させる。
+        File.Delete(b.Paths.SettingsJsonFile);
+        Directory.CreateDirectory(b.Paths.SettingsJsonFile);
+        Assert.Throws<IOException>(() => StartupPull(b));
+        Directory.Delete(b.Paths.SettingsJsonFile);
+
+        // 本体は取り出した版なので、要約と同期履歴もその版にそろっている。
+        Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
+        Assert.False(store.IsMergePending(key));
+
+        // 手元で値を変えて Push しても、取り込んだ +50 を手元の変更とは見ない。
+        // 前の版を祖先にマージすると、手元の +10 に取り込んだ +50 も足して 210 になる。
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        var result = Push(b);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "置き換えを始めた後にマージが例外で止まれば、置き換えの記録を残す")]
+    public void MergeKeepsPendingReplaceRecordWhenReplaceThrows()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var throwing = new ThrowingReplaceService(b.Service, b.Paths.SqliteFile);
+
+        Assert.Throws<IOException>(() => b.Runner.Merge(throwing, b.Settings, _storage));
+
+        // 退けた WAL の場所を含む記録が残り、次回に置き換えの前後を見分けられる。
+        var pending = store.LoadPendingReplace(key);
+        Assert.NotNull(pending);
+        Assert.Equal(".vrctds-aside-test", pending!.AsideSuffix);
+
+        // 本体は元のままなので、次のマージは置き換える前に止まったと見て進む。
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.False(store.IsMergePending(key));
+    }
+
+    /// <summary>置き換えの記録を書いた直後に、本体の差し替えで失敗するマージ。</summary>
+    private sealed class ThrowingReplaceService(IMergeableSyncService inner, string database) : IMergeableSyncService
+    {
+        public string ToolKey => inner.ToolKey;
+        public TrackedDatabase? TrackedDatabase => inner.TrackedDatabase;
+        public SyncResult Push(PushOptions options) => inner.Push(options);
+        public SyncResult Pull(PullOptions options) => inner.Pull(options);
+
+        public SyncResult PullMerge(PullMergeOptions options)
+        {
+            options.BeforeReplaceLocal?.Invoke(new MergePendingState(
+                null, 999, FileHasher.Sha256(database), "0", ".vrctds-aside-test"));
+            throw new IOException("本体を差し替えられません");
+        }
+    }
+
     [Fact(DisplayName = "予定の版を別の PC が取った記録を捨てるとき、抱えていた前の反映済みの記録で祖先を決め直す")]
     public void MergeFallsBackToPreviousRecordWhenPlannedVersionWasTakenByOthers()
     {

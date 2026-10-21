@@ -143,6 +143,22 @@ public sealed class PullOptions
     /// を返す。比べられない場合 (前回の要約が無いなど) は空を返し、従来どおり上書きする。
     /// </summary>
     public Func<IReadOnlyList<string>>? FindUnsyncedLocalChanges { get; init; }
+
+    /// <summary>
+    /// 追跡する DB の本体を差し替える直前に、差し替える前後の本体のハッシュと取り出した写しの
+    /// 要約を渡す。差し替えた後、残りのファイルの差し替えや要約の保存で止まると、手元は
+    /// 取り出した版なのに要約と同期履歴は前の版のままになる。次のマージがその違いを手元の
+    /// 変更と見て古い要約を祖先にすると、取り込んだ内容を二重に足す。この記録があれば、
+    /// 次回に本体のハッシュから差し替わったかを見分け、取り出した写しの要約を祖先にできる。
+    /// </summary>
+    public Action<MergePendingState>? BeforeReplaceLocal { get; init; }
+
+    /// <summary>
+    /// 追跡する DB の本体を差し替えた後、残りのファイルの差し替えで失敗したときに、差し替えた
+    /// 版と取り出した写しの要約とハッシュを渡す。本体は取り出した版になっているので、呼び出し側は
+    /// 成功した Pull と同じく要約と同期履歴をその版へそろえる。例外はそのまま投げる。
+    /// </summary>
+    public Action<long, DatabaseSummary?, string>? AfterDatabaseReplaced { get; init; }
 }
 
 public sealed class SyncResult

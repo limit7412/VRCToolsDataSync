@@ -400,6 +400,17 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
+        // 本体を差し替える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
+        // 設定の差し替えや要約の保存で止まっても、次回に本体が差し替わったかを見分けて、
+        // 取り出した写しの要約を祖先にできる。
+        if (options.BeforeReplaceLocal is not null && staging.IsStaged(_paths.SqliteFile))
+        {
+            options.BeforeReplaceLocal(new MergePendingState(
+                pulledSummary, entry.Version,
+                File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "",
+                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile))));
+        }
+
         // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
         // 古い WAL が新しい本体に対して再生されてデータが破損するため、
         // --no-backup でも飛ばさない。
@@ -416,7 +427,18 @@ public sealed class VrcxSyncService : IMergeableSyncService
         }
 
         var affected = new List<string>();
-        staging.Apply(affected);
+        try
+        {
+            staging.Apply(affected);
+        }
+        catch (Exception) when (affected.Contains(_paths.SqliteFile) && options.AfterDatabaseReplaced is not null)
+        {
+            // 本体は差し替わり、設定の差し替えで止まった。本体だけは取り出した版なので、
+            // 要約と同期履歴をその版へそろえてもらう。そろえないと、次の同期が本体の違いを
+            // 手元の変更と見て、前の版を祖先に取り込んだ内容を二重に足す。
+            options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteSnapshot.Sha256);
+            throw;
+        }
 
         if (remoteSettings is null && File.Exists(_paths.SettingsJsonFile))
         {

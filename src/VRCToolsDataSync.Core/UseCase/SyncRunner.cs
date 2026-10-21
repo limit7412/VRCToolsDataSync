@@ -207,24 +207,41 @@ public sealed class SyncRunner
             FindUnsyncedLocalChanges = skipIfNotNewer
                 ? () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0)
                 : null,
+            // 本体を差し替えた直後に止まっても、次回に差し替わったかを見分けて祖先をそろえられるよう、
+            // マージと同じ記録を残す。要約を保存できれば RecordBaseSummary が消す。
+            BeforeReplaceLocal = pending => _baseSummaries.SavePendingReplace(stateKey, pending),
+            // 本体を差し替えた後に残りの差し替えで止まったら、本体の版へそろえる。
+            AfterDatabaseReplaced = (version, summary, sha256) => CommitPulled(service, settings, stateKey, state, version, summary, sha256),
         });
 
-        if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue)
+        if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue
+            && !CommitPulled(service, settings, stateKey, state, result.RemoteVersion.Value, result.SyncedSummary, result.SyncedSha256))
         {
-            // Push と同じく、要約を先に保存する。
-            if (!RecordBaseSummary(service, stateKey, result.RemoteVersion.Value, result.SyncedSummary))
-            {
-                KeepPulledSnapshotRecord(stateKey, result);
-                return WithMessage(result, "取り込みは済みましたが、同期時点の要約を保存できなかったため、同期履歴は進めていません。次の同期でそろいます");
-            }
-            state ??= new ToolSyncState();
-            state.LastPulledVersion = result.RemoteVersion.Value;
-            state.LastPulledAt = DateTimeOffset.Now;
-            settings.ToolState[stateKey] = state;
-            // Push と同じ理由で SaveToolStateOnly を使う。
-            _store.SaveToolStateOnly(settings);
+            return WithMessage(result, "取り込みは済みましたが、同期時点の要約を保存できなかったため、同期履歴は進めていません。次の同期でそろいます");
         }
         return result;
+    }
+
+    /// <summary>
+    /// 取り出した版へ要約と同期履歴をそろえる。Push と同じく、要約を先に保存する。
+    /// 要約を保存できなければ同期履歴は進めず、取り出した写しの記録を残して偽を返す。
+    /// </summary>
+    private bool CommitPulled(
+        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState? state,
+        long version, DatabaseSummary? summary, string? sha256)
+    {
+        if (!RecordBaseSummary(service, stateKey, version, summary))
+        {
+            KeepPulledSnapshotRecord(stateKey, version, summary, sha256);
+            return false;
+        }
+        state ??= new ToolSyncState();
+        state.LastPulledVersion = version;
+        state.LastPulledAt = DateTimeOffset.Now;
+        settings.ToolState[stateKey] = state;
+        // Push と同じ理由で SaveToolStateOnly を使う。
+        _store.SaveToolStateOnly(settings);
+        return true;
     }
 
     /// <summary>Push を競合で取り直す回数の上限。</summary>
@@ -345,6 +362,8 @@ public sealed class SyncRunner
                 // 前の中断の印が残っていれば、それは消さない。
                 var wasPending = _baseSummaries.IsMergePending(stateKey);
                 if (!dryRun) _baseSummaries.MarkMergePending(stateKey);
+                // 置き換えの記録を書いた後は、置き換えが始まっている。
+                var replaceStarted = false;
                 SyncResult merged;
                 try
                 {
@@ -359,7 +378,11 @@ public sealed class SyncRunner
                         DryRun = dryRun,
                         // 2 周目以降のローカルは前の周のマージ結果なので、退避するのは最初だけ。
                         SkipBackup = skipBackup || attempt > 1,
-                        BeforeReplaceLocal = pending => _baseSummaries.SavePendingReplace(stateKey, pending),
+                        BeforeReplaceLocal = pending =>
+                        {
+                            replaceStarted = true;
+                            _baseSummaries.SavePendingReplace(stateKey, pending);
+                        },
                         AfterReplaceLocal = (remoteVersion, hostBaseline) =>
                         {
                             // 置き換えた後のローカルは、土台にした版に手元の変更を足したもの
@@ -379,9 +402,11 @@ public sealed class SyncRunner
                 }
                 catch
                 {
-                    // 置き換える前に失敗したなら、ローカルは元のままなので印は要らない。
-                    // 置き換えた後なら印を残し、次の同期で手元の変更を守る。
-                    if (!committed && !wasPending && !dryRun) TryClearMergePending(stateKey);
+                    // 置き換えを始める前に失敗したなら、ローカルは元のままなので印は要らない。
+                    // 置き換えを始めた後なら、本体の差し替えに失敗して退けた WAL を戻せなかった
+                    // こともあるので、記録を残す。次回に本体のハッシュで置き換えの前後を見分け、
+                    // 退けた WAL を戻すか、祖先と同期履歴をそろえる。
+                    if (!committed && !replaceStarted && !wasPending && !dryRun) TryClearMergePending(stateKey);
                     // そろえている途中で失敗した。要約と同期履歴が食い違わないよう元へ戻す。
                     // ローカルはマージ結果のままだが、手元に未 Push の変更があるものとして
                     // 扱われるので、次の同期で同期先の変更を上書きすることはない。
@@ -644,14 +669,14 @@ public sealed class SyncRunner
     /// 記録も残せなければ古い要約を消し、祖先なしでマージさせる。
     /// </para>
     /// </summary>
-    private void KeepPulledSnapshotRecord(string stateKey, SyncResult result)
+    private void KeepPulledSnapshotRecord(string stateKey, long version, DatabaseSummary? summary, string? sha256)
     {
         try
         {
-            if (result.SyncedSummary is { } summary && !string.IsNullOrEmpty(result.SyncedSha256) && result.RemoteVersion is long version)
+            if (summary is not null && !string.IsNullOrEmpty(sha256))
             {
                 summary.RemoteVersion = version;
-                _baseSummaries.SavePushed(stateKey, new PushedRecord(result.SyncedSha256, summary, version, Committed: true, PlannedVersion: version));
+                _baseSummaries.SavePushed(stateKey, new PushedRecord(sha256, summary, version, Committed: true, PlannedVersion: version));
                 return;
             }
         }
@@ -697,7 +722,7 @@ public sealed class SyncRunner
             {
                 // マージ結果で置き換えた後、要約か同期履歴を保存し終える前に止まった。
                 // 要約が当てにならないので、比べずに手元の変更があるものとして扱う。
-                return new[] { "前回のマージが途中で止まりました" };
+                return new[] { "前回のマージか Pull が途中で止まりました" };
             }
             var baseline = _baseSummaries.Load(stateKey);
             // 要約の方が同期履歴より新しいのは、マージ結果で置き換えた後、要約を保存して
