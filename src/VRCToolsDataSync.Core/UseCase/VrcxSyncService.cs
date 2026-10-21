@@ -385,8 +385,21 @@ public sealed class VrcxSyncService : IMergeableSyncService
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
 
-        // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップの間に
-        //     VRCX が起動して書き込んでいないかを確かめる。DB が大きいほどこの間は長い。
+        // 本体を差し替える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
+        // 設定の差し替えや要約の保存で止まっても、次回に本体が差し替わったかを見分けて、
+        // 取り出した写しの要約を祖先にできる。ハッシュを取るのは DB が大きいほど長いので、
+        // 書き換えの確認より前に済ませる。記録を残した後、差し替える前に中止したときは、
+        // 呼び出し側が記録を消す。
+        if (options.BeforeReplaceLocal is not null && staging.IsStaged(_paths.SqliteFile))
+        {
+            options.BeforeReplaceLocal(new MergePendingState(
+                pulledSummary, entry.Version,
+                File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "",
+                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile))));
+        }
+
+        // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
+        //     間に VRCX が起動して書き込んでいないかを確かめる。DB が大きいほどこの間は長い。
         ProcessGuard.EnsureNotRunning(ProcessGuard.VrcxProcessNames);
         if (FingerprintPullTargets() != localFingerprint)
         {
@@ -398,17 +411,6 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 Message = "Pull の間に VRCX の DB か設定が書き換えられたため、差し替える前に中止しました。" +
                           "VRCX を終了してからやり直してください。",
             };
-        }
-
-        // 本体を差し替える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
-        // 設定の差し替えや要約の保存で止まっても、次回に本体が差し替わったかを見分けて、
-        // 取り出した写しの要約を祖先にできる。
-        if (options.BeforeReplaceLocal is not null && staging.IsStaged(_paths.SqliteFile))
-        {
-            options.BeforeReplaceLocal(new MergePendingState(
-                pulledSummary, entry.Version,
-                File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "",
-                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile))));
         }
 
         // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
@@ -430,23 +432,25 @@ public sealed class VrcxSyncService : IMergeableSyncService
         try
         {
             staging.Apply(affected);
+
+            if (remoteSettings is null && File.Exists(_paths.SettingsJsonFile))
+            {
+                // リモートに latest.json がなくなったときはローカルも削除して状態を
+                // 揃える。握りつぶすと Push 側で削除済み判定との対称性が崩れて、
+                // 古い VRCX.json が次の Push で manifest に再登録されてしまうため、
+                // 失敗は呼び出し側に伝播させる。
+                File.Delete(_paths.SettingsJsonFile);
+            }
         }
         catch (Exception) when (affected.Contains(_paths.SqliteFile) && options.AfterDatabaseReplaced is not null)
         {
-            // 本体は差し替わり、設定の差し替えで止まった。本体だけは取り出した版なので、
-            // 要約と同期履歴をその版へそろえてもらう。そろえないと、次の同期が本体の違いを
-            // 手元の変更と見て、前の版を祖先に取り込んだ内容を二重に足す。
+            // 本体は差し替わり、設定の差し替えか削除で止まった。本体だけは取り出した版なので、
+            // 要約をその版へそろえてもらう。そろえないと、次の同期が本体の違いを手元の変更と
+            // 見て、前の版を祖先に取り込んだ内容を二重に足す。設定の削除の失敗も同じ扱いに
+            // する。扱いを分けると、残った記録から本体の差し替えが済んだと見て同期履歴まで
+            // 進め、次の Push が消した設定を同期先へ送り直す。
             options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteSnapshot.Sha256);
             throw;
-        }
-
-        if (remoteSettings is null && File.Exists(_paths.SettingsJsonFile))
-        {
-            // リモートに latest.json がなくなったときはローカルも削除して状態を
-            // 揃える。握りつぶすと Push 側で削除済み判定との対称性が崩れて、
-            // 古い VRCX.json が次の Push で manifest に再登録されてしまうため、
-            // 失敗は呼び出し側に伝播させる。
-            File.Delete(_paths.SettingsJsonFile);
         }
 
         _logger.LogInformation("VRCX Pull 完了 version={Version} backup={Backup}", entry.Version, backupPath ?? "(none)");

@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
+using VRCToolsDataSync.Core.Merge;
 using VRCToolsDataSync.Core.UseCase;
 using Xunit;
 
@@ -104,6 +105,158 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
         // 要約を保存できなかったとき、取り出した写しの記録を残すのに要る。
         Assert.Equal(SyncOutcome.Success, result.Outcome);
         Assert.Equal(FileHasher.Sha256(b.DbV11File), result.SyncedSha256);
+    }
+
+    [Fact(DisplayName = "Push は本体の写しを送る直前と manifest に反映した直後に記録の呼び出しをする")]
+    public void PushRecordsSentSnapshotAroundManifestUpdate()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        SqliteConnection.ClearAllPools();
+        var before = new List<(string Sha256, long? Planned)>();
+        var after = new List<(string Sha256, long Version)>();
+        var options = new PushOptions
+        {
+            Storage = storage,
+            MachineName = "test",
+            BeforeCommit = (sha256, _, planned) => before.Add((sha256, planned)),
+            AfterCommit = (sha256, version) => after.Add((sha256, version)),
+        };
+
+        var result = ServiceOf("a").Push(options);
+
+        // 送った写しの記録が無いと、送った後に要約を保存できなかったときに復旧できない。
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        var sent = new ManifestStore(storage).Load().Tools[FriendConnectSyncService.Key].Files
+            .Single(f => f.RelativePath == DbV11Key);
+        Assert.Equal(new[] { (sent.Sha256, (long?)1) }, before);
+        Assert.Equal(new[] { (sent.Sha256, 1L) }, after);
+
+        // 変更が無い Push も、同期先の版が送ろうとした写しと同じ内容だと伝える。
+        Assert.Equal(SyncOutcome.Success, ServiceOf("a").Push(new PushOptions
+        {
+            Storage = storage,
+            MachineName = "test",
+            LastPulledVersion = 1,
+            BeforeCommit = options.BeforeCommit,
+            AfterCommit = options.AfterCommit,
+        }).Outcome);
+        Assert.Equal(2, before.Count);
+        Assert.Equal(new[] { (sent.Sha256, 1L), (sent.Sha256, 1L) }, after);
+    }
+
+    [Fact(DisplayName = "送る写しの記録を控えられなければ、Push は送る前に中止する")]
+    public void PushAbortsWhenSentSnapshotCannotBeRecorded()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        SqliteConnection.ClearAllPools();
+        var notCommitted = 0;
+
+        var result = ServiceOf("a").Push(new PushOptions
+        {
+            Storage = storage,
+            MachineName = "test",
+            BeforeCommit = (_, _, _) => throw new IOException("記録できません (テスト)"),
+            NotCommitted = () => notCommitted++,
+        });
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("記録を控えられない", result.Message);
+        Assert.False(new ManifestStore(storage).Load().Tools.ContainsKey(FriendConnectSyncService.Key));
+        Assert.Equal(0, notCommitted);
+    }
+
+    [Fact(DisplayName = "記録を控えた後に送信で失敗したら、反映していないと伝える")]
+    public void PushReportsNotCommittedWhenUploadFailsAfterRecording()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        SqliteConnection.ClearAllPools();
+        var recorded = 0;
+        var notCommitted = 0;
+        storage.FailNextCommit = true;
+
+        Assert.Throws<SyncStorageException>(() => ServiceOf("a").Push(new PushOptions
+        {
+            Storage = storage,
+            MachineName = "test",
+            BeforeCommit = (_, _, _) => recorded++,
+            NotCommitted = () => notCommitted++,
+        }));
+
+        Assert.Equal(1, recorded);
+        Assert.Equal(1, notCommitted);
+    }
+
+    [Fact(DisplayName = "Pull は本体を差し替える前に前後のハッシュを渡し、残りで止まったら本体の版を伝える")]
+    public void PullRecordsReplaceAndReportsDatabaseWhenRestFails()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        WriteFile(a.ConfigJsonFile, "{\"a\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+        var remoteSha256 = new ManifestStore(storage).Load().Tools[FriendConnectSyncService.Key].Files
+            .Single(f => f.RelativePath == DbV11Key).Sha256;
+
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+        var localSha256 = FileHasher.Sha256(b.DbV11File);
+        // 設定の場所にフォルダを置き、本体を差し替えた後の設定の差し替えで失敗させる。
+        Directory.CreateDirectory(b.ConfigJsonFile);
+        MergePendingState? pending = null;
+        (long Version, string Sha256)? replaced = null;
+
+        Assert.Throws<IOException>(() => ServiceOf("b").Pull(new PullOptions
+        {
+            Storage = storage,
+            SkipBackup = true,
+            BeforeReplaceLocal = state => pending = state,
+            AfterDatabaseReplaced = (version, _, sha256) => replaced = (version, sha256),
+        }));
+
+        // 本体は取り出した版。次回に差し替わったかを見分けられるよう前後のハッシュを渡し、
+        // 残りで止まったら本体の版を伝える。伝えないと、次の起動時 Pull が本体の違いを
+        // 手元の変更と見て見送り続ける。
+        Assert.Equal("v11", ReadDb(b.DbV11File));
+        Assert.NotNull(pending);
+        Assert.Equal(1, pending!.RemoteVersion);
+        Assert.Equal(localSha256, pending.LocalSha256);
+        Assert.Equal(remoteSha256, pending.MergedSha256);
+        Assert.Equal((1L, remoteSha256), replaced);
+    }
+
+    [Fact(DisplayName = "記録を残している間に本体が書き換えられたら、差し替える前に中止する")]
+    public void PullAbortsWhenDatabaseChangesWhileRecordingReplace()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+
+        var result = ServiceOf("b").Pull(new PullOptions
+        {
+            Storage = storage,
+            SkipBackup = true,
+            // ハッシュを取って記録を残す間に Friend Connect が起動して書き込んだ状況。
+            BeforeReplaceLocal = _ =>
+            {
+                CreateDb(b.DbV11File, new string('x', 16 * 1024));
+                SqliteConnection.ClearAllPools();
+            },
+        });
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("書き換えられた", result.Message);
+        Assert.Equal("old", ReadDb(b.DbV11File));
     }
 
     private static void CreateDb(string path, string value)

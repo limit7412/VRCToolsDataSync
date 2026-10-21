@@ -1398,6 +1398,130 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(160, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
+    [Fact(DisplayName = "Pull は記録を残した後に書き換えを確かめ、書き換えられていれば差し替えない")]
+    public void PullChecksForWritesAfterRecordingReplace()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var before = CountLocations(b.Paths.SqliteFile);
+
+        var result = b.Service.Pull(new PullOptions
+        {
+            Storage = _storage,
+            SkipBackup = true,
+            // 前後のハッシュを取って記録を残す間に VRCX が起動して書き込んだ状況。DB が
+            // 大きいほどこの間は長い。
+            BeforeReplaceLocal = _ => AddLocation(b, "2026-10-03T00:00:00Z"),
+        });
+
+        // 記録を残す前に確かめるだけでは、この書き込みを見ずに WAL を消して差し替え、
+        // 起動後の変更を失う。
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("書き換えられた", result.Message);
+        Assert.Equal(before + 1, CountLocations(b.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "記録を残した後に差し替える前で中止した Pull は、記録を残さない")]
+    public void PullClearsReplaceRecordWhenAbortedBeforeReplacing()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        // 取り出しの間に VRCX が起動して書き込んだ状況。記録を残した後の確かめで中止する。
+        _storage.OnDownload = _ => AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: true);
+        _storage.OnDownload = null;
+
+        // ローカルは元のままなので記録は要らない。残すと、本体のハッシュがどちらの記録とも
+        // 合わず、次のマージが置き換えの前後を見分けられないとして止まる。
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.False(store.IsMergePending(key));
+        Assert.Null(store.LoadPendingReplace(key));
+    }
+
+    [Fact(DisplayName = "設定が同期先から消えた版の Pull が設定の削除で止まっても、要約は本体の版にそろう")]
+    public void PullCommitsDatabaseWhenSettingsDeletionFails()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
+        // 同期先では設定が消え、本体は進んだ。
+        File.Delete(a.Paths.SettingsJsonFile);
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // 本体を差し替えた後、設定の削除で失敗させる。
+        using (var locked = LockAgainstDelete(b.Paths.SettingsJsonFile))
+        {
+            if (locked is null) return; // この環境では削除を失敗させられない。
+            Assert.ThrowsAny<Exception>(() => StartupPull(b));
+        }
+
+        // 本体は取り出した版なので要約はその版にそろい、設定は残っているので同期履歴は進めない。
+        // 進めると、次の起動時 Pull が取り込み済みと見て削除をやり直さず、残った設定を次の
+        // Push で同期先へ送り直す。
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.True(File.Exists(b.Paths.SettingsJsonFile));
+        Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
+
+        // 次の起動時 Pull は、取り込んだ本体を手元の変更と見ずに削除をやり直す。
+        var retried = StartupPull(b);
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.False(File.Exists(b.Paths.SettingsJsonFile));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+    }
+
+    /// <summary>
+    /// ファイルを消せない状態にする。Windows は共有を許さずに開いたままにし、Linux は
+    /// 変更不可の属性を付ける (root でないか、対応しないファイルシステムなら null)。
+    /// </summary>
+    private static IDisposable? LockAgainstDelete(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+        }
+        if (!OperatingSystem.IsLinux()) return null;
+        try
+        {
+            if (RunChattr("+i", path) != 0) return null;
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or IOException)
+        {
+            return null;
+        }
+        return new ImmutableFlag(path);
+    }
+
+    private static int RunChattr(string flag, string path)
+    {
+        using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("chattr", new[] { flag, path })
+        {
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+        })!;
+        process.WaitForExit();
+        return process.ExitCode;
+    }
+
+    private sealed class ImmutableFlag(string path) : IDisposable
+    {
+        public void Dispose() => RunChattr("-i", path);
+    }
+
     [Fact(DisplayName = "Push の後に要約を保存できなくても、マージ無しの起動時 Pull と Push が送った写しの記録でそろえ直せる")]
     public void SyncRecoversAfterPushSummarySaveFailureWithoutMerge()
     {

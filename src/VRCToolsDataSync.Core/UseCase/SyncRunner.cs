@@ -205,27 +205,50 @@ public sealed class SyncRunner
         bool skipIfNotNewer)
     {
         var state = ResolveState(settings, storage, service.ToolKey, out var stateKey);
-        var result = service.Pull(new PullOptions
+        // 置き換えの記録を残した後は真。サービスは記録を残してから、差し替える直前にツールの
+        // 起動や書き換えを確かめる。そこで中止したらローカルは元のままなので、記録を消す。
+        // 残すと、次回に本体のハッシュがどちらの記録とも合わず、置き換えの前後を見分けられない
+        // としてマージが止まる。
+        var replaceRecorded = false;
+        SyncResult result;
+        try
         {
-            Storage = storage,
-            SkipBackup = skipBackup,
-            SkipIfNotNewer = skipIfNotNewer,
-            LastPulledVersion = state is null || state.LastPulledVersion == 0
-                ? null
-                : state.LastPulledVersion,
-            FindUnsyncedLocalChanges = skipIfNotNewer
-                ? () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0)
-                : null,
-            // 本体を差し替えた直後に止まっても、次回に差し替わったかを見分けて祖先をそろえられるよう、
-            // マージと同じ記録を残す。要約を保存できれば RecordBaseSummary が消す。
-            BeforeReplaceLocal = pending => _baseSummaries.SavePendingReplace(stateKey, pending),
-            // 本体を差し替えた後に残りの差し替えで止まったら、祖先の要約だけを本体の版へそろえる。
-            // 同期履歴は進めない。進めると、次の起動時 Pull が取り込み済みと見て残りの差し替えを
-            // やり直さず、古い設定が残ったまま次の Push で同期先の新しい設定を上書きする。
-            AfterDatabaseReplaced = (version, summary, sha256) =>
-                CommitPulled(service, settings, stateKey, state, version, summary, sha256, advanceHistory: false),
-        });
-
+            result = service.Pull(new PullOptions
+            {
+                Storage = storage,
+                SkipBackup = skipBackup,
+                SkipIfNotNewer = skipIfNotNewer,
+                LastPulledVersion = state is null || state.LastPulledVersion == 0
+                    ? null
+                    : state.LastPulledVersion,
+                FindUnsyncedLocalChanges = skipIfNotNewer
+                    ? () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0)
+                    : null,
+                // 本体を差し替えた直後に止まっても、次回に差し替わったかを見分けて祖先をそろえられるよう、
+                // マージと同じ記録を残す。要約を保存できれば RecordBaseSummary が消す。
+                BeforeReplaceLocal = pending =>
+                {
+                    _baseSummaries.SavePendingReplace(stateKey, pending);
+                    replaceRecorded = true;
+                },
+                // 本体を差し替えた後に残りの差し替えで止まったら、祖先の要約だけを本体の版へそろえる。
+                // 同期履歴は進めない。進めると、次の起動時 Pull が取り込み済みと見て残りの差し替えを
+                // やり直さず、古い設定が残ったまま次の Push で同期先の新しい設定を上書きする。
+                AfterDatabaseReplaced = (version, summary, sha256) =>
+                    CommitPulled(service, settings, stateKey, state, version, summary, sha256, advanceHistory: false),
+            });
+        }
+        catch (RunningProcessException) when (replaceRecorded)
+        {
+            // 記録を残した後、差し替える直前の確かめでツールが起動していた。差し替えていない。
+            TryClearMergePending(stateKey);
+            throw;
+        }
+        if (replaceRecorded && result.Outcome == SyncOutcome.Aborted)
+        {
+            // 記録を残した後、差し替える直前の確かめで書き換えが見つかった。差し替えていない。
+            TryClearMergePending(stateKey);
+        }
         if (result.Outcome == SyncOutcome.Success && result.RemoteVersion.HasValue
             && !CommitPulled(service, settings, stateKey, state, result.RemoteVersion.Value, result.SyncedSummary, result.SyncedSha256))
         {
