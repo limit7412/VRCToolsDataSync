@@ -1485,14 +1485,15 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
     }
 
     /// <summary>
-    /// ファイルを消せない状態にする。Windows は共有を許さずに開いたままにし、Linux は
-    /// 変更不可の属性を付ける (root でないか、対応しないファイルシステムなら null)。
+    /// ファイルを消せない状態にする。Windows は読み取りだけ共有して開いたままにし (バックアップの
+    /// 複製は通り、削除は共有違反になる)、Linux は変更不可の属性を付ける (root でないか、対応
+    /// しないファイルシステムなら null)。
     /// </summary>
     private static IDisposable? LockAgainstDelete(string path)
     {
         if (OperatingSystem.IsWindows())
         {
-            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         }
         if (!OperatingSystem.IsLinux()) return null;
         try
