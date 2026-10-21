@@ -1387,13 +1387,15 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
         Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
         Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
-        Assert.False(store.IsMergePending(key));
+        // 置き換えの記録は残りをそろえるまで残る。
+        Assert.True(store.IsMergePending(key));
 
         // 次の起動時 Pull は、取り込んだ本体を手元の変更と見ずに残りの差し替えをやり直す。
         var retried = StartupPull(b);
         Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
         Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
         Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
 
         // 手元で値を変えて Push しても、取り込んだ +50 を手元の変更とは見ない。
         // 前の版を祖先にマージすると、手元の +10 に取り込んだ +50 も足して 210 になる。
@@ -1481,13 +1483,154 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.True(File.Exists(b.Paths.SettingsJsonFile));
         Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
         Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
-        Assert.False(store.IsMergePending(key));
+        Assert.True(store.IsMergePending(key));
 
         // 次の起動時 Pull は、取り込んだ本体を手元の変更と見ずに削除をやり直す。
         var retried = StartupPull(b);
         Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
         Assert.False(File.Exists(b.Paths.SettingsJsonFile));
         Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "本体を差し替えた後に設定で止まった起動時 Pull の後、マージが有効でも Push は自動マージへ進まない")]
+    public void PushWithMergeEnabledDoesNotMergeAfterPartiallyAppliedStartupPull()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":2}");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // 本体を差し替えた後の設定の差し替えで失敗する。要約は本体の版にそろうが、設定は前の版。
+        File.Delete(b.Paths.SettingsJsonFile);
+        Directory.CreateDirectory(b.Paths.SettingsJsonFile);
+        Assert.Throws<IOException>(() => StartupPull(b));
+        Directory.Delete(b.Paths.SettingsJsonFile);
+        File.WriteAllText(b.Paths.SettingsJsonFile, "{\"v\":1}");
+
+        // 競合からの自動マージに進むと、DB をマージした後に前の版の設定を送り、同期先の新しい
+        // 設定を上書きする。
+        var push = Push(b);
+
+        Assert.Equal(SyncOutcome.Aborted, push.Outcome);
+        Assert.Equal(pushed.RemoteVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
+
+        var retried = StartupPull(b);
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "本体が同期先と同じで設定だけの Pull が止まっても、記録を残して Push は自動マージへ進まない")]
+    public void PullRecordsReplaceWhenOnlySettingsChange()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = b.Settings.ToolState[key].LastPulledVersion;
+        // 同期先では設定だけが変わった。本体は同じなので差し替えない。
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":2}");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        File.Delete(b.Paths.SettingsJsonFile);
+        Directory.CreateDirectory(b.Paths.SettingsJsonFile);
+        Assert.Throws<IOException>(() => StartupPull(b));
+        Directory.Delete(b.Paths.SettingsJsonFile);
+        File.WriteAllText(b.Paths.SettingsJsonFile, "{\"v\":1}");
+
+        // 本体は差し替えていないが同期先と同じなので、要約はその版にそろい、記録が残る。
+        Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.True(store.IsMergePending(key));
+
+        // 記録が無いと、競合からの自動マージに進んで前の版の設定を送る。
+        var push = Push(b);
+        Assert.Equal(SyncOutcome.Aborted, push.Outcome);
+        Assert.Equal(pushed.RemoteVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
+
+        var retried = StartupPull(b);
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "強制 Push が予定と違う版を取った直後に止まっても、起動時 Pull は Push の値で反映済みにする")]
+    public void StartupPullConfirmsUncommittedPushRecordByIdWhenVersionMoved()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var before = store.Load(key)!;
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: true).Outcome);
+
+        // a の非常用の強制 Push が manifest を保存する直前に b が版を進める。強制 Push は読み直して
+        // その次の版を取るので、予定の版 (2) とは違う版 (3) になる。
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        var interrupted = false;
+        _storage.OnBeforeSaveManifest = () =>
+        {
+            if (interrupted) return;
+            interrupted = true;
+            AddLocation(b, "2026-10-02T12:00:00Z");
+            Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+        };
+        SyncResult forced;
+        try
+        {
+            forced = a.Runner.Push(a.Service, a.Settings, _storage, force: true, reuploadAll: true);
+        }
+        finally
+        {
+            _storage.OnBeforeSaveManifest = null;
+        }
+        Assert.Equal(SyncOutcome.Success, forced.Outcome);
+        Assert.Equal(3, forced.RemoteVersion);
+        // manifest を保存した直後、反映済みと記録する前に止まった状態。
+        RewindToInterruptedPush(a, store, key, before, pulledBefore, 2, committed: false);
+
+        // 同期先の項目はこの Push のものなので、版が予定と違っても実際の版で反映済みにする。
+        var pull = StartupPull(a);
+
+        Assert.True(pull.Outcome == SyncOutcome.Success, pull.Message);
+        Assert.Equal(3, a.Settings.ToolState[key].LastPulledVersion);
+        AddLocation(a, "2026-10-03T00:00:00Z");
+        var result = Push(a);
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(4, result.RemoteVersion);
     }
 
     /// <summary>

@@ -287,9 +287,10 @@ public sealed class SyncRunner
     /// 残らない。要約を保存できず写しの記録も残せなければ、置き換えの記録だけが手掛かりなので残す。
     /// </para>
     /// <para>
-    /// <paramref name="advanceHistory"/> が偽なら要約だけを保存し、同期履歴は進めない。本体だけを
-    /// 差し替えて残りで止まったときに使う。要約の版が同期履歴より新しい状態になり、起動時 Pull は
-    /// その要約と比べて手元の変更を見つけ、無ければ残りの差し替えをやり直す。
+    /// <paramref name="advanceHistory"/> が偽なら要約だけを保存し、同期履歴は進めず、置き換えの
+    /// 記録も残す。本体だけを差し替えて残りで止まったときに使う。起動時 Pull は記録の要約と比べて
+    /// 手元の変更を見つけ、無ければ残りの差し替えをやり直す。通常の Push とマージは残りを
+    /// そろえるまで中止する。
     /// </para>
     /// </summary>
     private bool CommitPulled(
@@ -298,11 +299,13 @@ public sealed class SyncRunner
     {
         if (!RecordBaseSummary(service, stateKey, version, summary))
         {
-            if (KeepPulledSnapshotRecord(stateKey, version, summary, sha256)) TryClearMergePending(stateKey);
+            if (KeepPulledSnapshotRecord(stateKey, version, summary, sha256) && advanceHistory) TryClearMergePending(stateKey);
             return false;
         }
-        TryClearMergePending(stateKey);
+        // 本体だけが取り出した版なら、置き換えの記録は残りをそろえる Pull が済むまで残す。消すと、
+        // 競合した Push から続く自動マージが止まらず、マージした DB と前の版の設定を送る。
         if (!advanceHistory) return true;
+        TryClearMergePending(stateKey);
         state ??= new ToolSyncState();
         state.LastPulledVersion = version;
         state.LastPulledAt = DateTimeOffset.Now;
@@ -697,9 +700,9 @@ public sealed class SyncRunner
     /// <summary>
     /// 反映されたか分からないまま残った送信の記録を、同期先の manifest と照らして確かめる。
     /// manifest を保存した直後、反映済みと記録する前に止まると、記録は予定の版を持ったまま
-    /// 未反映として残る。同期先が予定の版で、その項目が記録と同じ Push のものなら反映済みに
-    /// する。予定の版を別の PC が取っていれば、反映されなかったので捨てる。同期先が予定の版を
-    /// 越えていれば見分けられないので、そのまま残す (マージが止めて知らせる)。
+    /// 未反映として残る。同期先の項目が記録と同じ Push のものなら、その版で反映済みにする。
+    /// 予定の版を別の PC が取っていれば、反映されなかったので捨てる。同期先が予定の版を
+    /// 越えていて別の Push のものなら見分けられないので、そのまま残す (マージが止めて知らせる)。
     /// <para>
     /// マージは同じ照合を自分で行うが、マージ無しの起動時 Pull と Push は反映済みの記録しか
     /// 見ないので、ここで確かめておかないと、送った DB を手元の変更と見て見送り続け、Push も
@@ -713,17 +716,16 @@ public sealed class SyncRunner
         try
         {
             if (!new ManifestStore(storage).Load().Tools.TryGetValue(service.ToolKey, out var entry)) return;
-            if (entry.Version != planned) return;
             // 同じ版を別の PC が同じ DB で取ると、DB の写しのハッシュでは見分けられず、設定や
             // メモが違う版を自分の Push と見て、次の Push がそれらを上書きする。Push を見分ける
-            // 値で照らす。
-            var sent = string.Equals(entry.PushId, pushId, StringComparison.Ordinal);
-            if (sent)
+            // 値で照らす。値が同じなら今の項目はこの Push のもの。版は予定と違うことがある
+            // (非常用の強制 Push は、送る間に他の PC が進めた版の次を取る) ので、実際の版で確定する。
+            if (string.Equals(entry.PushId, pushId, StringComparison.Ordinal))
             {
-                _logger.LogInformation("前回の Push (版 {Version}) は同期先に反映されていました ({Tool})", planned, service.ToolKey);
-                _baseSummaries.MarkPushedCommitted(stateKey, record.Sha256, planned);
+                _logger.LogInformation("前回の Push (版 {Version}) は同期先に反映されていました ({Tool})", entry.Version, service.ToolKey);
+                _baseSummaries.MarkPushedCommitted(stateKey, record.Sha256, entry.Version);
             }
-            else
+            else if (entry.Version == planned)
             {
                 _logger.LogInformation("前回の Push は反映されていませんでした (版 {Version} は別の PC のもの) ({Tool})", planned, service.ToolKey);
                 _baseSummaries.DiscardUncommittedPushed(stateKey);

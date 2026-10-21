@@ -414,18 +414,21 @@ public sealed class FriendConnectSyncService : ISyncService
                 shouldBackupFile: path => !PullStaging.IsIncomingFile(path));
         }
 
-        // 本体 (db_1.1) を差し替える前に、差し替える前後の本体のハッシュを控える。本体を
+        // ローカルを書き換える前に、本体 (db_1.1) の差し替える前後のハッシュを控える。本体を
         // 差し替えた後に残りの差し替えや要約の保存で止まっても、次回に本体が差し替わったかを
-        // 見分けて、取り出した写しの要約を祖先にできる。ハッシュを取るのは DB が大きいほど
+        // 見分けて、取り出した写しの要約を祖先にできる。本体が同期先と同じで差し替えない場合も
+        // 控える。設定やメモだけの差し替えや削除で止まると、同期履歴だけが前の版に残り、記録が
+        // 無いと次の Push が通って前の版の設定などを送る。ハッシュを取るのは DB が大きいほど
         // 長いので、書き換えの確認より前に済ませる。記録を残した後、差し替える前に中止した
         // ときは、呼び出し側が記録を消す。
-        if (options.BeforeReplaceLocal is not null && staging.IsStaged(_paths.DbV11File))
+        var databaseStaged = staging.IsStaged(_paths.DbV11File);
+        if (options.BeforeReplaceLocal is not null && remoteDbV11 is not null)
         {
+            // 差し替えないなら、本体は取得を省いた時点で同期先の写しと同じ内容。
+            var localSha256 = !databaseStaged ? remoteDbV11.Sha256
+                : File.Exists(_paths.DbV11File) ? FileHasher.Sha256(_paths.DbV11File) : "";
             options.BeforeReplaceLocal(new MergePendingState(
-                pulledSummary, entry.Version,
-                File.Exists(_paths.DbV11File) ? FileHasher.Sha256(_paths.DbV11File) : "",
-                FileHasher.Sha256(staging.SourceOf(_paths.DbV11File)),
-                FromPull: true));
+                pulledSummary, entry.Version, localSha256, remoteDbV11.Sha256, FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
@@ -492,12 +495,12 @@ public sealed class FriendConnectSyncService : ISyncService
                 RemoveStaleFiles(directory, remoteDirectoryFiles[directory]);
             }
         }
-        catch (Exception) when (affected.Contains(_paths.DbV11File) && remoteDbV11 is not null && options.AfterDatabaseReplaced is not null)
+        catch (Exception) when ((affected.Contains(_paths.DbV11File) || !databaseStaged) && remoteDbV11 is not null && options.AfterDatabaseReplaced is not null)
         {
-            // 本体 (db_1.1) は差し替わり、残りの差し替えか削除で止まった。本体だけは取り出した
-            // 版なので、要約をその版へそろえてもらう。そろえないと、次の起動時 Pull が本体の
-            // 違いを手元の変更と見て見送り続け、Friend Connect はマージしないので残りを
-            // 取り込めない。
+            // 本体 (db_1.1) は取り出した版 (差し替わったか、元から同期先と同じ) で、残りの
+            // 差し替えか削除で止まった。要約をその版へそろえてもらう。そろえないと、次の起動時
+            // Pull が本体の違いを手元の変更と見て見送り続け、Friend Connect はマージしないので
+            // 残りを取り込めない。
             options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteDbV11.Sha256);
             throw;
         }

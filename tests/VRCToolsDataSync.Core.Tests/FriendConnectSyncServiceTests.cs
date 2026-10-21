@@ -231,6 +231,47 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
         Assert.Equal((1L, remoteSha256), replaced);
     }
 
+    [Fact(DisplayName = "本体が同期先と同じで設定だけの Pull が残りで止まっても、記録を残して本体の版を伝える")]
+    public void PullRecordsReplaceWhenDatabaseUnchanged()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        WriteFile(a.ConfigJsonFile, "{\"a\":1}");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+        Assert.Equal(SyncOutcome.Success, Pull(ServiceOf("b"), storage).Outcome);
+        // 同期先では設定だけが変わる。本体は同じなので差し替えない。
+        WriteFile(a.ConfigJsonFile, "{\"a\":2}");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage, lastPulled: 1).Outcome);
+        var remoteSha256 = new ManifestStore(storage).Load().Tools[FriendConnectSyncService.Key].Files
+            .Single(f => f.RelativePath == DbV11Key).Sha256;
+        File.Delete(b.ConfigJsonFile);
+        Directory.CreateDirectory(b.ConfigJsonFile);
+        MergePendingState? pending = null;
+        (long Version, string Sha256)? replaced = null;
+
+        Assert.Throws<IOException>(() => ServiceOf("b").Pull(new PullOptions
+        {
+            Storage = storage,
+            SkipBackup = true,
+            LastPulledVersion = 1,
+            BeforeReplaceLocal = state => pending = state,
+            AfterDatabaseReplaced = (version, _, sha256) => replaced = (version, sha256),
+        }));
+
+        // 本体は元から同期先の写しと同じなので、前後のハッシュは同じ値。残りで止まったら
+        // 本体の版を伝える。記録が無いと、次の Push が前の版の設定を送る。
+        Assert.NotNull(pending);
+        Assert.Equal(2, pending!.RemoteVersion);
+        Assert.Equal(remoteSha256, pending.LocalSha256);
+        Assert.Equal(remoteSha256, pending.MergedSha256);
+        Assert.True(pending.FromPull);
+        Assert.Equal((2L, remoteSha256), replaced);
+    }
+
     [Fact(DisplayName = "記録を残している間に本体が書き換えられたら、差し替える前に中止する")]
     public void PullAbortsWhenDatabaseChangesWhileRecordingReplace()
     {

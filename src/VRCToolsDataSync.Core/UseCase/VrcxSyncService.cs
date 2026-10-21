@@ -386,18 +386,21 @@ public sealed class VrcxSyncService : IMergeableSyncService
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
 
-        // 本体を差し替える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
+        // ローカルを書き換える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
         // 設定の差し替えや要約の保存で止まっても、次回に本体が差し替わったかを見分けて、
-        // 取り出した写しの要約を祖先にできる。ハッシュを取るのは DB が大きいほど長いので、
-        // 書き換えの確認より前に済ませる。記録を残した後、差し替える前に中止したときは、
-        // 呼び出し側が記録を消す。
-        if (options.BeforeReplaceLocal is not null && staging.IsStaged(_paths.SqliteFile))
+        // 取り出した写しの要約を祖先にできる。本体が同期先と同じで差し替えない場合も控える。
+        // 設定だけの差し替えや削除で止まると、同期履歴だけが前の版に残り、記録が無いと次の
+        // Push が競合から自動マージへ進んで前の版の設定を送る。ハッシュを取るのは DB が
+        // 大きいほど長いので、書き換えの確認より前に済ませる。記録を残した後、差し替える前に
+        // 中止したときは、呼び出し側が記録を消す。
+        var databaseStaged = staging.IsStaged(_paths.SqliteFile);
+        if (options.BeforeReplaceLocal is not null)
         {
+            // 差し替えないなら、本体は取得を省いた時点で同期先の写しと同じ内容。
+            var localSha256 = !databaseStaged ? remoteSnapshot.Sha256
+                : File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "";
             options.BeforeReplaceLocal(new MergePendingState(
-                pulledSummary, entry.Version,
-                File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "",
-                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile)),
-                FromPull: true));
+                pulledSummary, entry.Version, localSha256, remoteSnapshot.Sha256, FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
@@ -444,13 +447,13 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 File.Delete(_paths.SettingsJsonFile);
             }
         }
-        catch (Exception) when (affected.Contains(_paths.SqliteFile) && options.AfterDatabaseReplaced is not null)
+        catch (Exception) when ((affected.Contains(_paths.SqliteFile) || !databaseStaged) && options.AfterDatabaseReplaced is not null)
         {
-            // 本体は差し替わり、設定の差し替えか削除で止まった。本体だけは取り出した版なので、
-            // 要約をその版へそろえてもらう。そろえないと、次の同期が本体の違いを手元の変更と
-            // 見て、前の版を祖先に取り込んだ内容を二重に足す。設定の削除の失敗も同じ扱いに
-            // する。扱いを分けると、残った記録から本体の差し替えが済んだと見て同期履歴まで
-            // 進め、次の Push が消した設定を同期先へ送り直す。
+            // 本体は取り出した版 (差し替わったか、元から同期先と同じ) で、設定の差し替えか削除で
+            // 止まった。要約をその版へそろえてもらう。そろえないと、次の同期が本体の違いを
+            // 手元の変更と見て、前の版を祖先に取り込んだ内容を二重に足す。設定の削除の失敗も
+            // 同じ扱いにする。扱いを分けると、残った記録から本体の差し替えが済んだと見て
+            // 同期履歴まで進め、次の Push が消した設定を同期先へ送り直す。
             options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteSnapshot.Sha256);
             throw;
         }
