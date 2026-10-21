@@ -24,7 +24,7 @@ public sealed class FriendConnectSyncService : ISyncService
 
     public string ToolKey => Key;
 
-    public TrackedDatabase TrackedDatabase => new(_paths.DbV11File, MergeProfiles.FriendConnect);
+    public TrackedDatabase TrackedDatabase => new(_paths.DbV11File, MergeProfiles.FriendConnect, DbV11Key);
 
     public FriendConnectSyncService(
         FriendConnectPaths? paths = null,
@@ -423,7 +423,8 @@ public sealed class FriendConnectSyncService : ISyncService
             options.BeforeReplaceLocal(new MergePendingState(
                 pulledSummary, entry.Version,
                 File.Exists(_paths.DbV11File) ? FileHasher.Sha256(_paths.DbV11File) : "",
-                FileHasher.Sha256(staging.SourceOf(_paths.DbV11File))));
+                FileHasher.Sha256(staging.SourceOf(_paths.DbV11File)),
+                FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の

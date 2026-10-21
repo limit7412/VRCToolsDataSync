@@ -21,7 +21,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
 
     public string ToolKey => Key;
 
-    public TrackedDatabase TrackedDatabase => new(_paths.SqliteFile, MergeProfiles.Vrcx);
+    public TrackedDatabase TrackedDatabase => new(_paths.SqliteFile, MergeProfiles.Vrcx, SnapshotKey);
 
     public VrcxSyncService(VrcxPaths? paths = null, LocalBackup? backup = null, ILogger<VrcxSyncService>? logger = null)
     {
@@ -395,7 +395,8 @@ public sealed class VrcxSyncService : IMergeableSyncService
             options.BeforeReplaceLocal(new MergePendingState(
                 pulledSummary, entry.Version,
                 File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "",
-                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile))));
+                FileHasher.Sha256(staging.SourceOf(_paths.SqliteFile)),
+                FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の

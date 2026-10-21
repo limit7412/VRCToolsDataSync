@@ -319,9 +319,16 @@ public sealed record PushedRecord(
     long? PlannedVersion = null,
     PushedRecord? Previous = null);
 
+/// <summary>
+/// 置き換えの直前の記録。<paramref name="FromPull"/> が真なら Pull が本体を差し替える前に
+/// 書いた記録。Pull は本体の後に設定などの残りも差し替えるので、本体が差し替わった後に
+/// 止まっていても、残りをそろえるまで同期履歴は進めない。マージの記録 (偽) は本体を
+/// 置き換えれば済むので、置き換わっていれば同期履歴もそろえる。
+/// </summary>
 public sealed record MergePendingState(
     DatabaseSummary? Summary,
     long RemoteVersion,
     string LocalSha256,
     string MergedSha256,
-    string? AsideSuffix = null);
+    string? AsideSuffix = null,
+    bool FromPull = false);
