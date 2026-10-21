@@ -101,6 +101,13 @@ public sealed class PushOptions
     public long? LastPulledVersion { get; init; }
 
     /// <summary>
+    /// この Push を見分ける値。manifest の項目 (<see cref="ToolManifestEntry.PushId"/>) に書く。
+    /// 呼び出し側は <see cref="BeforeCommit"/> で控える記録にも同じ値を残し、反映されたか
+    /// 分からないまま止まった後に、同期先の項目と照らして確かめる。
+    /// </summary>
+    public string? PushId { get; init; }
+
+    /// <summary>
     /// 送る DB の写しを同期先へ書き込む直前に呼ぶ。引数は写しの SHA-256 と、その要約と、
     /// manifest で取る予定の version (強制 Push では決まらないので null)。送った後に同期履歴を
     /// 保存する前に止まっても、次のマージで同期先に送った内容が入っていると見分けるために控える。

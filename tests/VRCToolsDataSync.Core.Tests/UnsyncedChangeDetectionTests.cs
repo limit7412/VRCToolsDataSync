@@ -1581,17 +1581,82 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         // この Push が通り、前の版の設定で同期先の新しい設定を上書きする。
         var push = Push(b);
 
-        Assert.Equal(SyncOutcome.ConflictDetected, push.Outcome);
+        Assert.Equal(SyncOutcome.Aborted, push.Outcome);
+        Assert.Contains("Pull", push.Message);
         Assert.Equal(pushed.RemoteVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
         Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
         Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
-        Assert.False(store.IsMergePending(key));
+        // 記録は残りをそろえるまで残る。
+        Assert.True(store.IsMergePending(key));
 
         // 次の起動時 Pull は、取り込んだ本体を手元の変更と見ずに残りをそろえる。
         var retried = StartupPull(b);
         Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
         Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
         Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
+
+        // そろえた後は Push も通る。
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 160");
+        var result = Push(b);
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+    }
+
+    [Fact(DisplayName = "Pull が本体を差し替えた後に止まっていれば、マージが有効でも Push は自動マージへ進まない")]
+    public void PushWithMergeEnabledDoesNotMergeOverInterruptedPull()
+    {
+        var (b, store, key, pushed, pulledBefore) = ArrangePullInterruptedAfterDatabase(mergeEnabled: true);
+
+        // 競合からの自動マージに進むと、DB をマージした後に前の版の設定を送り、同期先の新しい
+        // 設定を上書きする。
+        var push = Push(b);
+
+        Assert.Equal(SyncOutcome.Aborted, push.Outcome);
+        Assert.Equal(pushed.RemoteVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
+        Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.True(store.IsMergePending(key));
+
+        var retried = StartupPull(b);
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "初めての Pull が本体を差し替えた後に止まっても、次の起動時 Pull が残りをそろえる")]
+    public void FirstStartupPullResolvesInterruptedPullRecord()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":1}");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+
+        // b はまだ一度も同期していない (同期履歴が無い)。初めての Pull が本体を差し替えた後、
+        // 設定の差し替えで止まる。
+        var b = CreateMachine("b");
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        Directory.CreateDirectory(b.Paths.SettingsJsonFile);
+        Assert.Throws<IOException>(() => b.Service.Pull(new PullOptions
+        {
+            Storage = _storage,
+            SkipBackup = true,
+            BeforeReplaceLocal = pending => store.SavePendingReplace(key, pending),
+        }));
+        Directory.Delete(b.Paths.SettingsJsonFile);
+        Assert.True(store.IsMergePending(key));
+        Assert.False(b.Settings.ToolState.ContainsKey(key));
+
+        var result = StartupPull(b);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal("{\"v\":1}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+        Assert.False(store.IsMergePending(key));
     }
 
     [Fact(DisplayName = "Pull が本体を差し替えた後に止まっていれば、マージは残りをそろえるまで中止する")]
@@ -1606,11 +1671,45 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Contains("Pull", merged.Message);
         Assert.Equal(pushed.RemoteVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version);
         Assert.Equal(pulledBefore, b.Settings.ToolState[key].LastPulledVersion);
-        Assert.False(store.IsMergePending(key));
+        Assert.True(store.IsMergePending(key));
 
         var retried = StartupPull(b);
         Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
         Assert.Equal("{\"v\":2}", File.ReadAllText(b.Paths.SettingsJsonFile));
+        Assert.False(store.IsMergePending(key));
+    }
+
+    [Fact(DisplayName = "同じ DB で別の PC が予定の版を取っていても、自分の Push が反映されたとは見ない")]
+    public void PushDoesNotTreatOtherMachinesVersionWithSameDatabaseAsOwn()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        File.WriteAllText(a.Paths.SettingsJsonFile, "{\"v\":\"a\"}");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        // b は同じ DB のまま設定だけを変えて次の版を取った。
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: true).Outcome);
+        File.WriteAllText(b.Paths.SettingsJsonFile, "{\"v\":\"b\"}");
+        var pushedByB = Push(b);
+        Assert.Equal(SyncOutcome.Success, pushedByB.Outcome);
+        var entry = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key];
+        var snapshot = entry.Files.Single(f => f.RelativePath == "vrcx/latest.sqlite3");
+        // a も同じ版を取る予定で送り、manifest を保存する前に止まっていた。DB の写しは b と同じ。
+        store.SavePushed(key, new PushedRecord(snapshot.Sha256, store.Load(key), PlannedVersion: pushedByB.RemoteVersion, PushId: "a-push"));
+
+        // 同期先の版を自分の Push と見ると、取り込み済みとして競合の検査を通り、b の設定を上書きする。
+        var result = Push(a);
+
+        Assert.Equal(SyncOutcome.ConflictDetected, result.Outcome);
+        Assert.Null(store.LoadPushed(key));
+        var settings = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Files.Single(f => f.RelativePath == "vrcx/latest.json");
+        Assert.Equal(entry.Files.Single(f => f.RelativePath == "vrcx/latest.json").Sha256, settings.Sha256);
     }
 
     [Fact(DisplayName = "反映の直後に止まった送信の記録は、起動時 Pull が同期先と照らして反映済みにする")]
@@ -1888,12 +1987,12 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         bool committed = true)
     {
         var pushedSummary = store.Load(key)!;
-        var snapshot = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Files
-            .Single(f => f.RelativePath == "vrcx/latest.sqlite3");
+        var entry = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key];
+        var snapshot = entry.Files.Single(f => f.RelativePath == "vrcx/latest.sqlite3");
         store.Save(key, before);
         store.SavePushed(key, committed
-            ? new PushedRecord(snapshot.Sha256, pushedSummary, pushedVersion, Committed: true, PlannedVersion: pushedVersion)
-            : new PushedRecord(snapshot.Sha256, pushedSummary, PlannedVersion: pushedVersion));
+            ? new PushedRecord(snapshot.Sha256, pushedSummary, pushedVersion, Committed: true, PlannedVersion: pushedVersion, PushId: entry.PushId)
+            : new PushedRecord(snapshot.Sha256, pushedSummary, PlannedVersion: pushedVersion, PushId: entry.PushId));
         a.Settings.ToolState[key].LastPulledVersion = pulledBefore;
     }
 

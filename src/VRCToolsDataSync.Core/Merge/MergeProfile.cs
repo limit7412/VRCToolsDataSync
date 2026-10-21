@@ -128,9 +128,5 @@ public sealed class MergeProfile
         = _ => (string.Empty, null);
 }
 
-/// <summary>
-/// 前回同期時点の要約を取る DB の場所と、その規則の組。<paramref name="RemoteKey"/> は、その DB の
-/// 写しが manifest に載る位置。送った写しの記録が反映されたかを、manifest の写しのハッシュと
-/// 照らして確かめるのに使う。
-/// </summary>
-public sealed record TrackedDatabase(string Path, MergeProfile Profile, string? RemoteKey = null);
+/// <summary>前回同期時点の要約を取る DB の場所と、その規則の組。</summary>
+public sealed record TrackedDatabase(string Path, MergeProfile Profile);

@@ -317,7 +317,8 @@ public sealed record PushedRecord(
     long? Version = null,
     bool Committed = false,
     long? PlannedVersion = null,
-    PushedRecord? Previous = null);
+    PushedRecord? Previous = null,
+    string? PushId = null);
 
 /// <summary>
 /// 置き換えの直前の記録。<paramref name="FromPull"/> が真なら Pull が本体を差し替える前に

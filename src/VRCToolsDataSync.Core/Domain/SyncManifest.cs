@@ -47,6 +47,14 @@ public sealed class ToolManifestEntry
     /// null も引き継ぎ、強制 Push が値を書き直すまで確かめられないままにする。
     /// </summary>
     public long? LastForcedVersion { get; set; }
+
+    /// <summary>
+    /// この項目を書いた Push を見分ける値。送った PC が送る前に決めて記録に控え、manifest を
+    /// 保存した直後に止まっても、次回に同期先の項目がその Push のものかを確かめられる。
+    /// 同じ版を別の PC が同じ DB で取ることがあり、DB の写しのハッシュでは見分けられない。
+    /// null は、この項目を知らない古い版のツールが書いた項目。
+    /// </summary>
+    public string? PushId { get; set; }
 }
 
 public sealed class ManifestFile

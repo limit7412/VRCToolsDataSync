@@ -112,7 +112,7 @@ public sealed class SyncRunner
             // 退けた WAL が残っていれば戻してから送る。戻さずに送ると、WAL にしか無い手元の
             // 変更を含まない本体が送られ、送った後に記録が消えて戻せなくなる。戻せなければ
             // 送らない。置き換えの前後を見分けられない状態からは、強制 Push で抜け出せる。
-            var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false, force: force || reuploadAll);
+            var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false, force: force || reuploadAll, caller: RecoveryCaller.Push);
             if (recovered.Abort is not null) return recovered.Abort;
             ConfirmPushedRecord(service, storage, stateKey);
             // 前回の Push が反映された後に要約を保存できていないと、同期履歴は送る前の版のまま。
@@ -124,6 +124,9 @@ public sealed class SyncRunner
             {
                 pulledVersion = syncedVersion;
             }
+            // この Push を見分ける値。manifest の項目と送信の記録の両方に残し、反映されたか
+            // 分からないまま止まった後に、同期先の項目がこの Push のものかを確かめる。
+            var pushId = Guid.NewGuid().ToString("N");
             var result = service.Push(new PushOptions
             {
                 Storage = storage,
@@ -131,10 +134,11 @@ public sealed class SyncRunner
                 ForceOverwriteOnConflict = force || reuploadAll,
                 ReuploadAll = reuploadAll,
                 LastPulledVersion = pulledVersion == 0 ? null : pulledVersion,
+                PushId = pushId,
                 // 控えられなければ送らない (サービス側が中止する)。送った後に要約の保存にも
                 // 失敗すると、次のマージが送った内容を見分けられない。
                 BeforeCommit = (sha256, summary, planned) =>
-                    _baseSummaries.BeginPushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned)),
+                    _baseSummaries.BeginPushed(stateKey, new PushedRecord(sha256, summary, PlannedVersion: planned, PushId: pushId)),
                 AfterCommit = (sha256, version) => TryMarkPushedCommitted(stateKey, sha256, version),
                 // 反映しなかった送信の記録は捨てる。残すと、同期先が進んだときに反映されたか
                 // 分からない記録として扱われ、マージが止まる。
@@ -216,10 +220,12 @@ public sealed class SyncRunner
             // 前回のマージか Pull が置き換えの前後で止まっていれば、先にそろえる。Pull が本体を
             // 差し替えた後に止まっていた場合は、祖先だけが本体の版になり、この Pull が残りを
             // そろえる。見分けられなければ、手元の変更ありとして見送るのではなく、理由を添えて止める。
-            if (state is not null && _baseSummaries.LoadPendingReplace(stateKey) is not null)
+            // 初めての Pull が止まった場合は同期履歴がまだ無いので、空の同期履歴で解決する。
+            if (_baseSummaries.LoadPendingReplace(stateKey) is not null)
             {
-                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun: false);
+                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state ?? new ToolSyncState(), dryRun: false, caller: RecoveryCaller.Pull);
                 if (recovered.Abort is not null) return recovered.Abort;
+                state ??= settings.ToolState.GetValueOrDefault(stateKey);
             }
             // 起動時の自動 Pull は、送った写しの記録と比べて手元の変更を見つける。反映の直後に
             // 止まって反映済みと記録できていなければ、同期先と照らして先に確かめる。
@@ -407,7 +413,7 @@ public sealed class SyncRunner
             {
                 var state = ResolveState(settings, storage, service.ToolKey, out var stateKey) ?? new ToolSyncState();
                 // 前回のマージが置き換えの前後で止まっていれば、先に祖先をそろえる。
-                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun, forMerge: true);
+                var recovered = ResolveInterruptedReplace(service, settings, stateKey, state, dryRun, caller: RecoveryCaller.Merge);
                 if (recovered.Abort is not null) return (WithBackupPath(recovered.Abort, firstBackupPath), attempt > 1);
                 var previousBaseline = recovered.Baseline ?? _baseSummaries.Load(stateKey);
                 var previousPulledVersion = recovered.PulledVersion ?? state.LastPulledVersion;
@@ -530,13 +536,14 @@ public sealed class SyncRunner
     /// 正として送ると選んだのだから中止しない。退けた WAL を戻せない状態は、WAL にしか無い
     /// 変更を失うので強制 Push でも中止する。
     /// </param>
-    /// <param name="forMerge">
-    /// マージから呼ぶなら真。Pull が本体を差し替えた後、残りの差し替えの前に止まっていれば中止する。
-    /// マージは設定などに触れず、続く Push が手元の設定を送るので、そのまま進むと同期先の新しい
-    /// 設定を前の版の設定で上書きする。
+    /// <param name="caller">
+    /// どの操作から呼ぶか。Pull が本体を差し替えた後、残りの差し替えの前に止まっていた場合の扱いが
+    /// 違う。Pull はそのまま残りをそろえる。マージは設定などに触れず、続く Push が手元の設定を
+    /// 送るので中止する。Push も、前の版の設定などで同期先を上書きしないよう中止する (強制 Push は
+    /// 利用者が手元を正として送ると選んだので送る)。
     /// </param>
     private (SyncResult? Abort, DatabaseSummary? Baseline, long? PulledVersion) ResolveInterruptedReplace(
-        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun, bool force = false, bool forMerge = false)
+        ISyncService service, SyncSettings settings, string stateKey, ToolSyncState state, bool dryRun, bool force = false, RecoveryCaller caller = RecoveryCaller.Push)
     {
         var pending = _baseSummaries.LoadPendingReplace(stateKey);
         if (pending is null)
@@ -567,27 +574,32 @@ public sealed class SyncRunner
                 // Pull が本体を差し替えた後、残りの差し替えの前に止まった。本体は取り出した版なので
                 // 要約だけをその版へそろえ、同期履歴は進めない。進めると、次の起動時 Pull が
                 // 取り込み済みと見て残りをやり直さず、前の版の設定などを次の Push で同期先へ送る。
-                // 要約が同期履歴より新しければ、起動時 Pull は要約と比べて手元の変更を見つけ、
-                // 無ければ残りをやり直す。Push は同期先の方が新しいので競合として止まる。
+                // 記録は残りをそろえる Pull が済むまで消さない。消すと、競合した Push から続く
+                // 自動マージが止まらず、マージした DB と前の版の設定を送る。起動時 Pull は記録の
+                // 要約と比べて手元の変更を見つけ、無ければ残りをやり直す。
                 _logger.LogInformation("前回の Pull は本体を差し替えた後に止まっていました。祖先を本体の版にそろえ、残りは次の Pull で差し替えます ({Tool})", service.ToolKey);
                 if (pending.Summary is not null) pending.Summary.RemoteVersion = pending.RemoteVersion;
                 if (!dryRun)
                 {
                     if (pending.Summary is null) _baseSummaries.Delete(stateKey);
                     else _baseSummaries.Save(stateKey, pending.Summary);
-                    TryClearMergePending(stateKey);
                 }
-                if (forMerge)
+                if (caller == RecoveryCaller.Pull) return (null, null, null);
+                if (force)
                 {
-                    return (new SyncResult
-                    {
-                        Outcome = SyncOutcome.Aborted,
-                        Message = $"前回の Pull (版 {pending.RemoteVersion}) が DB の本体を差し替えた後、設定などの残りを差し替える前に止まっています。" +
-                                  "マージは設定に触れず、続く Push が手元の設定を送るので、同期先の設定を前の版のもので上書きしないよう中止しました。" +
-                                  "先に Pull (起動時の自動 Pull でも可) で残りをそろえてください",
-                    }, null, null);
+                    // 利用者が手元の内容を正として送ると選んだ。送った後に記録は消える。
+                    _logger.LogWarning("前回の Pull が本体を差し替えた後に止まっていますが、強制 Push なので手元の内容をそのまま送ります ({Tool})", service.ToolKey);
+                    return (null, null, null);
                 }
-                return (null, null, null);
+                return (new SyncResult
+                {
+                    Outcome = SyncOutcome.Aborted,
+                    Message = $"前回の Pull (版 {pending.RemoteVersion}) が DB の本体を差し替えた後、設定などの残りを差し替える前に止まっています。" +
+                              (caller == RecoveryCaller.Merge
+                                  ? "マージは設定に触れず、続く Push が手元の設定を送るので、同期先の設定を前の版のもので上書きしないよう中止しました。"
+                                  : "そのまま送ると前の版の設定などで同期先を上書きするので、Push を中止しました。") +
+                              "先に Pull (起動時の自動 Pull でも可) で残りをそろえてください。手元の内容を正として送るなら、非常用の強制 Push をしてください",
+                }, null, null);
             }
             // 置き換えた後、要約と同期履歴を保存する前に止まった。その保存をここで終える。
             _logger.LogInformation("前回のマージは置き換えた後に止まっていました。祖先と同期履歴をそろえます ({Tool})", service.ToolKey);
@@ -685,7 +697,7 @@ public sealed class SyncRunner
     /// <summary>
     /// 反映されたか分からないまま残った送信の記録を、同期先の manifest と照らして確かめる。
     /// manifest を保存した直後、反映済みと記録する前に止まると、記録は予定の版を持ったまま
-    /// 未反映として残る。同期先が予定の版で、追跡する DB の写しが送ったものなら反映済みに
+    /// 未反映として残る。同期先が予定の版で、その項目が記録と同じ Push のものなら反映済みに
     /// する。予定の版を別の PC が取っていれば、反映されなかったので捨てる。同期先が予定の版を
     /// 越えていれば見分けられないので、そのまま残す (マージが止めて知らせる)。
     /// <para>
@@ -696,15 +708,16 @@ public sealed class SyncRunner
     /// </summary>
     private void ConfirmPushedRecord(ISyncService service, ISyncStorage storage, string stateKey)
     {
-        if (_baseSummaries.LoadPushed(stateKey) is not { Committed: false, PlannedVersion: long planned } record) return;
-        if (service.TrackedDatabase is not { RemoteKey: { } remoteKey }) return;
+        // Push を見分ける値の無い記録は、古い版のツールが書いたもので確かめられない。
+        if (_baseSummaries.LoadPushed(stateKey) is not { Committed: false, PlannedVersion: long planned, PushId: { } pushId } record) return;
         try
         {
             if (!new ManifestStore(storage).Load().Tools.TryGetValue(service.ToolKey, out var entry)) return;
             if (entry.Version != planned) return;
-            var sent = entry.Files.Any(f =>
-                string.Equals(f.RelativePath, remoteKey, StringComparison.Ordinal)
-                && string.Equals(f.Sha256, record.Sha256, StringComparison.OrdinalIgnoreCase));
+            // 同じ版を別の PC が同じ DB で取ると、DB の写しのハッシュでは見分けられず、設定や
+            // メモが違う版を自分の Push と見て、次の Push がそれらを上書きする。Push を見分ける
+            // 値で照らす。
+            var sent = string.Equals(entry.PushId, pushId, StringComparison.Ordinal);
             if (sent)
             {
                 _logger.LogInformation("前回の Push (版 {Version}) は同期先に反映されていました ({Tool})", planned, service.ToolKey);
@@ -720,6 +733,14 @@ public sealed class SyncRunner
         {
             _logger.LogWarning(ex, "送った写しの記録を同期先と照らして確かめられませんでした ({Tool})", service.ToolKey);
         }
+    }
+
+    /// <summary><see cref="ResolveInterruptedReplace"/> を呼ぶ操作。</summary>
+    private enum RecoveryCaller
+    {
+        Push,
+        Merge,
+        Pull,
     }
 
     private void TryMarkPushedCommitted(string stateKey, string sha256, long version)
@@ -863,13 +884,31 @@ public sealed class SyncRunner
         try
         {
             if (!File.Exists(tracked.Path)) return Array.Empty<string>();
+            DatabaseSummary? baseline;
             if (_baseSummaries.IsMergePending(stateKey))
             {
-                // マージ結果で置き換えた後、要約か同期履歴を保存し終える前に止まった。
-                // 要約が当てにならないので、比べずに手元の変更があるものとして扱う。
-                return new[] { "前回のマージか Pull が途中で止まりました" };
+                if (_baseSummaries.LoadPendingReplace(stateKey) is { FromPull: true } pending
+                    && string.Equals(FileHasher.Sha256(tracked.Path), pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Pull が本体を差し替えた後、残りの差し替えの前に止まった。本体は取り出した
+                    // 写しそのものなので、その要約と比べれば手元の変更を見つけられる。記録は残りを
+                    // そろえる Pull が済むまで残すので、ここで手元の変更ありと見ると進めない。
+                    _logger.LogInformation("前回の Pull が本体を差し替えた後に止まっているので、取り出した写しの要約 (版 {Version}) と比べます ({Tool})", pending.RemoteVersion, service.ToolKey);
+                    if (pending.Summary is null) return Array.Empty<string>();
+                    pending.Summary.RemoteVersion = pending.RemoteVersion;
+                    baseline = pending.Summary;
+                }
+                else
+                {
+                    // マージ結果で置き換えた後、要約か同期履歴を保存し終える前に止まった。
+                    // 要約が当てにならないので、比べずに手元の変更があるものとして扱う。
+                    return new[] { "前回のマージか Pull が途中で止まりました" };
+                }
             }
-            var baseline = _baseSummaries.Load(stateKey);
+            else
+            {
+                baseline = _baseSummaries.Load(stateKey);
+            }
             // 送った写し (か、要約を保存できなかった Pull の写し) の記録が反映済みで、要約より
             // 新しければ、ローカルはその写しに手元の変更を足したもの。要約の保存に失敗した後も
             // 起動時 Pull が進めるよう、その写しの要約と比べる。

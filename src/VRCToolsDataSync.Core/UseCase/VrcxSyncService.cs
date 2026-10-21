@@ -21,7 +21,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
 
     public string ToolKey => Key;
 
-    public TrackedDatabase TrackedDatabase => new(_paths.SqliteFile, MergeProfiles.Vrcx, SnapshotKey);
+    public TrackedDatabase TrackedDatabase => new(_paths.SqliteFile, MergeProfiles.Vrcx);
 
     public VrcxSyncService(VrcxPaths? paths = null, LocalBackup? backup = null, ILogger<VrcxSyncService>? logger = null)
     {
@@ -200,6 +200,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 // この項目を知らない古い版のツールが書いたことを表し、通常の Push で 0 にすると、
                 // 古いツールの強制 Push があったかを後から確かめられなくなる。
                 LastForcedVersion = forced ? version : existing is null ? 0 : existing.LastForcedVersion,
+                PushId = options.PushId,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
