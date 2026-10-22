@@ -77,6 +77,23 @@ public sealed class DatabaseSummaryTests : IDisposable
         Assert.DoesNotContain("cache_world", baseline.Tables.Keys);
     }
 
+    [Fact(DisplayName = "列を残していない古い要約と列を持つ要約は、内容が同じでも違いとして扱う")]
+    public void OldSummaryWithoutColumnsIsTreatedAsChanged()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+        baseline.Tables["memos"].Columns = null;
+        baseline.Tables["gamelog_location"].Columns = null;
+
+        var current = Summarize(path, MergeProfiles.Vrcx);
+        Assert.Equal(new[] { "gamelog_location", "memos" }, current.FindChangedTables(baseline));
+
+        // 双方が古い要約なら、従来どおり内容だけを比べる。
+        current.Tables["memos"].Columns = null;
+        current.Tables["gamelog_location"].Columns = null;
+        Assert.Empty(current.FindChangedTables(baseline));
+    }
+
     [Fact(DisplayName = "VRCX: 履歴の追加とメモの編集とお気に入りの削除を、それぞれ拾う")]
     public void VrcxDetectsChanges()
     {
@@ -102,6 +119,39 @@ public sealed class DatabaseSummaryTests : IDisposable
 
         // VRCX はワールドを出たときに、入ったときの行へ滞在時間を書き込む。行は増えない。
         Exec(path, "UPDATE gamelog_location SET time = 3600000 WHERE created_at = '2026-10-01T00:00:00Z'");
+
+        Assert.Equal(
+            new[] { "gamelog_location" },
+            Summarize(path, MergeProfiles.Vrcx).FindChangedTables(baseline));
+    }
+
+    [Fact(DisplayName = "VRCX: 古い形式のユーザー ID の接頭辞を持つテーブルも対象にする")]
+    public void VrcxMatchesLegacyUserPrefix()
+    {
+        var path = CreateVrcx();
+        // 古いアカウントの ID は英数字で、先頭が数字なら VRCX が _ を付ける。
+        Exec(path, """
+            CREATE TABLE _8YwQ1aBcDe_feed_gps (id INTEGER PRIMARY KEY, created_at TEXT, user_id TEXT, display_name TEXT, location TEXT, world_name TEXT, previous_location TEXT, time INTEGER, group_name TEXT);
+            CREATE TABLE AbCdEfGhIj_notifications_v2 (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, expires_at TEXT, type TEXT, link TEXT, link_text TEXT, message TEXT, title TEXT, image_url TEXT, seen INTEGER, sender_user_id TEXT, sender_username TEXT, data TEXT, responses TEXT, details TEXT);
+            """);
+
+        var summary = Summarize(path, MergeProfiles.Vrcx);
+
+        Assert.Contains("_8YwQ1aBcDe_feed_gps", summary.Tables.Keys);
+        Assert.Contains("AbCdEfGhIj_notifications_v2", summary.Tables.Keys);
+    }
+
+    [Fact(DisplayName = "VRCX: 履歴のテーブルに列が増えたら、変更として拾う")]
+    public void VrcxDetectsAddedColumnInAppendOnly()
+    {
+        var path = CreateVrcx();
+        var baseline = Summarize(path, MergeProfiles.Vrcx);
+
+        // 増えた列だけを既存行に書いても、追加専用の要約の行数やハッシュは変わらない。
+        Exec(path, """
+            ALTER TABLE gamelog_location ADD COLUMN note TEXT;
+            UPDATE gamelog_location SET note = 'n';
+            """);
 
         Assert.Equal(
             new[] { "gamelog_location" },

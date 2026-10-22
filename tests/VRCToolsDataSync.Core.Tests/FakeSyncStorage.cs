@@ -122,9 +122,19 @@ internal sealed class FakeSyncStorage : ISyncStorage
         return staged;
     }
 
+    /// <summary>
+    /// <see cref="TryDownload"/> の直前に呼ばれる。取得の間にツールがローカルの DB を
+    /// 書き換える状況を作る。
+    /// </summary>
+    public Action<string>? OnDownload { get; set; }
+
+    /// <summary>真なら、次の <see cref="IStagedUpload.Commit"/> が失敗する。送信の途中の失敗を作る。</summary>
+    public bool FailNextCommit { get; set; }
+
     public bool TryDownload(string key, string localPath)
     {
         if (!_objects.TryGetValue(key, out var entry)) return false;
+        OnDownload?.Invoke(key);
         File.WriteAllBytes(localPath, entry.Content);
         return true;
     }
@@ -252,6 +262,11 @@ internal sealed class FakeSyncStorage : ISyncStorage
         public void Commit(string key)
         {
             _storage.Calls.Add("Commit:" + key);
+            if (_storage.FailNextCommit)
+            {
+                _storage.FailNextCommit = false;
+                throw new SyncStorageException($"送信できません (テスト): {key}");
+            }
             _storage._objects[key] = new StoredEntry(File.ReadAllBytes(LocalPath), _storage.Now);
             _committed = true;
             Cleanup();

@@ -11,45 +11,58 @@ namespace VRCToolsDataSync.Core.Merge;
 /// </summary>
 public static class MergeProfiles
 {
-    /// <summary>VRCX がユーザーごとに付けるテーブル名の接頭辞 (例: usr0123abcd..._feed_gps)。</summary>
-    private const string UserPrefix = "usr[0-9a-f]+_";
+    /// <summary>
+    /// VRCX がユーザーごとに付けるテーブル名の接頭辞。VRCX はユーザー ID から <c>-</c> と
+    /// <c>_</c> を除いたものを使い、先頭が数字なら <c>_</c> を付ける (index.js の
+    /// initUserTables)。今の ID は usr0123abcd... の形だが、古いアカウントの ID は
+    /// 8Yw... のような英数字なので、それも合わせる。
+    /// </summary>
+    private const string UserPrefix = "_?[0-9A-Za-z]+_";
 
     public static MergeProfile Vrcx { get; } = new()
     {
         ToolKey = "vrcx",
+        SupportsMerge = true,
         Rules = new MergeTableRule[]
         {
             // VRChat のログから作る履歴。UNIQUE 制約の列をそのままキーにする。
-            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" },
+            new("gamelog_location", MergeTableKind.AppendOnly, new[] { "created_at", "location" }, OrderColumn: "created_at",
                 GrowingColumns: new[] { "time" }),
-            new("gamelog_join_leave", MergeTableKind.AppendOnly, new[] { "created_at", "type", "display_name" }),
-            new("gamelog_portal_spawn", MergeTableKind.AppendOnly, new[] { "created_at", "display_name" }),
-            new("gamelog_video_play", MergeTableKind.AppendOnly, new[] { "created_at", "video_url" }),
-            new("gamelog_resource_load", MergeTableKind.AppendOnly, new[] { "created_at", "resource_url" }),
-            new("gamelog_event", MergeTableKind.AppendOnly, new[] { "created_at", "data" }),
-            new("gamelog_external", MergeTableKind.AppendOnly, new[] { "created_at", "message" }),
+            new("gamelog_join_leave", MergeTableKind.AppendOnly, new[] { "created_at", "type", "display_name" }, OrderColumn: "created_at"),
+            new("gamelog_portal_spawn", MergeTableKind.AppendOnly, new[] { "created_at", "display_name" }, OrderColumn: "created_at"),
+            new("gamelog_video_play", MergeTableKind.AppendOnly, new[] { "created_at", "video_url" }, OrderColumn: "created_at"),
+            new("gamelog_resource_load", MergeTableKind.AppendOnly, new[] { "created_at", "resource_url" }, OrderColumn: "created_at"),
+            new("gamelog_event", MergeTableKind.AppendOnly, new[] { "created_at", "data" }, OrderColumn: "created_at"),
+            new("gamelog_external", MergeTableKind.AppendOnly, new[] { "created_at", "message" }, OrderColumn: "created_at"),
 
             // フレンドの動きの履歴。UNIQUE 制約が無いので、キーは本ツールで決める。
-            new(UserPrefix + "feed_gps", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "location" }),
-            new(UserPrefix + "feed_status", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "status" }),
-            new(UserPrefix + "feed_bio", MergeTableKind.AppendOnly, new[] { "created_at", "user_id" }),
-            new(UserPrefix + "feed_avatar", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "avatar_name" }),
-            new(UserPrefix + "feed_online_offline", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }),
-            new(UserPrefix + "friend_log_history", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }),
+            new(UserPrefix + "feed_gps", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "location" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_status", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "status" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_bio", MergeTableKind.AppendOnly, new[] { "created_at", "user_id" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_avatar", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "avatar_name" }, OrderColumn: "created_at"),
+            new(UserPrefix + "feed_online_offline", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
+            new(UserPrefix + "friend_log_history", MergeTableKind.AppendOnly, new[] { "created_at", "user_id", "type" }, OrderColumn: "created_at"),
             new(UserPrefix + "notifications", MergeTableKind.AppendOnly, new[] { "id" },
                 GrowingColumns: new[] { "expired" }),
 
             // 新しい形式の通知。VRCX は同じ id の行を上書きし、既読や期限を書き換え、
             // 利用者の操作で消す。追加専用ではないので、キー付きとして扱う。
-            new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at"),
+            // 既読 (seen) と期限切れ (expires_at を現在時刻に早める) は updated_at を
+            // 変えないので、両方が書き換えていたら、どちらの行を残してもこの 2 列は合成する。
+            new(UserPrefix + "notifications_v2", MergeTableKind.Keyed, new[] { "id" }, EditedAtColumn: "updated_at",
+                GrowingColumns: new[] { "seen" }, ShrinkingColumns: new[] { "expires_at" }),
 
             // 着用したアバターの履歴。VRCX はアバターごとに 1 行を持ち、着け直すと
-            // created_at を、着用時間が延びると time を書き換える。両方の PC で書き換えて
-            // いたら、最後に着けた方 (created_at の新しい方) の行を残す。
-            new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at"),
+            // created_at を書き換え、着用時間 (time) は累計に足していく。両方の PC で
+            // 書き換えていたら、created_at は新しい方を残し、time は双方の増分を足す。
+            new(UserPrefix + "avatar_history", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "created_at",
+                GrowingColumns: new[] { "created_at" }, CounterColumns: new[] { "time" }),
 
             // ユーザーが手で編集するもの。
             new("memos", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "edited_at"),
+            // VRChat 側に保存するユーザーのメモの写し。VRCX は addUserNote で同じ user_id の行を
+            // 上書きし、deleteUserNote で消す (memos.js)。created_at は VRChat が付けた時刻。
+            new(UserPrefix + "notes", MergeTableKind.Keyed, new[] { "user_id" }, EditedAtColumn: "created_at"),
             new("world_memos", MergeTableKind.Keyed, new[] { "world_id" }, EditedAtColumn: "edited_at"),
             new("avatar_memos", MergeTableKind.Keyed, new[] { "avatar_id" }, EditedAtColumn: "edited_at"),
             new("avatar_tags", MergeTableKind.Keyed, new[] { "avatar_id", "tag" }),

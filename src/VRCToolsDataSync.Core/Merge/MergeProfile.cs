@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
@@ -42,10 +44,28 @@ public enum MergeTableKind
 /// <see cref="MergeTableKind.Watched"/> で比べない列。アプリが自動で書き換える
 /// 時刻列や、作り直しで変わる id を外す。
 /// </param>
+/// <param name="OrderColumn">
+/// <see cref="MergeTableKind.AppendOnly"/> で、出来事の順序を表す列。行を足した後、
+/// id の順がこの列の順と合うように振り直す。VRCX は id の大きい行を「最新」と
+/// して扱うため、古い出来事を後から足すと最新として表示されてしまう。
+/// </param>
 /// <param name="GrowingColumns">
 /// <see cref="MergeTableKind.AppendOnly"/> で、既存行に後から書き込まれる列。VRCX は
 /// ワールドを出たときに gamelog_location の滞在時間 (time) を書き込み、通知を期限切れに
 /// したときに expired を 1 にする。どちらも値が増える方向にしか変わらない。
+/// <see cref="MergeTableKind.Keyed"/> では、両方が同じキーを書き換えていたときに、
+/// どちらの行を残してもこの列は大きい方の値にする。既読の印のように、編集時刻を
+/// 更新せずに書き換わる列を、もう一方の編集で巻き戻さないため。
+/// </param>
+/// <param name="ShrinkingColumns">
+/// <see cref="MergeTableKind.Keyed"/> で、両方が同じキーを書き換えていたときに小さい方の
+/// 値を残す列。NULL は値が無いものとして扱う。VRCX は通知を期限切れにするとき、
+/// 期限 (expires_at) をその時刻に早める。
+/// </param>
+/// <param name="CounterColumns">
+/// <see cref="MergeTableKind.Keyed"/> で、各 PC が自分の使った分を足していく累計の列。
+/// 両方が同じキーを書き換えていたら、祖先の値に双方の増分を足した値にする。大きい方を
+/// 残すと、少ない側の PC で足した分が失われる。祖先の値が要約に無ければ大きい方を残す。
 /// </param>
 public sealed record MergeTableRule(
     string NamePattern,
@@ -55,7 +75,10 @@ public sealed record MergeTableRule(
     string? EditedAtColumn = null,
     string? Filter = null,
     IReadOnlyList<string>? IgnoredColumns = null,
-    IReadOnlyList<string>? GrowingColumns = null)
+    string? OrderColumn = null,
+    IReadOnlyList<string>? GrowingColumns = null,
+    IReadOnlyList<string>? ShrinkingColumns = null,
+    IReadOnlyList<string>? CounterColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
@@ -63,14 +86,38 @@ public sealed record MergeTableRule(
 }
 
 /// <summary>
-/// ツールごとのマージの規則一式。今は前回同期時点の要約 (<see cref="DatabaseSummary"/>)
-/// を取るためだけに使い、行の書き込みはまだ行わない。
+/// ツールごとのマージの規則一式。前回同期時点の要約 (<see cref="DatabaseSummary"/>) と、
+/// 行を合成するマージ (<see cref="SqliteMerger"/>) の両方がこれに従う。
 /// </summary>
 public sealed class MergeProfile
 {
     public required string ToolKey { get; init; }
 
     public required IReadOnlyList<MergeTableRule> Rules { get; init; }
+
+    private string? _rulesDigest;
+
+    /// <summary>
+    /// 規則一式を表すハッシュ。要約に残し、要約を取ったときと今とで規則が同じかを見分ける。
+    /// 規則に無いテーブルは要約に入らないので、規則を増やした後の最初のマージでは、
+    /// 前回の要約にそのテーブルの祖先が無い。
+    /// </summary>
+    public string RulesDigest => _rulesDigest ??= ComputeRulesDigest();
+
+    private string ComputeRulesDigest()
+    {
+        static string Columns(IReadOnlyList<string>? columns) => columns is null ? "-" : string.Join(",", columns);
+        var text = string.Join("\n", Rules.Select(r => string.Join("|",
+            r.NamePattern, r.Kind.ToString(), Columns(r.KeyColumns), Columns(r.ValueColumns),
+            r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
+            Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns))));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// 行を書き込むマージを許すか。false のツールは要約による検知だけを行う。
+    /// </summary>
+    public bool SupportsMerge { get; init; }
 
     /// <summary>
     /// DB のスキーマが本ツールの対応している版かを確かめる。対応していれば

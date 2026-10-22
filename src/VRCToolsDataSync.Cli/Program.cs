@@ -85,6 +85,42 @@ pullFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationCon
 });
 pullCommand.AddCommand(pullFriendConnectCommand);
 
+// --- merge: 置き換えの代わりに、手元の変更を足して同期する (issue #87) ---
+
+var mergeCommand = new Command("merge", "同期先の最新に手元の変更を足してから Push する (VRCX のみ)");
+
+var mergeDryRunOption = new Option<bool>(
+    aliases: new[] { "--dry-run" },
+    description: "何を足すかを数えるだけで、手元にも同期先にも書かない");
+var mergeEnableOption = new Option<bool>(
+    aliases: new[] { "--enable" },
+    description: "以後、起動時の Pull と Push の競合でマージを使うようにする (マージ自体は実行しない)");
+var mergeDisableOption = new Option<bool>(
+    aliases: new[] { "--disable" },
+    description: "以後、マージを使わず従来どおり置き換える (マージ自体は実行しない)");
+
+var mergeVrcxCommand = new Command("vrcx", "VRCX のデータをマージする");
+mergeVrcxCommand.AddOption(cloudOption);
+mergeVrcxCommand.AddOption(noBackupOption);
+mergeVrcxCommand.AddOption(mergeDryRunOption);
+mergeVrcxCommand.AddOption(mergeEnableOption);
+mergeVrcxCommand.AddOption(mergeDisableOption);
+mergeVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
+{
+    var enable = ctx.ParseResult.GetValueForOption(mergeEnableOption);
+    var disable = ctx.ParseResult.GetValueForOption(mergeDisableOption);
+    if (enable || disable)
+    {
+        ctx.ExitCode = ConfigureMerge(enable, disable);
+        return;
+    }
+    ctx.ExitCode = RunMerge(
+        ctx.ParseResult.GetValueForOption(cloudOption),
+        ctx.ParseResult.GetValueForOption(noBackupOption),
+        ctx.ParseResult.GetValueForOption(mergeDryRunOption));
+});
+mergeCommand.AddCommand(mergeVrcxCommand);
+
 var statusCommand = new Command("status", "現在の同期設定と最後の同期情報を表示");
 statusCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
@@ -242,6 +278,7 @@ selfUpdateCommand.AddCommand(selfUpdateApplyCommand);
 
 rootCommand.AddCommand(pushCommand);
 rootCommand.AddCommand(pullCommand);
+rootCommand.AddCommand(mergeCommand);
 rootCommand.AddCommand(statusCommand);
 rootCommand.AddCommand(storageCommand);
 rootCommand.AddCommand(selfUpdateCommand);
@@ -416,6 +453,95 @@ static int RunPull(
     }
 }
 
+static int ConfigureMerge(bool enable, bool disable)
+{
+    if (enable && disable)
+    {
+        Console.Error.WriteLine("--enable と --disable は同時に指定できません");
+        return 2;
+    }
+    var store = new SettingsStore();
+    var settings = store.Load();
+    settings.MergeVrcx = enable;
+    store.Save(settings);
+    Console.WriteLine($"VRCX のマージ同期: {(enable ? "ON" : "OFF")}");
+    return 0;
+}
+
+static int RunMerge(string? cloudOverride, bool noBackup, bool dryRun)
+{
+    var ctx = LoadContext(cloudOverride);
+    if (ctx is null) return 2;
+    var (runner, settings, storage, loggerFactory) = ctx.Value;
+
+    try
+    {
+        var service = new VrcxSyncService(logger: loggerFactory.CreateLogger<VrcxSyncService>());
+        var result = runner.Merge(service, settings, storage, skipBackup: noBackup, dryRun: dryRun);
+
+        if (result.MergeReport is { } report)
+        {
+            foreach (var table in report.Tables.Where(t => t.Inserted + t.Updated + t.Deleted > 0))
+            {
+                Console.WriteLine(
+                    $"  {table.Table}: 追加 {table.Inserted} / 更新 {table.Updated} / 削除 {table.Deleted}" +
+                    (table.Renumbered ? " (id を振り直し)" : string.Empty) +
+                    (table.Created ? " (テーブルを作成)" : string.Empty));
+            }
+            foreach (var conflict in report.Conflicts)
+            {
+                Console.WriteLine($"  両方で編集: {conflict.Table} → {(conflict.KeptLocal ? "手元" : "同期先")}の内容を残す");
+            }
+        }
+
+        switch (result.Outcome)
+        {
+            case SyncOutcome.Success:
+                Console.WriteLine(dryRun
+                    ? $"VRCX マージ (dry-run) 土台 version={result.RemoteVersion}"
+                    : $"VRCX マージ完了 version={result.RemoteVersion}");
+                if (!string.IsNullOrEmpty(result.Message)) Console.WriteLine($"  {result.Message}");
+                if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
+                return 0;
+            case SyncOutcome.ConflictDetected:
+                Console.Error.WriteLine("マージ後の Push が他の PC の Push と競合し続けました。もう一度実行してください。");
+                return 3;
+            case SyncOutcome.NothingToDo:
+            case SyncOutcome.SourceMissing:
+                Console.Error.WriteLine(result.Message);
+                return 4;
+            default:
+                Console.Error.WriteLine($"マージできませんでした: {result.Message}");
+                return 1;
+        }
+    }
+    catch (RunningProcessException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Console.Error.WriteLine("VRCX を終了してから再実行してください。");
+        return 5;
+    }
+    catch (SyncStorageConcurrencyException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 3;
+    }
+    catch (SyncStorageException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 2;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"エラー: {ex.Message}");
+        return 1;
+    }
+    finally
+    {
+        loggerFactory.Dispose();
+    }
+}
+
 static int ShowStatus()
 {
     var store = new SettingsStore();
@@ -433,6 +559,7 @@ static int ShowStatus()
         Console.WriteLine($"  条件付き書き込み: {(s3.UseConditionalWrites ? "ON" : "OFF")}");
     }
     Console.WriteLine($"VRCX 同期: {(settings.SyncVrcx ? "ON" : "OFF")}");
+    Console.WriteLine($"VRCX のマージ同期: {(settings.MergeVrcx ? "ON" : "OFF")}");
     Console.WriteLine($"Friend Connect 同期: {(settings.SyncFriendConnect ? "ON" : "OFF")}");
     if (settings.ToolState.Count == 0)
     {

@@ -27,6 +27,9 @@ public static class SqliteSnapshot
             DataSource = sourceDbPath,
             Mode = SqliteOpenMode.ReadOnly,
             Cache = SqliteCacheMode.Shared,
+            // 接続をプールに残すと、Windows では写し元のファイルが開いたままになり、
+            // 直後に同じファイルを置き換える処理 (マージ結果の書き戻しなど) が失敗する。
+            Pooling = false,
         }.ToString();
 
         using var connection = new SqliteConnection(connectionString);

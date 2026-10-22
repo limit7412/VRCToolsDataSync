@@ -25,6 +25,13 @@ public sealed class DatabaseSummary
     /// <summary>DB のスキーマの版 (<see cref="MergeProfile.CheckSchema"/> が返したもの)。</summary>
     public string SchemaVersion { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 要約を取ったときの規則一式 (<see cref="MergeProfile.RulesDigest"/>)。無ければ、
+    /// この項目を知らない版のツールが取った要約。今の規則と違えば、規則に無かった
+    /// テーブルの祖先がこの要約に無い。
+    /// </summary>
+    public string? RulesDigest { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 
     /// <summary>
@@ -77,66 +84,131 @@ public sealed class DatabaseSummary
         var summary = new DatabaseSummary
         {
             SchemaVersion = version,
+            RulesDigest = profile.RulesDigest,
             CreatedAt = DateTimeOffset.Now,
         };
 
-        foreach (var table in ListTables(connection))
+        foreach (var table in ListTables(connection, "main"))
         {
             var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
             if (rule is null) continue;
 
-            var columns = ListColumns(connection, table);
-            // 編集時刻の列はまだ要約には使わないが、後の 3-way で使うので
-            // ここで欠けていないことを確かめておく。
-            var missing = rule.KeyColumns
-                .Concat(rule.ValueColumns ?? Array.Empty<string>())
-                .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
-                .Concat(rule.GrowingColumns ?? Array.Empty<string>())
-                .Where(c => !columns.Contains(c, StringComparer.Ordinal))
-                .ToList();
-            if (missing.Count > 0)
+            var columns = ListColumns(connection, "main", table);
+            if (FindMissingColumns(rule, columns) is { Count: > 0 } missing)
             {
                 reason = $"テーブル {table} に想定した列がありません: {string.Join(", ", missing)}";
                 return null;
             }
 
-            summary.Tables[table] = rule.Kind switch
-            {
-                MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, table, rule),
-                MergeTableKind.Keyed => SummarizeKeyed(connection, table, rule, columns),
-                MergeTableKind.Watched => SummarizeWatched(connection, table, rule, columns),
-                _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
-            };
+            summary.Tables[table] = SummarizeTable(connection, "main", table, rule, columns);
         }
 
         reason = null;
         return summary;
     }
 
-    private static List<string> ListTables(SqliteConnection connection)
+    /// <summary>
+    /// テーブル 1 つの要約を取る。マージでは、同期先に無いテーブルが手元で変わったかを
+    /// 祖先と比べるために、ATTACH した手元の DB からも取る。
+    /// </summary>
+    internal static TableSummary SummarizeTable(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+    {
+        var tableSummary = rule.Kind switch
+        {
+            MergeTableKind.AppendOnly => SummarizeAppendOnly(connection, schema, table, rule),
+            MergeTableKind.Keyed => SummarizeKeyed(connection, schema, table, rule, columns),
+            MergeTableKind.Watched => SummarizeWatched(connection, schema, table, rule, columns),
+            _ => throw new InvalidOperationException($"未知の種類です: {rule.Kind}"),
+        };
+        tableSummary.Columns = columns.ToList();
+        return tableSummary;
+    }
+
+    /// <summary>
+    /// 土台にした版の要約 <paramref name="summary"/> を、マージで id を振り直したテーブル
+    /// について、振り直しの後も元の rowid のまま残った行だけの要約に縮める。
+    /// <para>
+    /// この要約は、マージ結果で置き換えたローカルの祖先になる。振り直したテーブルでは
+    /// 土台の版の末尾の rowid に手元から足した行が入るので、そのままでは次のマージが
+    /// 手元で行を消したと見誤る。縮めた範囲より後の行は、次のマージで足す候補に戻るが、
+    /// キーで突き合わせるので二重にはならない。
+    /// </para>
+    /// </summary>
+    public static void TrimRenumbered(DatabaseSummary summary, string mergedPath, MergeProfile profile, MergeReport report)
+    {
+        var renumbered = report.Tables
+            .Where(t => t.Renumbered && summary.Tables.ContainsKey(t.Table))
+            .ToList();
+        if (renumbered.Count == 0) return;
+
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = mergedPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        foreach (var table in renumbered)
+        {
+            var rule = profile.Rules.First(r => r.Matches(table.Table));
+            var kept = table.KeptMaxRowId;
+            var entry = summary.Tables[table.Table];
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"SELECT count(*) FROM main.{Quote(table.Table)} WHERE rowid <= $max";
+                command.Parameters.AddWithValue("$max", kept);
+                entry.RowCount = (long)command.ExecuteScalar()!;
+            }
+            entry.MaxRowId = kept;
+            entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule.KeyColumns, kept);
+            // 後から書き換わる列のハッシュと、縮めた範囲から外れた祖先の行は、マージが
+            // 合成する前の同期先の値で取ってある。マージ結果から取ると手元の書き換えが
+            // 祖先に混ざり、次のマージでその書き換えを見分けられない。
+            entry.Digest = table.KeptDigest;
+            entry.TailRows = table.TailRows;
+        }
+    }
+
+    /// <summary>
+    /// 規則が前提にしている列のうち、テーブルに無いものを返す。編集時刻の列は要約には
+    /// 使わないが、3-way のマージで使うので、ここで欠けていないことを確かめる。
+    /// </summary>
+    internal static List<string> FindMissingColumns(MergeTableRule rule, IReadOnlyList<string> columns)
+        => rule.KeyColumns
+            .Concat(rule.ValueColumns ?? Array.Empty<string>())
+            .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
+            .Concat(rule.OrderColumn is null ? Array.Empty<string>() : new[] { rule.OrderColumn })
+            .Concat(rule.GrowingColumns ?? Array.Empty<string>())
+            .Concat(rule.ShrinkingColumns ?? Array.Empty<string>())
+            .Concat(rule.CounterColumns ?? Array.Empty<string>())
+            .Where(c => !columns.Contains(c, StringComparer.Ordinal))
+            .ToList();
+
+    internal static List<string> ListTables(SqliteConnection connection, string schema)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name";
+        command.CommandText = $"SELECT name FROM {Quote(schema)}.sqlite_master WHERE type = 'table' ORDER BY name";
         using var reader = command.ExecuteReader();
         var tables = new List<string>();
         while (reader.Read()) tables.Add(reader.GetString(0));
         return tables;
     }
 
-    private static List<string> ListColumns(SqliteConnection connection, string table)
+    internal static List<string> ListColumns(SqliteConnection connection, string schema, string table)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT name FROM pragma_table_info({Literal(table)}) ORDER BY cid";
+        command.CommandText = $"SELECT name FROM pragma_table_info({Literal(table)}, {Literal(schema)}) ORDER BY cid";
         using var reader = command.ExecuteReader();
         var columns = new List<string>();
         while (reader.Read()) columns.Add(reader.GetString(0));
         return columns;
     }
 
-    private static TableSummary SummarizeAppendOnly(SqliteConnection connection, string table, MergeTableRule rule)
+    private static TableSummary SummarizeAppendOnly(SqliteConnection connection, string schema, string table, MergeTableRule rule)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT count(*), coalesce(max(rowid), 0) FROM {Quote(table)}";
+        command.CommandText = $"SELECT count(*), coalesce(max(rowid), 0) FROM {Quote(schema)}.{Quote(table)}";
         using var reader = command.ExecuteReader();
         reader.Read();
         var summary = new TableSummary
@@ -149,54 +221,193 @@ public sealed class DatabaseSummary
         // 変わらないことがある。末尾の行のキーも残して、入れ替わりを拾う。
         summary.LastRowHash = summary.MaxRowId == 0
             ? null
-            : DigestRows(connection, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
-        if (rule.GrowingColumns is { Count: > 0 } growing)
+            : DigestRows(connection, schema, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
+        if (rule.GrowingColumns is { Count: > 0 })
         {
             // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
-            summary.Digest = DigestRows(connection, table, rule.KeyColumns.Concat(growing).ToList(), "rowid").Digest;
+            summary.Digest = DigestGrowing(connection, schema, table, rule, summary.MaxRowId);
         }
         return summary;
     }
 
-    private static TableSummary SummarizeKeyed(
-        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+    /// <summary>
+    /// <paramref name="whereSql"/> を満たす行を、キーのハッシュから rowid と
+    /// <see cref="MergeTableRule.GrowingColumns"/> の内容のハッシュへ写す。振り直しで
+    /// rowid が変わった祖先の行を、次のマージでキーで見分けるのに使う。同じキーの行が
+    /// 複数あれば <paramref name="duplicated"/> を真にする (後の行で上書きされる)。
+    /// </summary>
+    internal static Dictionary<string, (long RowId, string GrowingHash)> HashRowsByKey(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, string whereSql,
+        out bool duplicated)
     {
-        var valueColumns = rule.ValueColumns
-            ?? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList();
-        var selected = rule.KeyColumns.Concat(valueColumns).ToList();
-
+        duplicated = false;
+        var growing = rule.GrowingColumns ?? Array.Empty<string>();
+        var selected = rule.KeyColumns.Concat(growing).ToList();
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(table)}" +
+            $"SELECT rowid, {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} WHERE {whereSql}";
+        using var reader = command.ExecuteReader();
+
+        var rows = new Dictionary<string, (long, string)>(StringComparer.Ordinal);
+        var keyCount = rule.KeyColumns.Count;
+        var key = new StringBuilder();
+        var values = new StringBuilder();
+        while (reader.Read())
+        {
+            key.Clear();
+            values.Clear();
+            for (var i = 0; i < keyCount; i++) AppendValue(key, reader, i + 1);
+            for (var i = keyCount; i < selected.Count; i++) AppendValue(values, reader, i + 1);
+            var keyHash = Hash(key.ToString());
+            if (rows.ContainsKey(keyHash)) duplicated = true;
+            rows[keyHash] = (reader.GetInt64(0), Hash(values.ToString()));
+        }
+        return rows;
+    }
+
+    /// <summary>
+    /// rowid が <paramref name="maxRowId"/> 以下の行について、キーと
+    /// <see cref="MergeTableRule.GrowingColumns"/> の内容を rowid の順にハッシュにする。
+    /// 要約とマージで同じ方法で求めるため、両方がここを通る。<paramref name="excludeSql"/>
+    /// を満たす行は除く (振り直しで後ろへ移る行を、移す前に除いて取るのに使う)。
+    /// </summary>
+    internal static string DigestGrowing(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, long maxRowId,
+        string? excludeSql = null)
+    {
+        var columns = rule.KeyColumns.Concat(rule.GrowingColumns ?? Array.Empty<string>()).ToList();
+        var exclude = excludeSql is null ? "" : $" AND NOT ({excludeSql})";
+        return DigestQuery(connection, columns.Count,
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)}{exclude} ORDER BY rowid").Digest;
+    }
+
+    private static TableSummary SummarizeKeyed(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+    {
+        var rows = ReadKeyedRows(connection, schema, table, rule, columns);
+        return new TableSummary
+        {
+            Kind = MergeTableKind.Keyed,
+            RowCount = rows.Count,
+            Rows = rows.ToDictionary(r => r.Key, r => r.Value.Hash, StringComparer.Ordinal),
+            Counters = rule.CounterColumns is { Count: > 0 } ? ReadCounters(connection, schema, table, rule) : null,
+        };
+    }
+
+    /// <summary>
+    /// <see cref="MergeTableRule.CounterColumns"/> の値を、キー (<see cref="ReadKeyedRows"/>
+    /// と同じ形) ごとに読む。整数でない値は残さない。
+    /// </summary>
+    private static Dictionary<string, Dictionary<string, long>> ReadCounters(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule)
+    {
+        var counters = rule.CounterColumns!;
+        var selected = rule.KeyColumns.Concat(counters).ToList();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)}" +
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
-        var rows = new Dictionary<string, string>(StringComparer.Ordinal);
+        var result = new Dictionary<string, Dictionary<string, long>>(StringComparer.Ordinal);
         var keyCount = rule.KeyColumns.Count;
         while (reader.Read())
         {
             var key = new StringBuilder();
             for (var i = 0; i < keyCount; i++) AppendValue(key, reader, i);
+            var values = new Dictionary<string, long>(StringComparer.Ordinal);
+            for (var i = 0; i < counters.Count; i++)
+            {
+                if (!reader.IsDBNull(keyCount + i) && reader.GetValue(keyCount + i) is long value)
+                {
+                    values[counters[i]] = value;
+                }
+            }
+            result[key.ToString()] = values;
+        }
+        return result;
+    }
+
+    /// <summary>キー付きのテーブルの 1 キーぶん。キーの値そのものと、内容のハッシュを持つ。</summary>
+    internal sealed record KeyedRow(object?[] KeyValues, string Hash);
+
+    /// <summary>
+    /// キー付きのテーブルを読み、キー (型付きで文字列にしたもの) から行へ写す。
+    /// 要約とマージで同じハッシュを使うため、両方がここを通る。
+    /// </summary>
+    /// <param name="exactColumns">
+    /// 真なら、規則の <see cref="MergeTableRule.ValueColumns"/> に関わらず <paramref name="columns"/>
+    /// のうちキー以外の列をそのまま比べる。前回の同期の後に増えた列だけを比べるのに使う。
+    /// </param>
+    internal static Dictionary<string, KeyedRow> ReadKeyedRows(
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns,
+        bool exactColumns = false)
+    {
+        var valueColumns = exactColumns
+            ? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList()
+            : ValueColumnsOf(rule, columns);
+        var selected = rule.KeyColumns.Concat(valueColumns).ToList();
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)}" +
+            (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
+        using var reader = command.ExecuteReader();
+
+        var keyValuesByKey = new Dictionary<string, object?[]>(StringComparer.Ordinal);
+        var hashesByKey = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var keyCount = rule.KeyColumns.Count;
+        while (reader.Read())
+        {
+            var key = new StringBuilder();
+            var keyValues = new object?[keyCount];
+            for (var i = 0; i < keyCount; i++)
+            {
+                AppendValue(key, reader, i);
+                keyValues[i] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            }
             var value = new StringBuilder();
             for (var i = keyCount; i < selected.Count; i++) AppendValue(value, reader, i);
-            // キーが重複するテーブル (UNIQUE 制約の無い favorite_* など) では、
-            // 同じキーの行をまとめて一つの値として扱う。
-            var hash = Hash(value.ToString());
-            rows[key.ToString()] = rows.TryGetValue(key.ToString(), out var existing)
-                ? Hash(existing + hash)
-                : hash;
+            var keyText = key.ToString();
+            if (!hashesByKey.TryGetValue(keyText, out var hashes))
+            {
+                hashes = new List<string>(1);
+                hashesByKey[keyText] = hashes;
+                keyValuesByKey[keyText] = keyValues;
+            }
+            hashes.Add(Hash(value.ToString()));
         }
 
-        return new TableSummary
+        // キーが重複するテーブル (UNIQUE 制約の無い favorite_* など) では、同じキーの行を
+        // まとめて一つの値として扱う。rowid の順は PC ごとに違いうるので、行のハッシュを
+        // 並べ替えてから束ねる。2 行ずつ順に束ねると 3 行以上で順序に左右される。
+        var rows = new Dictionary<string, KeyedRow>(StringComparer.Ordinal);
+        foreach (var (keyText, hashes) in hashesByKey)
         {
-            Kind = MergeTableKind.Keyed,
-            RowCount = rows.Count,
-            Rows = rows,
-        };
+            rows[keyText] = new KeyedRow(keyValuesByKey[keyText], CombineUnordered(hashes));
+        }
+        return rows;
+    }
+
+    /// <summary><see cref="MergeTableKind.Keyed"/> で比べる列。指定が無ければキー以外のすべて。</summary>
+    internal static IReadOnlyList<string> ValueColumnsOf(MergeTableRule rule, IReadOnlyList<string> columns)
+        => rule.ValueColumns
+           ?? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList();
+
+    /// <summary>
+    /// 行のハッシュの多重集合を、順序に依らない一つのハッシュにする。1 行なら
+    /// そのハッシュのまま (重複の無いテーブルの要約を変えないため)。
+    /// </summary>
+    private static string CombineUnordered(List<string> hashes)
+    {
+        if (hashes.Count == 1) return hashes[0];
+        hashes.Sort(StringComparer.Ordinal);
+        return Hash(string.Concat(hashes));
     }
 
     private static TableSummary SummarizeWatched(
-        SqliteConnection connection, string table, MergeTableRule rule, IReadOnlyList<string> columns)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, IReadOnlyList<string> columns)
     {
         var ignored = rule.IgnoredColumns ?? Array.Empty<string>();
         var selected = columns.Where(c => !ignored.Contains(c, StringComparer.Ordinal)).ToList();
@@ -205,7 +416,7 @@ public sealed class DatabaseSummary
             return new TableSummary { Kind = MergeTableKind.Watched, Digest = Hash(string.Empty) };
         }
 
-        var (count, digest) = DigestRows(connection, table, selected, string.Join(", ", selected.Select(Quote)));
+        var (count, digest) = DigestRows(connection, schema, table, selected, string.Join(", ", selected.Select(Quote)));
         return new TableSummary
         {
             Kind = MergeTableKind.Watched,
@@ -216,11 +427,27 @@ public sealed class DatabaseSummary
 
     /// <summary>指定した列の内容を、<paramref name="orderBy"/> の順に読んでハッシュにする。</summary>
     private static (long Count, string Digest) DigestRows(
-        SqliteConnection connection, string table, IReadOnlyList<string> columns, string orderBy)
+        SqliteConnection connection, string schema, string table, IReadOnlyList<string> columns, string orderBy)
+        => DigestQuery(connection, columns.Count,
+            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} ORDER BY {orderBy}");
+
+    /// <summary>
+    /// rowid が <paramref name="rowId"/> の行のキーのハッシュを返す。行が無ければ null。
+    /// 要約の <see cref="TableSummary.LastRowHash"/> と同じ方法で求める。
+    /// </summary>
+    internal static string? HashRowKey(
+        SqliteConnection connection, string schema, string table, IReadOnlyList<string> keyColumns, long rowId)
+    {
+        var (count, digest) = DigestQuery(connection, keyColumns.Count,
+            $"SELECT {string.Join(", ", keyColumns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
+            $"WHERE rowid = {rowId.ToString(CultureInfo.InvariantCulture)}");
+        return count == 0 ? null : digest;
+    }
+
+    private static (long Count, string Digest) DigestQuery(SqliteConnection connection, int columnCount, string sql)
     {
         using var command = connection.CreateCommand();
-        command.CommandText =
-            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(table)} ORDER BY {orderBy}";
+        command.CommandText = sql;
         using var reader = command.ExecuteReader();
 
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -229,7 +456,7 @@ public sealed class DatabaseSummary
         while (reader.Read())
         {
             row.Clear();
-            for (var i = 0; i < columns.Count; i++) AppendValue(row, reader, i);
+            for (var i = 0; i < columnCount; i++) AppendValue(row, reader, i);
             row.Append('\n');
             sha.AppendData(Encoding.UTF8.GetBytes(row.ToString()));
             count++;
@@ -271,9 +498,9 @@ public sealed class DatabaseSummary
     private static string Hash(string text)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..32];
 
-    private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"") + "\"";
+    internal static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"") + "\"";
 
-    private static string Literal(string text) => "'" + text.Replace("'", "''") + "'";
+    internal static string Literal(string text) => "'" + text.Replace("'", "''") + "'";
 }
 
 /// <summary>テーブル 1 つぶんの要約。どの項目を埋めるかは <see cref="Kind"/> で決まる。</summary>
@@ -290,17 +517,48 @@ public sealed class TableSummary
     public Dictionary<string, string>? Rows { get; set; }
 
     /// <summary>
+    /// <see cref="MergeTableKind.Keyed"/>: キーから、<see cref="MergeTableRule.CounterColumns"/>
+    /// の値へ。3-way のマージで双方の増分を求めるのに使う。内容の比較には使わない
+    /// (<see cref="Rows"/> のハッシュに含まれている)。
+    /// </summary>
+    public Dictionary<string, Dictionary<string, long>>? Counters { get; set; }
+
+    /// <summary>
     /// <see cref="MergeTableKind.Watched"/>: 内容全体のハッシュ。
     /// <see cref="MergeTableKind.AppendOnly"/>: 後から書き換わる列があるときだけ、キーとその列のハッシュ。
     /// </summary>
     public string? Digest { get; set; }
 
+    /// <summary>
+    /// 要約を取ったときの列の並び。マージでは、今の列と違えば祖先に使わない。
+    /// 列が増えるとキー付きの内容ハッシュがすべて変わり、変えていない行まで
+    /// 編集されたように見えるため。
+    /// </summary>
+    public List<string>? Columns { get; set; }
+
     /// <summary><see cref="MergeTableKind.AppendOnly"/>: rowid が最大の行のキーのハッシュ。</summary>
     public string? LastRowHash { get; set; }
+
+    /// <summary>
+    /// <see cref="MergeTableKind.AppendOnly"/> で、マージの振り直しで <see cref="MaxRowId"/> より
+    /// 後ろへ移った祖先の行。キーのハッシュから、後から書き換わる列の内容のハッシュへ。
+    /// rowid では手元で足した行と見分けられないので、キーで見分ける。
+    /// </summary>
+    public Dictionary<string, string>? TailRows { get; set; }
 
     public bool HasSameContent(TableSummary other)
     {
         if (Kind != other.Kind || RowCount != other.RowCount) return false;
+        // 列が増えたテーブルは、内容が変わったものとして扱う。追加専用の要約や列を絞った
+        // キー付きの要約は既知の列しか見ないので、増えた列だけを書き換えても気付けない。
+        // 列を残していない古い要約と列を持つ要約は、列が同じか確かめられないので違うものとして
+        // 扱う。同じとみなすと、古い要約の後で増えた列だけを手元で書き換えた場合に
+        // 気付けない。双方が古い要約なら、従来どおり内容だけを比べる。
+        if ((Columns is null) != (other.Columns is null)) return false;
+        if (Columns is not null && !Columns.SequenceEqual(other.Columns!, StringComparer.Ordinal))
+        {
+            return false;
+        }
         return Kind switch
         {
             MergeTableKind.AppendOnly => MaxRowId == other.MaxRowId

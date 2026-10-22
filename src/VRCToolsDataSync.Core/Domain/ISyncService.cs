@@ -16,6 +16,63 @@ public interface ISyncService
     SyncResult Pull(PullOptions options);
 }
 
+/// <summary>
+/// 行を合成するマージに対応したツール。マージは「同期先の最新を土台にし、手元にしか
+/// 無い変更を足し戻す」操作で、結果はローカルに置くだけである。同期先へ反映する
+/// Push は呼び出し側 (<c>SyncRunner</c>) が続けて行う。
+/// </summary>
+public interface IMergeableSyncService : ISyncService
+{
+    SyncResult PullMerge(PullMergeOptions options);
+}
+
+public sealed class PullMergeOptions
+{
+    public required ISyncStorage Storage { get; init; }
+
+    /// <summary>前回同期した時点の要約。無ければ 2-way のマージになる。</summary>
+    public DatabaseSummary? Baseline { get; init; }
+
+    /// <summary>
+    /// 自分が最後に送った DB の写しの記録。同期先の写しがその写しと同じなら、同期先は
+    /// 自分の送った内容そのものなので、<see cref="Baseline"/> の代わりに同期先の要約を
+    /// 祖先にする。写しは違っても、送った版の反映が済んでいて同期先がそれより後の版なら、
+    /// 送った写しの要約を祖先にする。送った後に要約と同期履歴を保存する前に止まった場合に、
+    /// 送った変更を同期先と手元の両方の変更と見て二重に足さないため。
+    /// </summary>
+    public PushedRecord? OwnPush { get; init; }
+
+    /// <summary>
+    /// <see cref="OwnPush"/> が反映されなかったと分かったときに呼ぶ。呼び出し側は記録を捨てる。
+    /// 残すと、同期先がさらに進んだときに反映されたか分からない記録として扱われ、マージが止まる。
+    /// </summary>
+    public Action? DiscardOwnPush { get; init; }
+
+    /// <summary>true なら結果を数えるだけで、ローカルには何も書かない。</summary>
+    public bool DryRun { get; init; }
+
+    public bool SkipBackup { get; init; }
+
+    /// <summary>
+    /// ローカルをマージ結果で置き換えた直後に呼ぶ。引数は土台にした同期先の version と、
+    /// その版の要約 (取れなければ null)。呼び出し側は、置き換えた後のローカルに合う
+    /// 同期履歴と祖先の要約をここで保存する。
+    /// <para>
+    /// 置き換えより後に呼ぶのは、間で落ちたときに同期履歴だけが進まないようにするため。
+    /// 同期履歴が進んで DB が古いままだと、次の Push が同期先の変更を古い DB で上書きする。
+    /// 逆に DB だけが新しいなら、手元に未 Push の変更があるものとして扱われ、上書きされない。
+    /// </para>
+    /// </summary>
+    public Action<long, DatabaseSummary?>? AfterReplaceLocal { get; init; }
+
+    /// <summary>
+    /// ローカルをマージ結果で置き換える直前に呼ぶ。呼び出し側は引数を保留として残し、
+    /// <see cref="AfterReplaceLocal"/> の保存が終わる前に止まっても、次回に置き換えが
+    /// 済んだかを見分けて祖先を復旧できるようにする。例外を投げれば置き換えない。
+    /// </summary>
+    public Action<MergePendingState>? BeforeReplaceLocal { get; init; }
+}
+
 public sealed class PushOptions
 {
     /// <summary>同期先。ローカル同期フォルダか S3 互換ストレージのどちらか。</summary>
@@ -42,6 +99,34 @@ public sealed class PushOptions
     public bool ReuploadAll { get; init; }
 
     public long? LastPulledVersion { get; init; }
+
+    /// <summary>
+    /// この Push を見分ける値。manifest の項目 (<see cref="ToolManifestEntry.PushId"/>) に書く。
+    /// 呼び出し側は <see cref="BeforeCommit"/> で控える記録にも同じ値を残し、反映されたか
+    /// 分からないまま止まった後に、同期先の項目と照らして確かめる。
+    /// </summary>
+    public string? PushId { get; init; }
+
+    /// <summary>
+    /// 送る DB の写しを同期先へ書き込む直前に呼ぶ。引数は写しの SHA-256 と、その要約と、
+    /// manifest で取る予定の version (強制 Push では決まらないので null)。送った後に同期履歴を
+    /// 保存する前に止まっても、次のマージで同期先に送った内容が入っていると見分けるために控える。
+    /// </summary>
+    public Action<string, DatabaseSummary?, long?>? BeforeCommit { get; init; }
+
+    /// <summary>
+    /// 送った写しの manifest への反映が済んだ直後に呼ぶ。引数は写しの SHA-256 と、
+    /// 反映した version。
+    /// </summary>
+    public Action<string, long>? AfterCommit { get; init; }
+
+    /// <summary>
+    /// manifest を更新せずに終わったとき (他の PC が先に更新していた、manifest の更新より前に
+    /// 送信が失敗した、送るものが無かった) に呼ぶ。呼び出し側は <see cref="BeforeCommit"/> で
+    /// 控えた記録を捨てる。manifest の更新そのものが失敗した場合は、反映されたか分からないので
+    /// 呼ばない。
+    /// </summary>
+    public Action? NotCommitted { get; init; }
 }
 
 public sealed class PullOptions
@@ -65,6 +150,30 @@ public sealed class PullOptions
     /// を返す。比べられない場合 (前回の要約が無いなど) は空を返し、従来どおり上書きする。
     /// </summary>
     public Func<IReadOnlyList<string>>? FindUnsyncedLocalChanges { get; init; }
+
+    /// <summary>
+    /// ローカルを書き換える直前に、追跡する DB の本体の差し替える前後のハッシュと取り出した写しの
+    /// 要約を渡す。差し替えた後、残りのファイルの差し替えや要約の保存で止まると、手元は
+    /// 取り出した版なのに要約と同期履歴は前の版のままになる。次のマージがその違いを手元の
+    /// 変更と見て古い要約を祖先にすると、取り込んだ内容を二重に足す。この記録があれば、
+    /// 次回に本体のハッシュから差し替わったかを見分け、取り出した写しの要約を祖先にできる。
+    /// 本体が同期先と同じで差し替えない場合も渡す (前後のハッシュは同じ値)。残りの差し替えで
+    /// 止まったことを記録に残さないと、次の Push が前の版の設定などを送る。
+    /// <para>
+    /// ハッシュを取るのに時間がかかるので、サービスはこれを呼んでから、差し替える直前にツールの
+    /// 起動や書き換えを確かめる。そこで中止すれば (Aborted か <see cref="Infra.RunningProcessException"/>)
+    /// 差し替えていないので、呼び出し側は記録を消す。
+    /// </para>
+    /// </summary>
+    public Action<MergePendingState>? BeforeReplaceLocal { get; init; }
+
+    /// <summary>
+    /// 追跡する DB の本体が取り出した版になった後 (差し替えたか、元から同期先と同じ)、残りの
+    /// ファイルの差し替えや削除で失敗したときに、その版と取り出した写しの要約とハッシュを渡す。
+    /// 呼び出し側は要約をその版へそろえる。同期履歴は進めず、置き換えの記録も残す。残りの
+    /// 差し替えは次の Pull がやり直す。例外はそのまま投げる。
+    /// </summary>
+    public Action<long, DatabaseSummary?, string>? AfterDatabaseReplaced { get; init; }
 }
 
 public sealed class SyncResult
@@ -75,6 +184,23 @@ public sealed class SyncResult
     public long? LastPulledVersion { get; init; }
     public string? BackupPath { get; init; }
     public IReadOnlyList<string> AffectedFiles { get; init; } = Array.Empty<string>();
+
+    /// <summary>マージを行った場合の内訳。</summary>
+    public MergeReport? MergeReport { get; init; }
+
+    /// <summary>
+    /// Push で実際に送った DB の写し、または Pull で取り出して手元に置いた写しの要約。
+    /// 次に比べる基準はこれから保存する。同期した後に手元の DB から取ると、その間に
+    /// ツールが書き込んだ未送信の変更が基準に混ざり、次の起動時 Pull がその変更を
+    /// 見落として上書きする。
+    /// </summary>
+    public DatabaseSummary? SyncedSummary { get; init; }
+
+    /// <summary>
+    /// <see cref="SyncedSummary"/> を取った写しの SHA-256。Pull で取り出した写しの要約を
+    /// 保存できなかったとき、その写しの記録を残すのに使う。
+    /// </summary>
+    public string? SyncedSha256 { get; init; }
 }
 
 public enum SyncOutcome

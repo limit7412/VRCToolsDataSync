@@ -46,6 +46,9 @@ public sealed class FriendConnectSyncService : ISyncService
     /// </summary>
     private sealed record SyncedDirectory(string LocalDirectory, string KeyPrefix);
 
+    /// <summary>送る写しの記録を控えられなかった。送る前に中止する。</summary>
+    private sealed class PushedRecordException(Exception inner) : Exception(inner.Message, inner);
+
     private readonly IReadOnlyList<SyncedDirectory> _directories;
 
     public SyncResult Push(PushOptions options)
@@ -92,34 +95,77 @@ public sealed class FriendConnectSyncService : ISyncService
         var files = new List<ManifestFile>();
         var affected = new List<string>();
 
-        files.Add(PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace));
-
-        if (File.Exists(_paths.DbFile))
+        // 送る写しの記録を控えるのは、本体 (db_1.1) の写しを同期先へ書き込む直前。VRCX と同じく、
+        // 送った後に要約を保存できなくても、次の同期が送った内容を見分けられるようにする。
+        // 控えられなければ送らない。
+        ManifestFile dbV11;
+        DatabaseSummary? pushedSummary;
+        var recorded = false;
+        try
         {
-            files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace));
+            dbV11 = PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace, out pushedSummary,
+                beforeCommit: (sha256, summary) =>
+                {
+                    options.BeforeCommit?.Invoke(sha256, summary, (existing?.Version ?? 0) + 1);
+                    recorded = true;
+                });
         }
-        // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
-        // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
-        // 実データはここでは消さない (理由は下の note の後始末と同じ)。
-
-        if (File.Exists(_paths.ConfigJsonFile))
+        catch (Exception) when (recorded)
         {
-            var (config, sent) = SyncTransfer.Send(
-                storage, remoteFiles, _paths.ConfigJsonFile, ConfigKey, replace);
-            if (sent)
-            {
-                affected.Add(ConfigKey);
-            }
-            else
-            {
-                _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
-            }
-            files.Add(config);
+            // 記録を控えた後、写しの送信で失敗した。manifest は更新していないので記録は要らない。
+            options.NotCommitted?.Invoke();
+            throw;
         }
-
-        foreach (var directory in _directories)
+        catch (PushedRecordException ex)
         {
-            files.AddRange(PushDirectory(storage, directory, remoteFiles, affected, replace));
+            _logger.LogWarning(ex.InnerException, "送った写しの記録を控えられないため、Push を中止します");
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = existing?.Version,
+                Message = $"送った写しの記録を控えられないため、Push を中止しました: {ex.InnerException!.Message}。" +
+                          "ディスクの空き容量と、同期履歴のフォルダへの書き込み権限を確かめてください",
+            };
+        }
+        files.Add(dbV11);
+        var snapshotSha256 = dbV11.Sha256;
+
+        // ここから manifest を更新するまでに失敗したら、送信は反映されていない。記録は要らない。
+        // 残すと、同期先が進んだときに反映されたか分からない記録として扱われ、マージが止まる。
+        try
+        {
+            if (File.Exists(_paths.DbFile))
+            {
+                files.Add(PushSqlite(storage, _paths.DbFile, DbKey, remoteFiles, affected, replace, out _));
+            }
+            // ローカルに無いファイルは manifest の files[] に載せないことで「無い」ことを
+            // 表す。Pull は manifest を正としてローカルへ反映するので、削除はそれで伝わる。
+            // 実データはここでは消さない (理由は下の note の後始末と同じ)。
+
+            if (File.Exists(_paths.ConfigJsonFile))
+            {
+                var (config, sent) = SyncTransfer.Send(
+                    storage, remoteFiles, _paths.ConfigJsonFile, ConfigKey, replace);
+                if (sent)
+                {
+                    affected.Add(ConfigKey);
+                }
+                else
+                {
+                    _logger.LogInformation("Friend Connect config.json の送信を省略 (内容が同じ)");
+                }
+                files.Add(config);
+            }
+
+            foreach (var directory in _directories)
+            {
+                files.AddRange(PushDirectory(storage, directory, remoteFiles, affected, replace));
+            }
+        }
+        catch
+        {
+            options.NotCommitted?.Invoke();
+            throw;
         }
 
         // 非常用の強制 Push では、内容が同じでも version を進める。他の PC が壊れた実体を
@@ -133,29 +179,46 @@ public sealed class FriendConnectSyncService : ISyncService
             // 通っていないため、Load してから今までに他 PC が追加した note を
             // 消してしまう恐れがある。孤児の掃除は次の実際の Push に任せる。
             _logger.LogInformation("Friend Connect Push: 変更なし version={Version}", existing!.Version);
+            // 同期先の今の版は、送ろうとした写しと同じ内容。前回の Push が反映された後に
+            // 要約の保存で止まっていた記録を、ここで消してはいけない。反映済みの記録として
+            // 残し、要約の保存が済めば消える。
+            options.AfterCommit?.Invoke(snapshotSha256, existing.Version);
             return new SyncResult
             {
                 Outcome = SyncOutcome.Success,
                 RemoteVersion = existing.Version,
                 Message = "前回の Push から変更がないため、同期先はそのままです",
+                SyncedSummary = pushedSummary,
             };
         }
 
         long nextVersion;
         try
         {
+            var forced = options.ForceOverwriteOnConflict || replace;
             ToolManifestEntry BuildEntry(long version) => new()
             {
                 Version = version,
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
+                // 初めての項目は 0。前の項目の null (古い版のツールが書いた) も引き継ぐ。
+                LastForcedVersion = forced ? version : existing is null ? 0 : existing.LastForcedVersion,
+                PushId = options.PushId,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
             // 更新していても manifest と実データはずれない。競合で止めずに上書きする。
             nextVersion = replace
                 ? manifestStore.OverwriteToolEntry(Key, BuildEntry)
                 : manifestStore.UpdateToolEntry(Key, existing?.Version ?? 0, BuildEntry);
+        }
+        catch (SyncStorageConcurrencyException)
+        {
+            // 条件付きの保存が毎回拒まれた。manifest には一度も反映していないので、送信の
+            // 記録は要らない。残すと、他の PC が予定の版の先まで進めたときに反映されたか
+            // 分からない記録として扱われ、マージが止まり続ける。
+            options.NotCommitted?.Invoke();
+            throw;
         }
         catch (ToolEntryChangedException ex)
         {
@@ -170,6 +233,7 @@ public sealed class FriendConnectSyncService : ISyncService
             _logger.LogInformation(
                 "Friend Connect Push 中止: Push 中に同期先が更新された (expected={Expected}, actual={Actual})",
                 ex.ExpectedVersion, ex.ActualVersion);
+            options.NotCommitted?.Invoke();
             return new SyncResult
             {
                 Outcome = SyncOutcome.ConflictDetected,
@@ -188,18 +252,23 @@ public sealed class FriendConnectSyncService : ISyncService
         // 欠落オブジェクトを指しうる (この経路は以前ここにあった競合そのもの)。
         // 参照されなくなったものは猶予期間を置いて GC (BlobGarbageCollector) が回収する。
 
+        options.AfterCommit?.Invoke(snapshotSha256, nextVersion);
         _logger.LogInformation("Friend Connect Push 完了 version={Version} files={Count}", nextVersion, files.Count);
         return new SyncResult
         {
             Outcome = SyncOutcome.Success,
             RemoteVersion = nextVersion,
             AffectedFiles = affected,
+            SyncedSummary = pushedSummary,
         };
     }
 
     public SyncResult Pull(PullOptions options)
     {
         ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+        // ここから差し替えまでの間 (取得と要約で長くなりうる) に Friend Connect が起動して
+        // 書き込むと、その変更は WAL ごと消える。差し替える直前に、もう一度確かめる。
+        var localFingerprint = FingerprintPullTargets();
 
         var storage = options.Storage;
         var manifest = new ManifestStore(storage).Load();
@@ -280,7 +349,9 @@ public sealed class FriendConnectSyncService : ISyncService
         // manifest が要求するファイルはすべて揃わなければ Pull を成功にしない。
         // 欠けたまま成功にすると LastPulledVersion だけ進み、以後の起動時 Pull は
         // この version を最新とみなして省略するため、差異が固定される。
-        var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File)
+        // db_1.1 は本体が同期先と同じでも写しを残す。要約は手元の本体ではなく、WAL を
+        // 伴わない同期先の内容から取る。
+        var missing = FetchOptional(staging, storage, remoteDbV11, _paths.DbV11File, keepCopyWhenUnchanged: true)
             ?? FetchOptional(staging, storage, remoteDb, _paths.DbFile)
             ?? FetchOptional(staging, storage, remoteConfig, _paths.ConfigJsonFile)
             ?? _directories
@@ -307,7 +378,13 @@ public sealed class FriendConnectSyncService : ISyncService
             };
         }
 
-        // (3) ここから先はローカルを書き換える。
+        // 次に比べる基準は、同期先の内容の写しから取る。手元の DB から取ると、本体が
+        // 同期先と同じでも WAL に残る未送信の変更が基準に混ざり、次の同期で失われる。
+        var pulledSummary = remoteDbV11 is null
+            ? null
+            : DatabaseSummary.Compute(staging.SourceOf(_paths.DbV11File), TrackedDatabase.Profile, out _);
+
+        // (3) バックアップを取る。ここまではローカルを書き換えない。
         string? backupPath = null;
         if (!options.SkipBackup)
         {
@@ -337,6 +414,38 @@ public sealed class FriendConnectSyncService : ISyncService
                 shouldBackupFile: path => !PullStaging.IsIncomingFile(path));
         }
 
+        // ローカルを書き換える前に、本体 (db_1.1) の差し替える前後のハッシュを控える。本体を
+        // 差し替えた後に残りの差し替えや要約の保存で止まっても、次回に本体が差し替わったかを
+        // 見分けて、取り出した写しの要約を祖先にできる。本体が同期先と同じで差し替えない場合も
+        // 控える。設定やメモだけの差し替えや削除で止まると、同期履歴だけが前の版に残り、記録が
+        // 無いと次の Push が通って前の版の設定などを送る。ハッシュを取るのは DB が大きいほど
+        // 長いので、書き換えの確認より前に済ませる。記録を残した後、差し替える前に中止した
+        // ときは、呼び出し側が記録を消す。
+        var databaseStaged = staging.IsStaged(_paths.DbV11File);
+        if (options.BeforeReplaceLocal is not null && remoteDbV11 is not null)
+        {
+            // 差し替えないなら、本体は取得を省いた時点で同期先の写しと同じ内容。
+            var localSha256 = !databaseStaged ? remoteDbV11.Sha256
+                : File.Exists(_paths.DbV11File) ? FileHasher.Sha256(_paths.DbV11File) : "";
+            options.BeforeReplaceLocal(new MergePendingState(
+                pulledSummary, entry.Version, localSha256, remoteDbV11.Sha256, FromPull: true));
+        }
+
+        // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
+        //     間に Friend Connect が起動して書き込んでいないかを確かめる。
+        ProcessGuard.EnsureNotRunning(ProcessGuard.FriendConnectProcessNames);
+        if (FingerprintPullTargets() != localFingerprint)
+        {
+            return new SyncResult
+            {
+                Outcome = SyncOutcome.Aborted,
+                RemoteVersion = entry.Version,
+                BackupPath = backupPath,
+                Message = "Pull の間に Friend Connect の DB か設定かメモ・サムネイルが書き換えられたため、差し替える前に中止しました。" +
+                          "Friend Connect を終了してからやり直してください。",
+            };
+        }
+
         // WAL/SHM を消すのは、その DB の本体を差し替えるか削除するとき。残したままだと
         // 古い WAL が別内容の本体に対して再生されてデータが破損するため、
         // --no-backup でも飛ばさない。
@@ -362,26 +471,38 @@ public sealed class FriendConnectSyncService : ISyncService
         }
 
         var affected = new List<string>();
-        staging.Apply(affected);
+        try
+        {
+            staging.Apply(affected);
 
-        // リモートにない任意ファイルはローカルも削除して状態を揃える。
-        // 削除失敗を握りつぶすと、次の Push で古いファイルが manifest に
-        // 再登録されてしまうため、失敗は呼び出し側に伝播させる。
-        if (remoteDbV11 is null && File.Exists(_paths.DbV11File))
-        {
-            File.Delete(_paths.DbV11File);
+            // リモートにない任意ファイルはローカルも削除して状態を揃える。
+            // 削除失敗を握りつぶすと、次の Push で古いファイルが manifest に
+            // 再登録されてしまうため、失敗は呼び出し側に伝播させる。
+            if (remoteDbV11 is null && File.Exists(_paths.DbV11File))
+            {
+                File.Delete(_paths.DbV11File);
+            }
+            if (remoteDb is null && File.Exists(_paths.DbFile))
+            {
+                File.Delete(_paths.DbFile);
+            }
+            if (remoteConfig is null && File.Exists(_paths.ConfigJsonFile))
+            {
+                File.Delete(_paths.ConfigJsonFile);
+            }
+            foreach (var directory in _directories)
+            {
+                RemoveStaleFiles(directory, remoteDirectoryFiles[directory]);
+            }
         }
-        if (remoteDb is null && File.Exists(_paths.DbFile))
+        catch (Exception) when ((affected.Contains(_paths.DbV11File) || !databaseStaged) && remoteDbV11 is not null && options.AfterDatabaseReplaced is not null)
         {
-            File.Delete(_paths.DbFile);
-        }
-        if (remoteConfig is null && File.Exists(_paths.ConfigJsonFile))
-        {
-            File.Delete(_paths.ConfigJsonFile);
-        }
-        foreach (var directory in _directories)
-        {
-            RemoveStaleFiles(directory, remoteDirectoryFiles[directory]);
+            // 本体 (db_1.1) は取り出した版 (差し替わったか、元から同期先と同じ) で、残りの
+            // 差し替えか削除で止まった。要約をその版へそろえてもらう。そろえないと、次の起動時
+            // Pull が本体の違いを手元の変更と見て見送り続け、Friend Connect はマージしないので
+            // 残りを取り込めない。
+            options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteDbV11.Sha256);
+            throw;
         }
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
@@ -392,21 +513,44 @@ public sealed class FriendConnectSyncService : ISyncService
             RemoteVersion = entry.Version,
             BackupPath = backupPath,
             AffectedFiles = affected,
+            SyncedSummary = pulledSummary,
+            SyncedSha256 = remoteDbV11?.Sha256,
         };
     }
 
-    /// <summary>SQLite を WAL 統合済みのスナップショットにして送る。</summary>
+    /// <summary>
+    /// SQLite を WAL 統合済みのスナップショットにして送る。<see cref="TrackedDatabase"/> の
+    /// DB なら、次に比べる基準にする要約を送る写しから取って <paramref name="summary"/> に返す。
+    /// </summary>
+    /// <param name="beforeCommit">
+    /// 写しを同期先へ書き込む直前に、写しの SHA-256 と要約を渡して呼ぶ。IO の失敗は
+    /// <see cref="PushedRecordException"/> に包んで伝える。写しの作成や送信の失敗と区別して、
+    /// 送る前に中止できるようにするため。
+    /// </param>
     private ManifestFile PushSqlite(
         ISyncStorage storage,
         string sourceDb,
         string key,
         IReadOnlyList<ManifestFile> remoteFiles,
         List<string> affected,
-        bool replace)
+        bool replace,
+        out DatabaseSummary? summary,
+        Action<string, DatabaseSummary?>? beforeCommit = null)
     {
         using var staged = storage.BeginUpload();
         SqliteSnapshot.Create(sourceDb, staged.LocalPath);
         var described = SyncTransfer.Describe(staged.LocalPath, key);
+        summary = string.Equals(sourceDb, TrackedDatabase.Path, StringComparison.Ordinal)
+            ? DatabaseSummary.Compute(staged.LocalPath, TrackedDatabase.Profile, out _)
+            : null;
+        try
+        {
+            beforeCommit?.Invoke(described.Sha256, summary);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new PushedRecordException(ex);
+        }
         if (!replace && SyncTransfer.CanSkipUpload(storage, remoteFiles, described))
         {
             _logger.LogInformation("送信を省略 (内容が同じ): {Key}", key);
@@ -466,10 +610,11 @@ public sealed class FriendConnectSyncService : ISyncService
         PullStaging staging,
         ISyncStorage storage,
         ManifestFile? remote,
-        string targetPath)
+        string targetPath,
+        bool keepCopyWhenUnchanged = false)
     {
         if (remote is null) return null;
-        return staging.Fetch(storage, remote, targetPath) ? null : remote.RelativePath;
+        return staging.Fetch(storage, remote, targetPath, keepCopyWhenUnchanged) ? null : remote.RelativePath;
     }
 
     /// <summary>フォルダの中身を取り出す。見つからないキーがあればその名前を返す。</summary>
@@ -538,4 +683,13 @@ public sealed class FriendConnectSyncService : ISyncService
             File.Delete(path);
         }
     }
+
+    /// <summary>
+    /// Pull が差し替えるもの (2 つの DB 本体と WAL、設定の JSON、同期するフォルダの中身) の状態。
+    /// フォルダは、manifest に無いファイルを消すので、取得の間に増えたファイルも見る。
+    /// </summary>
+    private string FingerprintPullTargets()
+        => DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File)
+           + "|" + DatabaseFingerprint.OfFile(_paths.ConfigJsonFile)
+           + string.Concat(_directories.Select(d => "|" + DatabaseFingerprint.OfDirectory(d.LocalDirectory, PullStaging.IsIncomingFile)));
 }
