@@ -471,13 +471,18 @@ public sealed class SyncRunner
                         },
                     });
                 }
-                catch
+                catch (Exception ex)
                 {
                     // 置き換えを始める前に失敗したなら、ローカルは元のままなので印は要らない。
                     // 置き換えを始めた後なら、本体の差し替えに失敗して退けた WAL を戻せなかった
                     // こともあるので、記録を残す。次回に本体のハッシュで置き換えの前後を見分け、
                     // 退けた WAL を戻すか、祖先と同期履歴をそろえる。
-                    if (!committed && !replaceStarted && !wasPending && !dryRun) TryClearMergePending(stateKey);
+                    // 記録を残した後、置き換える直前の確かめでツールが起動していた場合も、まだ
+                    // 何も退けていないのでローカルは元のまま。記録を残すと、そのツールが終了時に
+                    // WAL を本体へ書き戻したとき本体のハッシュが記録のどちらとも合わず、次回の
+                    // Push とマージが置き換えの前後を見分けられないとして止まり続ける。
+                    var localUntouched = !replaceStarted || ex is RunningProcessException;
+                    if (!committed && localUntouched && !wasPending && !dryRun) TryClearMergePending(stateKey);
                     // そろえている途中で失敗した。要約と同期履歴が食い違わないよう元へ戻す。
                     // ローカルはマージ結果のままだが、手元に未 Push の変更があるものとして
                     // 扱われるので、次の同期で同期先の変更を上書きすることはない。

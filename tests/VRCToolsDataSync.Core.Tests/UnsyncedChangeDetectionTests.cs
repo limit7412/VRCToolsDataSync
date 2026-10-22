@@ -2340,6 +2340,52 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.True(store.IsMergePending(key));
     }
 
+    [Fact(DisplayName = "記録を残した後、置き換える直前の確かめで VRCX が起動していたマージは、記録を残さない")]
+    public void MergeClearsReplaceRecordWhenToolStartsBeforeReplacing()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        // 記録を残す間に VRCX が起動し、置き換える直前の確かめで見つかった状況。
+        var service = new RunningAfterRecordService(b.Service);
+
+        Assert.Throws<RunningProcessException>(() => b.Runner.Merge(service, b.Settings, _storage, skipBackup: true));
+
+        // 本体も WAL もまだ退けていないので記録は要らない。残すと、VRCX が終了時に WAL を本体へ
+        // 書き戻したとき本体のハッシュがどちらの記録とも合わず、次の Push とマージが止まり続ける。
+        Assert.False(store.IsMergePending(key));
+        Assert.Null(store.LoadPendingReplace(key));
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.Equal(SyncOutcome.Success, b.Runner.Merge(b.Service, b.Settings, _storage, skipBackup: true).Outcome);
+    }
+
+    /// <summary>置き換えの記録を残した直後に、VRCX の起動を検知したことにする。</summary>
+    private sealed class RunningAfterRecordService : IMergeableSyncService
+    {
+        private readonly VrcxSyncService _inner;
+        public RunningAfterRecordService(VrcxSyncService inner) => _inner = inner;
+        public string ToolKey => _inner.ToolKey;
+        public TrackedDatabase? TrackedDatabase => _inner.TrackedDatabase;
+        public SyncResult Push(PushOptions options) => _inner.Push(options);
+        public SyncResult Pull(PullOptions options) => _inner.Pull(options);
+        public SyncResult PullMerge(PullMergeOptions options) => _inner.PullMerge(new PullMergeOptions
+        {
+            Storage = options.Storage,
+            Baseline = options.Baseline,
+            OwnPush = options.OwnPush,
+            DiscardOwnPush = options.DiscardOwnPush,
+            DryRun = options.DryRun,
+            SkipBackup = options.SkipBackup,
+            AfterReplaceLocal = options.AfterReplaceLocal,
+            BeforeReplaceLocal = pending =>
+            {
+                options.BeforeReplaceLocal?.Invoke(pending);
+                throw new RunningProcessException(ProcessGuard.VrcxProcessNames);
+            },
+        });
+    }
+
     [Fact(DisplayName = "マージが済めば、マージの印は残らない")]
     public void MergeClearsPendingMark()
     {
