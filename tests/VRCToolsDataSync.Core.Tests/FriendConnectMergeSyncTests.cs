@@ -165,4 +165,26 @@ public sealed class FriendConnectMergeSyncTests : IDisposable
 
         Assert.Equal(SyncOutcome.ConflictDetected, Push(b).Outcome);
     }
+
+    [Fact(DisplayName = "同期先に db_1.1.sqlite が無くマージできなければ、Pull は見送りとして返し強制 Pull を選べる")]
+    public void PullFallsBackToPendingWhenRemoteHasNoMergeBase()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        b.Settings.MergeFriendConnect = true;
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+        // 旧版のツールが書いた同期先のように、db_1.1.sqlite が載っていない manifest にする。
+        var manifest = _storage.LoadManifest().Manifest;
+        var entry = manifest.Tools[FriendConnectSyncService.Key];
+        entry.Files.RemoveAll(f => f.RelativePath == "friend-connect/db/db_1.1.sqlite");
+        entry.Files.Add(new ManifestFile { RelativePath = "friend-connect/db/db.sqlite", Sha256 = "", BlobKey = "", Size = 0 });
+        entry.Version++;
+        _storage.SeedManifest(manifest);
+
+        var result = Pull(b);
+
+        Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
+        Assert.Contains("マージはできませんでした", result.Message);
+        Assert.Equal("usr_a:memo-a,usr_b:memo-b", Notes(b.Paths.DbV11File));
+        _ = a;
+    }
 }

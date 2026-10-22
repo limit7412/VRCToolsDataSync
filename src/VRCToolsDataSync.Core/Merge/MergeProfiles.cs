@@ -96,6 +96,13 @@ public static class MergeProfiles
     private static readonly ColumnReference TagByName = new("tagId", "Tag", new[] { "type", "name" });
 
     /// <summary>
+    /// Friend Connect の FavoriteLocal がお気に入りのグループを指す列。groupKey は文字列で PC 間で
+    /// 同じなので付け替えは要らないが、参照として持つことで、グループの行を消す前にそのグループへ
+    /// 同期先だけで足されたお気に入りが無いかを確かめられる。
+    /// </summary>
+    private static readonly ColumnReference GroupByKey = new("groupKey", "FavoriteLocalGroup", new[] { "groupKey" }, IdColumn: "groupKey");
+
+    /// <summary>
     /// Friend Connect の規則。すべてのテーブルの id が PC ごとに別の値を取る
     /// (AUTOINCREMENT で、消して入れ直す更新もある) ので、行は自然キーで突き合わせ、
     /// 別のテーブルを id で指す列は <see cref="ColumnReference"/> で自然キーに置き換える。
@@ -120,8 +127,9 @@ public static class MergeProfiles
                 Filter: "note IS NOT NULL AND note <> ''", UpdateInPlace: true, ClearOnDelete: true,
                 ClearedColumns: new[] { "lastUserAvatarId", "lastLocationId", "lastUserStatusId" }),
             // タグの定義。UserTag / WorldTag が id で指すので、入れ直さずに書き換える。
-            // 名前を変えると別のタグとして消して入れ直すことになり、同期先だけで付けていた
-            // 旧名のタグ付けは消える。
+            // 名前を変えると別のタグとして消して入れ直すことになる。旧名の行の削除は、参照する
+            // テーブルを合わせた後まで遅らせ、同期先だけで付けていた旧名のタグ付けが残っていれば
+            // 旧名の行も残す (SqliteMerger の参照される行の削除の扱い)。
             new("Tag", MergeTableKind.Keyed, new[] { "type", "name" }, ValueColumns: new[] { "description", "sort", "isSystem" },
                 UpdateInPlace: true),
             new("FavoriteLocalGroup", MergeTableKind.Keyed, new[] { "groupKey" }, ValueColumns: new[] { "type", "name", "sort" },
@@ -132,9 +140,9 @@ public static class MergeProfiles
                 References: new[] { UserByApiId, TagByName }),
             new("WorldTag", MergeTableKind.Keyed, new[] { "worldId", "tagId" }, ValueColumns: Array.Empty<string>(),
                 References: new[] { WorldByApiId, TagByName }),
-            // ローカルのお気に入り。groupKey は文字列で FavoriteLocalGroup を指すので付け替えは要らない。
+            // ローカルのお気に入り。
             new("FavoriteLocal", MergeTableKind.Keyed, new[] { "groupKey", "userId", "worldId" }, ValueColumns: Array.Empty<string>(),
-                References: new[] { UserByApiId, WorldByApiId }),
+                References: new[] { GroupByKey, UserByApiId, WorldByApiId }),
             // ユーザーごとの通知設定。同じ (ユーザー、種類、通知先) の行が複数ありうるので、
             // キーの行をまとめて比べる。
             new("UserNotificationSetting", MergeTableKind.Keyed, new[] { "userId", "type", "notifyAPI" }, ValueColumns: new[] { "value" },

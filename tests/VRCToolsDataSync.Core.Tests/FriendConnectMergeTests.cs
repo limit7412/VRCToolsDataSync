@@ -343,4 +343,65 @@ public sealed class FriendConnectMergeTests : IDisposable
         Exec(local, TagUser("usr_b", "work"));
         Assert.Equal(new[] { "UserTag" }, DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!.FindChangedTables(baseline));
     }
+
+    [Fact(DisplayName = "手元で消したグループに同期先だけでお気に入りが足されていたら、グループを残す")]
+    public void KeepsGroupDeletedLocallyWhenHostAddedFavorites()
+    {
+        // 祖先: グループ fav に usr_a。手元は fav を消した (連鎖でお気に入りも消える)。
+        // 同期先は fav に usr_b を足した。
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM FavoriteLocalGroup WHERE groupKey = 'fav'");
+        Exec(host, FavoriteUser("fav", "usr_b"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM FavoriteLocalGroup WHERE groupKey = 'fav'"));
+        // 手元で消した usr_a のお気に入りは消え、同期先で足した usr_b は残る。
+        Assert.Equal("usr_b", Rows(host, "SELECT u.apiId FROM FavoriteLocal f JOIN User u ON u.id = f.userId WHERE f.groupKey = 'fav'").Single());
+        Assert.Single(report.KeptReferencedRows);
+        Assert.Equal(0, report.Tables.Single(t => t.Table == "FavoriteLocalGroup").Deleted);
+        Assert.Contains("残しました", report.Describe());
+    }
+
+    [Fact(DisplayName = "手元で消したグループを同期先が触っていなければ、お気に入りごと消す")]
+    public void DeletesGroupDeletedLocallyWhenHostUnchanged()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM FavoriteLocalGroup WHERE groupKey = 'fav'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM FavoriteLocalGroup WHERE groupKey = 'fav'"));
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM FavoriteLocal"));
+        Assert.Empty(report.KeptReferencedRows);
+        Assert.Equal(1, report.Tables.Single(t => t.Table == "FavoriteLocalGroup").Deleted);
+    }
+
+    [Fact(DisplayName = "手元でタグ名を変えても、同期先だけで旧名を付けたユーザーがいれば旧名のタグを残す")]
+    public void KeepsRenamedTagWhenHostTaggedWithOldName()
+    {
+        // 祖先: タグ friend を usr_a に付けている。手元は friend を buddy に改名。同期先は usr_b に friend を付けた。
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE Tag SET name = 'buddy' WHERE name = 'friend'");
+        Exec(host, TagUser("usr_b", "friend"));
+
+        Merge(host, local, baseline);
+
+        Assert.Equal("buddy,friend,work", string.Join(",", Rows(host, "SELECT name FROM Tag WHERE type = 'user' ORDER BY name")));
+        Assert.Equal("usr_a:buddy,usr_b:friend", string.Join(",", Rows(host,
+            "SELECT u.apiId || ':' || t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId ORDER BY u.apiId")));
+    }
+
+    [Fact(DisplayName = "手元でタグ名を変え、同期先が旧名を触っていなければ、旧名のタグは消える")]
+    public void RenamedTagRemovesOldNameWhenHostUnchanged()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE Tag SET name = 'buddy' WHERE name = 'friend'");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal("buddy,work", string.Join(",", Rows(host, "SELECT name FROM Tag WHERE type = 'user' ORDER BY name")));
+        Assert.Equal("usr_a:buddy", string.Join(",", Rows(host,
+            "SELECT u.apiId || ':' || t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId ORDER BY u.apiId")));
+    }
 }

@@ -222,7 +222,16 @@ public sealed class SyncRunner
             && service is IMergeableSyncService mergeable)
         {
             _logger.LogInformation("手元に未 Push の変更があるので、上書きの代わりにマージして Push します ({Tool})", service.ToolKey);
-            return Merge(mergeable, settings, storage, skipBackup);
+            var merged = Merge(mergeable, settings, storage, skipBackup);
+            if (merged.Outcome is SyncOutcome.NothingToDo or SyncOutcome.SourceMissing)
+            {
+                // 土台にする DB が同期先に無い (旧版のツールが書いた同期先など)。通常の Pull なら
+                // 旧版の DB や設定だけでも取り込めるので、見送りの結果に戻して、利用者が強制 Pull を
+                // 選べるようにする。
+                _logger.LogInformation("マージの土台が無いので、Pull の見送りとして返します: {Message}", merged.Message);
+                return WithMessage(result, $"マージはできませんでした ({merged.Message})");
+            }
+            return merged;
         }
         return result;
     }
