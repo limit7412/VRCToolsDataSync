@@ -396,7 +396,7 @@ static int RunPush(
     }
     catch (SyncStorageException ex)
     {
-        // 設定不備と、保存先へ到達できない場合をまとめて扱う。README の
+        // 設定不備と、保存先へ到達できない場合をまとめて扱う。docs/cli.md の
         // 終了コード表で 2 と定めているのはこの両方。
         Console.Error.WriteLine(ex.Message);
         return 2;
@@ -467,7 +467,7 @@ static int RunPull(
     }
     catch (SyncStorageException ex)
     {
-        // 設定不備と、保存先へ到達できない場合をまとめて扱う。README の
+        // 設定不備と、保存先へ到達できない場合をまとめて扱う。docs/cli.md の
         // 終了コード表で 2 と定めているのはこの両方。
         Console.Error.WriteLine(ex.Message);
         return 2;
