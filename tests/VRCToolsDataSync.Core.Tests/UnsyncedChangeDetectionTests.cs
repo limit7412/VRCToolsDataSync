@@ -2386,6 +2386,93 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         });
     }
 
+    [Fact(DisplayName = "前回同期した版の後に別の PC が強制 Push で上書きしていれば、要約を祖先にせず中止する")]
+    public void MergeAbortsWhenLaterVersionWasForcedAfterBaseline()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        // A は B の取り込んだ版とは別の祖先から、強制 Push で同期先を上書きした。
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 120");
+        Assert.Equal(SyncOutcome.Success, a.Runner.Push(a.Service, a.Settings, _storage, force: true).Outcome);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage, skipBackup: true);
+
+        // 送った写しの記録が無い通常の状態でも、要約の版より後の強制 Push を見て止める。
+        // 要約を祖先にすると、祖先からの双方の増分を実際と違う祖先を基に足す。
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("強制 Push", result.Message);
+        Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "前回同期した版の後の版を古いツールが書いていれば、強制 Push の有無を確かめられないので要約を祖先にせず中止する")]
+    public void MergeAbortsWhenVersionAfterBaselineLacksForcedVersion()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            CREATE TABLE usr0123abcd_avatar_history (avatar_id TEXT PRIMARY KEY, created_at TEXT, time INTEGER);
+            INSERT INTO usr0123abcd_avatar_history VALUES ('avtr_a', '2026-10-01T00:00:00Z', 100);
+            """);
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        Exec(a.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 120");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        // A のツールが古く、強制 Push の版を書かなかったことにする。
+        var manifest = _storage.LoadManifest().Manifest;
+        manifest.Tools[VrcxSyncService.Key].LastForcedVersion = null;
+        _storage.SeedManifest(manifest);
+        Exec(b.Paths.SqliteFile, "UPDATE usr0123abcd_avatar_history SET time = 150");
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage, skipBackup: true);
+
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains("古く", result.Message);
+        Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
+    }
+
+    [Fact(DisplayName = "Push の後に要約だけ保存して同期履歴を保存する前に止まっても、マージ無しの Push は自分の版と競合しない")]
+    public void PushUsesSavedSummaryVersionWhenHistorySaveFailed()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "a", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var pulledBefore = a.Settings.ToolState[key].LastPulledVersion;
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        var pushed = Push(a);
+        Assert.Equal(SyncOutcome.Success, pushed.Outcome);
+        // 要約は送った版で保存され、送った写しの記録は消えた後、同期履歴の保存で止まった状態。
+        Assert.Equal(pushed.RemoteVersion, store.Load(key)!.RemoteVersion);
+        Assert.Null(store.LoadPushed(key));
+        a.Settings.ToolState[key].LastPulledVersion = pulledBefore;
+        AddLocation(a, "2026-10-03T00:00:00Z");
+
+        var result = Push(a);
+
+        // 同期履歴だけで見ると自分が送った版と競合し、先に Pull しない限り送れない。
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(pushed.RemoteVersion + 1, result.RemoteVersion);
+        Assert.Equal(result.RemoteVersion, a.Settings.ToolState[key].LastPulledVersion);
+    }
+
     [Fact(DisplayName = "マージが済めば、マージの印は残らない")]
     public void MergeClearsPendingMark()
     {

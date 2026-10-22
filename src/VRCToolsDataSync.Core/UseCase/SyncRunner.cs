@@ -124,6 +124,16 @@ public sealed class SyncRunner
             {
                 pulledVersion = syncedVersion;
             }
+            // 要約を保存した後、同期履歴を保存する前に止まると、要約の版だけが進む。要約を保存すると
+            // 送った写しの記録は消えるので、上の記録では補えない。要約の版は自分が送ったか取り込んだ
+            // 版なので、その版までは取り込んだものとして扱う。Pull が本体だけを差し替えて止まった
+            // 状態は、本体は取り出した版でも設定などは前の版なので対象にしない (印が残っていれば、
+            // 上の ResolveInterruptedReplace が止めている)。
+            if (!_baseSummaries.IsMergePending(stateKey)
+                && _baseSummaries.Load(stateKey) is { } savedSummary && savedSummary.RemoteVersion > pulledVersion)
+            {
+                pulledVersion = savedSummary.RemoteVersion;
+            }
             // この Push を見分ける値。manifest の項目と送信の記録の両方に残し、反映されたか
             // 分からないまま止まった後に、同期先の項目がこの Push のものかを確かめる。
             var pushId = Guid.NewGuid().ToString("N");

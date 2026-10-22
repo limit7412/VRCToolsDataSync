@@ -662,6 +662,34 @@ public sealed class VrcxSyncService : IMergeableSyncService
             {
                 return ownPushAbort;
             }
+            if (baseline is not null && ReferenceEquals(baseline, options.Baseline) && entry.Version > baseline.RemoteVersion)
+            {
+                // 前回同期した版より後に別の PC が強制 Push で上書きしていれば、同期先はその版の
+                // 内容を取り込んだ子孫とは限らない。その要約を祖先にすると、祖先からの双方の増分を
+                // 足す合成 (着用時間の累計など) が実際と違う祖先を基に計算され、値が狂う。
+                if (entry.LastForcedVersion is null)
+                {
+                    return new SyncResult
+                    {
+                        Outcome = SyncOutcome.Aborted,
+                        RemoteVersion = entry.Version,
+                        Message = $"同期先の版 {entry.Version} を書いた PC のツールが古く、前回の同期 (版 {baseline.RemoteVersion}) の後に強制 Push があったかを確かめられません。" +
+                                  "前回そろえた内容を二重に数えたり失ったりしないよう、自動マージを中止しました。" +
+                                  "すべての PC でツールを更新したうえで、同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                    };
+                }
+                if (entry.LastForcedVersion is long forcedAfterBaseline && forcedAfterBaseline > baseline.RemoteVersion)
+                {
+                    return new SyncResult
+                    {
+                        Outcome = SyncOutcome.Aborted,
+                        RemoteVersion = entry.Version,
+                        Message = $"前回の同期 (版 {baseline.RemoteVersion}) の後に別の PC が強制 Push (版 {forcedAfterBaseline}) で同期先を上書きしています。" +
+                                  "前回そろえた内容が同期先に残っているか分からないため、自動マージを中止しました。" +
+                                  "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください",
+                    };
+                }
+            }
             var report = SqliteMerger.Merge(hostPath, localPath, MergeProfiles.Vrcx, baseline, options.DryRun);
             if (hostBaseline is not null && report.Succeeded)
             {
