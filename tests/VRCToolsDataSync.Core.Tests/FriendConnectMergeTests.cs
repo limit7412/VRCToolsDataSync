@@ -1,0 +1,346 @@
+using Microsoft.Data.Sqlite;
+using VRCToolsDataSync.Core.Merge;
+using Xunit;
+using static VRCToolsDataSync.Core.Tests.FriendConnectSchema;
+
+namespace VRCToolsDataSync.Core.Tests;
+
+/// <summary>
+/// Friend Connect の DB のマージを確かめる。共通の祖先から同期先 (host) と手元 (local) が
+/// それぞれ変更を重ねた状態を作る。手元の id は祖先からずらし、2 台の PC で id が
+/// 一致しない実際の状態に合わせる。
+/// </summary>
+public sealed class FriendConnectMergeTests : IDisposable
+{
+    private readonly string _root;
+
+    public FriendConnectMergeTests()
+    {
+        _root = Path.Combine(Path.GetTempPath(), "vrctds-fc-merge-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_root);
+    }
+
+    public void Dispose()
+    {
+        SqliteConnection.ClearAllPools();
+        try { Directory.Delete(_root, recursive: true); } catch { /* best-effort cleanup */ }
+    }
+
+    /// <summary>
+    /// 祖先: ユーザー a (メモあり)、b、c、ワールド w1、タグ friend / work、a に friend、
+    /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件。
+    /// </summary>
+    private (string Host, string Local, DatabaseSummary Baseline) Arrange()
+    {
+        var ancestor = Path.Combine(_root, "ancestor.sqlite");
+        FriendConnectSchema.Create(ancestor);
+        Exec(ancestor,
+            InsertUser("usr_a", "A", "memo-a", lastLocationId: 1) + InsertUser("usr_b", "B") + InsertUser("usr_c", "C") +
+            InsertWorld("wrld_1", "W1") +
+            InsertTag("friend") + InsertTag("work") + InsertTag("scenic", type: "world") +
+            TagUser("usr_a", "friend") +
+            InsertFavoriteGroup("fav", "Favorites") + FavoriteUser("fav", "usr_a") +
+            SetNotification("usr_a", "login", "discord") +
+            "INSERT INTO Location (userId, startAt) SELECT id, 1 FROM User WHERE apiId = 'usr_a';" +
+            "INSERT INTO Location (userId, startAt) SELECT id, 2 FROM User WHERE apiId = 'usr_a';");
+        var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
+        Assert.True(baseline is not null, reason);
+
+        var host = Path.Combine(_root, "host.sqlite");
+        var local = Path.Combine(_root, "local.sqlite");
+        File.Copy(ancestor, host);
+        File.Copy(ancestor, local);
+        // 手元の id をずらす。外部キーは ON UPDATE CASCADE なので参照も付いて動く。
+        Exec(local, "UPDATE User SET id = id + 100; UPDATE Tag SET id = id + 200; UPDATE World SET id = id + 300;");
+        return (host, local, baseline!);
+    }
+
+    private static MergeReport Merge(string host, string local, DatabaseSummary? baseline, bool dryRun = false)
+    {
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun);
+        Assert.True(report.Succeeded, report.AbortReason);
+        return report;
+    }
+
+    private static long UserId(string path, string apiId) => Scalar(path, $"SELECT id FROM User WHERE apiId = '{apiId}'");
+
+    [Fact(DisplayName = "メモの編集は User の行を入れ直さず書き換え、履歴やタグ付けを巻き込まない")]
+    public void NoteEditIsAppliedInPlace()
+    {
+        var (host, local, baseline) = Arrange();
+        var hostUserId = UserId(host, "usr_a");
+        Exec(local, "UPDATE User SET note = 'memo-a2', updatedAt = 9 WHERE apiId = 'usr_a'");
+        // 同期先ではその間も履歴が増えている。
+        Exec(host, "INSERT INTO Location (userId, startAt) SELECT id, 3 FROM User WHERE apiId = 'usr_a'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "memo-a2" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_a'"));
+        Assert.Equal(hostUserId, UserId(host, "usr_a"));
+        Assert.Equal(3, Scalar(host, "SELECT count(*) FROM Location"));
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserTag"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "User").Updated);
+        // 2 回目は足すものが無い。
+        Assert.Equal(0, Merge(host, local, baseline).ChangedRows);
+    }
+
+    [Fact(DisplayName = "メモを消すと、同期先の User の行は残して note だけ消す")]
+    public void ClearedNoteClearsHostNote()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE User SET note = NULL WHERE apiId = 'usr_a'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "null" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_a'"));
+        Assert.Equal(3, Scalar(host, "SELECT count(*) FROM User"));
+        Assert.Equal(2, Scalar(host, "SELECT count(*) FROM Location"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "User").Deleted);
+    }
+
+    [Fact(DisplayName = "同期先に無いユーザーのメモは User の行ごと写し、履歴を指す id は消す")]
+    public void NoteOnUnknownUserCopiesUserRow()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertUser("usr_d", "D", "memo-d", lastLocationId: 777));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "D|memo-d|null" }, Rows(host, "SELECT displayName, note, lastLocationId FROM User WHERE apiId = 'usr_d'"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "User").Inserted);
+    }
+
+    [Fact(DisplayName = "同期先で初めてメモが書かれたユーザーは、行があるので書き換えで足りる")]
+    public void FirstNoteOnExistingUserUpdates()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "memo-b" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_b'"));
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM User WHERE apiId = 'usr_b'"));
+    }
+
+    [Fact(DisplayName = "タグ付けは同期先の id に付け替えて足し、2 回目は足さない")]
+    public void UserTagIsTranslatedToHostIds()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, TagUser("usr_b", "work"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "usr_a|friend", "usr_b|work" },
+            Rows(host, "SELECT u.apiId, t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId ORDER BY ut.id"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "UserTag").Inserted);
+        Assert.Equal(0, Merge(host, local, baseline).ChangedRows);
+    }
+
+    [Fact(DisplayName = "手元で外したタグ付けは同期先からも外し、同期先で付けたものは残す")]
+    public void RemovedUserTagIsDeleted()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM UserTag");
+        Exec(host, TagUser("usr_c", "friend"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "usr_c|friend" },
+            Rows(host, "SELECT u.apiId, t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "UserTag").Deleted);
+    }
+
+    [Fact(DisplayName = "新しいタグとそのタグ付けは、タグを先に写してから付ける")]
+    public void NewTagWithTaggingIsCopiedInOrder()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertTag("vip", description: "important", sort: 5) + TagUser("usr_a", "vip") + TagUser("usr_c", "vip"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "vip|important|5" }, Rows(host, "SELECT name, description, sort FROM Tag WHERE name = 'vip'"));
+        Assert.Equal(2, Scalar(host, "SELECT count(*) FROM UserTag ut JOIN Tag t ON t.id = ut.tagId WHERE t.name = 'vip'"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "Tag").Inserted);
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "UserTag").Inserted);
+    }
+
+    [Fact(DisplayName = "タグの説明の変更は Tag の行を入れ直さず、タグ付けを巻き込まない")]
+    public void TagEditKeepsTaggings()
+    {
+        var (host, local, baseline) = Arrange();
+        var hostTagId = Scalar(host, "SELECT id FROM Tag WHERE name = 'friend'");
+        Exec(local, "UPDATE Tag SET description = 'close friends', updatedAt = 9 WHERE name = 'friend'");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "close friends" }, Rows(host, "SELECT description FROM Tag WHERE name = 'friend'"));
+        Assert.Equal(hostTagId, Scalar(host, "SELECT id FROM Tag WHERE name = 'friend'"));
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserTag"));
+    }
+
+    [Fact(DisplayName = "ワールドのタグ付けで、同期先に無いワールドは行を写してから付ける")]
+    public void WorldTagCopiesMissingWorld()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertWorld("wrld_2", "W2") + TagWorld("wrld_2", "scenic") + TagWorld("wrld_1", "scenic"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "wrld_1|scenic", "wrld_2|scenic" },
+            Rows(host, "SELECT w.apiId, t.name FROM WorldTag wt JOIN World w ON w.id = wt.worldId JOIN Tag t ON t.id = wt.tagId ORDER BY w.apiId"));
+        Assert.Equal(new[] { "W2" }, Rows(host, "SELECT name FROM World WHERE apiId = 'wrld_2'"));
+        var table = Assert.Single(report.Tables, t => t.Table == "WorldTag");
+        Assert.Equal(2, table.Inserted);
+        Assert.Equal(1, table.CopiedReferences!["World"]);
+        Assert.Contains("World 1", report.Describe());
+    }
+
+    [Fact(DisplayName = "新しいお気に入りグループとその中身は、グループを先に写してから足す")]
+    public void FavoriteGroupWithEntries()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertFavoriteGroup("worlds", "Worlds", type: "world") + FavoriteWorld("worlds", "wrld_1") + FavoriteUser("fav", "usr_c"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "fav|usr_a|null", "fav|usr_c|null", "worlds|null|wrld_1" },
+            Rows(host, "SELECT f.groupKey, u.apiId, w.apiId FROM FavoriteLocal f LEFT JOIN User u ON u.id = f.userId LEFT JOIN World w ON w.id = f.worldId ORDER BY f.groupKey, u.apiId"));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "FavoriteLocalGroup").Inserted);
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "FavoriteLocal").Inserted);
+        Assert.Equal(0, Merge(host, local, baseline).ChangedRows);
+    }
+
+    [Fact(DisplayName = "通知設定の値の変更は手元の内容になる")]
+    public void NotificationSettingValueFollowsLocal()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE UserNotificationSetting SET value = 'https://hook' WHERE type = 'login'");
+        Exec(local, SetNotification("usr_b", "move", "webhook", "x"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(
+            new[] { "usr_a|login|https://hook", "usr_b|move|x" },
+            Rows(host, "SELECT u.apiId, s.type, s.value FROM UserNotificationSetting s JOIN User u ON u.id = s.userId ORDER BY u.apiId"));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserNotificationSetting");
+        Assert.Equal(1, table.Updated);
+        Assert.Equal(1, table.Inserted);
+    }
+
+    [Fact(DisplayName = "両方で別のメモを書いていたら、編集時刻が無いので同期先の内容を残す")]
+    public void ConflictingNotesKeepHost()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "UPDATE User SET note = 'host' WHERE apiId = 'usr_a'");
+        Exec(local, "UPDATE User SET note = 'local' WHERE apiId = 'usr_a'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "host" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_a'"));
+        var conflict = Assert.Single(report.Conflicts);
+        Assert.False(conflict.KeptLocal);
+        Assert.Contains("同期先", report.Describe());
+    }
+
+    [Fact(DisplayName = "同期先だけが変えたものは、手元が変えていなければそのまま残る")]
+    public void HostOnlyChangesSurvive()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "UPDATE User SET note = 'host' WHERE apiId = 'usr_a'; DELETE FROM UserTag;" + TagUser("usr_b", "work"));
+        // 手元では起動しているだけで起きる書き換え。
+        Exec(local, "UPDATE User SET updatedAt = 99, displayName = 'A!'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(0, report.ChangedRows);
+        Assert.Equal(new[] { "host" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_a'"));
+        Assert.Equal(new[] { "usr_b|work" },
+            Rows(host, "SELECT u.apiId, t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId"));
+    }
+
+    [Fact(DisplayName = "祖先が無ければ 2-way になり、手元で外したタグ付けは同期先から戻る")]
+    public void WithoutBaselineDeletionsDoNotPropagate()
+    {
+        var (host, local, _) = Arrange();
+        Exec(local, "DELETE FROM UserTag;" + TagUser("usr_b", "work"));
+
+        Merge(host, local, null);
+
+        Assert.Equal(2, Scalar(host, "SELECT count(*) FROM UserTag"));
+    }
+
+    [Fact(DisplayName = "dry-run は結果を数えるだけで同期先の写しにも書かない")]
+    public void DryRunWritesNothing()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, TagUser("usr_b", "work") + "UPDATE User SET note = 'x' WHERE apiId = 'usr_a'");
+
+        var report = Merge(host, local, baseline, dryRun: true);
+
+        Assert.Equal(2, report.ChangedRows);
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserTag"));
+        Assert.Equal(new[] { "memo-a" }, Rows(host, "SELECT note FROM User WHERE apiId = 'usr_a'"));
+    }
+
+    [Fact(DisplayName = "前回の要約が変化を見るだけの古い規則で取られていれば、内容が違うテーブルは中止する")]
+    public void OldWatchedSummaryAbortsWhenDifferent()
+    {
+        var (host, local, baseline) = Arrange();
+        baseline.RulesDigest = "old";
+        baseline.Tables["Tag"] = new TableSummary { Kind = MergeTableKind.Watched, RowCount = 3, Digest = "x", Columns = baseline.Tables["Tag"].Columns };
+        Exec(local, InsertTag("vip"));
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: true);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("Tag", report.AbortReason);
+        Assert.Contains("マージの対象にしていません", report.AbortReason);
+
+        // 内容が同じなら合わせるものが無いので進む。
+        Exec(local, "DELETE FROM Tag WHERE name = 'vip'");
+        Assert.True(SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: true).Succeeded);
+    }
+
+    [Fact(DisplayName = "確かめていない版のスキーマなら中止する")]
+    public void UnknownSchemaVersionAborts()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "INSERT INTO _prisma_migrations (id, checksum, finished_at, migration_name) VALUES ('3', '', 3, '20991231000000_future')");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: true);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("20991231000000_future", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "参照先が手元にも無い行は制約に掛かるので、取り消して中止する")]
+    public void DanglingReferenceAborts()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "PRAGMA foreign_keys = OFF; INSERT INTO UserTag (userId, tagId, updatedAt) VALUES (9999, 201, 1);");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("UserTag", report.AbortReason);
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserTag"));
+    }
+
+    [Fact(DisplayName = "要約は id ではなく自然キーで取るので、id がずれた写しどうしで同じになる")]
+    public void SummaryIgnoresIds()
+    {
+        var (host, local, baseline) = Arrange();
+
+        var hostSummary = DatabaseSummary.Compute(host, MergeProfiles.FriendConnect, out _)!;
+        var localSummary = DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!;
+
+        Assert.Empty(hostSummary.FindChangedTables(baseline));
+        Assert.Empty(localSummary.FindChangedTables(baseline));
+        Exec(local, TagUser("usr_b", "work"));
+        Assert.Equal(new[] { "UserTag" }, DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!.FindChangedTables(baseline));
+    }
+}

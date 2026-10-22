@@ -6,7 +6,7 @@ using VRCToolsDataSync.Core.Merge;
 
 namespace VRCToolsDataSync.Core.UseCase;
 
-public sealed class FriendConnectSyncService : ISyncService
+public sealed class FriendConnectSyncService : IMergeableSyncService
 {
     public const string Key = "friend-connect";
 
@@ -688,6 +688,42 @@ public sealed class FriendConnectSyncService : ISyncService
     /// Pull が差し替えるもの (2 つの DB 本体と WAL、設定の JSON、同期するフォルダの中身) の状態。
     /// フォルダは、manifest に無いファイルを消すので、取得の間に増えたファイルも見る。
     /// </summary>
+    /// <summary>
+    /// 同期先の最新の db_1.1.sqlite を土台に、手元の DB にしか無い変更を足した DB を作り、
+    /// ローカルの DB と置き換える。手順は <see cref="DatabaseMergeFlow"/>。
+    /// <para>
+    /// 合わせるのは手で編集するデータ (メモ、タグ、ローカルのお気に入り、通知設定) だけで、
+    /// 規則は <see cref="MergeProfiles.FriendConnect"/>。旧版の db.sqlite、config.json、
+    /// サムネイルには触れない。続く Push で手元のものが送られる。
+    /// </para>
+    /// </summary>
+    public SyncResult PullMerge(PullMergeOptions options)
+    {
+        var flow = new DatabaseMergeFlow
+        {
+            ToolKey = Key,
+            DisplayName = DisplayName,
+            SnapshotKey = DbV11Key,
+            DatabasePath = _paths.DbV11File,
+            Profile = MergeProfiles.FriendConnect,
+            ProcessNames = ProcessGuard.FriendConnectProcessNames,
+            Logger = _logger,
+            CreateBackup = () =>
+            {
+                // 置き換えるのは db_1.1 だけだが、Pull と同じく WAL/SHM ごと退避する。
+                // この後で消すので、含めておかないと本体へ未反映のローカル変更が復元できなくなる。
+                var filesToBackup = new List<string>
+                {
+                    _paths.DbV11File,
+                    Path.Combine(_paths.DbDirectory, "db_1.1.sqlite-wal"),
+                    Path.Combine(_paths.DbDirectory, "db_1.1.sqlite-shm"),
+                };
+                return _backup.CreateSnapshot(Key, filesToBackup);
+            },
+        };
+        return flow.Run(options);
+    }
+
     private string FingerprintPullTargets()
         => DatabaseFingerprint.Of(_paths.DbFile) + "|" + DatabaseFingerprint.Of(_paths.DbV11File)
            + "|" + DatabaseFingerprint.OfFile(_paths.ConfigJsonFile)

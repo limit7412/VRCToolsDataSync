@@ -26,10 +26,19 @@ public sealed class SyncSettings
     public bool MergeVrcx { get; set; }
 
     /// <summary>
-    /// ツールをマージで同期するか。Friend Connect は、開発者に確認するまで
-    /// 行単位の書き込みを行わないので対象にしない。
+    /// Friend Connect の DB (db_1.1.sqlite) をマージで同期するか。既定は無効。VRCX とは
+    /// 別に切り替える。マージは Friend Connect の DB のコピーに行単位で書き込むので、
+    /// 利用規約上の扱いを利用者が判断して有効にする。
     /// </summary>
-    public bool IsMergeEnabled(string toolKey) => toolKey == "vrcx" && MergeVrcx;
+    public bool MergeFriendConnect { get; set; }
+
+    /// <summary>ツールをマージで同期するか。</summary>
+    public bool IsMergeEnabled(string toolKey) => toolKey switch
+    {
+        "vrcx" => MergeVrcx,
+        "friend-connect" => MergeFriendConnect,
+        _ => false,
+    };
 
     public bool AutoSyncEnabled { get; set; } = false;
 

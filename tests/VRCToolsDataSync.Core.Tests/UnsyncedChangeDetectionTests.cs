@@ -961,7 +961,7 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         var result = Push(a);
 
         Assert.Equal(SyncOutcome.ConflictDetected, result.Outcome);
-        Assert.Contains("古く", result.Message);
+        Assert.Contains("強制 Push の版が無く", result.Message);
         Assert.Equal(150, Scalar(a.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 
@@ -2439,7 +2439,7 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         var result = b.Runner.Merge(b.Service, b.Settings, _storage, skipBackup: true);
 
         Assert.Equal(SyncOutcome.Aborted, result.Outcome);
-        Assert.Contains("古く", result.Message);
+        Assert.Contains("強制 Push の版が無く", result.Message);
         Assert.Equal(150, Scalar(b.Paths.SqliteFile, "SELECT time FROM usr0123abcd_avatar_history"));
     }
 

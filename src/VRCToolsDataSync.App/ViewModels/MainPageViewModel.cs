@@ -52,6 +52,7 @@ public partial class MainPageViewModel : ObservableObject
         CloudFolderPath = _settings.CloudFolderPath;
         SyncVrcx = _settings.SyncVrcx;
         MergeVrcx = _settings.MergeVrcx;
+        MergeFriendConnect = _settings.MergeFriendConnect;
         SyncFriendConnect = _settings.SyncFriendConnect;
         AutoSyncEnabled = _settings.AutoSyncEnabled;
         LoadStorageSettingsToProperties();
@@ -219,6 +220,10 @@ public partial class MainPageViewModel : ObservableObject
     /// <summary>VRCX を置き換えではなくマージで同期するか (issue #87)。</summary>
     [ObservableProperty]
     public partial bool MergeVrcx { get; set; }
+
+    /// <summary>Friend Connect を置き換えではなくマージで同期するか (issue #87)。</summary>
+    [ObservableProperty]
+    public partial bool MergeFriendConnect { get; set; }
 
     [ObservableProperty]
     public partial bool SyncFriendConnect { get; set; }
@@ -472,6 +477,7 @@ public partial class MainPageViewModel : ObservableObject
         settings.CloudFolderPath = CloudFolderPath?.Trim() ?? string.Empty;
         settings.SyncVrcx = SyncVrcx;
         settings.MergeVrcx = MergeVrcx;
+        settings.MergeFriendConnect = MergeFriendConnect;
         settings.SyncFriendConnect = SyncFriendConnect;
         settings.AutoSyncEnabled = AutoSyncEnabled;
         ApplyStoragePropertiesToSettings(settings);

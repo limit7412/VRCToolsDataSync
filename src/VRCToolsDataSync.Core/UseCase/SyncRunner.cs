@@ -659,7 +659,7 @@ public sealed class SyncRunner
                 {
                     Outcome = SyncOutcome.Aborted,
                     Message = "前回のマージが退けた WAL を戻せません (" + string.Join(", ", aside) + ")。" +
-                              "戻す先に別のファイルがあります。VRCX を終了してからもう一度実行してください。" +
+                              "戻す先に別のファイルがあります。ツールを終了してからもう一度実行してください。" +
                               "それでも進まなければ、退けたファイルの中身が要らないことを確かめて消してください",
                 }, null, null);
             }
