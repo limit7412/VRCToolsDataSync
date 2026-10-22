@@ -67,6 +67,29 @@ public enum MergeTableKind
 /// 両方が同じキーを書き換えていたら、祖先の値に双方の増分を足した値にする。大きい方を
 /// 残すと、少ない側の PC で足した分が失われる。祖先の値が要約に無ければ大きい方を残す。
 /// </param>
+/// <param name="References">
+/// <see cref="MergeTableKind.Keyed"/> で、キーの列のうち別のテーブルの行を整数 id で指すもの。
+/// Friend Connect の id は PC ごとに別の値を取るので、id のままでは突き合わせられない。
+/// 要約とマージでは、その列の値の代わりに指している行の自然キーを使い、手元の行を
+/// 同期先へ写すときは同期先での id に付け替える。指している行が同期先に無ければ、
+/// その行も手元から写す。
+/// </param>
+/// <param name="UpdateInPlace">
+/// <see cref="MergeTableKind.Keyed"/> で、同期先にあるキーの行を消して入れ直すのではなく、
+/// 比べる列だけを書き換える。他のテーブルから id で参照されるテーブル (Friend Connect の
+/// User や Tag) に使う。入れ直すと id が変わり、ON DELETE CASCADE で参照している行まで消える。
+/// <see cref="ValueColumns"/> を指定したテーブルだけに使える。
+/// </param>
+/// <param name="ClearOnDelete">
+/// <see cref="MergeTableKind.Keyed"/> で、手元からキーが消えていたときに同期先の行を消す代わりに
+/// 比べる列を NULL にする。<see cref="Filter"/> で絞ったキーは、行が残っていても列を消すと
+/// キーから外れるので、その「消えた」は行の削除ではなく列の消去を表す。Friend Connect の
+/// User.note は、メモを消しても User の行は残る。
+/// </param>
+/// <param name="ClearedColumns">
+/// 手元の行を同期先へ写すときに NULL にする列。外部キーの制約が無いまま別の行の id を
+/// 持つ列で、同期先では別の行を指してしまうもの。
+/// </param>
 public sealed record MergeTableRule(
     string NamePattern,
     MergeTableKind Kind,
@@ -78,12 +101,30 @@ public sealed record MergeTableRule(
     string? OrderColumn = null,
     IReadOnlyList<string>? GrowingColumns = null,
     IReadOnlyList<string>? ShrinkingColumns = null,
-    IReadOnlyList<string>? CounterColumns = null)
+    IReadOnlyList<string>? CounterColumns = null,
+    IReadOnlyList<ColumnReference>? References = null,
+    bool UpdateInPlace = false,
+    bool ClearOnDelete = false,
+    IReadOnlyList<string>? ClearedColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
     public bool Matches(string tableName) => _pattern.IsMatch(tableName);
+
+    /// <summary><paramref name="column"/> が指す別のテーブルの行の対応。無ければ null。</summary>
+    public ColumnReference? ReferenceOf(string column)
+        => References?.FirstOrDefault(r => string.Equals(r.Column, column, StringComparison.Ordinal));
 }
+
+/// <summary>
+/// 別のテーブルの行を整数 id で指す列と、その行を PC をまたいで見分ける自然キーの対応。
+/// </summary>
+/// <param name="Column">このテーブルの、参照している列。</param>
+/// <param name="Table">参照先のテーブル。</param>
+/// <param name="KeyColumns">参照先の行を見分ける列。複数なら組で見分ける。</param>
+/// <param name="IdColumn">参照先の、<see cref="Column"/> の値が指す列。</param>
+public sealed record ColumnReference(
+    string Column, string Table, IReadOnlyList<string> KeyColumns, string IdColumn = "id");
 
 /// <summary>
 /// ツールごとのマージの規則一式。前回同期時点の要約 (<see cref="DatabaseSummary"/>) と、
@@ -107,10 +148,14 @@ public sealed class MergeProfile
     private string ComputeRulesDigest()
     {
         static string Columns(IReadOnlyList<string>? columns) => columns is null ? "-" : string.Join(",", columns);
+        static string References(IReadOnlyList<ColumnReference>? references) => references is null
+            ? "-"
+            : string.Join(",", references.Select(r => $"{r.Column}>{r.Table}.{r.IdColumn}({Columns(r.KeyColumns)})"));
         var text = string.Join("\n", Rules.Select(r => string.Join("|",
             r.NamePattern, r.Kind.ToString(), Columns(r.KeyColumns), Columns(r.ValueColumns),
             r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
-            Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns))));
+            Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
+            References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 

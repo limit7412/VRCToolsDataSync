@@ -177,6 +177,8 @@ public sealed class DatabaseSummary
     internal static List<string> FindMissingColumns(MergeTableRule rule, IReadOnlyList<string> columns)
         => rule.KeyColumns
             .Concat(rule.ValueColumns ?? Array.Empty<string>())
+            .Concat(rule.ClearedColumns ?? Array.Empty<string>())
+            .Concat(rule.References?.Select(r => r.Column) ?? Array.Empty<string>())
             .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
             .Concat(rule.OrderColumn is null ? Array.Empty<string>() : new[] { rule.OrderColumn })
             .Concat(rule.GrowingColumns ?? Array.Empty<string>())
@@ -303,15 +305,16 @@ public sealed class DatabaseSummary
         SqliteConnection connection, string schema, string table, MergeTableRule rule)
     {
         var counters = rule.CounterColumns!;
-        var selected = rule.KeyColumns.Concat(counters).ToList();
+        var keys = KeyExpressions(rule, schema, "t");
+        var selected = keys.Concat(counters.Select(c => $"t.{Quote(c)}")).ToList();
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)}" +
+            $"SELECT {string.Join(", ", selected)} FROM {Quote(schema)}.{Quote(table)} AS t" +
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
         var result = new Dictionary<string, Dictionary<string, long>>(StringComparer.Ordinal);
-        var keyCount = rule.KeyColumns.Count;
+        var keyCount = keys.Count;
         while (reader.Read())
         {
             var key = new StringBuilder();
@@ -329,8 +332,36 @@ public sealed class DatabaseSummary
         return result;
     }
 
-    /// <summary>キー付きのテーブルの 1 キーぶん。キーの値そのものと、内容のハッシュを持つ。</summary>
+    /// <summary>
+    /// キー付きのテーブルの 1 キーぶん。キーの値そのものと、内容のハッシュを持つ。キーの値は
+    /// <see cref="KeyExpressions"/> の式の順で、id で参照する列はその行の自然キーの値になっている。
+    /// </summary>
     internal sealed record KeyedRow(object?[] KeyValues, string Hash);
+
+    /// <summary>
+    /// キーの列を、<paramref name="alias"/> の付いたテーブルから読む SQL の式にする。別のテーブルの
+    /// 行を id で指す列 (<see cref="MergeTableRule.References"/>) は、その行の自然キーを読む
+    /// 副問い合わせに置き換える。1 列が複数の式になることがあるので、キーの幅は式の数で数える。
+    /// 要約とマージで同じキーを使うため、両方がここを通る。
+    /// </summary>
+    internal static List<string> KeyExpressions(MergeTableRule rule, string schema, string alias)
+    {
+        var expressions = new List<string>();
+        foreach (var column in rule.KeyColumns)
+        {
+            if (rule.ReferenceOf(column) is { } reference)
+            {
+                expressions.AddRange(reference.KeyColumns.Select(k =>
+                    $"(SELECT r.{Quote(k)} FROM {Quote(schema)}.{Quote(reference.Table)} AS r " +
+                    $"WHERE r.{Quote(reference.IdColumn)} = {alias}.{Quote(column)})"));
+            }
+            else
+            {
+                expressions.Add($"{alias}.{Quote(column)}");
+            }
+        }
+        return expressions;
+    }
 
     /// <summary>
     /// キー付きのテーブルを読み、キー (型付きで文字列にしたもの) から行へ写す。
@@ -347,17 +378,18 @@ public sealed class DatabaseSummary
         var valueColumns = exactColumns
             ? columns.Where(c => !rule.KeyColumns.Contains(c, StringComparer.Ordinal)).ToList()
             : ValueColumnsOf(rule, columns);
-        var selected = rule.KeyColumns.Concat(valueColumns).ToList();
+        var keys = KeyExpressions(rule, schema, "t");
+        var selected = keys.Concat(valueColumns.Select(c => $"t.{Quote(c)}")).ToList();
 
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)}" +
+            $"SELECT {string.Join(", ", selected)} FROM {Quote(schema)}.{Quote(table)} AS t" +
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
         var keyValuesByKey = new Dictionary<string, object?[]>(StringComparer.Ordinal);
         var hashesByKey = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        var keyCount = rule.KeyColumns.Count;
+        var keyCount = keys.Count;
         while (reader.Read())
         {
             var key = new StringBuilder();
