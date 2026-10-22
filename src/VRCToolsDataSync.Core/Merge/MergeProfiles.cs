@@ -86,29 +86,71 @@ public static class MergeProfiles
         "20260930120000_mcp_memory_indexes",
     };
 
-    /// <summary>Friend Connect が自動で書き換える列。変化の検知から外す。</summary>
-    private static readonly string[] FriendConnectAutoColumns = { "id", "createdAt", "updatedAt", "lastUpdateAt" };
+    /// <summary>Friend Connect の User を PC をまたいで見分ける列。VRChat のユーザー ID。</summary>
+    private static readonly ColumnReference UserByApiId = new("userId", "User", new[] { "apiId" });
 
+    /// <summary>Friend Connect の World を PC をまたいで見分ける列。VRChat のワールド ID。</summary>
+    private static readonly ColumnReference WorldByApiId = new("worldId", "World", new[] { "apiId" });
+
+    /// <summary>Friend Connect の Tag を見分ける列。名前は種類 (user / world) ごとに付く。</summary>
+    private static readonly ColumnReference TagByName = new("tagId", "Tag", new[] { "type", "name" });
+
+    /// <summary>
+    /// Friend Connect の FavoriteLocal がお気に入りのグループを指す列。groupKey は文字列で PC 間で
+    /// 同じなので付け替えは要らないが、参照として持つことで、グループの行を消す前にそのグループへ
+    /// 同期先だけで足されたお気に入りが無いかを確かめられる。
+    /// </summary>
+    private static readonly ColumnReference GroupByKey = new("groupKey", "FavoriteLocalGroup", new[] { "groupKey" }, IdColumn: "groupKey");
+
+    /// <summary>
+    /// Friend Connect の規則。すべてのテーブルの id が PC ごとに別の値を取る
+    /// (AUTOINCREMENT で、消して入れ直す更新もある) ので、行は自然キーで突き合わせ、
+    /// 別のテーブルを id で指す列は <see cref="ColumnReference"/> で自然キーに置き換える。
+    /// 比べる列は手で編集するものに絞り、id と Friend Connect が自動で書き換える
+    /// createdAt / updatedAt は比べない。編集時刻の列は信用できない (起動しているだけで
+    /// updatedAt が書き換わる) ので持たず、両方で編集されていたら同期先の内容を残す。
+    /// </summary>
     public static MergeProfile FriendConnect { get; } = new()
     {
         ToolKey = "friend-connect",
+        SupportsMerge = true,
         Rules = new MergeTableRule[]
         {
-            // User は VRChat のユーザー情報のキャッシュで、ほとんどの列は
-            // Friend Connect が書き換える。ユーザーが書くのはメモだけ。
+            // 参照される側を先に並べる。マージはこの順に合わせる。
+
+            // User は VRChat のユーザー情報のキャッシュで、ほとんどの列は Friend Connect が
+            // 書き換える。ユーザーが書くのはメモ (note) だけ。履歴やタグがこの行を id で
+            // 指すので、入れ直さずに書き換える。メモを消しても行は残るので、消えたキーは
+            // 行の削除ではなく note の消去。同期先に無いユーザーのメモは User の行ごと写すが、
+            // 最後に見た履歴を指す 3 列は制約の無い id なので消す (Friend Connect が埋め直す)。
             new("User", MergeTableKind.Keyed, new[] { "apiId" }, ValueColumns: new[] { "note" },
-                Filter: "note IS NOT NULL AND note <> ''"),
+                Filter: "note IS NOT NULL AND note <> ''", UpdateInPlace: true, ClearOnDelete: true,
+                ClearedColumns: new[] { "lastUserAvatarId", "lastLocationId", "lastUserStatusId" }),
+            // タグの定義。UserTag / WorldTag が id で指すので、入れ直さずに書き換える。
+            // 名前を変えると別のタグとして消して入れ直すことになる。旧名の行の削除は、参照する
+            // テーブルを合わせた後まで遅らせ、同期先だけで付けていた旧名のタグ付けが残っていれば
+            // 旧名の行も残す (SqliteMerger の参照される行の削除の扱い)。
+            new("Tag", MergeTableKind.Keyed, new[] { "type", "name" }, ValueColumns: new[] { "description", "sort", "isSystem" },
+                UpdateInPlace: true),
+            new("FavoriteLocalGroup", MergeTableKind.Keyed, new[] { "groupKey" }, ValueColumns: new[] { "type", "name", "sort" },
+                UpdateInPlace: true),
 
-            // 以下は列の意味をまだ確かめていないので、マージはせず変化だけを見る。
-            // Friend Connect への行単位の書き込みは、開発者への確認を待ってから扱う。
-            new("Tag", MergeTableKind.Watched, Array.Empty<string>(), IgnoredColumns: FriendConnectAutoColumns),
-            new("UserTag", MergeTableKind.Watched, Array.Empty<string>(), IgnoredColumns: FriendConnectAutoColumns),
-            new("FavoriteLocal", MergeTableKind.Watched, Array.Empty<string>(), IgnoredColumns: FriendConnectAutoColumns),
-            new("FavoriteLocalGroup", MergeTableKind.Watched, Array.Empty<string>(), IgnoredColumns: FriendConnectAutoColumns),
-            new("UserNotificationSetting", MergeTableKind.Watched, Array.Empty<string>(), IgnoredColumns: FriendConnectAutoColumns),
+            // ユーザーやワールドへのタグ付け。行の有無だけが意味を持つ。
+            new("UserTag", MergeTableKind.Keyed, new[] { "userId", "tagId" }, ValueColumns: Array.Empty<string>(),
+                References: new[] { UserByApiId, TagByName }),
+            new("WorldTag", MergeTableKind.Keyed, new[] { "worldId", "tagId" }, ValueColumns: Array.Empty<string>(),
+                References: new[] { WorldByApiId, TagByName }),
+            // ローカルのお気に入り。
+            new("FavoriteLocal", MergeTableKind.Keyed, new[] { "groupKey", "userId", "worldId" }, ValueColumns: Array.Empty<string>(),
+                References: new[] { GroupByKey, UserByApiId, WorldByApiId }),
+            // ユーザーごとの通知設定。同じ (ユーザー、種類、通知先) の行が複数ありうるので、
+            // キーの行をまとめて比べる。
+            new("UserNotificationSetting", MergeTableKind.Keyed, new[] { "userId", "type", "notifyAPI" }, ValueColumns: new[] { "value" },
+                References: new[] { UserByApiId }),
 
-            // 履歴 (Location、UserStatus など) は当面マージしない。自然キーが無く、
-            // 外部キーが不安定な整数 id を指しているため。
+            // 履歴 (Location、UserStatus、UserAvatar、NUserHistory、LocationMaster) と集計
+            // (UserConnection、UserWorldVisit、UserAnalytics) はマージしない。履歴は自然キーが
+            // 無く、集計は足すと二重に数える。ここに無いテーブルは同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,
     };

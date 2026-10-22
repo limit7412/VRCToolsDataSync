@@ -239,15 +239,10 @@ public sealed class DatabaseSummaryTests : IDisposable
     private string CreateFriendConnect(string migration)
     {
         var path = Db("db_1.1.sqlite");
-        Exec(path, $"""
-            CREATE TABLE _prisma_migrations (id TEXT PRIMARY KEY, checksum TEXT, finished_at DATETIME, migration_name TEXT, logs TEXT, rolled_back_at DATETIME, started_at DATETIME, applied_steps_count INTEGER);
-            INSERT INTO _prisma_migrations (id, finished_at, migration_name) VALUES ('1', 1, '20250202000000_init');
-            INSERT INTO _prisma_migrations (id, finished_at, migration_name) VALUES ('2', 2, '{migration}');
-            CREATE TABLE User (id INTEGER PRIMARY KEY AUTOINCREMENT, apiId TEXT, displayName TEXT, note TEXT, updatedAt DATETIME);
-            CREATE TABLE Tag (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, createdAt DATETIME, updatedAt DATETIME);
-            INSERT INTO User (apiId, displayName, note, updatedAt) VALUES ('usr_a', 'A', 'memo', 1), ('usr_b', 'B', NULL, 1);
-            INSERT INTO Tag (name, createdAt, updatedAt) VALUES ('friend', 1, 1);
-            """);
+        FriendConnectSchema.Create(path, migration);
+        FriendConnectSchema.Exec(path,
+            FriendConnectSchema.InsertUser("usr_a", "A", "memo") + FriendConnectSchema.InsertUser("usr_b", "B") +
+            FriendConnectSchema.InsertTag("friend"));
         return path;
     }
 
@@ -261,7 +256,7 @@ public sealed class DatabaseSummaryTests : IDisposable
         Exec(path, "UPDATE User SET displayName = 'A2', updatedAt = 2; UPDATE Tag SET updatedAt = 2;");
         Assert.Empty(Summarize(path, MergeProfiles.FriendConnect).FindChangedTables(baseline));
 
-        Exec(path, "UPDATE User SET note = 'memo2' WHERE apiId = 'usr_a'; INSERT INTO Tag (name) VALUES ('work');");
+        Exec(path, "UPDATE User SET note = 'memo2' WHERE apiId = 'usr_a';" + FriendConnectSchema.InsertTag("work"));
         Assert.Equal(
             new[] { "Tag", "User" },
             Summarize(path, MergeProfiles.FriendConnect).FindChangedTables(baseline));

@@ -965,13 +965,14 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Single(Rows(host, "SELECT id FROM gamelog_location"));
     }
 
-    [Fact(DisplayName = "Friend Connect の規則ではマージしない")]
-    public void RefusesFriendConnect()
+    [Fact(DisplayName = "Friend Connect の規則で VRCX の DB を合わせようとすると、スキーマの版が読めず中止する")]
+    public void RefusesDatabaseOfAnotherTool()
     {
         var (host, local, _) = Arrange();
 
         var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, null, dryRun: true);
 
         Assert.False(report.Succeeded);
+        Assert.Contains("スキーマの版", report.AbortReason);
     }
 }

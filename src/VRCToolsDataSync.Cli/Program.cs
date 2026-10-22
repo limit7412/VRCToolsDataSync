@@ -22,6 +22,10 @@ var noBackupOption = new Option<bool>(
     aliases: new[] { "--no-backup" },
     description: "Pull 前のローカルバックアップを省略する");
 
+var forcePullOption = new Option<bool>(
+    aliases: new[] { "--force", "-f" },
+    description: "非常用の強制 Pull。手元の未 Push の変更を確かめず、同期先の内容で上書きする (手元の変更はバックアップにだけ残る)");
+
 var pushCommand = new Command("push", "ローカルデータをクラウドへアップロード");
 
 // NOTE: System.CommandLine 2.0.0-beta4 では、ハンドラ内で Environment.ExitCode を
@@ -64,11 +68,13 @@ var pullCommand = new Command("pull", "クラウドからローカルへデー�
 var pullVrcxCommand = new Command("vrcx", "VRCX のデータを Pull");
 pullVrcxCommand.AddOption(cloudOption);
 pullVrcxCommand.AddOption(noBackupOption);
+pullVrcxCommand.AddOption(forcePullOption);
 pullVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
-    ctx.ExitCode = RunPull(cloud, noBackup, "VRCX",
+    var force = ctx.ParseResult.GetValueForOption(forcePullOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, force, "VRCX",
         lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()));
 });
 pullCommand.AddCommand(pullVrcxCommand);
@@ -76,18 +82,20 @@ pullCommand.AddCommand(pullVrcxCommand);
 var pullFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Pull");
 pullFriendConnectCommand.AddOption(cloudOption);
 pullFriendConnectCommand.AddOption(noBackupOption);
+pullFriendConnectCommand.AddOption(forcePullOption);
 pullFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
-    ctx.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
+    var force = ctx.ParseResult.GetValueForOption(forcePullOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, force, "VRC Friend Connect",
         lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()));
 });
 pullCommand.AddCommand(pullFriendConnectCommand);
 
 // --- merge: 置き換えの代わりに、手元の変更を足して同期する (issue #87) ---
 
-var mergeCommand = new Command("merge", "同期先の最新に手元の変更を足してから Push する (VRCX のみ)");
+var mergeCommand = new Command("merge", "同期先の最新に手元の変更を足してから Push する");
 
 var mergeDryRunOption = new Option<bool>(
     aliases: new[] { "--dry-run" },
@@ -99,27 +107,38 @@ var mergeDisableOption = new Option<bool>(
     aliases: new[] { "--disable" },
     description: "以後、マージを使わず従来どおり置き換える (マージ自体は実行しない)");
 
-var mergeVrcxCommand = new Command("vrcx", "VRCX のデータをマージする");
-mergeVrcxCommand.AddOption(cloudOption);
-mergeVrcxCommand.AddOption(noBackupOption);
-mergeVrcxCommand.AddOption(mergeDryRunOption);
-mergeVrcxCommand.AddOption(mergeEnableOption);
-mergeVrcxCommand.AddOption(mergeDisableOption);
-mergeVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
+Command MergeCommandFor(string name, string description, string displayName, string toolKey,
+    Func<ILoggerFactory, IMergeableSyncService> serviceFactory)
 {
-    var enable = ctx.ParseResult.GetValueForOption(mergeEnableOption);
-    var disable = ctx.ParseResult.GetValueForOption(mergeDisableOption);
-    if (enable || disable)
+    var command = new Command(name, description);
+    command.AddOption(cloudOption);
+    command.AddOption(noBackupOption);
+    command.AddOption(mergeDryRunOption);
+    command.AddOption(mergeEnableOption);
+    command.AddOption(mergeDisableOption);
+    command.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
     {
-        ctx.ExitCode = ConfigureMerge(enable, disable);
-        return;
-    }
-    ctx.ExitCode = RunMerge(
-        ctx.ParseResult.GetValueForOption(cloudOption),
-        ctx.ParseResult.GetValueForOption(noBackupOption),
-        ctx.ParseResult.GetValueForOption(mergeDryRunOption));
-});
-mergeCommand.AddCommand(mergeVrcxCommand);
+        var enable = ctx.ParseResult.GetValueForOption(mergeEnableOption);
+        var disable = ctx.ParseResult.GetValueForOption(mergeDisableOption);
+        if (enable || disable)
+        {
+            ctx.ExitCode = ConfigureMerge(displayName, toolKey, enable, disable);
+            return;
+        }
+        ctx.ExitCode = RunMerge(
+            ctx.ParseResult.GetValueForOption(cloudOption),
+            ctx.ParseResult.GetValueForOption(noBackupOption),
+            ctx.ParseResult.GetValueForOption(mergeDryRunOption),
+            displayName, serviceFactory);
+    });
+    return command;
+}
+
+mergeCommand.AddCommand(MergeCommandFor("vrcx", "VRCX のデータをマージする", "VRCX", VrcxSyncService.Key,
+    lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>())));
+mergeCommand.AddCommand(MergeCommandFor("friend-connect", "VRC Friend Connect のデータをマージする", "Friend Connect",
+    FriendConnectSyncService.Key,
+    lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>())));
 
 var statusCommand = new Command("status", "現在の同期設定と最後の同期情報を表示");
 statusCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
@@ -396,6 +415,7 @@ static int RunPush(
 static int RunPull(
     string? cloudOverride,
     bool noBackup,
+    bool force,
     string toolDisplayName,
     Func<ILoggerFactory, ISyncService> serviceFactory)
 {
@@ -405,12 +425,17 @@ static int RunPull(
 
     try
     {
-        var result = runner.Pull(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup);
+        if (force) Console.WriteLine($"{toolDisplayName} 非常用の強制 Pull: 手元の変更を確かめずに上書きします");
+        var result = runner.Pull(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup, force: force);
 
         switch (result.Outcome)
         {
             case SyncOutcome.Success:
-                Console.WriteLine($"{toolDisplayName} Pull 完了 version={result.RemoteVersion}");
+                // マージ同期が有効で手元に変更があれば、Pull はマージして Push まで行う。
+                Console.WriteLine(result.MergeReport is null
+                    ? $"{toolDisplayName} Pull 完了 version={result.RemoteVersion}"
+                    : $"{toolDisplayName} Pull 完了 (マージして Push) version={result.RemoteVersion}");
+                if (result.MergeReport is not null) Console.WriteLine($"  {result.Message}");
                 if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
                 return 0;
@@ -418,6 +443,11 @@ static int RunPull(
             case SyncOutcome.SourceMissing:
                 Console.Error.WriteLine(result.Message);
                 return 4;
+            case SyncOutcome.LocalChangesPending:
+                // 手元の変更とリモートの更新が両方ある。Push の競合と同じ扱いにする。
+                Console.Error.WriteLine(result.Message);
+                Console.Error.WriteLine("  上書きしてよければ --force を付けて再実行してください。");
+                return 3;
             default:
                 Console.Error.WriteLine($"想定外: {result.Outcome} {result.Message}");
                 return 1;
@@ -453,7 +483,7 @@ static int RunPull(
     }
 }
 
-static int ConfigureMerge(bool enable, bool disable)
+static int ConfigureMerge(string displayName, string toolKey, bool enable, bool disable)
 {
     if (enable && disable)
     {
@@ -462,13 +492,16 @@ static int ConfigureMerge(bool enable, bool disable)
     }
     var store = new SettingsStore();
     var settings = store.Load();
-    settings.MergeVrcx = enable;
+    if (toolKey == VrcxSyncService.Key) settings.MergeVrcx = enable;
+    else settings.MergeFriendConnect = enable;
     store.Save(settings);
-    Console.WriteLine($"VRCX のマージ同期: {(enable ? "ON" : "OFF")}");
+    Console.WriteLine($"{displayName} のマージ同期: {(enable ? "ON" : "OFF")}");
     return 0;
 }
 
-static int RunMerge(string? cloudOverride, bool noBackup, bool dryRun)
+static int RunMerge(
+    string? cloudOverride, bool noBackup, bool dryRun, string displayName,
+    Func<ILoggerFactory, IMergeableSyncService> serviceFactory)
 {
     var ctx = LoadContext(cloudOverride);
     if (ctx is null) return 2;
@@ -476,8 +509,7 @@ static int RunMerge(string? cloudOverride, bool noBackup, bool dryRun)
 
     try
     {
-        var service = new VrcxSyncService(logger: loggerFactory.CreateLogger<VrcxSyncService>());
-        var result = runner.Merge(service, settings, storage, skipBackup: noBackup, dryRun: dryRun);
+        var result = runner.Merge(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup, dryRun: dryRun);
 
         if (result.MergeReport is { } report)
         {
@@ -498,8 +530,8 @@ static int RunMerge(string? cloudOverride, bool noBackup, bool dryRun)
         {
             case SyncOutcome.Success:
                 Console.WriteLine(dryRun
-                    ? $"VRCX マージ (dry-run) 土台 version={result.RemoteVersion}"
-                    : $"VRCX マージ完了 version={result.RemoteVersion}");
+                    ? $"{displayName} マージ (dry-run) 土台 version={result.RemoteVersion}"
+                    : $"{displayName} マージ完了 version={result.RemoteVersion}");
                 if (!string.IsNullOrEmpty(result.Message)) Console.WriteLine($"  {result.Message}");
                 if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
                 return 0;
@@ -518,7 +550,7 @@ static int RunMerge(string? cloudOverride, bool noBackup, bool dryRun)
     catch (RunningProcessException ex)
     {
         Console.Error.WriteLine(ex.Message);
-        Console.Error.WriteLine("VRCX を終了してから再実行してください。");
+        Console.Error.WriteLine($"{displayName} を終了してから再実行してください。");
         return 5;
     }
     catch (SyncStorageConcurrencyException ex)
@@ -561,6 +593,7 @@ static int ShowStatus()
     Console.WriteLine($"VRCX 同期: {(settings.SyncVrcx ? "ON" : "OFF")}");
     Console.WriteLine($"VRCX のマージ同期: {(settings.MergeVrcx ? "ON" : "OFF")}");
     Console.WriteLine($"Friend Connect 同期: {(settings.SyncFriendConnect ? "ON" : "OFF")}");
+    Console.WriteLine($"Friend Connect のマージ同期: {(settings.MergeFriendConnect ? "ON" : "OFF")}");
     if (settings.ToolState.Count == 0)
     {
         Console.WriteLine("同期履歴: なし");

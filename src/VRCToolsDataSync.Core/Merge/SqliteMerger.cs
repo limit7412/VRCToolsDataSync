@@ -11,6 +11,12 @@ public sealed class MergeReport
 
     public List<MergeConflict> Conflicts { get; } = new();
 
+    /// <summary>
+    /// 手元で消していたが、同期先では前回の同期の後にその行を指す行が足されていたので残したキー。
+    /// 消すと指している行も ON DELETE CASCADE で消え、別の PC の追加が失われる。
+    /// </summary>
+    public List<MergeConflict> KeptReferencedRows { get; } = new();
+
     public string? AbortReason { get; set; }
 
     public bool Succeeded => AbortReason is null;
@@ -29,7 +35,7 @@ public sealed class MergeReport
     {
         if (!Succeeded) return $"マージを中止しました: {AbortReason}";
         var changed = Tables.Where(t => t.Inserted + t.Updated + t.Deleted > 0).ToList();
-        if (changed.Count == 0) return "手元から足すものはありませんでした";
+        if (changed.Count == 0 && Conflicts.Count == 0 && KeptReferencedRows.Count == 0) return "手元から足すものはありませんでした";
         var parts = changed.Select(t =>
         {
             var items = new List<string>();
@@ -38,8 +44,30 @@ public sealed class MergeReport
             if (t.Deleted > 0) items.Add($"削除 {t.Deleted}");
             return $"{t.Table} ({string.Join(", ", items)})";
         });
-        var text = "手元の変更を足しました: " + string.Join(", ", parts);
-        if (Conflicts.Count > 0) text += $"。両方で編集されていたもの {Conflicts.Count} 件は新しい方を残しました";
+        // 両方で編集されていて同期先の内容を残したものだけなら、足した行は無い。
+        var text = changed.Count == 0
+            ? "手元から足すものはありませんでした"
+            : "手元の変更を足しました: " + string.Join(", ", parts);
+        var copied = Tables
+            .Where(t => t.CopiedReferences is { Count: > 0 })
+            .SelectMany(t => t.CopiedReferences!)
+            .GroupBy(c => c.Key, StringComparer.Ordinal)
+            .Select(g => $"{g.Key} {g.Sum(c => c.Value)}")
+            .ToList();
+        if (copied.Count > 0) text += $"。参照先の行も写しました: {string.Join(", ", copied)}";
+        if (Conflicts.Count > 0)
+        {
+            var keptLocal = Conflicts.Count(c => c.KeptLocal);
+            text += $"。両方で編集されていたもの {Conflicts.Count} 件は新しい方を残しました" +
+                    (keptLocal == Conflicts.Count ? string.Empty
+                        : keptLocal == 0 ? " (編集時刻が無いものは同期先の内容)"
+                        : $" (手元 {keptLocal} 件、同期先 {Conflicts.Count - keptLocal} 件)");
+        }
+        if (KeptReferencedRows.Count > 0)
+        {
+            var tables = KeptReferencedRows.Select(k => k.Table).Distinct(StringComparer.Ordinal);
+            text += $"。手元で消した行 {KeptReferencedRows.Count} 件 ({string.Join(", ", tables)}) は、同期先で新しくその行を指す行が足されているので残しました";
+        }
         return text;
     }
 }
@@ -62,9 +90,14 @@ public sealed class MergeReport
 /// 振り直しで後ろへ移った同期先の行。キーのハッシュから、後から書き換わる列の内容の
 /// ハッシュへ。これも合成する前の値で取る。
 /// </param>
+/// <param name="CopiedReferences">
+/// 手元の行を写すときに、その行が指す先が同期先に無かったので手元から写した行の数。
+/// 参照先のテーブル名から行数へ。
+/// </param>
 public sealed record TableMergeReport(
     string Table, long Inserted, long Updated, long Deleted, bool Renumbered, bool Created,
-    long KeptMaxRowId = 0, string? KeptDigest = null, Dictionary<string, string>? TailRows = null);
+    long KeptMaxRowId = 0, string? KeptDigest = null, Dictionary<string, string>? TailRows = null,
+    Dictionary<string, long>? CopiedReferences = null);
 
 /// <summary>両方で別々に編集されていたキー。どちらを残したかを記録する。</summary>
 /// <param name="Table">テーブル名。</param>
@@ -190,16 +223,42 @@ public static class SqliteMerger
         // 要約を取ったときと規則が違えば、そのとき規則に無かったテーブルは要約に入っていない。
         var ancestorRulesChanged = baseline is not null
             && !string.Equals(baseline.RulesDigest, profile.RulesDigest, StringComparison.Ordinal);
-        foreach (var table in localTables)
+        // テーブルは規則の順に合わせる。id で参照される側 (Friend Connect の User や Tag) を
+        // 参照する側 (UserTag) より先に合わせないと、写した行の指す先がまだ無い。
+        var ruleIndex = new Dictionary<MergeTableRule, int>(ReferenceEqualityComparer.Instance);
+        for (var i = 0; i < profile.Rules.Count; i++) ruleIndex[profile.Rules[i]] = i;
+        var targets = localTables
+            .Select(table => (Table: table, Rule: profile.Rules.FirstOrDefault(r => r.Matches(table))))
+            .Where(t => t.Rule is not null && t.Rule.Kind != MergeTableKind.Watched)
+            .OrderBy(t => ruleIndex[t.Rule!])
+            .ThenBy(t => t.Table, StringComparer.Ordinal);
+        var deferredDeletes = new List<DeferredDelete>();
+        foreach (var (table, rule) in targets)
         {
-            var rule = profile.Rules.FirstOrDefault(r => r.Matches(table));
-            if (rule is null || rule.Kind == MergeTableKind.Watched) continue;
-
-            var tableReport = MergeTable(
-                connection, table, rule, baseline?.Tables.GetValueOrDefault(table), ancestorRulesChanged, report,
-                maxRenumberedTailRows);
+            TableMergeReport? tableReport;
+            try
+            {
+                tableReport = MergeTable(
+                    connection, table, rule!, profile, baseline?.Tables.GetValueOrDefault(table), ancestorRulesChanged, report,
+                    maxRenumberedTailRows, deferredDeletes);
+            }
+            catch (SqliteException ex)
+            {
+                // 制約に掛かった (参照先の行が手元にも無い、など)。取り消して従来の動作に戻す。
+                report.AbortReason = $"テーブル {table} を合わせられません: {ex.Message}";
+                return;
+            }
             if (tableReport is null) return;
             report.Tables.Add(tableReport);
+        }
+        try
+        {
+            ApplyDeferredDeletes(connection, profile, deferredDeletes, report);
+        }
+        catch (SqliteException ex)
+        {
+            report.AbortReason = $"参照される行を消せません: {ex.Message}";
+            return;
         }
         if (baseline is null) return;
 
@@ -226,16 +285,85 @@ public static class SqliteMerger
         }
     }
 
+    /// <summary>
+    /// 手元で消していた、別のテーブルから参照される行。参照する側のテーブルを合わせた後に消す。
+    /// </summary>
+    private sealed record DeferredDelete(string Table, MergeTableRule Rule, object?[] KeyValues, string Key);
+
+    /// <summary>
+    /// <paramref name="table"/> を id で参照する規則があるか。参照される行を消すと、参照する行が
+    /// ON DELETE CASCADE で消える。
+    /// </summary>
+    private static bool IsReferenced(MergeProfile profile, string table)
+        => profile.Rules.Any(r => r.References?.Any(x => string.Equals(x.Table, table, StringComparison.Ordinal)) == true);
+
+    /// <summary>
+    /// 参照される行の削除を、参照する側のテーブルを合わせた後に行う。
+    /// <para>
+    /// 参照される行 (お気に入りのグループなど) を参照する側 (お気に入り) より先に消すと、同期先で
+    /// そのグループへ足されたお気に入りが ON DELETE CASCADE で消え、参照する側の比較では同期先の
+    /// 追加として見えなくなる。参照する側を先に合わせれば、手元で消した行を指す同期先の行のうち、
+    /// 前回の同期時点にあったものは手元の削除 (連鎖で消えている) に従って消え、残るのは前回の後に
+    /// 同期先で足されたものだけになる。残っていれば、その追加を失わないよう行を消さずに残す。
+    /// </para>
+    /// </summary>
+    private static void ApplyDeferredDeletes(
+        SqliteConnection connection, MergeProfile profile, List<DeferredDelete> deferred, MergeReport report)
+    {
+        if (deferred.Count == 0) return;
+        var hostTables = ListTables(connection, "main");
+        foreach (var item in deferred)
+        {
+            if (HasReferencingRows(connection, profile, hostTables, item))
+            {
+                report.KeptReferencedRows.Add(new MergeConflict(item.Table, item.Key, KeptLocal: false));
+                continue;
+            }
+            DeleteKey(connection, item.Table, item.Rule, item.KeyValues);
+            var index = report.Tables.FindIndex(t => string.Equals(t.Table, item.Table, StringComparison.Ordinal));
+            if (index >= 0) report.Tables[index] = report.Tables[index] with { Deleted = report.Tables[index].Deleted + 1 };
+        }
+    }
+
+    /// <summary>同期先に、<paramref name="item"/> の行を指す行が残っているか。</summary>
+    private static bool HasReferencingRows(
+        SqliteConnection connection, MergeProfile profile, IReadOnlyList<string> hostTables, DeferredDelete item)
+    {
+        foreach (var rule in profile.Rules)
+        {
+            foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
+            {
+                if (!string.Equals(reference.Table, item.Table, StringComparison.Ordinal)) continue;
+                foreach (var child in hostTables.Where(rule.Matches))
+                {
+                    using var command = connection.CreateCommand();
+                    command.CommandText =
+                        $"SELECT count(*) FROM main.{Quote(child)} AS c WHERE c.{Quote(reference.Column)} IN " +
+                        $"(SELECT t.{Quote(reference.IdColumn)} FROM main.{Quote(item.Table)} AS t " +
+                        $"WHERE {KeyCondition(command, item.Rule, item.KeyValues, "main", "t", includeFilter: false)})";
+                    if ((long)command.ExecuteScalar()! > 0) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// <summary>テーブル 1 つを合わせる。中止すべき問題があれば理由を記録して null を返す。</summary>
     private static TableMergeReport? MergeTable(
-        SqliteConnection connection, string table, MergeTableRule rule, TableSummary? baseline, bool ancestorRulesChanged,
-        MergeReport report, int maxRenumberedTailRows)
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile, TableSummary? baseline,
+        bool ancestorRulesChanged, MergeReport report, int maxRenumberedTailRows, List<DeferredDelete> deferredDeletes)
     {
         var localColumns = ListColumns(connection, Local, table);
         if (FindMissingColumns(rule, localColumns) is { Count: > 0 } missing)
         {
             report.AbortReason = $"手元のテーブル {table} に想定した列がありません: {string.Join(", ", missing)}";
             return null;
+        }
+        if (baseline is not null && baseline.Kind != rule.Kind)
+        {
+            // 要約を取った版のツールは、このテーブルを別の種類 (変化を見るだけなど) で扱っていた。
+            // その要約に祖先として使える内容は無いので、規則に無かったテーブルと同じに扱う。
+            baseline = null;
         }
 
         var created = false;
@@ -276,7 +404,7 @@ public static class SqliteMerger
             var host = DatabaseSummary.SummarizeTable(connection, "main", table, rule, hostColumns);
             if (!local.HasSameContent(host))
             {
-                report.AbortReason = $"テーブル {table} は前回の同期時点の要約に無く (要約を取った版のツールはこのテーブルを対象にしていません)、" +
+                report.AbortReason = $"テーブル {table} は前回の同期時点の要約に無く (要約を取った版のツールはこのテーブルをマージの対象にしていません)、" +
                                      "同期先と手元で内容が違うため、祖先なしでは手元の削除を見分けられません。" +
                                      "同期先の内容を正とするなら Pull を、手元の内容を正とするなら非常用の強制 Push をしてください";
                 return null;
@@ -326,7 +454,7 @@ public static class SqliteMerger
 
         return rule.Kind == MergeTableKind.AppendOnly
             ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report, maxRenumberedTailRows)
-            : MergeKeyed(connection, table, rule, localColumns, hashColumns, baseline, created, report);
+            : MergeKeyed(connection, table, rule, profile, localColumns, hashColumns, baseline, created, report, deferredDeletes);
     }
 
     /// <summary>
@@ -611,17 +739,20 @@ public static class SqliteMerger
     /// 同期先の内容を残す。
     /// </summary>
     private static TableMergeReport MergeKeyed(
-        SqliteConnection connection, string table, MergeTableRule rule,
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
         IReadOnlyList<string> columns, IReadOnlyList<string> hashColumns,
-        TableSummary? baseline, bool created, MergeReport report)
+        TableSummary? baseline, bool created, MergeReport report, List<DeferredDelete> deferredDeletes)
     {
         var local = ReadKeyedRows(connection, Local, table, rule, hashColumns);
+        // 参照される行の削除は、参照する側のテーブルを合わせた後まで遅らせる (ApplyDeferredDeletes)。
+        var deferDeletes = !rule.ClearOnDelete && IsReferenced(profile, table);
         var host = ReadKeyedRows(connection, "main", table, rule, hashColumns);
         var ancestor = baseline is { Kind: MergeTableKind.Keyed, Rows: { } rows }
             ? rows
             : new Dictionary<string, string>(StringComparer.Ordinal);
 
         long inserted = 0, updated = 0, deleted = 0;
+        var copiedReferences = new Dictionary<string, long>(StringComparer.Ordinal);
         var keys = new SortedSet<string>(local.Keys, StringComparer.Ordinal);
         keys.UnionWith(host.Keys);
         keys.UnionWith(ancestor.Keys);
@@ -657,10 +788,14 @@ public static class SqliteMerger
                     baseline?.Counters?.GetValueOrDefault(key))
                 : null;
 
-            if (takeLocal)
+            if (takeLocal && mine is null && deferDeletes)
+            {
+                deferredDeletes.Add(new DeferredDelete(table, rule, theirs!.KeyValues, key));
+            }
+            else if (takeLocal)
             {
                 var keyValues = (mine ?? theirs)!.KeyValues;
-                ReplaceKey(connection, table, rule, columns, keyValues, copyFromLocal: mine is not null);
+                ApplyLocalKey(connection, table, rule, profile, columns, keyValues, localHas: mine is not null, copiedReferences);
                 if (mine is null) deleted++;
                 else if (theirs is null) inserted++;
                 else updated++;
@@ -673,7 +808,8 @@ public static class SqliteMerger
             }
         }
 
-        return new TableMergeReport(table, inserted, updated, deleted, false, created);
+        return new TableMergeReport(table, inserted, updated, deleted, false, created,
+            CopiedReferences: copiedReferences.Count > 0 ? copiedReferences : null);
     }
 
     /// <summary>
@@ -720,8 +856,8 @@ public static class SqliteMerger
     {
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT count(*) FROM {Quote(schema)}.{Quote(table)} " +
-            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({AddedColumnsSet(connection, schema, table, added, null)})";
+            $"SELECT count(*) FROM {Quote(schema)}.{Quote(table)} AS t " +
+            $"WHERE {KeyCondition(command, rule, keyValues, schema, "t")} AND ({AddedColumnsSet(connection, schema, table, added, "t")})";
         return (long)command.ExecuteScalar()! > 0;
     }
 
@@ -869,18 +1005,11 @@ public static class SqliteMerger
             .Concat(shrinking.Select(c => Pick(c, "<")))
             .Concat(all.SelectMany(c => new[] { $"l.{Quote(c)}", $"h.{Quote(c)}" }));
         using var command = connection.CreateCommand();
-        var keys = new List<string>();
-        for (var i = 0; i < rule.KeyColumns.Count; i++)
-        {
-            var name = "$k" + i;
-            command.Parameters.AddWithValue(name, keyValues[i] ?? DBNull.Value);
-            var k = Quote(rule.KeyColumns[i]);
-            keys.Add($"h.{k} IS {name} AND l.{k} IS {name}");
-        }
         command.CommandText =
             $"SELECT {string.Join(", ", expressions)} " +
             $"FROM main.{Quote(table)} AS h, {Local}.{Quote(table)} AS l " +
-            $"WHERE {string.Join(" AND ", keys)} LIMIT 1";
+            $"WHERE {KeyCondition(command, rule, keyValues, "main", "h", prefix: "$h")} " +
+            $"AND {KeyCondition(command, rule, keyValues, Local, "l", prefix: "$l")} LIMIT 1";
         using var reader = command.ExecuteReader();
         if (!reader.Read()) return null;
         var values = new Dictionary<string, object?>(StringComparer.Ordinal);
@@ -948,8 +1077,8 @@ public static class SqliteMerger
             differs.Add($"{Quote(column)} IS NOT {name}");
         }
         command.CommandText =
-            $"UPDATE main.{Quote(table)} SET {string.Join(", ", sets)} " +
-            $"WHERE {KeyCondition(command, rule, keyValues)} AND ({string.Join(" OR ", differs)})";
+            $"UPDATE main.{Quote(table)} AS t SET {string.Join(", ", sets)} " +
+            $"WHERE {KeyCondition(command, rule, keyValues, "main", "t")} AND ({string.Join(" OR ", differs)})";
         return command.ExecuteNonQuery();
     }
 
@@ -958,44 +1087,161 @@ public static class SqliteMerger
     {
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT max({Quote(column)}) FROM {Quote(schema)}.{Quote(table)} WHERE {KeyCondition(command, rule, keyValues)}";
+            $"SELECT max(t.{Quote(column)}) FROM {Quote(schema)}.{Quote(table)} AS t WHERE {KeyCondition(command, rule, keyValues, schema, "t")}";
         return command.ExecuteScalar() as string;
     }
 
-    /// <summary>同期先にあるそのキーの行を消し、手元の行で置き換える (手元に無ければ消すだけ)。</summary>
-    private static void ReplaceKey(
-        SqliteConnection connection, string table, MergeTableRule rule,
-        IReadOnlyList<string> columns, object?[] keyValues, bool copyFromLocal)
+    /// <summary>
+    /// 同期先のそのキーを手元の内容にそろえる。手元に無ければ消す (<see cref="MergeTableRule.ClearOnDelete"/>
+    /// なら比べる列を消す)。あれば、同期先の行を書き換える (<see cref="MergeTableRule.UpdateInPlace"/>) か、
+    /// 消して手元の行を写す。写すときは、id で参照する列を同期先の id に付け替え、指す先が同期先に
+    /// 無ければその行も写す。
+    /// </summary>
+    private static void ApplyLocalKey(
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
+        IReadOnlyList<string> columns, object?[] keyValues, bool localHas, Dictionary<string, long> copiedReferences)
     {
-        using (var command = connection.CreateCommand())
+        if (!localHas)
         {
-            command.CommandText = $"DELETE FROM main.{Quote(table)} WHERE {KeyCondition(command, rule, keyValues)}";
-            command.ExecuteNonQuery();
+            if (rule.ClearOnDelete)
+            {
+                var sets = string.Join(", ", ValueColumnsOf(rule, columns).Select(c => $"{Quote(c)} = NULL"));
+                using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"UPDATE main.{Quote(table)} AS t SET {sets} " +
+                    $"WHERE {KeyCondition(command, rule, keyValues, "main", "t", includeFilter: false)}";
+                command.ExecuteNonQuery();
+            }
+            else
+            {
+                DeleteKey(connection, table, rule, keyValues);
+            }
+            return;
         }
-        if (!copyFromLocal) return;
 
-        var rowIdAlias = FindRowIdAlias(connection, table);
-        var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
+        if (rule.UpdateInPlace)
+        {
+            // 行を消して入れ直すと id が変わり、この行を id で参照している行が ON DELETE CASCADE で
+            // 消える。同期先に行があれば、比べる列だけを手元の値にする。絞り込み (Filter) は
+            // 掛けない。手元で初めてメモを書いた User は同期先では絞り込みから外れているが、
+            // 行はあるので書き換えで足りる。
+            var values = ValueColumnsOf(rule, columns);
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                $"UPDATE main.{Quote(table)} AS t SET ({string.Join(", ", values.Select(Quote))}) = " +
+                $"(SELECT {string.Join(", ", values.Select(c => $"l.{Quote(c)}"))} FROM {Local}.{Quote(table)} AS l " +
+                $"WHERE {KeyCondition(command, rule, keyValues, Local, "l", prefix: "$l")} ORDER BY l.rowid LIMIT 1) " +
+                $"WHERE {KeyCondition(command, rule, keyValues, "main", "t", includeFilter: false)}";
+            if (command.ExecuteNonQuery() > 0) return;
+        }
+        else
+        {
+            DeleteKey(connection, table, rule, keyValues);
+        }
+
+        EnsureReferencedRows(connection, table, rule, profile, keyValues, copiedReferences);
         using (var command = connection.CreateCommand())
         {
+            var rowIdAlias = FindRowIdAlias(connection, table);
+            var targets = columns.Where(c => c != rowIdAlias).ToList();
             command.CommandText =
-                $"INSERT INTO main.{Quote(table)} ({insertColumns}) " +
-                $"SELECT {insertColumns} FROM {Local}.{Quote(table)} WHERE {KeyCondition(command, rule, keyValues)} " +
-                "ORDER BY rowid";
+                $"INSERT INTO main.{Quote(table)} ({string.Join(", ", targets.Select(Quote))}) " +
+                $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(rule, c, "l")))} " +
+                $"FROM {Local}.{Quote(table)} AS l WHERE {KeyCondition(command, rule, keyValues, Local, "l")} " +
+                "ORDER BY l.rowid";
             command.ExecuteNonQuery();
         }
     }
 
-    private static string KeyCondition(SqliteCommand command, MergeTableRule rule, object?[] keyValues)
+    private static void DeleteKey(SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues)
     {
-        var parts = new List<string>();
-        for (var i = 0; i < rule.KeyColumns.Count; i++)
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"DELETE FROM main.{Quote(table)} AS t WHERE {KeyCondition(command, rule, keyValues, "main", "t")}";
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// 手元の行を同期先へ写すときの、列 <paramref name="column"/> の値の式。別のテーブルを id で
+    /// 指す列は、手元で指している行の自然キーから同期先での id を引く。参照先に無い id を
+    /// 持つ列 (<see cref="MergeTableRule.ClearedColumns"/>) は NULL にする。
+    /// </summary>
+    private static string CopyExpression(MergeTableRule? rule, string column, string alias)
+    {
+        if (rule?.ClearedColumns?.Contains(column, StringComparer.Ordinal) == true) return "NULL";
+        if (rule?.ReferenceOf(column) is not { } reference) return $"{alias}.{Quote(column)}";
+        var match = string.Join(" AND ", reference.KeyColumns.Select(k =>
+            $"r.{Quote(k)} IS (SELECT x.{Quote(k)} FROM {Local}.{Quote(reference.Table)} AS x " +
+            $"WHERE x.{Quote(reference.IdColumn)} = {alias}.{Quote(reference.Column)})"));
+        return $"CASE WHEN {alias}.{Quote(column)} IS NULL THEN NULL ELSE " +
+               $"(SELECT r.{Quote(reference.IdColumn)} FROM main.{Quote(reference.Table)} AS r WHERE {match}) END";
+    }
+
+    /// <summary>
+    /// 手元のそのキーの行が id で指している先が同期先に無ければ、その行を手元から写す。
+    /// 写す行の列は、参照先のテーブルの規則 (あれば) に従って付け替えや消去をする。
+    /// </summary>
+    private static void EnsureReferencedRows(
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
+        object?[] keyValues, Dictionary<string, long> copiedReferences)
+    {
+        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
         {
-            var name = "$k" + i;
-            command.Parameters.AddWithValue(name, keyValues[i] ?? DBNull.Value);
-            parts.Add($"{Quote(rule.KeyColumns[i])} IS {name}");
+            // 参照先の id は整数とは限らない (FavoriteLocal.groupKey は文字列)。
+            var localIds = new List<object>();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText =
+                    $"SELECT DISTINCT l.{Quote(reference.Column)} FROM {Local}.{Quote(table)} AS l " +
+                    $"WHERE {KeyCondition(command, rule, keyValues, Local, "l")} AND l.{Quote(reference.Column)} IS NOT NULL";
+                using var reader = command.ExecuteReader();
+                while (reader.Read()) localIds.Add(reader.GetValue(0));
+            }
+            var match = string.Join(" AND ", reference.KeyColumns.Select(k =>
+                $"r.{Quote(k)} IS (SELECT x.{Quote(k)} FROM {Local}.{Quote(reference.Table)} AS x WHERE x.{Quote(reference.IdColumn)} = $id)"));
+            foreach (var id in localIds)
+            {
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = $"SELECT count(*) FROM main.{Quote(reference.Table)} AS r WHERE {match}";
+                    command.Parameters.AddWithValue("$id", id);
+                    if ((long)command.ExecuteScalar()! > 0) continue;
+                }
+                var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
+                var columns = ListColumns(connection, Local, reference.Table);
+                var rowIdAlias = FindRowIdAlias(connection, reference.Table);
+                var targets = columns.Where(c => c != rowIdAlias).ToList();
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText =
+                        $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
+                        $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "l")))} " +
+                        $"FROM {Local}.{Quote(reference.Table)} AS l WHERE l.{Quote(reference.IdColumn)} = $id";
+                    command.Parameters.AddWithValue("$id", id);
+                    copiedReferences[reference.Table] = copiedReferences.GetValueOrDefault(reference.Table) + command.ExecuteNonQuery();
+                }
+            }
         }
-        if (rule.Filter is not null) parts.Add($"({rule.Filter})");
+    }
+
+    /// <summary>
+    /// <paramref name="alias"/> の付いたテーブルの行がそのキー (<paramref name="keyValues"/>、
+    /// <see cref="KeyExpressions"/> の式の順) に一致する条件。値は <paramref name="prefix"/> から
+    /// 始まる名前の引数として <paramref name="command"/> に足す。
+    /// </summary>
+    private static string KeyCondition(
+        SqliteCommand command, MergeTableRule rule, object?[] keyValues, string schema, string alias,
+        string prefix = "$k", bool includeFilter = true)
+    {
+        var expressions = KeyExpressions(rule, schema, alias);
+        var parts = new List<string>();
+        for (var i = 0; i < expressions.Count; i++)
+        {
+            var name = prefix + i;
+            command.Parameters.AddWithValue(name, keyValues[i] ?? DBNull.Value);
+            parts.Add($"{expressions[i]} IS {name}");
+        }
+        if (includeFilter && rule.Filter is not null) parts.Add($"({rule.Filter})");
         return string.Join(" AND ", parts);
     }
 

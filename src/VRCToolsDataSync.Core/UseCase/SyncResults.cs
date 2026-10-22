@@ -6,7 +6,9 @@ namespace VRCToolsDataSync.Core.UseCase;
 internal static class SyncResults
 {
     /// <summary>
-    /// 起動時の自動 Pull で、手元に未 Push の変更があったため上書きを見送った結果。
+    /// Pull で、手元に未 Push の変更があったため上書きを見送った結果。マージ同期が有効なら
+    /// 呼び出し側 (SyncRunner) がこの結果を受けてマージに切り替えるので、この文面は
+    /// マージが無効なときだけ利用者に届く。
     /// </summary>
     public static SyncResult LocalChangesPending(string displayName, long remoteVersion, IReadOnlyList<string> changedTables)
     {
@@ -19,7 +21,8 @@ internal static class SyncResults
             RemoteVersion = remoteVersion,
             Message = $"リモートに新しい {displayName} のデータ (v{remoteVersion}) がありますが、" +
                       $"この PC にも前回の同期の後の変更 ({tables}) があるため、上書きを見送りました。" +
-                      "Push すると競合の問い合わせが出るので、そこで Pull か強制 Push を選んでください。",
+                      "両方を残すにはマージ同期を有効にしてもう一度 Pull してください。" +
+                      "この PC の変更を捨てて同期先に合わせるには、非常用の強制 Pull を使ってください。",
         };
     }
 }
