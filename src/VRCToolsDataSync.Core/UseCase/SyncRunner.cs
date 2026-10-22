@@ -730,7 +730,16 @@ public sealed class SyncRunner
         if (_baseSummaries.LoadPushed(stateKey) is not { Committed: false, PlannedVersion: long planned, PushId: { } pushId } record) return;
         try
         {
-            if (!new ManifestStore(storage).Load().Tools.TryGetValue(service.ToolKey, out var entry)) return;
+            // 同期先の版が予定の版に届いていなければ、manifest を保存する前に止まっている。版は
+            // 戻らないので、この Push は反映されなかったと確定できる。残すと、別の PC が予定の版を
+            // 越えた後に反映されたか分からない記録として扱われ、通常の Push とマージが止まる。
+            // 項目が無いのも同じで、初めての Push が manifest を保存する前に止まった状態。
+            if (!new ManifestStore(storage).Load().Tools.TryGetValue(service.ToolKey, out var entry) || entry.Version < planned)
+            {
+                _logger.LogInformation("前回の Push (版 {Version} の予定) は manifest を保存する前に止まっていました ({Tool})", planned, service.ToolKey);
+                _baseSummaries.DiscardUncommittedPushed(stateKey);
+                return;
+            }
             // 同じ版を別の PC が同じ DB で取ると、DB の写しのハッシュでは見分けられず、設定や
             // メモが違う版を自分の Push と見て、次の Push がそれらを上書きする。Push を見分ける
             // 値で照らす。値が同じなら今の項目はこの Push のもの。版は予定と違うことがある

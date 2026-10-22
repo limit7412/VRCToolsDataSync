@@ -2473,6 +2473,41 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(result.RemoteVersion, a.Settings.ToolState[key].LastPulledVersion);
     }
 
+    [Fact(DisplayName = "manifest を保存する前に止まった Push の記録は、起動時 Pull が取り込みを見送っても捨てる")]
+    public void StartupPullDiscardsUncommittedPushRecordWhenManifestWasNotSaved()
+    {
+        var a = CreateMachine("a");
+        Exec(a.Paths.SqliteFile, """
+            CREATE TABLE gamelog_location (id INTEGER PRIMARY KEY, created_at TEXT, location TEXT, world_id TEXT, world_name TEXT, time INTEGER, group_name TEXT, UNIQUE(created_at, location));
+            CREATE TABLE memos (user_id TEXT PRIMARY KEY, edited_at TEXT, memo TEXT);
+            """);
+        AddLocation(a, "2026-10-01T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        b.Settings.MergeVrcx = true;
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        var store = new BaseSummaryStore(Path.Combine(_root, "b", "base"));
+        var key = SyncRunner.ToolStateKey(_storage, VrcxSyncService.Key);
+        var remoteVersion = _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].Version;
+        // B が次の版を取る予定で送ったが、manifest を保存する前に止まった状態。同期先は前の版のまま。
+        store.SavePushed(key, new PushedRecord("0123456789abcdef", store.Load(key), PlannedVersion: remoteVersion + 1, PushId: "b-push"));
+
+        // 同期先が進んでいないので起動時 Pull は取り込みを見送るが、記録は反映されなかったと確定できる。
+        var pull = StartupPull(b);
+        Assert.NotEqual(SyncOutcome.Aborted, pull.Outcome);
+        Assert.Null(store.LoadPushed(key));
+
+        // その後に A が予定の版を越えても、B の Push は反映不明の記録に止められずにマージして送れる。
+        AddLocation(a, "2026-10-02T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        AddLocation(a, "2026-10-03T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        AddLocation(b, "2026-10-04T00:00:00Z");
+        var pushed = Push(b);
+        Assert.True(pushed.Outcome == SyncOutcome.Success, pushed.Message);
+        Assert.Equal(4, CountLocations(b.Paths.SqliteFile));
+    }
+
     [Fact(DisplayName = "マージが済めば、マージの印は残らない")]
     public void MergeClearsPendingMark()
     {
