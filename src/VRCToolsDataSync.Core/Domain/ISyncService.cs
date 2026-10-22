@@ -139,15 +139,15 @@ public sealed class PullOptions
     // Issue #19: 起動時自動 Pull の暴走防止。
     // SkipIfNotNewer=true かつ LastPulledVersion>=リモート Version の場合は Pull を行わず
     // NothingToDo を返す。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
-    // false のままにして、「ユーザが意図的に呼んだ Pull は従来通り上書きする」セマンティクスを維持する。
+    // false のままにして、同期先が手元より古くても取り込む。
     public long? LastPulledVersion { get; init; }
     public bool SkipIfNotNewer { get; init; }
 
     /// <summary>
-    /// 前回の同期の後に手元で変わったテーブルを返す (無ければ空)。起動時の自動 Pull
-    /// (<see cref="SkipIfNotNewer"/>) で、リモートが新しいと分かった後に呼ぶ。
-    /// 変わったテーブルがあれば上書きせず <see cref="SyncOutcome.LocalChangesPending"/>
-    /// を返す。比べられない場合 (前回の要約が無いなど) は空を返し、従来どおり上書きする。
+    /// 前回の同期の後に手元で変わったテーブルを返す (無ければ空)。リモートが新しいと
+    /// 分かった後、ローカルに触れる前に呼ぶ。変わったテーブルがあれば上書きせず
+    /// <see cref="SyncOutcome.LocalChangesPending"/> を返す。比べられない場合 (前回の要約が
+    /// 無いなど) は空を返し、従来どおり上書きする。null なら確かめずに上書きする (強制 Pull)。
     /// </summary>
     public Func<IReadOnlyList<string>>? FindUnsyncedLocalChanges { get; init; }
 

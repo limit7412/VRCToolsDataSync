@@ -54,8 +54,8 @@ public sealed class FriendConnectMergeSyncTests : IDisposable
 
     private SyncResult Push(Machine machine) => machine.Runner.Push(machine.Service, machine.Settings, _storage, force: false);
 
-    private SyncResult Pull(Machine machine, bool startup = false)
-        => machine.Runner.Pull(machine.Service, machine.Settings, _storage, skipBackup: false, skipIfNotNewer: startup);
+    private SyncResult Pull(Machine machine, bool startup = false, bool force = false)
+        => machine.Runner.Pull(machine.Service, machine.Settings, _storage, skipBackup: false, skipIfNotNewer: startup, force: force);
 
     private static string Notes(string db) => string.Join(",", Rows(db, "SELECT apiId || ':' || coalesce(note, '') FROM User ORDER BY apiId"));
 
@@ -113,15 +113,47 @@ public sealed class FriendConnectMergeSyncTests : IDisposable
         Assert.Equal("usr_a:memo-a2,usr_b:memo-b", Notes(b.Paths.DbV11File));
     }
 
-    [Fact(DisplayName = "Friend Connect のマージが無効なら、起動時 Pull は手元の変更を守って見送り、Push の競合は利用者に返す")]
+    [Fact(DisplayName = "Friend Connect のマージが無効なら、Pull は手元の変更を守って見送り、Push の競合は利用者に返す")]
     public void DisabledKeepsReplaceSemantics()
     {
         var (_, b) = ArrangeRemoteNewer();
         Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
 
         Assert.Equal(SyncOutcome.LocalChangesPending, Pull(b, startup: true).Outcome);
+        Assert.Equal(SyncOutcome.LocalChangesPending, Pull(b).Outcome);
         Assert.Equal(SyncOutcome.ConflictDetected, Push(b).Outcome);
         Assert.Equal("usr_a:memo-a,usr_b:memo-b", Notes(b.Paths.DbV11File));
+    }
+
+    [Fact(DisplayName = "Friend Connect のマージが有効なら、明示的な Pull もマージして Push する")]
+    public void ExplicitPullMergesWhenEnabled()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        b.Settings.MergeFriendConnect = true;
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+
+        var result = Pull(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.NotNull(result.MergeReport);
+        Assert.Equal("usr_a:memo-a2,usr_b:memo-b", Notes(b.Paths.DbV11File));
+        Assert.Equal(SyncOutcome.Success, Pull(a, startup: true).Outcome);
+        Assert.Equal("usr_a:memo-a2,usr_b:memo-b", Notes(a.Paths.DbV11File));
+    }
+
+    [Fact(DisplayName = "強制 Pull は、Friend Connect のマージ設定にかかわらず手元の変更を捨てて上書きする")]
+    public void ForcedPullOverwrites()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        b.Settings.MergeFriendConnect = true;
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+
+        var result = Pull(b, force: true);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Null(result.MergeReport);
+        Assert.NotNull(result.BackupPath);
+        Assert.Equal("usr_a:memo-a2,usr_b:", Notes(b.Paths.DbV11File));
     }
 
     [Fact(DisplayName = "VRCX のマージ設定は Friend Connect に効かない")]

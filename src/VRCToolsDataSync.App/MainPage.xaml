@@ -272,6 +272,10 @@
                                     ToolTipService.ToolTip="同期先をこの PC のデータで丸ごと置き換えます。通常の Push で直らないときに使います。"
                                     Command="{x:Bind ViewModel.EmergencyPushVrcxCommand}"
                                     IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            <Button Content="非常用の強制 Pull..."
+                                    ToolTipService.ToolTip="この PC のデータを同期先の内容で丸ごと置き換えます。手元の未 Push の変更は確かめずに上書きし、バックアップにだけ残します。"
+                                    Command="{x:Bind ViewModel.EmergencyPullVrcxCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
 
                         <StackPanel Spacing="4">
@@ -313,6 +317,10 @@
                             <Button Content="非常用の強制 Push..."
                                     ToolTipService.ToolTip="同期先をこの PC のデータで丸ごと置き換えます。通常の Push で直らないときに使います。"
                                     Command="{x:Bind ViewModel.EmergencyPushFriendConnectCommand}"
+                                    IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
+                            <Button Content="非常用の強制 Pull..."
+                                    ToolTipService.ToolTip="この PC のデータを同期先の内容で丸ごと置き換えます。手元の未 Push の変更は確かめずに上書きし、バックアップにだけ残します。"
+                                    Command="{x:Bind ViewModel.EmergencyPullFriendConnectCommand}"
                                     IsEnabled="{x:Bind ViewModel.CanRunSync, Mode=OneWay}" />
                         </StackPanel>
 

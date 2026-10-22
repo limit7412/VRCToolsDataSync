@@ -195,17 +195,66 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
     }
 
-    [Fact(DisplayName = "明示的な Pull は、手元に変更があっても上書きする")]
-    public void ExplicitPullStillOverwrites()
+    [Fact(DisplayName = "明示的な Pull も、手元に変更があれば上書きせずに見送る")]
+    public void ExplicitPullKeepsLocalChanges()
     {
         var (_, b) = ArrangeRemoteNewer();
         AddLocation(b, "2026-10-03T00:00:00Z");
 
         var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
 
+        Assert.Equal(SyncOutcome.LocalChangesPending, result.Outcome);
+        Assert.Contains("強制 Pull", result.Message);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+        Assert.Null(result.BackupPath);
+    }
+
+    [Fact(DisplayName = "明示的な Pull は、マージが有効なら手元の変更を残したままマージして Push する")]
+    public void ExplicitPullMergesWhenEnabled()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        b.Settings.MergeVrcx = true;
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+
         Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.NotNull(result.MergeReport);
+        // 同期先の 2 行 + 手元の 1 行。
+        Assert.Equal(3, CountLocations(b.Paths.SqliteFile));
+        // マージ結果は Push され、A の起動時 Pull に届く。
+        Assert.Equal(SyncOutcome.Success, StartupPull(a).Outcome);
+        Assert.Equal(3, CountLocations(a.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "強制 Pull は、手元に変更があってもバックアップを取って上書きする")]
+    public void ForcedPullOverwrites()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false, force: true);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Null(result.MergeReport);
         Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
         Assert.NotNull(result.BackupPath);
+        // 上書きした後は手元の変更は無く、次の起動時 Pull は何もしない。
+        Assert.Equal(SyncOutcome.NothingToDo, StartupPull(b).Outcome);
+    }
+
+    [Fact(DisplayName = "強制 Pull は、マージが有効でもマージせずに上書きする")]
+    public void ForcedPullIgnoresMergeSetting()
+    {
+        var (_, b) = ArrangeRemoteNewer();
+        b.Settings.MergeVrcx = true;
+        AddLocation(b, "2026-10-03T00:00:00Z");
+
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false, force: true);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Null(result.MergeReport);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
     }
 
     [Fact(DisplayName = "Push の後は、その時点が次の比較の基準になる")]
@@ -2253,7 +2302,8 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(sha, FileHasher.Sha256(db));
         Assert.True(File.Exists(db + "-wal"));
 
-        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false);
+        // WAL の行は手元の変更なので、通常の Pull は見送る。上書きさせるために強制 Pull を使う。
+        var result = b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false, force: true);
 
         Assert.Equal(SyncOutcome.Success, result.Outcome);
         Assert.DoesNotContain(db, result.AffectedFiles);

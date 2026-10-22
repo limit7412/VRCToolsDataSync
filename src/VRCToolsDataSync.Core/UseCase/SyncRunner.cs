@@ -180,33 +180,48 @@ public sealed class SyncRunner
         }
     }
 
+    /// <summary>
+    /// 同期先の内容を手元へ取り込む。
+    /// <para>
+    /// 手元に前回の同期の後の変更があれば上書きしない。マージ同期が有効なら、上書きの代わりに
+    /// 同期先の最新へ手元の変更を足して Push する。無効なら
+    /// <see cref="SyncOutcome.LocalChangesPending"/> を返し、呼び出し側が利用者に強制 Pull か
+    /// マージ同期の有効化を選ばせる。手元の変更を確かめられない場合 (前回の同期時点の要約が
+    /// 無いなど) は従来どおり上書きする。
+    /// </para>
+    /// </summary>
+    /// <param name="skipIfNotNewer">
+    /// 真なら、ローカルが既に最新と分かっているリモート (LastPulledVersion>=Version) の Pull を
+    /// 省く (issue #19)。起動時の自動 Pull (StartupSyncOrchestrator) が使う。
+    /// </param>
+    /// <param name="force">
+    /// 真なら、手元の変更を確かめずに同期先の内容で上書きする (非常用の強制 Pull)。手元の
+    /// 変更はバックアップにだけ残る。
+    /// </param>
     public SyncResult Pull(
         ISyncService service,
         SyncSettings settings,
         ISyncStorage storage,
         bool skipBackup,
-        bool skipIfNotNewer = false)
+        bool skipIfNotNewer = false,
+        bool force = false)
     {
-        // Issue #19: skipIfNotNewer=true の経路 (StartupSyncOrchestrator) では、
-        // ローカルが既に最新と分かっているリモート (LastPulledVersion>=Version) の
-        // Pull を抑止する。手動 Pull / コンフリクト解消 Pull は呼び出し側でデフォルトの
-        // false を使い、従来通り上書き Pull を行う。
         SyncResult result;
         lock (PushLock)
         {
             // Pull もローカルの DB を置き換えるので、別プロセスのマージと重ならないようにする。
             using var localLock = AcquireLocalLock(service.ToolKey);
             if (!localLock.IsHeld) return LocalLockBusy();
-            result = PullLocked(service, settings, storage, skipBackup, skipIfNotNewer);
+            result = PullLocked(service, settings, storage, skipBackup, skipIfNotNewer, force);
         }
 
-        // 起動時の自動 Pull が手元の変更を守って見送った場合、マージが有効なら
-        // 上書きの代わりにマージする。
+        // 手元の変更を守って見送った場合、マージが有効なら上書きの代わりにマージする。
+        // マージは結果を Push するので、この Pull で同期先も進む。
         if (result.Outcome == SyncOutcome.LocalChangesPending
             && settings.IsMergeEnabled(service.ToolKey)
             && service is IMergeableSyncService mergeable)
         {
-            _logger.LogInformation("手元に未 Push の変更があるのでマージします ({Tool})", service.ToolKey);
+            _logger.LogInformation("手元に未 Push の変更があるので、上書きの代わりにマージして Push します ({Tool})", service.ToolKey);
             return Merge(mergeable, settings, storage, skipBackup);
         }
         return result;
@@ -217,7 +232,8 @@ public sealed class SyncRunner
         SyncSettings settings,
         ISyncStorage storage,
         bool skipBackup,
-        bool skipIfNotNewer)
+        bool skipIfNotNewer,
+        bool force)
     {
         var state = ResolveState(settings, storage, service.ToolKey, out var stateKey);
         // 置き換えの記録を残した後は真。サービスは記録を残してから、差し替える直前にツールの
@@ -225,7 +241,9 @@ public sealed class SyncRunner
         // 残すと、次回に本体のハッシュがどちらの記録とも合わず、置き換えの前後を見分けられない
         // としてマージが止まる。
         var replaceRecorded = false;
-        if (skipIfNotNewer)
+        // 強制 Pull は手元の変更を確かめない。利用者が手元の内容を捨てると決めているので、
+        // 中断の復旧や送った写しの確認も要らず、同期先の内容をそのまま置く。
+        if (!force)
         {
             // 前回のマージか Pull が置き換えの前後で止まっていれば、先にそろえる。Pull が本体を
             // 差し替えた後に止まっていた場合は、祖先だけが本体の版になり、この Pull が残りを
@@ -237,7 +255,7 @@ public sealed class SyncRunner
                 if (recovered.Abort is not null) return recovered.Abort;
                 state ??= settings.ToolState.GetValueOrDefault(stateKey);
             }
-            // 起動時の自動 Pull は、送った写しの記録と比べて手元の変更を見つける。反映の直後に
+            // Pull は、送った写しの記録と比べて手元の変更を見つける。反映の直後に
             // 止まって反映済みと記録できていなければ、同期先と照らして先に確かめる。
             ConfirmPushedRecord(service, storage, stateKey);
         }
@@ -252,9 +270,9 @@ public sealed class SyncRunner
                 LastPulledVersion = state is null || state.LastPulledVersion == 0
                     ? null
                     : state.LastPulledVersion,
-                FindUnsyncedLocalChanges = skipIfNotNewer
-                    ? () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0)
-                    : null,
+                FindUnsyncedLocalChanges = force
+                    ? null
+                    : () => FindUnsyncedLocalChanges(service, stateKey, state?.LastPulledVersion ?? 0),
                 // 本体を差し替えた直後に止まっても、次回に差し替わったかを見分けて祖先をそろえられるよう、
                 // マージと同じ記録を残す。要約を保存できれば RecordBaseSummary が消す。
                 BeforeReplaceLocal = pending =>

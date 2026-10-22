@@ -22,6 +22,10 @@ var noBackupOption = new Option<bool>(
     aliases: new[] { "--no-backup" },
     description: "Pull 前のローカルバックアップを省略する");
 
+var forcePullOption = new Option<bool>(
+    aliases: new[] { "--force", "-f" },
+    description: "非常用の強制 Pull。手元の未 Push の変更を確かめず、同期先の内容で上書きする (手元の変更はバックアップにだけ残る)");
+
 var pushCommand = new Command("push", "ローカルデータをクラウドへアップロード");
 
 // NOTE: System.CommandLine 2.0.0-beta4 では、ハンドラ内で Environment.ExitCode を
@@ -64,11 +68,13 @@ var pullCommand = new Command("pull", "クラウドからローカルへデー�
 var pullVrcxCommand = new Command("vrcx", "VRCX のデータを Pull");
 pullVrcxCommand.AddOption(cloudOption);
 pullVrcxCommand.AddOption(noBackupOption);
+pullVrcxCommand.AddOption(forcePullOption);
 pullVrcxCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
-    ctx.ExitCode = RunPull(cloud, noBackup, "VRCX",
+    var force = ctx.ParseResult.GetValueForOption(forcePullOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, force, "VRCX",
         lf => new VrcxSyncService(logger: lf.CreateLogger<VrcxSyncService>()));
 });
 pullCommand.AddCommand(pullVrcxCommand);
@@ -76,11 +82,13 @@ pullCommand.AddCommand(pullVrcxCommand);
 var pullFriendConnectCommand = new Command("friend-connect", "VRC Friend Connect のデータを Pull");
 pullFriendConnectCommand.AddOption(cloudOption);
 pullFriendConnectCommand.AddOption(noBackupOption);
+pullFriendConnectCommand.AddOption(forcePullOption);
 pullFriendConnectCommand.SetHandler((System.CommandLine.Invocation.InvocationContext ctx) =>
 {
     var cloud = ctx.ParseResult.GetValueForOption(cloudOption);
     var noBackup = ctx.ParseResult.GetValueForOption(noBackupOption);
-    ctx.ExitCode = RunPull(cloud, noBackup, "VRC Friend Connect",
+    var force = ctx.ParseResult.GetValueForOption(forcePullOption);
+    ctx.ExitCode = RunPull(cloud, noBackup, force, "VRC Friend Connect",
         lf => new FriendConnectSyncService(logger: lf.CreateLogger<FriendConnectSyncService>()));
 });
 pullCommand.AddCommand(pullFriendConnectCommand);
@@ -407,6 +415,7 @@ static int RunPush(
 static int RunPull(
     string? cloudOverride,
     bool noBackup,
+    bool force,
     string toolDisplayName,
     Func<ILoggerFactory, ISyncService> serviceFactory)
 {
@@ -416,12 +425,17 @@ static int RunPull(
 
     try
     {
-        var result = runner.Pull(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup);
+        if (force) Console.WriteLine($"{toolDisplayName} 非常用の強制 Pull: 手元の変更を確かめずに上書きします");
+        var result = runner.Pull(serviceFactory(loggerFactory), settings, storage, skipBackup: noBackup, force: force);
 
         switch (result.Outcome)
         {
             case SyncOutcome.Success:
-                Console.WriteLine($"{toolDisplayName} Pull 完了 version={result.RemoteVersion}");
+                // マージ同期が有効で手元に変更があれば、Pull はマージして Push まで行う。
+                Console.WriteLine(result.MergeReport is null
+                    ? $"{toolDisplayName} Pull 完了 version={result.RemoteVersion}"
+                    : $"{toolDisplayName} Pull 完了 (マージして Push) version={result.RemoteVersion}");
+                if (result.MergeReport is not null) Console.WriteLine($"  {result.Message}");
                 if (result.BackupPath is not null) Console.WriteLine($"  backup: {result.BackupPath}");
                 foreach (var f in result.AffectedFiles) Console.WriteLine($"  {f}");
                 return 0;
@@ -429,6 +443,11 @@ static int RunPull(
             case SyncOutcome.SourceMissing:
                 Console.Error.WriteLine(result.Message);
                 return 4;
+            case SyncOutcome.LocalChangesPending:
+                // 手元の変更とリモートの更新が両方ある。Push の競合と同じ扱いにする。
+                Console.Error.WriteLine(result.Message);
+                Console.Error.WriteLine("  上書きしてよければ --force を付けて再実行してください。");
+                return 3;
             default:
                 Console.Error.WriteLine($"想定外: {result.Outcome} {result.Message}");
                 return 1;

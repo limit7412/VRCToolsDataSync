@@ -1086,6 +1086,12 @@ public partial class MainPageViewModel : ObservableObject
     [RelayCommand]
     private Task EmergencyPushFriendConnect() => RunEmergencyPushAsync("VRC Friend Connect", new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>()));
 
+    [RelayCommand]
+    private Task EmergencyPullVrcx() => RunEmergencyPullAsync("VRCX", new VrcxSyncService(logger: _runner.CreateLogger<VrcxSyncService>()));
+
+    [RelayCommand]
+    private Task EmergencyPullFriendConnect() => RunEmergencyPullAsync("VRC Friend Connect", new FriendConnectSyncService(logger: _runner.CreateLogger<FriendConnectSyncService>()));
+
     private async Task RunPushAsync(string displayName, ISyncService service)
     {
         if (!TryCreateStorage(out var storage)) return;
@@ -1116,7 +1122,7 @@ public partial class MainPageViewModel : ObservableObject
                         case ConflictChoice.PullFirst:
                             AppendLog($"{displayName} 先に Pull を実行");
                             var pulled = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
-                            ReportPullResult(displayName, pulled);
+                            await ReportPullOrAskEmergencyAsync(displayName, service, storage, pulled);
                             break;
                         default:
                             AppendLog($"{displayName} Push をキャンセル");
@@ -1196,6 +1202,83 @@ public partial class MainPageViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// 非常用の強制 Pull。確かめてから実行する。
+    /// <para>
+    /// 通常の Pull は手元に未 Push の変更があれば上書きせず、マージするか利用者に尋ねる。
+    /// 強制 Pull はその確認を飛ばし、この PC のデータを同期先の内容で丸ごと置き換える。
+    /// 手元の変更はバックアップにだけ残る。押し間違いで走らせないよう、強制 Push と同じく
+    /// 必ず問い合わせを挟み、<see cref="_promptGate"/> を握る。
+    /// </para>
+    /// </summary>
+    private async Task RunEmergencyPullAsync(string displayName, ISyncService service)
+    {
+        if (!TryCreateStorage(out var storage)) return;
+        IsBusy = true;
+        try
+        {
+            await _promptGate.WaitAsync();
+            try
+            {
+                if (!await AskEmergencyPullAsync(displayName))
+                {
+                    AppendLog($"{displayName} 非常用の強制 Pull をキャンセル");
+                    return;
+                }
+                AppendLog($"{displayName} 非常用の強制 Pull 開始 (手元の変更を確かめずに上書きします)...");
+                var result = await Task.Run(
+                    () => _runner.Pull(service, _settings, storage, skipBackup: false, force: true));
+                ReportPullResult(displayName, result);
+            }
+            finally
+            {
+                _promptGate.Release();
+            }
+        }
+        catch (RunningProcessException ex)
+        {
+            AppendLog($"{displayName}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"{displayName} エラー: {ex.Message}");
+        }
+        finally
+        {
+            RefreshStatusSummaries();
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// Pull の結果を記録する。手元の変更を守って見送っていたら、強制 Pull で上書きするかを
+    /// 尋ね、選ばれれば実行する。<see cref="_promptGate"/> を握って呼ぶこと。
+    /// </summary>
+    private async Task ReportPullOrAskEmergencyAsync(
+        string displayName, ISyncService service, ISyncStorage storage, SyncResult result, string logPrefix = "")
+    {
+        if (result.Outcome != SyncOutcome.LocalChangesPending)
+        {
+            ReportPullResult(displayName, result);
+            return;
+        }
+        AppendLog($"{logPrefix}{displayName} Pull 見送り: {result.Message}");
+        var overwrite = await AskAsync<bool>(
+            $"{displayName}: Pull を見送りました",
+            result.Message + " 強制 Pull を選ぶと、この PC の変更はバックアップにだけ残ります。",
+            InfoBarSeverity.Warning,
+            ("強制 Pull (手元の変更を捨てる)", true),
+            ("キャンセル", false));
+        if (!overwrite)
+        {
+            AppendLog($"{logPrefix}{displayName} Pull をキャンセル");
+            return;
+        }
+        AppendLog($"{logPrefix}{displayName} 非常用の強制 Pull 実行");
+        var forced = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false, force: true));
+        ReportPullResult(displayName, forced);
+    }
+
     private async Task RunPullAsync(string displayName, ISyncService service)
     {
         if (!TryCreateStorage(out var storage)) return;
@@ -1204,7 +1287,22 @@ public partial class MainPageViewModel : ObservableObject
         {
             AppendLog($"{displayName} Pull 開始...");
             var result = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
-            ReportPullResult(displayName, result);
+            if (result.Outcome != SyncOutcome.LocalChangesPending)
+            {
+                ReportPullResult(displayName, result);
+                return;
+            }
+            // 手元の変更を守って見送った。問い合わせから強制 Pull の実行までは、競合時と同じく
+            // 1 件ずつに絞る。
+            await _promptGate.WaitAsync();
+            try
+            {
+                await ReportPullOrAskEmergencyAsync(displayName, service, storage, result);
+            }
+            finally
+            {
+                _promptGate.Release();
+            }
         }
         catch (RunningProcessException ex)
         {
@@ -1342,7 +1440,16 @@ public partial class MainPageViewModel : ObservableObject
         switch (result.Outcome)
         {
             case SyncOutcome.Success:
-                AppendLog($"{displayName} Pull 完了 version={result.RemoteVersion} backup={result.BackupPath ?? "(none)"}");
+                if (result.MergeReport is not null)
+                {
+                    // 手元に変更があったので、上書きの代わりにマージして Push した。
+                    AppendLog($"{displayName} Pull 完了 (マージして Push) version={result.RemoteVersion} backup={result.BackupPath ?? "(none)"}");
+                    AppendLog($"{displayName} {result.Message}");
+                }
+                else
+                {
+                    AppendLog($"{displayName} Pull 完了 version={result.RemoteVersion} backup={result.BackupPath ?? "(none)"}");
+                }
                 // 常駐側 Coordinator にも反映 (ReportPushResult と同様の理由)。
                 _coordinator?.RefreshSettings(_settings);
                 break;
@@ -1412,7 +1519,8 @@ public partial class MainPageViewModel : ObservableObject
         string displayName, long remoteVersion, long lastPulledVersion) =>
         AskAsync<ConflictChoice>(
             $"{displayName}: Push が競合しました",
-            $"リモートの方が新しい更新を持っています (リモート v{remoteVersion} / 最後に Pull した版 v{lastPulledVersion})。どう処理しますか。",
+            $"リモートの方が新しい更新を持っています (リモート v{remoteVersion} / 最後に Pull した版 v{lastPulledVersion})。" +
+            "「先に Pull」は、手元に変更があればマージ同期が有効ならマージして Push し、無効なら上書きするかを改めて尋ねます。",
             InfoBarSeverity.Warning,
             ("先に Pull", ConflictChoice.PullFirst),
             ("強制 Push (上書き)", ConflictChoice.ForceOverwrite),
@@ -1426,6 +1534,17 @@ public partial class MainPageViewModel : ObservableObject
             "この PC が取得していないものは失われます。全ファイルを送り直すため、" +
             "データが大きいと時間と転送量がかかります。" +
             "同期先のファイルが壊れていて Pull が失敗し続けるときなど、通常の Push で直らない場合に使ってください。",
+            InfoBarSeverity.Error,
+            ("置き換える", true),
+            ("キャンセル", false));
+
+    /// <summary>非常用の強制 Pull を本当に行うかを尋ねる。</summary>
+    private Task<bool> AskEmergencyPullAsync(string displayName) =>
+        AskAsync<bool>(
+            $"{displayName}: 非常用の強制 Pull",
+            "この PC のデータを同期先の内容で丸ごと置き換えます。前回の同期の後にこの PC で加えた変更は、" +
+            "確かめずに上書きし、バックアップにだけ残ります。" +
+            "通常の Pull が手元の変更を見つけて止まり、その変更を捨ててよいと分かっている場合に使ってください。",
             InfoBarSeverity.Error,
             ("置き換える", true),
             ("キャンセル", false));
@@ -1469,8 +1588,9 @@ public partial class MainPageViewModel : ObservableObject
                     break;
                 case ConflictChoice.PullFirst:
                     AppendLog($"[auto] {e.DisplayName} 先に Pull を実行");
-                    var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
-                    ReportPullResult(e.DisplayName, pullResult);
+                    var pullService = e.ServiceFactory();
+                    var pullResult = await Task.Run(() => _runner.Pull(pullService, _settings, storage, skipBackup: false));
+                    await ReportPullOrAskEmergencyAsync(e.DisplayName, pullService, storage, pullResult, "[auto] ");
                     break;
                 default:
                     AppendLog($"[auto] {e.DisplayName} Push をキャンセル");
@@ -1512,8 +1632,9 @@ public partial class MainPageViewModel : ObservableObject
             if (choice != RemoteUpdateChoice.PullNow) return;
 
             AppendLog($"[auto] {e.DisplayName} Pull 実行");
-            var pullResult = await Task.Run(() => _runner.Pull(e.ServiceFactory(), _settings, storage, skipBackup: false));
-            ReportPullResult(e.DisplayName, pullResult);
+            var service = e.ServiceFactory();
+            var pullResult = await Task.Run(() => _runner.Pull(service, _settings, storage, skipBackup: false));
+            await ReportPullOrAskEmergencyAsync(e.DisplayName, service, storage, pullResult, "[auto] ");
         }
         catch (Exception ex)
         {

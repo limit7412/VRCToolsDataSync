@@ -298,12 +298,11 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
-        if (options.SkipIfNotNewer
-            && options.FindUnsyncedLocalChanges?.Invoke() is { Count: > 0 } changed)
+        if (options.FindUnsyncedLocalChanges?.Invoke() is { Count: > 0 } changed)
         {
-            // 起動時の自動 Pull は利用者が求めた操作ではない。ここで上書きすると、
-            // 前回の同期の後に手元で増えた履歴や編集が、気付かれないまま
-            // バックアップにしか残らなくなる。
+            // ここで上書きすると、前回の同期の後に手元で増えた履歴や編集が、バックアップに
+            // しか残らなくなる。呼び出し側がマージするか利用者に尋ねるかを決めるので、
+            // 見送って返す。強制 Pull は確かめる関数を渡さないのでここを通らない。
             _logger.LogInformation(
                 "{Tool} Pull 見送り: 手元に未 Push の変更がある (remote={Remote}, tables={Tables})",
                 DisplayName, entry.Version, string.Join(", ", changed));

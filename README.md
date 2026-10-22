@@ -14,7 +14,7 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
     - `thumbnails\`（写真のサムネイル）と、存在する場合は `notes\`
 - **保存先**: ローカル同期フォルダ（パスはユーザーが手動指定）または S3 互換オブジェクトストレージ
 - **マージ戦略**: 既定は last-writer-wins（置き換え）。VRCX と VRC Friend Connect のそれぞれについて、試験的なマージ同期を別々に有効にできる（後述）。Pull 前にローカルを `%AppData%\VRCToolsDataSync\backup\<tool>\<timestamp>\` へ自動退避（既定10世代）
-- **未同期の変更の保護**: 同期のたびに、DB のうち手で編集するデータと追加専用の履歴だけの要約を `%AppData%\VRCToolsDataSync\base\` に残す。起動時の自動 Pull は、リモートが新しくても手元の要約が前回から変わっていれば上書きを見送り、通知する。明示的な Pull はこれまでどおり上書きする
+- **未同期の変更の保護**: 同期のたびに、DB のうち手で編集するデータと追加専用の履歴だけの要約を `%AppData%\VRCToolsDataSync\base\` に残す。Pull は、リモートが新しくても手元の要約が前回から変わっていれば上書きしない。マージ同期が有効ならマージして Push し、無効なら見送って知らせる。手元の変更を捨てて上書きするのは、非常用の強制 Pull に限る（後述）
 - **転送の省略**: manifest に記録した SHA-256 と手元のファイルが一致する場合、送信も取得も行わない
 - **プロセス検知ガード**: 同期対象のツール (`VRCX`, `VRC Friend Connect`) が実行中の場合は WAL ロックによる DB 破損を避けるため同期を拒否
 - **暗号化**: 保存先のデータは暗号化しない。S3 互換モードのシークレットアクセスキーのみ、Windows の DPAPI で保護して `settings.json` に保存する
@@ -57,6 +57,8 @@ dotnet run --project src\VRCToolsDataSync.Cli -- status
 # VRCX
 dotnet run --project src\VRCToolsDataSync.Cli -- push vrcx --cloud "D:\OneDrive\VRCToolsDataSync"
 dotnet run --project src\VRCToolsDataSync.Cli -- pull vrcx --cloud "D:\OneDrive\VRCToolsDataSync"
+# 非常用の強制 Pull (手元の変更を確かめずに上書き)
+dotnet run --project src\VRCToolsDataSync.Cli -- pull vrcx --force
 
 # VRC Friend Connect
 dotnet run --project src\VRCToolsDataSync.Cli -- push friend-connect --cloud "D:\OneDrive\VRCToolsDataSync"
@@ -72,7 +74,7 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 | 0 | 成功 |
 | 1 | 想定外エラー |
 | 2 | 設定不備 (保存先が未設定 / 到達できない) |
-| 3 | コンフリクト（リモートがローカルの最終 Pull より新しい / Push 中に他 PC が更新した） |
+| 3 | コンフリクト（Push: リモートがローカルの最終 Pull より新しい / Push 中に他 PC が更新した。Pull: 手元に未 Push の変更があり、マージ同期が無効） |
 | 4 | 同期対象が存在しない |
 | 5 | プロセス実行中で同期不可 |
 
@@ -82,7 +84,7 @@ dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --cloud "D:
 dotnet run --project src\VRCToolsDataSync.App
 ```
 
-設定カードで保存先を選び (同期フォルダならパスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時は画面の上端に問い合わせが出るので、「先に Pull」「強制 Push」「キャンセル」を選択する。
+設定カードで保存先を選び (同期フォルダならパスを指定、S3 互換ストレージなら接続情報を入力) → 保存 → 各ツールのカードから Push/Pull。コンフリクト発生時は画面の上端に問い合わせが出るので、「先に Pull」「強制 Push」「キャンセル」を選択する。Pull が手元の未 Push の変更を見つけて見送ったときも同じ場所に問い合わせが出て、「強制 Pull (手元の変更を捨てる)」か「キャンセル」を選ぶ。
 
 ウィンドウの × はタスクトレイへの最小化として扱う。終了はトレイメニューの「同期して終了」から行う。
 
@@ -98,8 +100,10 @@ dotnet run --project src\VRCToolsDataSync.App
 
 既定の同期は置き換えで、2 台の PC で並行して変更が生まれると、後から Push した側だけが残る。マージ同期を有効にすると、そのツールの DB について次の 2 つの場面で、上書きの代わりに「同期先の最新に、手元にしか無い変更を足す」処理を行い、結果をそのまま Push する。VRCX と VRC Friend Connect で別々に有効にする。
 
-- 起動時の自動 Pull で、手元に未 Push の変更が見つかったとき
+- Pull で、手元に未 Push の変更が見つかったとき。起動時の自動 Pull、手動の Pull、競合時の「先に Pull」、別の PC の更新の通知からの Pull のどれも同じ（非常用の強制 Pull を除く）
 - Push が「リモートの方が新しい」ことで競合したとき（強制 Push を除く）
+
+マージ同期が無効のときは、Pull は手元の変更を見つけると上書きせずに見送る。GUI では強制 Pull で上書きするかを尋ね、CLI は終了コード 3 で止まる。手元の変更を確かめられない場合（前回の同期時点の要約が無いなど）は、どちらの設定でも従来どおり上書きする。
 
 ### VRCX
 
@@ -145,6 +149,17 @@ dotnet run --project src\VRCToolsDataSync.Cli -- push friend-connect --emergency
 ```
 
 GUI では各ツールのカードの「非常用の強制 Push...」から実行する。押すと確認が出るので、「置き換える」を選ぶと実行する。
+
+## 非常用の強制 Pull
+
+通常の Pull は、前回の同期の後に手元で変わったテーブルがあれば上書きしない。マージ同期が有効ならマージして Push し、無効なら見送って知らせる。手元の変更を捨てて同期先の内容に合わせたいときは、非常用の強制 Pull を使う。強制 Pull は手元の変更を確かめず、マージ同期の設定にかかわらず、同期先の内容でこの PC のデータを丸ごと置き換える。置き換える前のデータは通常の Pull と同じくバックアップへ退避する（`--no-backup` を付けた場合を除く）。
+
+```powershell
+dotnet run --project src\VRCToolsDataSync.Cli -- pull vrcx --force
+dotnet run --project src\VRCToolsDataSync.Cli -- pull friend-connect --force
+```
+
+GUI では各ツールのカードの「非常用の強制 Pull...」から実行する。押すと確認が出るので、「置き換える」を選ぶと実行する。通常の Pull が手元の変更を見つけて見送ったときの問い合わせで「強制 Pull (手元の変更を捨てる)」を選んだ場合も同じ処理になる。
 
 ## ドキュメント
 
