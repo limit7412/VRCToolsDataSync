@@ -55,8 +55,6 @@ public sealed class FriendConnectPaths
     /// <summary>現行の Friend Connect が使っている本体 DB。同期に必須。</summary>
     public string DbV11File => Path.Combine(DbDirectory, "db_1.1.sqlite");
 
-    public string NotesDirectory => Path.Combine(RootDirectory, "notes");
-
     /// <summary>写真のサムネイル。DB の写真の記録と対応している。</summary>
     public string ThumbnailsDirectory => Path.Combine(RootDirectory, "thumbnails");
 

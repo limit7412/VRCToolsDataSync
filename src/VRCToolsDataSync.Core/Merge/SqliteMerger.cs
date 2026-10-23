@@ -396,10 +396,13 @@ public static class SqliteMerger
             report.AbortReason = $"テーブル {table} の列が同期先と手元で違います";
             return null;
         }
-        if (!created && baseline is null && ancestorRulesChanged)
+        if (!created && baseline is null && ancestorRulesChanged
+            && !(rule.Kind == MergeTableKind.AppendOnly && rule.UnionWithoutAncestor))
         {
             // 前回の要約を取った版のツールは、このテーブルを規則に持っていなかった。祖先が無いまま
             // 合わせると、手元で消した行を同期先から戻す。内容が同じなら合わせるものが無い。
+            // アプリが行を消さない追加専用のテーブル (UnionWithoutAncestor) は、戻す削除が
+            // 無いので祖先なしで和集合を取る。
             var local = DatabaseSummary.SummarizeTable(connection, Local, table, rule, localColumns);
             var host = DatabaseSummary.SummarizeTable(connection, "main", table, rule, hostColumns);
             if (!local.HasSameContent(host))

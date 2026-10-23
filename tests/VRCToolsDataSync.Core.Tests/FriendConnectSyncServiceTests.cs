@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Data.Sqlite;
 using VRCToolsDataSync.Core.Domain;
 using VRCToolsDataSync.Core.Infra;
@@ -69,24 +71,64 @@ public sealed class FriendConnectSyncServiceTests : IDisposable
         var storage = new FakeSyncStorage();
         var a = PathsOf("a");
         CreateDb(a.DbV11File, "v11");
-        WriteFile(Path.Combine(a.NotesDirectory, "note.md"), "note-a");
         WriteFile(Path.Combine(a.ThumbnailsDirectory, "a.webp"), "thumb-a");
         Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
 
-        // b には notes も thumbnails もまだ無い。取り出しがフォルダを作っても
+        // b には thumbnails がまだ無い。取り出しがフォルダを作っても
         // 「取得の間に書き換えられた」と見ない。
         var b = PathsOf("b");
         CreateDb(b.DbV11File, "old");
         SqliteConnection.ClearAllPools();
-        Assert.False(Directory.Exists(b.NotesDirectory));
         Assert.False(Directory.Exists(b.ThumbnailsDirectory));
 
         var result = Pull(ServiceOf("b"), storage);
 
         Assert.Equal(SyncOutcome.Success, result.Outcome);
-        Assert.Equal("note-a", File.ReadAllText(Path.Combine(b.NotesDirectory, "note.md")));
         Assert.Equal("thumb-a", File.ReadAllText(Path.Combine(b.ThumbnailsDirectory, "a.webp")));
         Assert.Equal("v11", ReadDb(b.DbV11File));
+    }
+
+    [Fact(DisplayName = "以前の版が manifest に残した notes\\ の項目は取り出さず、次の Push で一覧から落とす")]
+    public void LegacyNotesEntriesAreIgnoredAndDropped()
+    {
+        var storage = new FakeSyncStorage();
+        var a = PathsOf("a");
+        CreateDb(a.DbV11File, "v11");
+        WriteFile(Path.Combine(a.ThumbnailsDirectory, "a.webp"), "thumb-a");
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("a"), storage).Outcome);
+
+        // notes\ を送っていた版が書いた項目を足す。Friend Connect にこのフォルダは無い。
+        const string legacyNotesKey = "friend-connect/notes/note.md";
+        var manifestStore = new ManifestStore(storage);
+        var manifest = manifestStore.Load();
+        var entry = manifest.Tools[FriendConnectSyncService.Key];
+        var note = Encoding.UTF8.GetBytes("note-a");
+        var sha = Convert.ToHexString(SHA256.HashData(note)).ToLowerInvariant();
+        storage.Seed(BlobKeys.FromSha256(sha), note);
+        entry.Files.Add(new ManifestFile
+        {
+            RelativePath = legacyNotesKey,
+            Size = note.Length,
+            Sha256 = sha,
+            BlobKey = BlobKeys.FromSha256(sha),
+        });
+        storage.SeedManifest(manifest);
+
+        var b = PathsOf("b");
+        CreateDb(b.DbV11File, "old");
+        SqliteConnection.ClearAllPools();
+
+        var pulled = Pull(ServiceOf("b"), storage);
+
+        Assert.Equal(SyncOutcome.Success, pulled.Outcome);
+        Assert.False(Directory.Exists(Path.Combine(b.RootDirectory, "notes")));
+        Assert.Equal("thumb-a", File.ReadAllText(Path.Combine(b.ThumbnailsDirectory, "a.webp")));
+        Assert.Equal("v11", ReadDb(b.DbV11File));
+
+        SqliteConnection.ClearAllPools();
+        Assert.Equal(SyncOutcome.Success, Push(ServiceOf("b"), storage, lastPulled: pulled.RemoteVersion).Outcome);
+        Assert.DoesNotContain(legacyNotesKey, RemotePaths(storage));
+        Assert.Contains(ThumbnailKey, RemotePaths(storage));
     }
 
     [Fact]

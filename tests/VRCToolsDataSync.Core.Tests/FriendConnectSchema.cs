@@ -131,6 +131,32 @@ internal static class FriendConnectSchema
             "startAt" DATETIME NOT NULL,
             CONSTRAINT "Location_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
         );
+        CREATE TABLE "PhotoFavorite" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "shotAt" DATETIME NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL
+        );
+        CREATE INDEX "PhotoFavorite_shotAt_idx" ON "PhotoFavorite"("shotAt");
+        CREATE UNIQUE INDEX "PhotoFavorite_shotAt_key" ON "PhotoFavorite"("shotAt");
+        CREATE TABLE "WorldNote" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "worldId" INTEGER NOT NULL,
+            "note" TEXT NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "WorldNote_worldId_fkey" FOREIGN KEY ("worldId") REFERENCES "World" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "WorldNote_worldId_idx" ON "WorldNote"("worldId");
+        CREATE TABLE "ScanRuntime" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "startAt" DATETIME NOT NULL,
+            "endAt" DATETIME NOT NULL,
+            "seconds" INTEGER NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL
+        );
+        CREATE INDEX "ScanRuntime_startAt_endAt_idx" ON "ScanRuntime"("startAt", "endAt");
         """;
 
     /// <summary>規則に関わるテーブルを作り、本ツールが確かめた版のマイグレーションを記録する。</summary>
@@ -181,6 +207,19 @@ internal static class FriendConnectSchema
     public static string SetNotification(string userApiId, string type, string notifyApi, string value = "")
         => "INSERT INTO UserNotificationSetting (userId, type, notifyAPI, value, updatedAt) VALUES (" +
            $"(SELECT id FROM User WHERE apiId = '{userApiId}'), '{type}', '{notifyApi}', '{value}', 1);";
+
+    /// <summary>写真のお気に入り。撮影時刻 (Unix ミリ秒) だけが意味を持つ。</summary>
+    public static string FavoritePhoto(long shotAt)
+        => $"INSERT INTO PhotoFavorite (shotAt, createdAt, updatedAt) VALUES ({shotAt}, 1, 1);";
+
+    /// <summary>ワールドへのメモ。作成時刻は Friend Connect が作成時に 1 回だけ書く。</summary>
+    public static string NoteWorld(string worldApiId, long createdAt, string note)
+        => "INSERT INTO WorldNote (worldId, note, createdAt, updatedAt) VALUES (" +
+           $"(SELECT id FROM World WHERE apiId = '{worldApiId}'), '{note.Replace("'", "''")}', {createdAt}, 1);";
+
+    /// <summary>Friend Connect の稼働区間。起動 1 回が 1 行で、動作中は endAt と seconds が伸びる。</summary>
+    public static string InsertScanRuntime(long startAt, long endAt)
+        => $"INSERT INTO ScanRuntime (startAt, endAt, seconds, createdAt, updatedAt) VALUES ({startAt}, {endAt}, {(endAt - startAt) / 1000}, 1, 1);";
 
     public static void Exec(string path, string sql)
     {

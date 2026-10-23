@@ -147,10 +147,23 @@ public static class MergeProfiles
             // キーの行をまとめて比べる。
             new("UserNotificationSetting", MergeTableKind.Keyed, new[] { "userId", "type", "notifyAPI" }, ValueColumns: new[] { "value" },
                 References: new[] { UserByApiId }),
+            // 写真のお気に入り。撮影時刻 (UNIQUE) がキーで、行の有無だけが意味を持つ。
+            new("PhotoFavorite", MergeTableKind.Keyed, new[] { "shotAt" }, ValueColumns: Array.Empty<string>()),
+            // ワールドへのメモ。1 ワールドに複数行を持てるので、作成時刻 (作成時に 1 回だけ書かれる)
+            // をキーに含める。ワールドが同期先に無ければ写す。
+            new("WorldNote", MergeTableKind.Keyed, new[] { "worldId", "createdAt" }, ValueColumns: new[] { "note" },
+                References: new[] { WorldByApiId }),
 
-            // 履歴 (Location、UserStatus、UserAvatar、NUserHistory、LocationMaster) と集計
-            // (UserConnection、UserWorldVisit、UserAnalytics) はマージしない。履歴は自然キーが
-            // 無く、集計は足すと二重に数える。ここに無いテーブルは同期先の内容がそのまま残る。
+            // Friend Connect の稼働区間。起動 1 回が 1 行で、動作中は endAt と seconds が毎分伸びる。
+            // Friend Connect はこの行を消さないので、祖先の無い最初のマージでも和集合を取る。
+            // 履歴の 2 台同時起動の期間を見分けるのに使う。
+            new("ScanRuntime", MergeTableKind.AppendOnly, new[] { "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
+                UnionWithoutAncestor: true),
+
+            // 履歴 (Location、UserStatus、UserAvatar、NUserHistory、LocationMaster)、写真の一覧 (Photo)
+            // と集計 (UserConnection、UserWorldVisit、UserAnalytics) はまだマージしない。履歴は
+            // 整数 id の付け替えが追加専用に無く、集計は足すと二重に数える。ここに無いテーブルは
+            // 同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,
     };

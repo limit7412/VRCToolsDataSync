@@ -13,7 +13,6 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
     private const string DbKey = "friend-connect/db/db.sqlite";
     private const string DbV11Key = "friend-connect/db/db_1.1.sqlite";
     private const string ConfigKey = "friend-connect/config.json";
-    private const string NotesKeyPrefix = "friend-connect/notes/";
     private const string ThumbnailsKeyPrefix = "friend-connect/thumbnails/";
 
     private readonly FriendConnectPaths _paths;
@@ -34,9 +33,11 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
         _paths = paths ?? FriendConnectPaths.Default();
         _backup = backup ?? new LocalBackup();
         _logger = logger ?? NullLogger<FriendConnectSyncService>.Instance;
+        // 以前は notes\ も送っていたが、Friend Connect にそのフォルダは無い (メモは DB の User.note)。
+        // 古い版が manifest に残した friend-connect/notes/ の項目は、ここに無いので取り出さず、
+        // 次の Push で一覧から落ちる。
         _directories = new[]
         {
-            new SyncedDirectory(_paths.NotesDirectory, NotesKeyPrefix),
             new SyncedDirectory(_paths.ThumbnailsDirectory, ThumbnailsKeyPrefix),
         };
     }
@@ -405,7 +406,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
                 .Where(Directory.Exists)
                 .ToList();
 
-            // notes や thumbnails の退避からは取り出し中のファイルを外す。バックアップは
+            // thumbnails の退避からは取り出し中のファイルを外す。バックアップは
             // 取り出しの後に取るので、除外しないとリモート版の複製が一時名のまま
             // 毎回混ざり、その世代を復元すると実データとして残ってしまう。
             backupPath = _backup.CreateSnapshot(
@@ -563,7 +564,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
     }
 
     /// <summary>
-    /// フォルダ (notes, thumbnails) を送る。ローカルから消えたファイルは、ここで作る
+    /// フォルダ (thumbnails) を送る。ローカルから消えたファイルは、ここで作る
     /// 一覧に載らないことで「無い」ことを表す。実データの回収は
     /// <see cref="BlobGarbageCollector"/> に任せる。
     /// </summary>
