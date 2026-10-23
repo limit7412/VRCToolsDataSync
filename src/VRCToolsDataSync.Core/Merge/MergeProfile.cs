@@ -158,12 +158,15 @@ public sealed class MergeProfile
         static string References(IReadOnlyList<ColumnReference>? references) => references is null
             ? "-"
             : string.Join(",", references.Select(r => $"{r.Column}>{r.Table}.{r.IdColumn}({Columns(r.KeyColumns)})"));
+        // 後から足した印は、付いている規則だけに書く。既定値でも書くと、その印を使わない
+        // プロファイル (VRCX) のダイジェストまで版が変わり、更新後の最初のマージで、前回の
+        // 要約の後に両方の PC で作られた同名のテーブルを「以前は対象外だった」と見誤る。
         var text = string.Join("\n", Rules.Select(r => string.Join("|",
             r.NamePattern, r.Kind.ToString(), Columns(r.KeyColumns), Columns(r.ValueColumns),
             r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
             Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
-            References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns),
-            r.UnionWithoutAncestor ? "a" : "-")));
+            References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))
+            + (r.UnionWithoutAncestor ? "|a" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 
