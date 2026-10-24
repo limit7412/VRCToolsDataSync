@@ -35,7 +35,8 @@ public sealed class MergeReport
     {
         if (!Succeeded) return $"マージを中止しました: {AbortReason}";
         var changed = Tables.Where(t => t.Inserted + t.Updated + t.Deleted > 0).ToList();
-        if (changed.Count == 0 && Conflicts.Count == 0 && KeptReferencedRows.Count == 0) return "手元から足すものはありませんでした";
+        var skipped = Tables.Where(t => t.SkippedWhileHostRunning > 0).ToList();
+        if (changed.Count == 0 && Conflicts.Count == 0 && KeptReferencedRows.Count == 0 && skipped.Count == 0) return "手元から足すものはありませんでした";
         var parts = changed.Select(t =>
         {
             var items = new List<string>();
@@ -55,6 +56,11 @@ public sealed class MergeReport
             .Select(g => $"{g.Key} {g.Sum(c => c.Value)}")
             .ToList();
         if (copied.Count > 0) text += $"。参照先の行も写しました: {string.Join(", ", copied)}";
+        if (skipped.Count > 0)
+        {
+            text += $"。相手の PC が動いていた期間の履歴 {skipped.Sum(t => t.SkippedWhileHostRunning)} 件 " +
+                    $"({string.Join(", ", skipped.Select(t => t.Table))}) は、相手も記録しているので足しませんでした";
+        }
         if (Conflicts.Count > 0)
         {
             var keptLocal = Conflicts.Count(c => c.KeptLocal);
@@ -94,10 +100,14 @@ public sealed class MergeReport
 /// 手元の行を写すときに、その行が指す先が同期先に無かったので手元から写した行の数。
 /// 参照先のテーブル名から行数へ。
 /// </param>
+/// <param name="SkippedWhileHostRunning">
+/// 手元にしか無いが、相手の PC のアプリが動いていた期間 (<see cref="MergeTableRule.RuntimeGate"/>)
+/// の出来事なので足さなかった行の数。
+/// </param>
 public sealed record TableMergeReport(
     string Table, long Inserted, long Updated, long Deleted, bool Renumbered, bool Created,
     long KeptMaxRowId = 0, string? KeptDigest = null, Dictionary<string, string>? TailRows = null,
-    Dictionary<string, long>? CopiedReferences = null);
+    Dictionary<string, long>? CopiedReferences = null, long SkippedWhileHostRunning = 0);
 
 /// <summary>両方で別々に編集されていたキー。どちらを残したかを記録する。</summary>
 /// <param name="Table">テーブル名。</param>
@@ -232,6 +242,13 @@ public static class SqliteMerger
             .Where(t => t.Rule is not null && t.Rule.Kind != MergeTableKind.Watched)
             .OrderBy(t => ruleIndex[t.Rule!])
             .ThenBy(t => t.Table, StringComparer.Ordinal);
+        // 稼働区間による絞り込みに使う同期先の区間は、稼働区間のテーブル自身を合わせる前に取る。
+        // 合わせた後の表には手元の区間も入り、手元の行がすべて「相手が動いていた期間」に見える。
+        if (PrepareRuntimeGates(connection, profile, localTables) is { } gateProblem)
+        {
+            report.AbortReason = gateProblem;
+            return;
+        }
         var deferredDeletes = new List<DeferredDelete>();
         foreach (var (table, rule) in targets)
         {
@@ -456,7 +473,7 @@ public static class SqliteMerger
         }
 
         return rule.Kind == MergeTableKind.AppendOnly
-            ? MergeAppendOnly(connection, table, rule, localColumns, baseline, created, report, maxRenumberedTailRows)
+            ? MergeAppendOnly(connection, table, rule, profile, localColumns, baseline, created, report, maxRenumberedTailRows)
             : MergeKeyed(connection, table, rule, profile, localColumns, hashColumns, baseline, created, report, deferredDeletes);
     }
 
@@ -467,7 +484,7 @@ public static class SqliteMerger
     /// <see cref="MergeTableRule.GrowingColumns"/> だけは既存行も見て、大きい方の値を残す。
     /// </summary>
     private static TableMergeReport? MergeAppendOnly(
-        SqliteConnection connection, string table, MergeTableRule rule,
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
         IReadOnlyList<string> columns, TableSummary? baseline, bool created, MergeReport report,
         int maxRenumberedTailRows)
     {
@@ -506,16 +523,25 @@ public static class SqliteMerger
             report.AbortReason = tailProblem;
             return null;
         }
-        var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+        // 足す候補: 前回の同期の後に増えた手元の行のうち、同期先に同じキーの行が無いもの。
+        var candidates = $"l.rowid > {sinceRowId.ToString(CultureInfo.InvariantCulture)} AND l.rowid NOT IN (SELECT rid FROM {matched})";
+        long skipped = 0;
+        if (rule.RuntimeGate is { } gate)
+        {
+            // 相手の PC のアプリが動いていた期間の出来事は、相手も記録しているので足さない。
+            var gated = RuntimeGateCondition(gate, "l");
+            skipped = ScalarLong(connection, $"SELECT count(*) FROM {source} AS l WHERE {candidates} AND {gated}");
+            candidates += $" AND NOT {gated}";
+        }
+        // 候補の行が id で指す先 (ユーザー、アバター) が同期先に無ければ、先に手元から写す。
+        var copiedReferences = CopyReferencedRowsOf(connection, table, rule, profile, candidates);
         long inserted;
         using (var command = connection.CreateCommand())
         {
             command.CommandText =
                 $"INSERT INTO {target} ({insertColumns}) " +
-                $"SELECT {insertColumns} FROM {source} AS l " +
-                $"WHERE l.rowid > $since AND l.rowid NOT IN (SELECT rid FROM {matched}) " +
-                $"ORDER BY l.rowid";
-            command.Parameters.AddWithValue("$since", sinceRowId);
+                $"SELECT {string.Join(", ", columns.Where(c => c != rowIdAlias).Select(c => CopyExpression(rule, c, "l")))} " +
+                $"FROM {source} AS l WHERE {candidates} ORDER BY l.rowid";
             inserted = command.ExecuteNonQuery();
         }
         Execute(connection, $"DROP TABLE {matched}");
@@ -564,12 +590,18 @@ public static class SqliteMerger
         // 方向にしか変わらないので、祖先と比べなくても新しい方が分かる。書き込みは
         // 前回の同期より前の行にも起きるので、ここは全行を突き合わせる。
         long updated = 0;
-        foreach (var column in rule.GrowingColumns ?? Array.Empty<string>())
+        if (rule.GrowingColumns is { Count: > 0 })
         {
-            var c = Quote(column);
-            updated += Execute(connection,
-                $"UPDATE {target} AS h SET {c} = l.{c} FROM {source} AS l " +
-                $"WHERE {match} AND l.{c} IS NOT NULL AND (h.{c} IS NULL OR l.{c} > h.{c})");
+            // 写した参照先の行も同期先の id を得たので、対応表を取り直してから突き合わせる。
+            var (maps, match) = KeyJoin(connection, rule, "h", "l");
+            var from = string.Concat(maps.Select(m => $", {m.Table} AS {m.Alias}"));
+            foreach (var column in rule.GrowingColumns)
+            {
+                var c = Quote(column);
+                updated += Execute(connection,
+                    $"UPDATE {target} AS h SET {c} = l.{c} FROM {source} AS l{from} " +
+                    $"WHERE {match} AND l.{c} IS NOT NULL AND (h.{c} IS NULL OR l.{c} > h.{c})");
+            }
         }
 
         if (oldestAdded is not null)
@@ -578,7 +610,134 @@ public static class SqliteMerger
         }
 
         return new TableMergeReport(table, inserted, updated, 0, keptMaxRowId is not null, created,
-            keptMaxRowId ?? 0, keptDigest, tailRows);
+            keptMaxRowId ?? 0, keptDigest, tailRows,
+            copiedReferences.Count > 0 ? copiedReferences : null, skipped);
+    }
+
+    /// <summary>稼働区間による絞り込みの、同期先の区間を写した一時テーブルの名前。</summary>
+    private static string RuntimeGateTable(RuntimeGate gate) => $"temp.{Quote("vrctds_gate_" + gate.Table)}";
+
+    /// <summary>
+    /// 規則が稼働区間による絞り込み (<see cref="MergeTableRule.RuntimeGate"/>) を持てば、相手の PC の
+    /// アプリが動いていた期間を一時テーブルに取る。期間は、同期先の稼働区間のうち手元が知らない
+    /// 部分 (<see cref="RuntimeGate"/> の説明のとおり) で、(開始, 終了] の形で持つ。
+    /// 稼働区間のテーブルがどちらかの DB に無ければ理由を返す。
+    /// </summary>
+    private static string? PrepareRuntimeGates(SqliteConnection connection, MergeProfile profile, IReadOnlyList<string> localTables)
+    {
+        var gates = profile.Rules
+            .Where(r => r.Kind == MergeTableKind.AppendOnly && r.RuntimeGate is not null && localTables.Any(r.Matches))
+            .Select(r => r.RuntimeGate!)
+            .DistinctBy(g => (g.Table, g.StartColumn, g.EndColumn));
+        foreach (var gate in gates)
+        {
+            if (ListColumns(connection, "main", gate.Table).Count == 0 || !localTables.Contains(gate.Table, StringComparer.Ordinal))
+            {
+                return $"稼働区間のテーブル {gate.Table} が同期先か手元に無く、2 台で同時に動かしていた期間の履歴を見分けられません";
+            }
+            var work = RuntimeGateTable(gate);
+            var start = Quote(gate.StartColumn);
+            var end = Quote(gate.EndColumn);
+            Execute(connection, $"DROP TABLE IF EXISTS {work}");
+            Execute(connection, $"CREATE TEMP TABLE {Quote("vrctds_gate_" + gate.Table)} (after_at, until_at)");
+            // 手元に同じ開始時刻の区間があれば、手元の終了時刻より後の部分だけが手元の知らない期間。
+            // 無ければ区間の全体 (開始時刻を含める)。
+            Execute(connection,
+                $"INSERT INTO {work} (after_at, until_at) " +
+                $"SELECT coalesce(max(l.{end}), h.{start} - 1), h.{end} FROM main.{Quote(gate.Table)} AS h " +
+                $"LEFT JOIN {Local}.{Quote(gate.Table)} AS l ON l.{start} IS h.{start} " +
+                $"WHERE h.{start} IS NOT NULL AND h.{end} IS NOT NULL GROUP BY h.rowid HAVING h.{end} > coalesce(max(l.{end}), h.{start} - 1)");
+            Execute(connection, $"CREATE INDEX {Quote("vrctds_gate_" + gate.Table + "_idx")} ON {Quote("vrctds_gate_" + gate.Table)} (after_at, until_at)");
+        }
+        return null;
+    }
+
+    /// <summary><paramref name="alias"/> の行の出来事の時刻が、相手の PC が動いていた期間に入る条件。</summary>
+    private static string RuntimeGateCondition(RuntimeGate gate, string alias)
+        => $"EXISTS (SELECT 1 FROM {RuntimeGateTable(gate)} AS g " +
+           $"WHERE {alias}.{Quote(gate.TimeColumn)} > g.after_at AND {alias}.{Quote(gate.TimeColumn)} <= g.until_at)";
+
+    /// <summary>参照先のテーブルの、手元の id から同期先の id への対応表の名前。</summary>
+    private static string ReferenceMapTable(ColumnReference reference) => $"temp.{Quote("vrctds_map_" + reference.Table)}";
+
+    /// <summary>
+    /// 規則のキーが id で指す参照先ごとに、手元の id から同期先の id への対応表を作り直す。自然キーで
+    /// 突き合わせ、同期先に同じ自然キーの行が複数あれば id の小さい方を取る。同期先に無い行は
+    /// 対応表に入らない (突き合わせでは「同期先に無い」になる)。
+    /// </summary>
+    private static void BuildReferenceMaps(SqliteConnection connection, MergeTableRule rule)
+    {
+        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
+        {
+            if (!rule.KeyColumns.Contains(reference.Column, StringComparer.Ordinal)) continue;
+            var work = ReferenceMapTable(reference);
+            var name = Quote("vrctds_map_" + reference.Table);
+            var match = string.Join(" AND ", reference.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+            Execute(connection, $"DROP TABLE IF EXISTS {work}");
+            Execute(connection, $"CREATE TEMP TABLE {name} (local_id PRIMARY KEY, host_id) WITHOUT ROWID");
+            Execute(connection,
+                $"INSERT INTO {work} (local_id, host_id) " +
+                $"SELECT l.{Quote(reference.IdColumn)}, min(h.{Quote(reference.IdColumn)}) " +
+                $"FROM {Local}.{Quote(reference.Table)} AS l JOIN main.{Quote(reference.Table)} AS h ON {match} " +
+                $"GROUP BY l.{Quote(reference.IdColumn)}");
+            Execute(connection, $"CREATE INDEX {Quote("vrctds_map_" + reference.Table + "_host")} ON {name} (host_id)");
+        }
+    }
+
+    /// <summary>
+    /// 同期先の行 <paramref name="host"/> と手元の行 <paramref name="local"/> が同じキーを持つ条件。
+    /// id で参照先を指すキーの列は、対応表 (<see cref="BuildReferenceMaps"/>、ここで作り直す) を
+    /// 通して比べる。Maps は FROM に加える対応表 (名前と別名)、Match は WHERE に書く条件。
+    /// 条件は「同期先の id = 対応表の host_id、対応表の local_id = 手元の id」の形で、同期先から
+    /// 対応表を引き、対応表から手元の索引を引ける。
+    /// </summary>
+    private static (List<(string Table, string Alias)> Maps, string Match) KeyJoin(
+        SqliteConnection connection, MergeTableRule rule, string host, string local)
+    {
+        BuildReferenceMaps(connection, rule);
+        var maps = new List<(string, string)>();
+        var match = new List<string>();
+        foreach (var key in rule.KeyColumns)
+        {
+            if (rule.ReferenceOf(key) is { } reference)
+            {
+                var m = $"m{maps.Count}";
+                maps.Add((ReferenceMapTable(reference), m));
+                match.Add($"{host}.{Quote(key)} = {m}.host_id AND {m}.local_id = {local}.{Quote(key)}");
+            }
+            else
+            {
+                match.Add($"{host}.{Quote(key)} IS {local}.{Quote(key)}");
+            }
+        }
+        return (maps, string.Join(" AND ", match));
+    }
+
+    /// <summary>
+    /// 手元の行のうち <paramref name="candidates"/> (別名 l) を満たすものが id で指す先が同期先に
+    /// 無ければ、その行を手元から写す。写す行の列は参照先の規則 (あれば) に従って付け替えや消去を
+    /// する。参照先のテーブル名から写した行数へ。
+    /// </summary>
+    private static Dictionary<string, long> CopyReferencedRowsOf(
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile, string candidates)
+    {
+        var copied = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
+        {
+            var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
+            var columns = ListColumns(connection, Local, reference.Table);
+            var rowIdAlias = FindRowIdAlias(connection, reference.Table);
+            var targets = columns.Where(c => c != rowIdAlias).ToList();
+            var exists = string.Join(" AND ", reference.KeyColumns.Select(k => $"r.{Quote(k)} IS x.{Quote(k)}"));
+            var count = Execute(connection,
+                $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
+                $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "x")))} " +
+                $"FROM {Local}.{Quote(reference.Table)} AS x " +
+                $"WHERE x.{Quote(reference.IdColumn)} IN (SELECT l.{Quote(reference.Column)} FROM {Local}.{Quote(table)} AS l WHERE {candidates}) " +
+                $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {exists}) ORDER BY x.rowid");
+            if (count > 0) copied[reference.Table] = count;
+        }
+        return copied;
     }
 
     /// <summary>
@@ -625,7 +784,7 @@ public static class SqliteMerger
         SqliteConnection connection, string table, MergeTableRule rule, TableSummary baseline)
     {
         if (!string.Equals(
-                HashRowKey(connection, Local, table, rule.KeyColumns, baseline.MaxRowId),
+                HashRowKey(connection, Local, table, rule, baseline.MaxRowId),
                 baseline.LastRowHash, StringComparison.Ordinal))
         {
             return true;
@@ -933,14 +1092,17 @@ public static class SqliteMerger
         var keys = string.Join(", ", rule.KeyColumns.Select(Quote));
         Execute(connection, $"CREATE INDEX IF NOT EXISTS {Local}.{Quote("vrctds_merge_" + table)} ON {Quote(table)} ({keys})");
         var matched = Quote("vrctds_matched_" + table);
-        var match = string.Join(" AND ", rule.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+        // id で参照先を指すキーの列 (Friend Connect の履歴の userId など) は、PC ごとに別の値を
+        // 取るので、参照先の自然キーで対応付けた id の対応表を通して比べる。
+        var (maps, match) = KeyJoin(connection, rule, "h", "l");
         Execute(connection, $"DROP TABLE IF EXISTS temp.{matched}");
         Execute(connection, $"CREATE TEMP TABLE {matched} (rid INTEGER PRIMARY KEY)");
-        // CROSS JOIN は結合の順序を固定する。同期先を外側にして、写しの索引で引かせる。
+        // CROSS JOIN は結合の順序を固定する。同期先を外側にして、対応表を経て写しの索引で引かせる。
+        var crossMaps = string.Concat(maps.Select(m => $" CROSS JOIN {m.Table} AS {m.Alias}"));
         Execute(connection,
             $"INSERT OR IGNORE INTO temp.{matched} (rid) SELECT l.rowid " +
-            $"FROM main.{Quote(table)} AS h CROSS JOIN {Local}.{Quote(table)} AS l ON {match} " +
-            $"WHERE l.rowid {localRowIdCondition}");
+            $"FROM main.{Quote(table)} AS h{crossMaps} CROSS JOIN {Local}.{Quote(table)} AS l " +
+            $"WHERE {match} AND l.rowid {localRowIdCondition}");
         return $"temp.{matched}";
     }
 

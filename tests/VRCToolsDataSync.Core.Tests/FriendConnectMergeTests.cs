@@ -29,7 +29,8 @@ public sealed class FriendConnectMergeTests : IDisposable
     /// <summary>
     /// 祖先: ユーザー a (メモあり)、b、c、ワールド w1、タグ friend / work、a に friend、
     /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件、写真のお気に入り 1 件、
-    /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)。
+    /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)、1 件目の稼働中の a のステータスと
+    /// アバター av1 の着用の履歴が 1 件ずつ。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) Arrange()
     {
@@ -45,7 +46,8 @@ public sealed class FriendConnectMergeTests : IDisposable
             "INSERT INTO Location (userId, startAt) SELECT id, 1 FROM User WHERE apiId = 'usr_a';" +
             "INSERT INTO Location (userId, startAt) SELECT id, 2 FROM User WHERE apiId = 'usr_a';" +
             FavoritePhoto(1000) + NoteWorld("wrld_1", 10, "wn-a") +
-            InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000));
+            InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000) +
+            InsertAvatar("avtr_1") + InsertUserStatus("usr_a", 110_000, 120_000) + InsertUserAvatar("usr_a", "avtr_1", 110_000, 150_000));
         var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
         Assert.True(baseline is not null, reason);
 
@@ -54,7 +56,7 @@ public sealed class FriendConnectMergeTests : IDisposable
         File.Copy(ancestor, host);
         File.Copy(ancestor, local);
         // 手元の id をずらす。外部キーは ON UPDATE CASCADE なので参照も付いて動く。
-        Exec(local, "UPDATE User SET id = id + 100; UPDATE Tag SET id = id + 200; UPDATE World SET id = id + 300;");
+        Exec(local, "UPDATE User SET id = id + 100; UPDATE Tag SET id = id + 200; UPDATE World SET id = id + 300; UPDATE Avatar SET id = id + 400;");
         return (host, local, baseline!);
     }
 
@@ -524,5 +526,128 @@ public sealed class FriendConnectMergeTests : IDisposable
 
         Assert.Equal(first, (PhotoFavorites(host), WorldNotes(host), ScanRuntimes(host)));
         Assert.Equal(0, again.Tables.Where(t => t.Table is "PhotoFavorite" or "WorldNote" or "ScanRuntime").Sum(t => t.Inserted + t.Updated + t.Deleted));
+    }
+
+    private static string UserStatuses(string db) => string.Join(",", Rows(db,
+        "SELECT u.apiId || '@' || s.startAt || '-' || s.endAt FROM UserStatus s JOIN User u ON u.id = s.userId ORDER BY s.startAt"));
+
+    private static string UserAvatars(string db) => string.Join(",", Rows(db,
+        "SELECT u.apiId || ':' || a.avatar || '@' || ua.startAt || '-' || ua.endAt FROM UserAvatar ua JOIN User u ON u.id = ua.userId JOIN Avatar a ON a.id = ua.avatarId ORDER BY ua.startAt"));
+
+    /// <summary>
+    /// 段階 6 の場面。前回の同期 (250000) の後、手元は動作中の区間を 290000 まで延ばして b の
+    /// ステータスを記録し、300000〜400000 にもう一度動かして b のステータスと a の新しいアバター、
+    /// 同期先に無いユーザー d のステータスを記録した。同期先は 330000〜380000 に動き、c の
+    /// ステータスを記録した。手元も同じ c のステータスを、ポーリングの分ずれた時刻で記録している。
+    /// </summary>
+    private static void ArrangeHistories(string host, string local)
+    {
+        Exec(local,
+            "UPDATE ScanRuntime SET endAt = 290000, seconds = 90 WHERE startAt = 200000;" + InsertScanRuntime(300_000, 400_000) +
+            InsertUserStatus("usr_b", 260_000, 270_000) + InsertUserStatus("usr_b", 320_000, 330_000) +
+            InsertAvatar("avtr_2") + InsertUserAvatar("usr_a", "avtr_2", 300_000, 310_000) +
+            InsertUser("usr_d", "D") + InsertUserStatus("usr_d", 305_000, 306_000) +
+            InsertUserStatus("usr_c", 340_500, 345_000));
+        Exec(host, InsertScanRuntime(330_000, 380_000) + InsertUserStatus("usr_c", 340_000, 345_000));
+    }
+
+    [Fact(DisplayName = "履歴は id を同期先の値に付け替えて足し、相手が動いていた期間の行は足さない")]
+    public void HistoriesAreRemappedAndRowsWhileHostRanAreSkipped()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeHistories(host, local);
+
+        var report = Merge(host, local, baseline);
+
+        // c の 340500 の行は同期先の 330000〜380000 の稼働中なので足さない。d はユーザーごと写す。
+        Assert.Equal("usr_a@110000-120000,usr_b@260000-270000,usr_d@305000-306000,usr_b@320000-330000,usr_c@340000-345000", UserStatuses(host));
+        Assert.Equal("usr_a:avtr_1@110000-150000,usr_a:avtr_2@300000-310000", UserAvatars(host));
+        var statuses = Assert.Single(report.Tables, t => t.Table == "UserStatus");
+        Assert.Equal((3L, 0L, 1L), (statuses.Inserted, statuses.Updated, statuses.SkippedWhileHostRunning));
+        Assert.Equal(1, statuses.CopiedReferences?["User"]);
+        var avatars = Assert.Single(report.Tables, t => t.Table == "UserAvatar");
+        Assert.Equal((1L, 0L), (avatars.Inserted, avatars.SkippedWhileHostRunning));
+        Assert.Equal(1, avatars.CopiedReferences?["Avatar"]);
+        // 写したユーザー d は、最後の履歴を指す列を空にして写す。
+        Assert.Equal("null|null|null", Assert.Single(Rows(host, "SELECT lastUserAvatarId, lastLocationId, lastUserStatusId FROM User WHERE apiId = 'usr_d'")));
+        Assert.Contains("足しませんでした", report.Describe());
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM UserStatus WHERE userId NOT IN (SELECT id FROM User)"));
+    }
+
+    [Fact(DisplayName = "履歴の滞在中に伸びる endAt と seconds は、同期先の同じ行を大きい方の値にする")]
+    public void HistoryGrowingColumnsAreExtended()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE UserAvatar SET endAt = 155000, seconds = 45 WHERE startAt = 110000;" +
+                    "UPDATE UserStatus SET endAt = 125000, seconds = 15 WHERE startAt = 110000;");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("usr_a:avtr_1@110000-155000", UserAvatars(host));
+        Assert.Equal("usr_a@110000-125000", UserStatuses(host));
+        Assert.Equal(45, Scalar(host, "SELECT seconds FROM UserAvatar WHERE startAt = 110000"));
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "UserAvatar").Updated);
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "UserStatus").Updated);
+    }
+
+    [Fact(DisplayName = "手元自身の稼働区間が同期先にもあっても、その間に手元が記録した行は足す")]
+    public void OwnRuntimeKnownToHostDoesNotGate()
+    {
+        var (host, local, baseline) = Arrange();
+        // 前回の同期で手元の区間 300000〜400000 が同期先に渡っていて (同期先の終了時刻は同期時点の
+        // 350000)、手元はその後 360000 に b のステータスを記録した。同期先の表にあるこの区間は
+        // 相手が動いていた期間ではない。
+        Exec(host, InsertScanRuntime(300_000, 350_000) + InsertScanRuntime(500_000, 510_000));
+        Exec(local, InsertScanRuntime(300_000, 400_000) + InsertUserStatus("usr_b", 360_000, 370_000) +
+                    InsertUserStatus("usr_b", 505_000, 506_000));
+
+        var report = Merge(host, local, baseline);
+
+        // 505000 の行だけが同期先の区間 500000〜510000 に入る。
+        Assert.Equal("usr_a@110000-120000,usr_b@360000-370000", UserStatuses(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserStatus");
+        Assert.Equal((1L, 1L), (table.Inserted, table.SkippedWhileHostRunning));
+    }
+
+    [Fact(DisplayName = "履歴は、規則に加える前の要約に祖先が無くても中止せずに和集合を取る")]
+    public void HistoriesUnionWithoutAncestor()
+    {
+        var (host, local, baseline) = Arrange();
+        baseline.Tables.Remove("UserStatus");
+        baseline.Tables.Remove("UserAvatar");
+        baseline.RulesDigest = "older";
+        ArrangeHistories(host, local);
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("usr_a@110000-120000,usr_b@260000-270000,usr_d@305000-306000,usr_b@320000-330000,usr_c@340000-345000", UserStatuses(host));
+        Assert.Equal("usr_a:avtr_1@110000-150000,usr_a:avtr_2@300000-310000", UserAvatars(host));
+        Assert.Equal(3, Assert.Single(report.Tables, t => t.Table == "UserStatus").Inserted);
+    }
+
+    [Fact(DisplayName = "履歴は、同じ手元を 2 回合わせても結果が変わらない")]
+    public void HistoriesAreIdempotent()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeHistories(host, local);
+
+        Merge(host, local, baseline);
+        var first = (UserStatuses(host), UserAvatars(host), ScanRuntimes(host), Scalar(host, "SELECT count(*) FROM User"), Scalar(host, "SELECT count(*) FROM Avatar"));
+        var again = Merge(host, local, baseline);
+
+        Assert.Equal(first, (UserStatuses(host), UserAvatars(host), ScanRuntimes(host), Scalar(host, "SELECT count(*) FROM User"), Scalar(host, "SELECT count(*) FROM Avatar")));
+        Assert.Equal(0, again.Tables.Where(t => t.Table is "UserStatus" or "UserAvatar").Sum(t => t.Inserted + t.Updated + t.Deleted));
+    }
+
+    [Fact(DisplayName = "稼働区間のテーブルが同期先に無ければ、履歴のマージを中止する")]
+    public void MissingRuntimeTableAborts()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "DROP TABLE ScanRuntime");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("ScanRuntime", report.AbortReason);
     }
 }

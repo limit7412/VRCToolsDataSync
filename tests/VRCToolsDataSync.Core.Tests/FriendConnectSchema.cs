@@ -157,6 +157,38 @@ internal static class FriendConnectSchema
             "updatedAt" DATETIME NOT NULL
         );
         CREATE INDEX "ScanRuntime_startAt_endAt_idx" ON "ScanRuntime"("startAt", "endAt");
+        CREATE TABLE "Avatar" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "avatar" TEXT NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL
+        );
+        CREATE UNIQUE INDEX "Avatar_avatar_key" ON "Avatar"("avatar");
+        CREATE INDEX "Avatar_avatar_idx" ON "Avatar"("avatar");
+        CREATE TABLE "UserAvatar" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "avatarId" INTEGER NOT NULL,
+            "startAt" DATETIME NOT NULL,
+            "endAt" DATETIME NOT NULL,
+            "seconds" INTEGER NOT NULL DEFAULT 0,
+            CONSTRAINT "UserAvatar_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "UserAvatar_avatarId_fkey" FOREIGN KEY ("avatarId") REFERENCES "Avatar" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "UserAvatar_userId_idx" ON "UserAvatar"("userId");
+        CREATE INDEX "UserAvatar_avatarId_idx" ON "UserAvatar"("avatarId");
+        CREATE INDEX "UserAvatar_startAt_endAt_idx" ON "UserAvatar"("startAt", "endAt");
+        CREATE TABLE "UserStatus" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "status" INTEGER NOT NULL,
+            "statusDescription" TEXT NOT NULL,
+            "startAt" DATETIME NOT NULL,
+            "endAt" DATETIME NOT NULL,
+            "seconds" INTEGER NOT NULL DEFAULT 0,
+            CONSTRAINT "UserStatus_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "UserStatus_id_userId_status_startAt_endAt_idx" ON "UserStatus"("id", "userId", "status", "startAt", "endAt");
         """;
 
     /// <summary>規則に関わるテーブルを作り、本ツールが確かめた版のマイグレーションを記録する。</summary>
@@ -220,6 +252,19 @@ internal static class FriendConnectSchema
     /// <summary>Friend Connect の稼働区間。起動 1 回が 1 行で、動作中は endAt と seconds が伸びる。</summary>
     public static string InsertScanRuntime(long startAt, long endAt)
         => $"INSERT INTO ScanRuntime (startAt, endAt, seconds, createdAt, updatedAt) VALUES ({startAt}, {endAt}, {(endAt - startAt) / 1000}, 1, 1);";
+
+    public static string InsertAvatar(string avatar)
+        => $"INSERT INTO Avatar (avatar, updatedAt) VALUES ('{avatar}', 1);";
+
+    /// <summary>ユーザー (apiId) のステータスの履歴。時刻は Unix ミリ秒。</summary>
+    public static string InsertUserStatus(string userApiId, long startAt, long endAt, int status = 1, string description = "")
+        => "INSERT INTO UserStatus (userId, status, statusDescription, startAt, endAt, seconds) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), {status}, '{description}', {startAt}, {endAt}, {(endAt - startAt) / 1000});";
+
+    /// <summary>ユーザー (apiId) のアバター (VRChat の ID) 着用の履歴。アバターの行は先に足しておく。</summary>
+    public static string InsertUserAvatar(string userApiId, string avatar, long startAt, long endAt)
+        => "INSERT INTO UserAvatar (userId, avatarId, startAt, endAt, seconds) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), (SELECT id FROM Avatar WHERE avatar = '{avatar}'), {startAt}, {endAt}, {(endAt - startAt) / 1000});";
 
     public static void Exec(string path, string sql)
     {
