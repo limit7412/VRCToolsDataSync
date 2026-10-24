@@ -275,6 +275,63 @@ internal static class FriendConnectSchema
             CONSTRAINT "UserStatus_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
         );
         CREATE INDEX "UserStatus_id_userId_status_startAt_endAt_idx" ON "UserStatus"("id", "userId", "status", "startAt", "endAt");
+        CREATE TABLE "UserConnection" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "targetUserId" INTEGER NOT NULL,
+            "joinACount" INTEGER NOT NULL DEFAULT 0,
+            "joinBCount" INTEGER NOT NULL DEFAULT 0,
+            "leaveACount" INTEGER NOT NULL DEFAULT 0,
+            "leaveBCount" INTEGER NOT NULL DEFAULT 0,
+            "stayCount" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds3Hour" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds6Hour" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds12Hour" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds1Day" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds2Day" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds3Day" INTEGER NOT NULL DEFAULT 0,
+            "lastContactAt" DATETIME,
+            "lastUpdateAt" DATETIME NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "UserConnection_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "UserConnection_targetUserId_fkey" FOREIGN KEY ("targetUserId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "UserConnection_userId_targetUserId_lastContactAt_idx" ON "UserConnection"("userId", "targetUserId", "lastContactAt");
+        CREATE UNIQUE INDEX "UserConnection_userId_targetUserId_key" ON "UserConnection"("userId", "targetUserId");
+        CREATE TABLE "UserWorldVisit" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "worldId" INTEGER NOT NULL,
+            "stayCount" INTEGER NOT NULL DEFAULT 0,
+            "staySeconds" INTEGER NOT NULL DEFAULT 0,
+            "stayAvg" INTEGER NOT NULL DEFAULT 0,
+            "lastUpdateAt" DATETIME NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "UserWorldVisit_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "UserWorldVisit_worldId_fkey" FOREIGN KEY ("worldId") REFERENCES "World" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "UserWorldVisit_userId_worldId_idx" ON "UserWorldVisit"("userId", "worldId");
+        CREATE UNIQUE INDEX "UserWorldVisit_userId_worldId_key" ON "UserWorldVisit"("userId", "worldId");
+        CREATE TABLE "UserAnalytics" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "instanceTypeRate" TEXT NOT NULL,
+            "privateRate" REAL NOT NULL,
+            "userStatusRate" TEXT NOT NULL,
+            "activeHeatmap" TEXT NOT NULL,
+            "stayAvgPerLocation" INTEGER NOT NULL,
+            "loginAvgPerDay" INTEGER NOT NULL,
+            "mostActivityHour" INTEGER NOT NULL,
+            "lastUpdateAt" DATETIME NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "UserAnalytics_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE UNIQUE INDEX "UserAnalytics_userId_key" ON "UserAnalytics"("userId");
+        CREATE INDEX "UserAnalytics_userId_idx" ON "UserAnalytics"("userId");
         """;
 
     /// <summary>規則に関わるテーブルを作り、本ツールが確かめた版のマイグレーションを記録する。</summary>
@@ -384,6 +441,28 @@ internal static class FriendConnectSchema
     public static string InsertPhoto(long shotAt, string thumbnail, string? userApiId = null, long locationStartAt = 0, string source = "C:\\photos\\p.png")
         => "INSERT INTO Photo (locationId, shotAt, source, thumbnail, hasThumbnail, updatedAt) VALUES (" +
            $"{(userApiId is null ? "NULL" : LocationId(userApiId, locationStartAt))}, {shotAt}, '{source}', '{thumbnail}', 1, 1);";
+
+    /// <summary>
+    /// 同席の集計。ユーザー (apiId) から相手 (apiId) を見た 1 行。秒数は実機と同じく小数を持ちうる。
+    /// 回数のうち合流・退室の 4 列は 1 で固定し、同席の回数と秒数と最終接触時刻だけを与える。
+    /// </summary>
+    public static string InsertConnection(string userApiId, string targetApiId, long stayCount, double staySeconds, long? lastContactAt = null, long lastUpdateAt = 1)
+        => "INSERT INTO UserConnection (userId, targetUserId, joinACount, joinBCount, leaveACount, leaveBCount, stayCount, staySeconds, " +
+           "staySeconds3Hour, staySeconds6Hour, staySeconds12Hour, staySeconds1Day, staySeconds2Day, staySeconds3Day, lastContactAt, lastUpdateAt, updatedAt) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), (SELECT id FROM User WHERE apiId = '{targetApiId}'), 1, 1, 1, 1, {stayCount}, " +
+           $"{staySeconds.ToString("R", System.Globalization.CultureInfo.InvariantCulture)}, 0, 0, 0, 0, 0, 0, " +
+           $"{(lastContactAt is null ? "NULL" : lastContactAt.Value.ToString())}, {lastUpdateAt}, 1);";
+
+    /// <summary>ワールド訪問の集計。平均滞在時間は Friend Connect と同じく秒数を回数で割って切り捨てる。</summary>
+    public static string InsertWorldVisit(string userApiId, string worldApiId, long stayCount, long staySeconds, long lastUpdateAt = 1)
+        => "INSERT INTO UserWorldVisit (userId, worldId, stayCount, staySeconds, stayAvg, lastUpdateAt, updatedAt) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), (SELECT id FROM World WHERE apiId = '{worldApiId}'), " +
+           $"{stayCount}, {staySeconds}, {(stayCount > 0 ? staySeconds / stayCount : 0)}, {lastUpdateAt}, 1);";
+
+    /// <summary>ユーザーごとの分析結果。文字列の列には適当な JSON を入れる。</summary>
+    public static string InsertAnalytics(string userApiId, int mostActivityHour = 1)
+        => "INSERT INTO UserAnalytics (userId, instanceTypeRate, privateRate, userStatusRate, activeHeatmap, stayAvgPerLocation, loginAvgPerDay, mostActivityHour, lastUpdateAt, updatedAt) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), '{{}}', 0, '{{}}', '{{}}', 39, 287, {mostActivityHour}, 1, 1);";
 
     private static string LocationId(string userApiId, long startAt)
         => $"(SELECT id FROM Location WHERE userId = (SELECT id FROM User WHERE apiId = '{userApiId}') AND startAt = {startAt})";

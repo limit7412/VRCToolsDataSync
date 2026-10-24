@@ -975,4 +975,19 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.False(report.Succeeded);
         Assert.Contains("スキーマの版", report.AbortReason);
     }
+
+    [Fact(DisplayName = "累計の合成は、整数だけなら整数のまま、実数が混ざれば実数で祖先に双方の増分を足す")]
+    public void AddCounterHandlesIntegersAndReals()
+    {
+        Assert.Equal(15L, SqliteMerger.AddCounter(13L, 12L, 10.0));
+        Assert.Equal(150.5, SqliteMerger.AddCounter(130.75, 120.25, 100.5));
+        Assert.Equal(112.5, SqliteMerger.AddCounter(110L, 102.5, 100.0));
+        // 祖先が無ければ大きい方。減っていた側の増分は 0。
+        Assert.Equal(130.75, SqliteMerger.AddCounter(130.75, 120L, null));
+        // 祖先より減っていた側は 0 から数え直したとみなし、その値を増分にする。
+        Assert.Equal(20L, SqliteMerger.AddCounter(8L, 12L, 10.0));
+        Assert.Equal(6L, SqliteMerger.AddCounter(1L, 5L, 4.0));
+        Assert.Equal(13L, SqliteMerger.AddCounter(10L, 13L, 10.0));
+        Assert.Equal("x", SqliteMerger.AddCounter(1L, "x", 0.0));
+    }
 }

@@ -191,6 +191,7 @@ public sealed class DatabaseSummary
             .Concat(rule.References?.Select(r => r.Column) ?? Array.Empty<string>())
             .Concat(rule.References?.Where(r => r.Fallback is not null).Select(r => r.Fallback!.TimeColumn) ?? Array.Empty<string>())
             .Concat(rule.IdentityColumns ?? Array.Empty<string>())
+            .Concat(rule.DerivedColumns?.Select(d => d.Column) ?? Array.Empty<string>())
             .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
             .Concat(rule.OrderColumn is null ? Array.Empty<string>() : new[] { rule.OrderColumn })
             .Concat(rule.GrowingColumns ?? Array.Empty<string>())
@@ -315,9 +316,9 @@ public sealed class DatabaseSummary
 
     /// <summary>
     /// <see cref="MergeTableRule.CounterColumns"/> の値を、キー (<see cref="ReadKeyedRows"/>
-    /// と同じ形) ごとに読む。整数でない値は残さない。
+    /// と同じ形) ごとに読む。数値でない値は残さない。
     /// </summary>
-    private static Dictionary<string, Dictionary<string, long>> ReadCounters(
+    private static Dictionary<string, Dictionary<string, double>> ReadCounters(
         SqliteConnection connection, string schema, string table, MergeTableRule rule)
     {
         var counters = rule.CounterColumns!;
@@ -329,18 +330,24 @@ public sealed class DatabaseSummary
             (rule.Filter is null ? string.Empty : $" WHERE {rule.Filter}");
         using var reader = command.ExecuteReader();
 
-        var result = new Dictionary<string, Dictionary<string, long>>(StringComparer.Ordinal);
+        var result = new Dictionary<string, Dictionary<string, double>>(StringComparer.Ordinal);
         var keyCount = keys.Count;
         while (reader.Read())
         {
             var key = new StringBuilder();
             for (var i = 0; i < keyCount; i++) AppendValue(key, reader, i);
-            var values = new Dictionary<string, long>(StringComparer.Ordinal);
+            var values = new Dictionary<string, double>(StringComparer.Ordinal);
             for (var i = 0; i < counters.Count; i++)
             {
-                if (!reader.IsDBNull(keyCount + i) && reader.GetValue(keyCount + i) is long value)
+                if (reader.IsDBNull(keyCount + i)) continue;
+                switch (reader.GetValue(keyCount + i))
                 {
-                    values[counters[i]] = value;
+                    case long integer:
+                        values[counters[i]] = integer;
+                        break;
+                    case double real:
+                        values[counters[i]] = real;
+                        break;
                 }
             }
             result[key.ToString()] = values;
@@ -601,9 +608,10 @@ public sealed class TableSummary
     /// <summary>
     /// <see cref="MergeTableKind.Keyed"/>: キーから、<see cref="MergeTableRule.CounterColumns"/>
     /// の値へ。3-way のマージで双方の増分を求めるのに使う。内容の比較には使わない
-    /// (<see cref="Rows"/> のハッシュに含まれている)。
+    /// (<see cref="Rows"/> のハッシュに含まれている)。整数の列も実数で持つ (JSON では整数の
+    /// 表記のまま読み書きできる)。
     /// </summary>
-    public Dictionary<string, Dictionary<string, long>>? Counters { get; set; }
+    public Dictionary<string, Dictionary<string, double>>? Counters { get; set; }
 
     /// <summary>
     /// <see cref="MergeTableKind.Watched"/>: 内容全体のハッシュ。

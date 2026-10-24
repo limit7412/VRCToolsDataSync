@@ -30,7 +30,8 @@ public sealed class FriendConnectMergeTests : IDisposable
     /// 祖先: ユーザー a (メモあり)、b、c、ワールド w1、タグ friend / work、a に friend、
     /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件、写真のお気に入り 1 件、
     /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)、1 件目の稼働中の a のステータスと
-    /// アバター av1 の着用の履歴が 1 件ずつ、a の最初の滞在中に撮った写真 1 件。
+    /// アバター av1 の着用の履歴が 1 件ずつ、a の最初の滞在中に撮った写真 1 件、a から b を見た同席の集計、
+    /// a の w1 への訪問の集計、a の分析結果。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) Arrange()
     {
@@ -48,7 +49,8 @@ public sealed class FriendConnectMergeTests : IDisposable
             FavoritePhoto(1000) + NoteWorld("wrld_1", 10, "wn-a") +
             InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000) +
             InsertAvatar("avtr_1") + InsertUserStatus("usr_a", 110_000, 120_000) + InsertUserAvatar("usr_a", "avtr_1", 110_000, 150_000) +
-            InsertPhoto(1_500, "t-1500.webp", "usr_a", 1));
+            InsertPhoto(1_500, "t-1500.webp", "usr_a", 1) +
+            InsertConnection("usr_a", "usr_b", 10, 100.5, lastContactAt: 500) + InsertWorldVisit("usr_a", "wrld_1", 4, 400) + InsertAnalytics("usr_a"));
         var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
         Assert.True(baseline is not null, reason);
 
@@ -910,5 +912,196 @@ public sealed class FriendConnectMergeTests : IDisposable
 
         Assert.Equal("usr_a@-5000@1-2,usr_a@-5000@2-9", Locations(host));
         Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "Location").Updated);
+    }
+
+    /// <summary>a から b を見た同席の集計の行の、回数・秒数・最終接触時刻。</summary>
+    private static List<string> Connections(string path)
+        => Rows(path, "SELECT u.apiId, t.apiId, c.joinACount, c.stayCount, c.staySeconds, c.lastContactAt, c.lastUpdateAt FROM UserConnection c " +
+                      "JOIN User u ON u.id = c.userId JOIN User t ON t.id = c.targetUserId ORDER BY u.apiId, t.apiId");
+
+    private static List<string> WorldVisits(string path)
+        => Rows(path, "SELECT u.apiId, w.apiId, v.stayCount, v.staySeconds, v.stayAvg, v.lastUpdateAt FROM UserWorldVisit v " +
+                      "JOIN User u ON u.id = v.userId JOIN World w ON w.id = v.worldId ORDER BY u.apiId, w.apiId");
+
+    private const string LocalConnectionAB = "UPDATE UserConnection SET stayCount = 13, staySeconds = 130.75, lastContactAt = 900, lastUpdateAt = 9 " +
+                                             "WHERE userId = (SELECT id FROM User WHERE apiId = 'usr_a') AND targetUserId = (SELECT id FROM User WHERE apiId = 'usr_b')";
+
+    private const string HostConnectionAB = "UPDATE UserConnection SET joinACount = 3, stayCount = 12, staySeconds = 120.25, lastContactAt = 700, lastUpdateAt = 7 " +
+                                            "WHERE userId = (SELECT id FROM User WHERE apiId = 'usr_a') AND targetUserId = (SELECT id FROM User WHERE apiId = 'usr_b')";
+
+    [Fact(DisplayName = "同席の集計が両方で増えていたら、前回の値に双方の増分を足し、最終接触時刻は新しい方を残す")]
+    public void ConnectionAddsBothIncrements()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, LocalConnectionAB);
+        Exec(host, HostConnectionAB);
+
+        var report = Merge(host, local, baseline);
+
+        // 回数 10 + 3 + 2、秒数 100.5 + 30.25 + 19.75、合流 1 + 0 + 2。
+        Assert.Equal(new[] { "usr_a|usr_b|3|15|150.5|900|9" }, Connections(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserConnection");
+        Assert.Equal(1, table.Updated);
+        Assert.Contains(report.Conflicts, c => c.Table == "UserConnection");
+    }
+
+    [Fact(DisplayName = "同席の集計を合成した後に要約を取り直せば、次のマージでは足すものが無い")]
+    public void ConnectionMergeIsStableAfterResummary()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, LocalConnectionAB);
+        Exec(host, HostConnectionAB);
+        Merge(host, local, baseline);
+        // マージ後は手元もマージ結果に置き換わり、その要約が次の祖先になる。
+        var merged = Path.Combine(_root, "merged.sqlite");
+        File.Copy(host, merged);
+        var next = DatabaseSummary.Compute(host, MergeProfiles.FriendConnect, out var reason);
+        Assert.True(next is not null, reason);
+
+        Assert.Equal(0, Merge(host, merged, next).ChangedRows);
+        Assert.Equal(new[] { "usr_a|usr_b|3|15|150.5|900|9" }, Connections(host));
+    }
+
+    [Fact(DisplayName = "手元だけで増えた相手との同席は同期先の id に付け替えて足し、相手が同期先に無ければ写す")]
+    public void ConnectionWithNewTargetIsTranslated()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertConnection("usr_a", "usr_c", 2, 20) + InsertUser("usr_d", "D") + InsertConnection("usr_a", "usr_d", 1, 10.5));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "usr_a|usr_b|1|10|100.5|500|1", "usr_a|usr_c|1|2|20|null|1", "usr_a|usr_d|1|1|10.5|null|1" }, Connections(host));
+        Assert.Equal(4, Scalar(host, "SELECT count(*) FROM User"));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserConnection");
+        Assert.Equal(2, table.Inserted);
+        Assert.Equal(1, table.CopiedReferences?["User"]);
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM UserConnection WHERE userId NOT IN (SELECT id FROM User) OR targetUserId NOT IN (SELECT id FROM User)"));
+    }
+
+    [Fact(DisplayName = "ワールド訪問の集計を合成した行は、平均滞在時間を回数と秒数から求め直す")]
+    public void WorldVisitRecomputesAverage()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE UserWorldVisit SET stayCount = 6, staySeconds = 700, stayAvg = 116, lastUpdateAt = 6");
+        Exec(host, "UPDATE UserWorldVisit SET stayCount = 5, staySeconds = 450, stayAvg = 90, lastUpdateAt = 5");
+
+        var report = Merge(host, local, baseline);
+
+        // 回数 4 + 2 + 1、秒数 400 + 300 + 50、平均 750 / 7 の切り捨て。
+        Assert.Equal(new[] { "usr_a|wrld_1|7|750|107|6" }, WorldVisits(host));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "UserWorldVisit").Updated);
+    }
+
+    [Fact(DisplayName = "手元だけで増えたワールド訪問は、手元の行を写し、平均滞在時間は手元の値のまま")]
+    public void WorldVisitFromLocalOnlyIsCopied()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE UserWorldVisit SET stayCount = 6, staySeconds = 700, stayAvg = 116, lastUpdateAt = 6");
+
+        Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "usr_a|wrld_1|6|700|116|6" }, WorldVisits(host));
+    }
+
+    [Fact(DisplayName = "同期先で消えたワールド訪問 (Friend Connect の保持期間) は、手元が変えていなければ戻さない")]
+    public void WorldVisitPrunedByHostStaysDeleted()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "DELETE FROM UserWorldVisit");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Empty(WorldVisits(host));
+        Assert.Equal(0, Assert.Single(report.Tables, t => t.Table == "UserWorldVisit").Inserted);
+    }
+
+    [Fact(DisplayName = "同期先で消えたワールド訪問を手元がその後も数えていれば、手元の行を戻す (編集は削除に勝つ)")]
+    public void WorldVisitPrunedByHostIsRestoredWhenLocalChanged()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "DELETE FROM UserWorldVisit");
+        Exec(local, "UPDATE UserWorldVisit SET stayCount = 6, staySeconds = 700, stayAvg = 116, lastUpdateAt = 6");
+
+        var report = Merge(host, local, baseline);
+
+        // 手元ではまだ訪れていて古くないので、同期先の保持期間による削除より手元の値を残す。
+        Assert.Equal(new[] { "usr_a|wrld_1|6|700|116|6" }, WorldVisits(host));
+        Assert.Contains(report.Conflicts, c => c.Table == "UserWorldVisit" && c.KeptLocal);
+    }
+
+    [Fact(DisplayName = "手元で消えて作り直されたワールド訪問 (回数が祖先より少ない) は、作り直した分を増分として足す")]
+    public void WorldVisitRecreatedLocallyAddsRecountedValues()
+    {
+        var (host, local, baseline) = Arrange();
+        // 手元では保持期間で消え、次の訪問で 1 回 50 秒から数え直した。同期先では数え続けている。
+        Exec(local, "DELETE FROM UserWorldVisit; " + InsertWorldVisit("usr_a", "wrld_1", 1, 50, lastUpdateAt: 6));
+        Exec(host, "UPDATE UserWorldVisit SET stayCount = 5, staySeconds = 450, stayAvg = 90, lastUpdateAt = 5");
+
+        Merge(host, local, baseline);
+
+        // 回数 4 + 1 + 1、秒数 400 + 50 + 50、平均 500 / 6 の切り捨て。
+        Assert.Equal(new[] { "usr_a|wrld_1|6|500|83|6" }, WorldVisits(host));
+    }
+
+    [Fact(DisplayName = "分析結果が手元で消えていても、同期先の行は残す")]
+    public void AnalyticsDeletedLocallyStayOnHost()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM UserAnalytics");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserAnalytics"));
+        Assert.Equal(0, Assert.Single(report.Tables, t => t.Table == "UserAnalytics").Deleted);
+    }
+
+    [Fact(DisplayName = "規則に加える前の要約に集計の祖先が無ければ、中止せず列ごとに大きい方を残し、手元にしか無い行を足す")]
+    public void AggregatesWithoutAncestorKeepLargerValues()
+    {
+        var (host, local, baseline) = Arrange();
+        foreach (var table in new[] { "UserConnection", "UserWorldVisit", "UserAnalytics" }) baseline.Tables.Remove(table);
+        baseline.RulesDigest = "older";
+        Exec(local, LocalConnectionAB + "; " + InsertConnection("usr_a", "usr_c", 2, 20) +
+                    "UPDATE UserWorldVisit SET stayCount = 6, staySeconds = 700, stayAvg = 116, lastUpdateAt = 6");
+        Exec(host, "UPDATE UserConnection SET stayCount = 12, staySeconds = 140.25, lastContactAt = 700, lastUpdateAt = 7; " +
+                   "UPDATE UserWorldVisit SET stayCount = 5, staySeconds = 450, stayAvg = 90, lastUpdateAt = 5");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "usr_a|usr_b|1|13|140.25|900|9", "usr_a|usr_c|1|2|20|null|1" }, Connections(host));
+        // 平均は大きい方を残した回数と秒数から求め直す (700 / 6 の切り捨て)。
+        Assert.Equal(new[] { "usr_a|wrld_1|6|700|116|6" }, WorldVisits(host));
+        Assert.True(report.Succeeded);
+    }
+
+    [Fact(DisplayName = "分析結果は同期先の値を残し、同期先に無いユーザーの行だけ写す")]
+    public void AnalyticsKeepHostValuesAndCopyNewUsers()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE UserAnalytics SET mostActivityHour = 5; " + InsertUser("usr_d", "D") + InsertAnalytics("usr_d", mostActivityHour: 7));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "usr_a|1", "usr_d|7" },
+            Rows(host, "SELECT u.apiId, a.mostActivityHour FROM UserAnalytics a JOIN User u ON u.id = a.userId ORDER BY u.apiId"));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserAnalytics");
+        Assert.Equal(1, table.Inserted);
+        Assert.Equal(0, table.Updated);
+        Assert.Equal(1, table.CopiedReferences?["User"]);
+    }
+
+    [Fact(DisplayName = "集計の要約は小数の秒数をそのまま保存し、読み戻しても増分の計算に使える")]
+    public void CounterSummaryRoundTripsRealValues()
+    {
+        var (host, local, baseline) = Arrange();
+        var store = new BaseSummaryStore(Path.Combine(_root, "base"));
+        store.Save("fake|friend-connect", baseline);
+        var loaded = store.Load("fake|friend-connect")!;
+        Exec(local, LocalConnectionAB);
+        Exec(host, HostConnectionAB);
+
+        Merge(host, local, loaded);
+
+        Assert.Equal(new[] { "usr_a|usr_b|3|15|150.5|900|9" }, Connections(host));
     }
 }

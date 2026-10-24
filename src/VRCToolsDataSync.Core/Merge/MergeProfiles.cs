@@ -89,6 +89,19 @@ public static class MergeProfiles
     /// <summary>Friend Connect の User を PC をまたいで見分ける列。VRChat のユーザー ID。</summary>
     private static readonly ColumnReference UserByApiId = new("userId", "User", new[] { "apiId" });
 
+    /// <summary>Friend Connect の同席の相手の User を見分ける列。userId と同じく VRChat のユーザー ID。</summary>
+    private static readonly ColumnReference TargetUserByApiId = new("targetUserId", "User", new[] { "apiId" });
+
+    /// <summary>
+    /// Friend Connect の同席の集計 (UserConnection) で、出来事ごとに足されていく列。回数は整数、
+    /// 秒数は実数 (小数を持つ)。
+    /// </summary>
+    private static readonly string[] ConnectionCounters =
+    {
+        "joinACount", "joinBCount", "leaveACount", "leaveBCount", "stayCount", "staySeconds",
+        "staySeconds3Hour", "staySeconds6Hour", "staySeconds12Hour", "staySeconds1Day", "staySeconds2Day", "staySeconds3Day",
+    };
+
     /// <summary>Friend Connect の World を PC をまたいで見分ける列。VRChat のワールド ID。</summary>
     private static readonly ColumnReference WorldByApiId = new("worldId", "World", new[] { "apiId" });
 
@@ -229,8 +242,33 @@ public static class MergeProfiles
             new("Photo", MergeTableKind.Keyed, new[] { "shotAt" }, ValueColumns: new[] { "thumbnail", "hasThumbnail" },
                 References: new[] { LocationByUserAndStart(timeColumn: "shotAt", nullIfMissing: true) }, UnionWithoutAncestor: true),
 
-            // インスタンスの人数の時系列 (NUserHistory)、通知の送信履歴 (UserNotificationHistory) と集計
-            // (UserConnection、UserWorldVisit、UserAnalytics) はまだマージしない。集計は足すと二重に数える。
+            // 同席とワールド訪問の集計。Friend Connect は履歴を 1 行ずつ数えて既存の行に足していく (増分の
+            // 集計で、消した行は作り直されない) ので、本ツールが集計をやり直すことはできず、前回の同期時点の
+            // 値に双方の増分を足す。相手 (targetUserId) もユーザーで、id は PC ごとに違うので VRChat のユーザー
+            // ID で突き合わせ、同期先に無いユーザーやワールドは写す。最終接触・更新時刻は新しい方を残す。
+            // 2 台で同時に動かしていた期間は両方が同じ同席を数えているので二重になるが、集計には時刻が無く
+            // 稼働区間で除けないため、精度より「反映されない」を避ける。規則に加える前の要約に祖先が無い
+            // 最初のマージは、双方の増分が分からないので列ごとに大きい方を残す。Friend Connect は保持期間を
+            // 過ぎたワールド訪問の行を自分で消すので、その削除は 3-way の削除としてそのまま伝える。
+            // 保持期間で消えた行を次の訪問で 0 から作り直すので、祖先より減っていた側の値はそのまま増分として足す。
+            // 回数と秒数を合成した行では、平均滞在時間 (stayAvg) を回数と秒数から求め直す (切り捨て)。
+            new("UserConnection", MergeTableKind.Keyed, new[] { "userId", "targetUserId" },
+                ValueColumns: ConnectionCounters.Concat(new[] { "lastContactAt", "lastUpdateAt" }).ToArray(),
+                GrowingColumns: new[] { "lastContactAt", "lastUpdateAt" }, CounterColumns: ConnectionCounters,
+                References: new[] { UserByApiId, TargetUserByApiId }, UnionWithoutAncestor: true),
+            new("UserWorldVisit", MergeTableKind.Keyed, new[] { "userId", "worldId" },
+                ValueColumns: new[] { "stayCount", "staySeconds", "lastUpdateAt" },
+                GrowingColumns: new[] { "lastUpdateAt" }, CounterColumns: new[] { "stayCount", "staySeconds" },
+                References: new[] { UserByApiId, WorldByApiId }, UnionWithoutAncestor: true,
+                DerivedColumns: new[] { new DerivedColumn("stayAvg", "CASE WHEN \"stayCount\" > 0 THEN CAST(\"staySeconds\" / \"stayCount\" AS INTEGER) ELSE 0 END") }),
+            // ユーザーごとの分析結果 (割合やヒートマップの文字列)。足し合わせられないので、同期先にあれば
+            // その値を残し、無いユーザーの行だけ写す。手元で消えていても同期先の行は残す (Friend Connect が
+            // 作り直さない値を失わないため)。Friend Connect は 2025 年 9 月以降この表を更新していない。
+            new("UserAnalytics", MergeTableKind.Keyed, new[] { "userId" }, ValueColumns: Array.Empty<string>(),
+                References: new[] { UserByApiId }, UnionWithoutAncestor: true, KeepHostOnLocalDelete: true),
+
+            // インスタンスの人数の時系列 (NUserHistory) と通知の送信履歴 (UserNotificationHistory) はまだ
+            // マージしない。ユーザーやワールドの score は Friend Connect が集計から求める値で、同期先のまま。
             // ここに無いテーブルは同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,

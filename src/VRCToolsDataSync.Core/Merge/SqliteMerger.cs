@@ -1086,10 +1086,12 @@ public static class SqliteMerger
                     && WriteValues(connection, table, rule, mine.KeyValues, sum) > 0)
                 {
                     updated++;
+                    RecomputeDerivedColumns(connection, table, rule, mine.KeyValues);
                 }
                 continue;
             }
             if (mine?.Hash == original) continue;       // 手元は変えていない。同期先のまま
+            if (mine is null && rule.KeepHostOnLocalDelete) continue;   // 手元の削除は伝えない
 
             var conflict = theirs?.Hash != original;    // 同期先も変えている
             var takeLocal = !conflict
@@ -1119,6 +1121,7 @@ public static class SqliteMerger
                 // 同期先の行を残し、合成した値も同期先と同じなら、何も書き換えていない。
                 var written = WriteValues(connection, table, rule, mine!.KeyValues, combined);
                 if (!takeLocal && written > 0) updated++;
+                if (written > 0) RecomputeDerivedColumns(connection, table, rule, mine.KeyValues);
             }
         }
 
@@ -1309,7 +1312,7 @@ public static class SqliteMerger
     /// </summary>
     private static Dictionary<string, object?>? ReadCombinedValues(
         SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues,
-        IReadOnlyDictionary<string, long>? ancestorCounters)
+        IReadOnlyDictionary<string, double>? ancestorCounters)
     {
         var growing = rule.GrowingColumns ?? Array.Empty<string>();
         var shrinking = rule.ShrinkingColumns ?? Array.Empty<string>();
@@ -1355,26 +1358,55 @@ public static class SqliteMerger
     }
 
     /// <summary>
-    /// 累計の列を合成する。祖先の値があれば、祖先に双方の増分を足す。減っていた側の
-    /// 増分は 0 とみなす。祖先の値が無いか、整数でない値があれば大きい方を取り、
-    /// 数値でなければ同期先の値を残す。
+    /// 累計の列を合成する。祖先の値があれば、祖先に双方の増分を足す。祖先より減っていた側は、
+    /// アプリが行を消して数え直した (Friend Connect が保持期間で消したワールド訪問を、次の訪問で
+    /// 0 から作り直す) とみなし、その値をそのまま増分にする。祖先の値が無ければ大きい方を取り、
+    /// 数値でなければ同期先の値を残す。両方と祖先がすべて整数なら整数のまま足し、実数が混ざれば
+    /// 実数で足す。
     /// </summary>
-    internal static object? AddCounter(object? mine, object? theirs, long? ancestor)
+    internal static object? AddCounter(object? mine, object? theirs, double? ancestor)
     {
         if (mine is null) return theirs;
         if (theirs is null) return mine;
         if (mine is long l && theirs is long h)
         {
             if (ancestor is not { } a) return Math.Max(l, h);
-            return a + Math.Max(0, l - a) + Math.Max(0, h - a);
+            if (a == Math.Floor(a) && Math.Abs(a) <= long.MaxValue / 2)
+            {
+                var integer = (long)a;
+                return integer + IntegerIncrement(l, integer) + IntegerIncrement(h, integer);
+            }
+            return a + RealIncrement(l, a) + RealIncrement(h, a);
         }
         if (mine is long or double && theirs is long or double)
         {
-            return Convert.ToDouble(mine, CultureInfo.InvariantCulture) >= Convert.ToDouble(theirs, CultureInfo.InvariantCulture)
-                ? mine
-                : theirs;
+            var m = Convert.ToDouble(mine, CultureInfo.InvariantCulture);
+            var t = Convert.ToDouble(theirs, CultureInfo.InvariantCulture);
+            if (ancestor is not { } a) return m >= t ? mine : theirs;
+            return a + RealIncrement(m, a) + RealIncrement(t, a);
         }
         return theirs;
+
+        // 祖先からの増分。祖先より小さければ、0 から数え直した値そのものが増分。
+        static long IntegerIncrement(long value, long ancestor) => value >= ancestor ? value - ancestor : value;
+        static double RealIncrement(double value, double ancestor) => value >= ancestor ? value - ancestor : value;
+    }
+
+    /// <summary>
+    /// 累計の列などを合成して書いた同期先の行で、他の列から決まる列
+    /// (<see cref="MergeTableRule.DerivedColumns"/>) を求め直す。
+    /// </summary>
+    private static void RecomputeDerivedColumns(
+        SqliteConnection connection, string table, MergeTableRule rule, object?[] keyValues)
+    {
+        if (rule.DerivedColumns is not { Count: > 0 } derived) return;
+        using var command = connection.CreateCommand();
+        var sets = string.Join(", ", derived.Select(d => $"{Quote(d.Column)} = ({d.Expression})"));
+        var differs = string.Join(" OR ", derived.Select(d => $"{Quote(d.Column)} IS NOT ({d.Expression})"));
+        command.CommandText =
+            $"UPDATE main.{Quote(table)} AS t SET {sets} " +
+            $"WHERE {KeyCondition(command, rule, keyValues, "main", "t")} AND ({differs})";
+        command.ExecuteNonQuery();
     }
 
     /// <summary>同期先のそのキーの行に値を書き、書き換わった行数を返す。</summary>
