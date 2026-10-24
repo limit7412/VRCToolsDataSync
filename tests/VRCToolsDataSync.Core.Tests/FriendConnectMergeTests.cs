@@ -31,7 +31,8 @@ public sealed class FriendConnectMergeTests : IDisposable
     /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件、写真のお気に入り 1 件、
     /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)、1 件目の稼働中の a のステータスと
     /// アバター av1 の着用の履歴が 1 件ずつ、a の最初の滞在中に撮った写真 1 件、a から b を見た同席の集計、
-    /// a の w1 への訪問の集計、a の分析結果。
+    /// a の w1 への訪問の集計、a の分析結果、1 件目の稼働中のインスタンスの人数の記録 1 件と a についての
+    /// 通知の送信履歴 1 件。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) Arrange()
     {
@@ -50,7 +51,8 @@ public sealed class FriendConnectMergeTests : IDisposable
             InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000) +
             InsertAvatar("avtr_1") + InsertUserStatus("usr_a", 110_000, 120_000) + InsertUserAvatar("usr_a", "avtr_1", 110_000, 150_000) +
             InsertPhoto(1_500, "t-1500.webp", "usr_a", 1) +
-            InsertConnection("usr_a", "usr_b", 10, 100.5, lastContactAt: 500) + InsertWorldVisit("usr_a", "wrld_1", 4, 400) + InsertAnalytics("usr_a"));
+            InsertConnection("usr_a", "usr_b", 10, 100.5, lastContactAt: 500) + InsertWorldVisit("usr_a", "wrld_1", 4, 400) + InsertAnalytics("usr_a") +
+            InsertNUserHistory(-5_000, 110_000, 3) + InsertNotificationHistory("usr_a", "login", 105_000));
         var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
         Assert.True(baseline is not null, reason);
 
@@ -1103,5 +1105,82 @@ public sealed class FriendConnectMergeTests : IDisposable
         Merge(host, local, loaded);
 
         Assert.Equal(new[] { "usr_a|usr_b|3|15|150.5|900|9" }, Connections(host));
+    }
+
+    private static string NUserHistories(string db) => string.Join(",", Rows(db,
+        "SELECT locationMasterId || '@' || checkedAt || '=' || nUsers FROM NUserHistory ORDER BY checkedAt, locationMasterId"));
+
+    private static string NotificationHistories(string db) => string.Join(",", Rows(db,
+        "SELECT u.apiId || ':' || h.type || '@' || h.createdAt FROM UserNotificationHistory h JOIN User u ON u.id = h.userId ORDER BY h.createdAt, u.apiId"));
+
+    /// <summary>
+    /// 段階 8 の場面。前回の同期 (250000) の後、手元は 300000〜400000 に動き、既存のインスタンス (-5000) と
+    /// 新しいインスタンス (-9000000) の人数を記録し、同期先の稼働中 (330000〜380000) にあたる 340500 にも
+    /// 人数を記録した。通知は a について 305000 と (同期先の稼働中の) 340500 に、新しいユーザー d について
+    /// 350000 に送った。同期先は 330000〜380000 に動き、340000 に人数を記録して a に通知を送った。
+    /// </summary>
+    private static void ArrangeSamples(string host, string local)
+    {
+        Exec(local,
+            InsertScanRuntime(300_000, 400_000) +
+            InsertLocationMaster(-9_000_000, "wrld_1:7~public", "wrld_1", nUsers: 5) +
+            InsertNUserHistory(-5_000, 305_000, 4) + InsertNUserHistory(-9_000_000, 310_000, 5) + InsertNUserHistory(-5_000, 340_500, 6) +
+            InsertNotificationHistory("usr_a", "login", 305_000) + InsertNotificationHistory("usr_a", "login", 340_500) +
+            InsertUser("usr_d", "D") + InsertNotificationHistory("usr_d", "move", 350_000));
+        Exec(host, InsertScanRuntime(330_000, 380_000) + InsertNUserHistory(-5_000, 340_000, 6) + InsertNotificationHistory("usr_a", "login", 340_000));
+    }
+
+    [Fact(DisplayName = "人数の時系列は相手の稼働中の記録を除いて足し、通知の送信履歴はユーザーを付け替えて全部足す")]
+    public void SamplesAreGatedAndNotificationsAreRemapped()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeSamples(host, local);
+
+        var report = Merge(host, local, baseline);
+
+        // 340500 の記録は同期先の稼働中なので足さない。新しいインスタンスは LocationMaster の規則で先に写っている。
+        Assert.Equal("-5000@110000=3,-5000@305000=4,-9000000@310000=5,-5000@340000=6", NUserHistories(host));
+        var samples = Assert.Single(report.Tables, t => t.Table == "NUserHistory");
+        Assert.Equal((2L, 0L, 1L), (samples.Inserted, samples.Updated, samples.SkippedWhileHostRunning));
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM LocationMaster WHERE id = -9000000 AND location = 'wrld_1:7~public'"));
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM NUserHistory WHERE locationMasterId NOT IN (SELECT id FROM LocationMaster)"));
+        // 通知は両方の PC が送った記録なので、同期先の稼働中の 340500 も足す。d はユーザーごと写す。
+        Assert.Equal("usr_a:login@105000,usr_a:login@305000,usr_a:login@340000,usr_a:login@340500,usr_d:move@350000", NotificationHistories(host));
+        var notifications = Assert.Single(report.Tables, t => t.Table == "UserNotificationHistory");
+        Assert.Equal((3L, 0L, 0L), (notifications.Inserted, notifications.Updated, notifications.SkippedWhileHostRunning));
+        Assert.Equal(1, notifications.CopiedReferences?["User"]);
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM UserNotificationHistory WHERE userId NOT IN (SELECT id FROM User)"));
+        // 2 回目は足すものが無い。
+        var again = Merge(host, local, baseline);
+        Assert.Equal(0, again.Tables.Where(t => t.Table is "NUserHistory" or "UserNotificationHistory").Sum(t => t.Inserted + t.Updated + t.Deleted));
+    }
+
+    [Fact(DisplayName = "人数の時系列と通知の送信履歴は、規則に加える前の要約に祖先が無くても中止せずに和集合を取る")]
+    public void SamplesUnionWithoutAncestor()
+    {
+        var (host, local, baseline) = Arrange();
+        baseline.Tables.Remove("NUserHistory");
+        baseline.Tables.Remove("UserNotificationHistory");
+        baseline.RulesDigest = "older";
+        ArrangeSamples(host, local);
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("-5000@110000=3,-5000@305000=4,-9000000@310000=5,-5000@340000=6", NUserHistories(host));
+        Assert.Equal("usr_a:login@105000,usr_a:login@305000,usr_a:login@340000,usr_a:login@340500,usr_d:move@350000", NotificationHistories(host));
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "NUserHistory").Inserted);
+        Assert.Equal(3, Assert.Single(report.Tables, t => t.Table == "UserNotificationHistory").Inserted);
+    }
+
+    [Fact(DisplayName = "人数の時系列と通知の送信履歴に手元で足した行は、要約の変化として見える")]
+    public void SampleAdditionsChangeTheSummary()
+    {
+        var (_, local, baseline) = Arrange();
+
+        Exec(local, InsertNUserHistory(-5_000, 305_000, 4));
+        Assert.Equal(new[] { "NUserHistory" }, DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!.FindChangedTables(baseline));
+        Exec(local, InsertNotificationHistory("usr_a", "login", 305_000));
+        Assert.Equal(new[] { "NUserHistory", "UserNotificationHistory" },
+            DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!.FindChangedTables(baseline).OrderBy(t => t, StringComparer.Ordinal));
     }
 }

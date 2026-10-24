@@ -332,6 +332,27 @@ internal static class FriendConnectSchema
         );
         CREATE UNIQUE INDEX "UserAnalytics_userId_key" ON "UserAnalytics"("userId");
         CREATE INDEX "UserAnalytics_userId_idx" ON "UserAnalytics"("userId");
+        CREATE TABLE "NUserHistory" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "locationMasterId" INTEGER NOT NULL,
+            "checkedAt" DATETIME NOT NULL,
+            "nUsers" INTEGER NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "NUserHistory_locationMasterId_fkey" FOREIGN KEY ("locationMasterId") REFERENCES "LocationMaster" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "NUserHistory_locationMasterId_checkedAt_idx" ON "NUserHistory"("locationMasterId", "checkedAt");
+        CREATE TABLE "UserNotificationHistory" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "userId" INTEGER NOT NULL,
+            "type" TEXT NOT NULL,
+            "content" TEXT NOT NULL,
+            "message" TEXT NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "UserNotificationHistory_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "UserNotificationHistory_userId_type_createdAt_idx" ON "UserNotificationHistory"("userId", "type", "createdAt");
         """;
 
     /// <summary>規則に関わるテーブルを作り、本ツールが確かめた版のマイグレーションを記録する。</summary>
@@ -452,6 +473,15 @@ internal static class FriendConnectSchema
            $"(SELECT id FROM User WHERE apiId = '{userApiId}'), (SELECT id FROM User WHERE apiId = '{targetApiId}'), 1, 1, 1, 1, {stayCount}, " +
            $"{staySeconds.ToString("R", System.Globalization.CultureInfo.InvariantCulture)}, 0, 0, 0, 0, 0, 0, " +
            $"{(lastContactAt is null ? "NULL" : lastContactAt.Value.ToString())}, {lastUpdateAt}, 1);";
+
+    /// <summary>インスタンス (LocationMaster の id) の人数の記録。時刻は Unix ミリ秒。</summary>
+    public static string InsertNUserHistory(long locationMasterId, long checkedAt, int nUsers)
+        => $"INSERT INTO NUserHistory (locationMasterId, checkedAt, nUsers, updatedAt) VALUES ({locationMasterId}, {checkedAt}, {nUsers}, 1);";
+
+    /// <summary>ユーザー (apiId) についての通知の送信履歴。時刻は Unix ミリ秒。</summary>
+    public static string InsertNotificationHistory(string userApiId, string type, long createdAt, string message = "m")
+        => "INSERT INTO UserNotificationHistory (userId, type, content, message, createdAt, updatedAt) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), '{type}', '{{}}', '{message}', {createdAt}, 1);";
 
     /// <summary>ワールド訪問の集計。平均滞在時間は Friend Connect と同じく秒数を回数で割って切り捨てる。</summary>
     public static string InsertWorldVisit(string userApiId, string worldApiId, long stayCount, long staySeconds, long lastUpdateAt = 1)
