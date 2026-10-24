@@ -45,6 +45,16 @@ public sealed class DatabaseSummary
     public Dictionary<string, TableSummary> Tables { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// この要約を取った同期の時点で、DB と一緒に同期したフォルダにあったファイル (manifest での
+    /// 相対パス)。マージでフォルダを和集合にするとき、同期先にあって手元に無いファイルのうち、
+    /// 前回の同期の後に同期先で増えたもの (ここに無いもの) だけを取り出し、手元で消したものを
+    /// 戻さないために使う。DB から取る要約には入らないので、同期の手順が埋める。無ければ
+    /// (古い版のツールが取った要約や、DB だけから取り直した要約)、同期先にあって手元に無いもの
+    /// をすべて取り出す。内容の比較 (<see cref="FindChangedTables"/>) には使わない。
+    /// </summary>
+    public List<string>? Files { get; set; }
+
+    /// <summary>
     /// <paramref name="baseline"/> と内容が違うテーブルの名前を返す。片方にしか無い
     /// テーブルも違いとして数える。
     /// </summary>
@@ -179,6 +189,8 @@ public sealed class DatabaseSummary
             .Concat(rule.ValueColumns ?? Array.Empty<string>())
             .Concat(rule.ClearedColumns ?? Array.Empty<string>())
             .Concat(rule.References?.Select(r => r.Column) ?? Array.Empty<string>())
+            .Concat(rule.References?.Where(r => r.Fallback is not null).Select(r => r.Fallback!.TimeColumn) ?? Array.Empty<string>())
+            .Concat(rule.IdentityColumns ?? Array.Empty<string>())
             .Concat(rule.EditedAtColumn is null ? Array.Empty<string>() : new[] { rule.EditedAtColumn })
             .Concat(rule.OrderColumn is null ? Array.Empty<string>() : new[] { rule.OrderColumn })
             .Concat(rule.GrowingColumns ?? Array.Empty<string>())
@@ -355,13 +367,45 @@ public sealed class DatabaseSummary
         {
             if (rule.ReferenceOf(column) is { } reference)
             {
-                expressions.AddRange(reference.KeyColumns.Select(k =>
-                    $"(SELECT r.{Quote(k)} FROM {Quote(schema)}.{Quote(reference.Table)} AS r " +
-                    $"WHERE r.{Quote(reference.IdColumn)} = {alias}.{Quote(column)})"));
+                expressions.AddRange(ReferencedKeyExpressions(reference, schema, alias + "_r", column => $"{alias}.{Quote(column)}"));
             }
             else
             {
                 expressions.Add($"{alias}.{Quote(column)}");
+            }
+        }
+        return expressions;
+    }
+
+    /// <summary>
+    /// <paramref name="reference"/> の指す先の行の自然キーを、参照する側の行の id の式
+    /// (<paramref name="localId"/> に <see cref="ColumnReference.Column"/> を渡して得る) から引く
+    /// SQL の式にする。参照先のキーの列がさらに別の行を指していれば (<see cref="ColumnReference.KeyReferences"/>)、
+    /// その先の自然キーまで辿る。<paramref name="alias"/> は参照先の行に付ける別名で、入れ子ごとに変える。
+    /// </summary>
+    internal static List<string> ReferencedKeyExpressions(
+        ColumnReference reference, string schema, string alias, Func<string, string> localId)
+        => ReferencedKeyColumnExpressions(reference, schema, alias)
+            .Select(e => $"(SELECT {e} FROM {Quote(schema)}.{Quote(reference.Table)} AS {alias} " +
+                         $"WHERE {alias}.{Quote(reference.IdColumn)} = {localId(reference.Column)})")
+            .ToList();
+
+    /// <summary>
+    /// 参照先のテーブルの行 (<paramref name="alias"/>) から、その行の自然キーを読む式。
+    /// キーの列がさらに別の行を指していれば、その先の自然キーを読む副問い合わせになる。
+    /// </summary>
+    internal static List<string> ReferencedKeyColumnExpressions(ColumnReference reference, string schema, string alias)
+    {
+        var expressions = new List<string>();
+        foreach (var key in reference.KeyColumns)
+        {
+            if (reference.KeyReferenceOf(key) is { } nested)
+            {
+                expressions.AddRange(ReferencedKeyExpressions(nested, schema, alias + "_r", column => $"{alias}.{Quote(column)}"));
+            }
+            else
+            {
+                expressions.Add($"{alias}.{Quote(key)}");
             }
         }
         return expressions;

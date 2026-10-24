@@ -102,11 +102,15 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
         ManifestFile dbV11;
         DatabaseSummary? pushedSummary;
         var recorded = false;
+        // 要約には、この Push で送るサムネイルの一覧も残す (マージでフォルダを和集合にするときの祖先)。
+        // 記録を控える前に要る。
+        var thumbnailKeys = ListLocalFiles(_directories[0]);
         try
         {
             dbV11 = PushSqlite(storage, _paths.DbV11File, DbV11Key, remoteFiles, affected, replace, out pushedSummary,
                 beforeCommit: (sha256, summary) =>
                 {
+                    if (summary is not null) summary.Files = thumbnailKeys;
                     options.BeforeCommit?.Invoke(sha256, summary, (existing?.Version ?? 0) + 1);
                     recorded = true;
                 });
@@ -383,6 +387,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
         var pulledSummary = remoteDbV11 is null
             ? null
             : DatabaseSummary.Compute(staging.SourceOf(_paths.DbV11File), TrackedDatabase.Profile, out _);
+        if (pulledSummary is not null) pulledSummary.Files = ThumbnailKeys(entry);
 
         // (3) バックアップを取る。ここまではローカルを書き換えない。
         string? backupPath = null;
@@ -692,9 +697,9 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
     /// 同期先の最新の db_1.1.sqlite を土台に、手元の DB にしか無い変更を足した DB を作り、
     /// ローカルの DB と置き換える。手順は <see cref="DatabaseMergeFlow"/>。
     /// <para>
-    /// 合わせるのは手で編集するデータ (メモ、タグ、ローカルのお気に入り、通知設定) だけで、
-    /// 規則は <see cref="MergeProfiles.FriendConnect"/>。旧版の db.sqlite、config.json、
-    /// サムネイルには触れない。続く Push で手元のものが送られる。
+    /// 規則は <see cref="MergeProfiles.FriendConnect"/>。旧版の db.sqlite と config.json には触れず、
+    /// 続く Push で手元のものが送られる。サムネイルは DB の写真の一覧 (Photo) と対応するので、
+    /// 同期先にしか無いファイルを手元へ取り出して和集合にする (<see cref="UnionThumbnails"/>)。
     /// </para>
     /// </summary>
     public SyncResult PullMerge(PullMergeOptions options)
@@ -708,6 +713,8 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
             Profile = MergeProfiles.FriendConnect,
             ProcessNames = ProcessGuard.FriendConnectProcessNames,
             Logger = _logger,
+            ListUnionFiles = ThumbnailKeys,
+            UnionFiles = UnionThumbnails,
             CreateBackup = () =>
             {
                 // 置き換えるのは db_1.1 だけだが、Pull と同じく WAL/SHM ごと退避する。
@@ -722,6 +729,59 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
             },
         };
         return flow.Run(options);
+    }
+
+    /// <summary>同期先の項目に載っているサムネイルのキー。</summary>
+    private static List<string> ThumbnailKeys(ToolManifestEntry entry)
+        => entry.Files.Where(f => f.RelativePath.StartsWith(ThumbnailsKeyPrefix, StringComparison.Ordinal))
+            .Select(f => f.RelativePath).ToList();
+
+    /// <summary>手元のフォルダにあるファイルのキー (Push が manifest に載せるものと同じ)。</summary>
+    private static List<string> ListLocalFiles(SyncedDirectory directory)
+    {
+        if (!Directory.Exists(directory.LocalDirectory)) return new List<string>();
+        return Directory.EnumerateFiles(directory.LocalDirectory, "*", SearchOption.AllDirectories)
+            .Where(path => !PullStaging.IsIncomingFile(path))
+            .Select(path => directory.KeyPrefix + StorageKey.FromRelativePath(Path.GetRelativePath(directory.LocalDirectory, path)))
+            .ToList();
+    }
+
+    /// <summary>
+    /// マージで、同期先にあって手元に無いサムネイルを手元へ取り出す。祖先の要約にサムネイルの一覧
+    /// (<see cref="DatabaseSummary.Files"/>) があれば、そこに無いもの (前回の同期の後に同期先で
+    /// 増えたもの) だけを取り出し、手元で消したものは戻さない。一覧が無ければ (古い版のツールが取った
+    /// 要約や、DB だけから取り直した要約)、同期先にあって手元に無いものをすべて取り出す。
+    /// 同期先で消されたサムネイルは手元に残り、続く Push で送り直される (写真の行は 3-way で消えるので、
+    /// 行の無いサムネイルとして残る)。
+    /// </summary>
+    private (string? Note, string? Problem) UnionThumbnails(
+        ISyncStorage storage, ToolManifestEntry entry, DatabaseSummary? baseline, bool dryRun)
+    {
+        var directory = _directories[0];
+        var known = baseline?.Files is { } files ? new HashSet<string>(files, StringComparer.Ordinal) : null;
+        var missing = entry.Files
+            .Where(f => f.RelativePath.StartsWith(ThumbnailsKeyPrefix, StringComparison.Ordinal))
+            .Where(f => known?.Contains(f.RelativePath) != true)
+            .Where(f => !File.Exists(ToLocalPath(directory, f)))
+            .ToList();
+        if (missing.Count == 0) return (null, null);
+        if (dryRun) return ($"同期先にしか無いサムネイル {missing.Count} 件を取り出します", null);
+
+        using var staging = new PullStaging(_logger);
+        foreach (var file in missing)
+        {
+            if (!staging.Fetch(storage, file, ToLocalPath(directory, file)))
+            {
+                return (null, $"同期先にサムネイルがありません: {file.RelativePath}");
+            }
+        }
+        if (staging.FindMismatchedKey() is { } mismatched)
+        {
+            return (null, $"取得したファイルの内容が manifest の記録と一致しません: {mismatched}");
+        }
+        staging.Apply(new List<string>());
+        _logger.LogInformation("同期先にしか無いサムネイル {Count} 件を取り出しました", missing.Count);
+        return ($"同期先にしか無いサムネイル {missing.Count} 件を取り出しました", null);
     }
 
     private string FingerprintPullTargets()

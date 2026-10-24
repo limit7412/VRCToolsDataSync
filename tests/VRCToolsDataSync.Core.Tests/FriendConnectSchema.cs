@@ -125,12 +125,98 @@ internal static class FriendConnectSchema
             "updatedAt" DATETIME NOT NULL,
             CONSTRAINT "UserNotificationSetting_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
         );
+        CREATE TABLE "Group" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "apiId" TEXT NOT NULL,
+            "name" TEXT NOT NULL,
+            "shortCode" TEXT NOT NULL,
+            "discriminator" TEXT NOT NULL,
+            "description" TEXT NOT NULL,
+            "ownerId" TEXT NOT NULL,
+            "iconId" TEXT NOT NULL,
+            "iconUrl" TEXT NOT NULL,
+            "bannerId" TEXT NOT NULL,
+            "bannerUrl" TEXT NOT NULL,
+            "memberCount" INTEGER NOT NULL DEFAULT 0,
+            "joinState" TEXT NOT NULL DEFAULT '',
+            "lastUpdateAt" DATETIME NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL
+        , "lastLocationUpdateAt" DATETIME);
+        CREATE UNIQUE INDEX "Group_apiId_key" ON "Group"("apiId");
+        CREATE TABLE "LocationMaster" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "location" TEXT NOT NULL,
+            "worldId" INTEGER,
+            "instanceNumber" TEXT,
+            "instanceId" TEXT,
+            "instanceType" INTEGER NOT NULL,
+            "ownerId" INTEGER,
+            "ownerApiId" TEXT,
+            "ownerName" TEXT,
+            "groupId" INTEGER,
+            "groupApiId" TEXT,
+            "nUsers" INTEGER NOT NULL,
+            "nUsersFriend" INTEGER NOT NULL DEFAULT 0,
+            "capacity" INTEGER NOT NULL,
+            "lastUpdateAt" DATETIME,
+            "nUserLastUpdateAt" DATETIME,
+            CONSTRAINT "LocationMaster_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User" ("id") ON DELETE SET NULL ON UPDATE CASCADE,
+            CONSTRAINT "LocationMaster_worldId_fkey" FOREIGN KEY ("worldId") REFERENCES "World" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "LocationMaster_groupId_fkey" FOREIGN KEY ("groupId") REFERENCES "Group" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE INDEX "LocationMaster_worldId_idx" ON "LocationMaster"("worldId");
         CREATE TABLE "Location" (
             "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
             "userId" INTEGER NOT NULL,
+            "locationKey" INTEGER NOT NULL,
+            "withOwner" BOOLEAN NOT NULL DEFAULT false,
+            "worldId" INTEGER,
+            "instanceNumber" TEXT,
+            "instanceId" TEXT,
+            "instanceType" INTEGER NOT NULL,
             "startAt" DATETIME NOT NULL,
-            CONSTRAINT "Location_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+            "endAt" DATETIME NOT NULL,
+            "seconds" INTEGER NOT NULL DEFAULT 0,
+            CONSTRAINT "Location_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "Location_worldId_fkey" FOREIGN KEY ("worldId") REFERENCES "World" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "Location_locationKey_fkey" FOREIGN KEY ("locationKey") REFERENCES "LocationMaster" ("id") ON DELETE CASCADE ON UPDATE CASCADE
         );
+        CREATE INDEX "Location_userId_idx" ON "Location"("userId");
+        CREATE INDEX "Location_startAt_idx" ON "Location"("startAt");
+        CREATE INDEX "Location_locationKey_idx" ON "Location"("locationKey");
+        CREATE TABLE "Video" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "dateTime" DATETIME NOT NULL,
+            "locationId" INTEGER NOT NULL,
+            "url" TEXT NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "Video_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "Location" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE UNIQUE INDEX "Video_dateTime_key" ON "Video"("dateTime");
+        CREATE TABLE "LocationNote" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "locationMasterId" INTEGER NOT NULL,
+            "locationId" INTEGER NOT NULL,
+            "note" TEXT NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "LocationNote_locationMasterId_fkey" FOREIGN KEY ("locationMasterId") REFERENCES "LocationMaster" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT "LocationNote_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "Location" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE TABLE "Photo" (
+            "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            "locationId" INTEGER,
+            "shotAt" DATETIME NOT NULL,
+            "source" TEXT NOT NULL,
+            "thumbnail" TEXT NOT NULL,
+            "hasThumbnail" BOOLEAN NOT NULL,
+            "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            "updatedAt" DATETIME NOT NULL,
+            CONSTRAINT "Photo_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "Location" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE UNIQUE INDEX "Photo_shotAt_key" ON "Photo"("shotAt");
         CREATE TABLE "PhotoFavorite" (
             "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
             "shotAt" DATETIME NOT NULL,
@@ -265,6 +351,42 @@ internal static class FriendConnectSchema
     public static string InsertUserAvatar(string userApiId, string avatar, long startAt, long endAt)
         => "INSERT INTO UserAvatar (userId, avatarId, startAt, endAt, seconds) VALUES (" +
            $"(SELECT id FROM User WHERE apiId = '{userApiId}'), (SELECT id FROM Avatar WHERE avatar = '{avatar}'), {startAt}, {endAt}, {(endAt - startAt) / 1000});";
+
+    public static string InsertGroup(string apiId, string name)
+        => $"INSERT INTO \"Group\" (apiId, name, shortCode, discriminator, description, ownerId, iconId, iconUrl, bannerId, bannerUrl, lastUpdateAt, updatedAt) " +
+           $"VALUES ('{apiId}', '{name}', '', '', '', '', '', '', '', '', 1, 1);";
+
+    /// <summary>
+    /// インスタンスのマスタ。id は Friend Connect が入力から決める値なので、こちらで与える
+    /// (負の値や、既存の行より小さい値もある)。ワールドと所有者は、その DB での id を引く。
+    /// </summary>
+    public static string InsertLocationMaster(long id, string location, string? worldApiId = null, string? ownerApiId = null, string? groupApiId = null, int nUsers = 1)
+        => "INSERT INTO LocationMaster (id, location, worldId, instanceType, ownerId, ownerApiId, groupId, groupApiId, nUsers, capacity, lastUpdateAt) VALUES (" +
+           $"{id}, '{location}', {(worldApiId is null ? "NULL" : $"(SELECT id FROM World WHERE apiId = '{worldApiId}')")}, 1, " +
+           $"{(ownerApiId is null ? "NULL" : $"(SELECT id FROM User WHERE apiId = '{ownerApiId}')")}, {(ownerApiId is null ? "NULL" : $"'{ownerApiId}'")}, " +
+           $"{(groupApiId is null ? "NULL" : $"(SELECT id FROM \"Group\" WHERE apiId = '{groupApiId}')")}, {(groupApiId is null ? "NULL" : $"'{groupApiId}'")}, {nUsers}, 16, 1);";
+
+    /// <summary>ユーザー (apiId) のインスタンス (LocationMaster の id) への滞在。時刻は Unix ミリ秒。</summary>
+    public static string InsertLocation(string userApiId, long locationMasterId, long startAt, long endAt, string? worldApiId = null)
+        => "INSERT INTO Location (userId, locationKey, worldId, instanceType, startAt, endAt, seconds) VALUES (" +
+           $"(SELECT id FROM User WHERE apiId = '{userApiId}'), {locationMasterId}, " +
+           $"{(worldApiId is null ? "NULL" : $"(SELECT id FROM World WHERE apiId = '{worldApiId}')")}, 1, {startAt}, {endAt}, {(endAt - startAt) / 1000});";
+
+    /// <summary>動画の再生履歴。滞在はユーザーと開始時刻で引く。</summary>
+    public static string InsertVideo(long dateTime, string url, string userApiId, long locationStartAt)
+        => $"INSERT INTO Video (dateTime, locationId, url, updatedAt) VALUES ({dateTime}, {LocationId(userApiId, locationStartAt)}, '{url}', 1);";
+
+    /// <summary>インスタンス (LocationMaster の id) と滞在 (ユーザーと開始時刻) へのメモ。</summary>
+    public static string NoteLocation(long locationMasterId, string userApiId, long locationStartAt, long createdAt, string note)
+        => $"INSERT INTO LocationNote (locationMasterId, locationId, note, createdAt, updatedAt) VALUES ({locationMasterId}, {LocationId(userApiId, locationStartAt)}, '{note}', {createdAt}, 1);";
+
+    /// <summary>写真。滞在 (ユーザーと開始時刻) は無くてもよい。</summary>
+    public static string InsertPhoto(long shotAt, string thumbnail, string? userApiId = null, long locationStartAt = 0, string source = "C:\\photos\\p.png")
+        => "INSERT INTO Photo (locationId, shotAt, source, thumbnail, hasThumbnail, updatedAt) VALUES (" +
+           $"{(userApiId is null ? "NULL" : LocationId(userApiId, locationStartAt))}, {shotAt}, '{source}', '{thumbnail}', 1, 1);";
+
+    private static string LocationId(string userApiId, long startAt)
+        => $"(SELECT id FROM Location WHERE userId = (SELECT id FROM User WHERE apiId = '{userApiId}') AND startAt = {startAt})";
 
     public static void Exec(string path, string sql)
     {

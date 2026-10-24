@@ -30,7 +30,7 @@ public sealed class FriendConnectMergeTests : IDisposable
     /// 祖先: ユーザー a (メモあり)、b、c、ワールド w1、タグ friend / work、a に friend、
     /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件、写真のお気に入り 1 件、
     /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)、1 件目の稼働中の a のステータスと
-    /// アバター av1 の着用の履歴が 1 件ずつ。
+    /// アバター av1 の着用の履歴が 1 件ずつ、a の最初の滞在中に撮った写真 1 件。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) Arrange()
     {
@@ -43,11 +43,12 @@ public sealed class FriendConnectMergeTests : IDisposable
             TagUser("usr_a", "friend") +
             InsertFavoriteGroup("fav", "Favorites") + FavoriteUser("fav", "usr_a") +
             SetNotification("usr_a", "login", "discord") +
-            "INSERT INTO Location (userId, startAt) SELECT id, 1 FROM User WHERE apiId = 'usr_a';" +
-            "INSERT INTO Location (userId, startAt) SELECT id, 2 FROM User WHERE apiId = 'usr_a';" +
+            InsertLocationMaster(-5_000, "wrld_1:1~private(usr_a)", "wrld_1", "usr_a") +
+            InsertLocation("usr_a", -5_000, 1, 2, "wrld_1") + InsertLocation("usr_a", -5_000, 2, 3, "wrld_1") +
             FavoritePhoto(1000) + NoteWorld("wrld_1", 10, "wn-a") +
             InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000) +
-            InsertAvatar("avtr_1") + InsertUserStatus("usr_a", 110_000, 120_000) + InsertUserAvatar("usr_a", "avtr_1", 110_000, 150_000));
+            InsertAvatar("avtr_1") + InsertUserStatus("usr_a", 110_000, 120_000) + InsertUserAvatar("usr_a", "avtr_1", 110_000, 150_000) +
+            InsertPhoto(1_500, "t-1500.webp", "usr_a", 1));
         var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
         Assert.True(baseline is not null, reason);
 
@@ -56,7 +57,10 @@ public sealed class FriendConnectMergeTests : IDisposable
         File.Copy(ancestor, host);
         File.Copy(ancestor, local);
         // 手元の id をずらす。外部キーは ON UPDATE CASCADE なので参照も付いて動く。
-        Exec(local, "UPDATE User SET id = id + 100; UPDATE Tag SET id = id + 200; UPDATE World SET id = id + 300; UPDATE Avatar SET id = id + 400;");
+        // LocationMaster の id はアプリが決める値で PC 間で同じなので、ずらさない。追加専用の履歴 (Location など) の
+        // id は前回の同期の後に増えた行の目印にするので、祖先からはずらさない (実機でも消して入れ直されない)。
+        Exec(local, "UPDATE User SET id = id + 100; UPDATE Tag SET id = id + 200; UPDATE World SET id = id + 300; UPDATE Avatar SET id = id + 400; " +
+                    "UPDATE Photo SET id = id + 600;");
         return (host, local, baseline!);
     }
 
@@ -76,7 +80,7 @@ public sealed class FriendConnectMergeTests : IDisposable
         var hostUserId = UserId(host, "usr_a");
         Exec(local, "UPDATE User SET note = 'memo-a2', updatedAt = 9 WHERE apiId = 'usr_a'");
         // 同期先ではその間も履歴が増えている。
-        Exec(host, "INSERT INTO Location (userId, startAt) SELECT id, 3 FROM User WHERE apiId = 'usr_a'");
+        Exec(host, InsertLocation("usr_a", -5_000, 3, 4));
 
         var report = Merge(host, local, baseline);
 
@@ -686,5 +690,225 @@ public sealed class FriendConnectMergeTests : IDisposable
         var table = Assert.Single(report.Tables, t => t.Table == "UserStatus");
         Assert.Equal((1L, 2L), (table.Inserted, table.Updated));
         Assert.Null(table.CopiedReferences);
+    }
+
+    private static string Locations(string db) => string.Join(",", Rows(db,
+        "SELECT u.apiId || '@' || l.locationKey || '@' || l.startAt || '-' || l.endAt FROM Location l JOIN User u ON u.id = l.userId ORDER BY l.startAt, u.apiId"));
+
+    private static string Videos(string db) => string.Join(",", Rows(db,
+        "SELECT v.dateTime || ':' || u.apiId || '@' || l.startAt FROM Video v JOIN Location l ON l.id = v.locationId JOIN User u ON u.id = l.userId ORDER BY v.dateTime"));
+
+    private static string Photos(string db) => string.Join(",", Rows(db,
+        "SELECT p.shotAt || ':' || p.thumbnail || ':' || coalesce(u.apiId || '@' || l.startAt, '-') FROM Photo p " +
+        "LEFT JOIN Location l ON l.id = p.locationId LEFT JOIN User u ON u.id = l.userId ORDER BY p.shotAt"));
+
+    private static string LocationMasters(string db) => string.Join(",", Rows(db,
+        "SELECT m.id || ':' || m.location || ':' || coalesce(w.apiId, '-') || ':' || coalesce(o.apiId, '-') || ':' || coalesce(g.apiId, '-') || ':' || m.nUsers " +
+        "FROM LocationMaster m LEFT JOIN World w ON w.id = m.worldId LEFT JOIN User o ON o.id = m.ownerId LEFT JOIN \"Group\" g ON g.id = m.groupId ORDER BY m.id"));
+
+    /// <summary>
+    /// 段階 7 の場面。前回の同期 (250000) の後、手元は 300000〜400000 に動き、新しいワールド w2 の
+    /// インスタンス (id は既存より小さい負の値と、グループ付きの正の値) を記録し、b の滞在 (305000)、
+    /// 同期先の稼働中 (330000〜380000) にあたる c の滞在 (340500) と b の滞在 (350000) を記録した。
+    /// 同期先は 330000〜380000 に動き、c の同じ滞在を 340000 から記録している。
+    /// </summary>
+    private static void ArrangeLocations(string host, string local)
+    {
+        Exec(local,
+            InsertScanRuntime(300_000, 400_000) + InsertWorld("wrld_2", "W2") + InsertGroup("grp_1", "G1") +
+            InsertLocationMaster(-9_000_000, "wrld_2:7~public", "wrld_2", nUsers: 5) +
+            InsertLocationMaster(123_456, "wrld_2:8~group(grp_1)", "wrld_2", groupApiId: "grp_1") +
+            InsertLocation("usr_b", -9_000_000, 305_000, 310_000, "wrld_2") +
+            InsertLocation("usr_c", 123_456, 340_500, 345_000, "wrld_2") +
+            InsertLocation("usr_b", -9_000_000, 350_000, 360_000, "wrld_2"));
+        Exec(host, InsertScanRuntime(330_000, 380_000) + InsertLocationMaster(-7_000, "wrld_1:3~public", "wrld_1", nUsers: 2) +
+                   InsertLocation("usr_c", -7_000, 340_000, 345_000, "wrld_1"));
+    }
+
+    [Fact(DisplayName = "インスタンスのマスタは id で突き合わせて id ごと写し、滞在は付け替えて足し、相手の稼働中の行は足さない")]
+    public void LocationsAreRemappedAndMastersAreUnionedById()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+
+        var report = Merge(host, local, baseline);
+
+        // 手元の新しいマスタは id が小さくても足され、ワールドとグループは写される。同期先の人数はそのまま。
+        Assert.Equal("-9000000:wrld_2:7~public:wrld_2:-:-:5,-7000:wrld_1:3~public:wrld_1:-:-:2,-5000:wrld_1:1~private(usr_a):wrld_1:usr_a:-:1,123456:wrld_2:8~group(grp_1):wrld_2:-:grp_1:1",
+            LocationMasters(host));
+        var masters = Assert.Single(report.Tables, t => t.Table == "LocationMaster");
+        Assert.Equal(2, masters.Inserted);
+        Assert.Equal(1, masters.CopiedReferences?["World"]);
+        Assert.Equal(1, masters.CopiedReferences?["Group"]);
+        // c の 340500 と b の 350000 の滞在は同期先の稼働中なので足さない。
+        Assert.Equal("usr_a@-5000@1-2,usr_a@-5000@2-3,usr_b@-9000000@305000-310000,usr_c@-7000@340000-345000", Locations(host));
+        var locations = Assert.Single(report.Tables, t => t.Table == "Location");
+        Assert.Equal((1L, 2L), (locations.Inserted, locations.SkippedWhileHostRunning));
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM Location WHERE locationKey NOT IN (SELECT id FROM LocationMaster) OR worldId NOT IN (SELECT id FROM World)"));
+    }
+
+    [Fact(DisplayName = "同じ id のインスタンスの文字列が同期先と手元で違えば、id が別の実体を指しているので中止する")]
+    public void LocationMasterWithDifferentContentAborts()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, InsertLocationMaster(777, "wrld_1:2~public", "wrld_1"));
+        Exec(local, InsertLocationMaster(777, "wrld_1:9~public", "wrld_1"));
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("LocationMaster", report.AbortReason);
+        Assert.Contains("777", report.AbortReason);
+        Assert.Contains("location", report.AbortReason);
+    }
+
+    [Fact(DisplayName = "動画は、同じ開始時刻の滞在が同期先に無ければ再生時刻を含む同じユーザーの滞在を指す")]
+    public void VideosFallBackToHostStayContainingTheirTime()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        // 307000 の動画は足される b の滞在 (305000) の中、342000 の動画は足されない c の滞在 (340500) の中。
+        Exec(local, InsertVideo(307_000, "https://v/1", "usr_b", 305_000) + InsertVideo(342_000, "https://v/2", "usr_c", 340_500));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("307000:usr_b@305000,342000:usr_c@340000", Videos(host));
+        var videos = Assert.Single(report.Tables, t => t.Table == "Video");
+        Assert.Equal(2, videos.Inserted);
+        Assert.Null(videos.CopiedReferences);
+    }
+
+    [Fact(DisplayName = "動画の滞在が同期先に無く、再生時刻を含む滞在も無ければ、滞在を写す")]
+    public void VideoWithoutAnyHostStayCopiesTheStay()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        // b の 350000 の滞在は相手の稼働中で足されず、相手も b のその滞在を記録していない。
+        Exec(local, InsertVideo(355_000, "https://v/3", "usr_b", 350_000));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("355000:usr_b@350000", Videos(host));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "Video").CopiedReferences?["Location"]);
+        Assert.Equal("usr_a@-5000@1-2,usr_a@-5000@2-3,usr_b@-9000000@305000-310000,usr_c@-7000@340000-345000,usr_b@-9000000@350000-360000", Locations(host));
+    }
+
+    [Fact(DisplayName = "動画のために写す滞在が同期先に無いユーザーやインスタンスを指していれば、それらも先に写す")]
+    public void CopyingStayForVideoCopiesItsUserAndInstance()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        // d は同期先に無いユーザーで、メモも無く、滞在は相手の稼働中 (足されない)。その滞在中の動画がある。
+        // 滞在のインスタンスも同期先に無く、そのワールドも無い。
+        Exec(local, InsertUser("usr_d", "D") + InsertWorld("wrld_3", "W3") + InsertLocationMaster(42, "wrld_3:1~public", "wrld_3") +
+                    InsertLocation("usr_d", 42, 352_000, 353_000, "wrld_3") + InsertVideo(352_500, "https://v/4", "usr_d", 352_000));
+        // インスタンスのマスタは先に全行が写るので、動画の時点で無いのはユーザーだけ。マスタが写る前の
+        // 状態も確かめるため、写しの後に同期先からマスタを消しておく代わりに、ここでは順序どおりに任せる。
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("352500:usr_d@352000", Videos(host));
+        var videos = Assert.Single(report.Tables, t => t.Table == "Video");
+        Assert.Equal(1, videos.CopiedReferences?["Location"]);
+        Assert.Equal(1, videos.CopiedReferences?["User"]);
+        Assert.Equal("null|null|null", Assert.Single(Rows(host, "SELECT lastUserAvatarId, lastLocationId, lastUserStatusId FROM User WHERE apiId = 'usr_d'")));
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM Location WHERE userId NOT IN (SELECT id FROM User) OR locationKey NOT IN (SELECT id FROM LocationMaster)"));
+    }
+
+    [Fact(DisplayName = "写真は撮影時刻で合わせ、手元で足した・消したものを伝え、滞在が同期先に無ければ対応を空にする")]
+    public void PhotosFollowLocalAddsAndRemovesAndLoseMissingStays()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        Exec(local, "DELETE FROM Photo WHERE shotAt = 1500;" +
+                    InsertPhoto(307_500, "t-307500.webp", "usr_b", 305_000) +
+                    InsertPhoto(342_500, "t-342500.webp", "usr_c", 340_500) +
+                    InsertPhoto(355_500, "t-355500.webp", "usr_b", 350_000) +
+                    InsertPhoto(999_000, "t-999000.webp"));
+        Exec(host, InsertPhoto(2_500, "t-2500.webp", "usr_a", 2));
+
+        var report = Merge(host, local, baseline);
+
+        // 342500 は相手の記録した c の滞在 (340000) に結び付き、355500 は該当する滞在が無いので対応を空にする (滞在は写さない)。
+        Assert.Equal("2500:t-2500.webp:usr_a@2,307500:t-307500.webp:usr_b@305000,342500:t-342500.webp:usr_c@340000,355500:t-355500.webp:-,999000:t-999000.webp:-", Photos(host));
+        var photos = Assert.Single(report.Tables, t => t.Table == "Photo");
+        Assert.Equal((4L, 0L, 1L), (photos.Inserted, photos.Updated, photos.Deleted));
+        Assert.Null(photos.CopiedReferences);
+        Assert.Equal(4, Scalar(host, "SELECT count(*) FROM Location"));
+        // 元の写真のパスは手元の値のまま。
+        Assert.Equal("C:\\photos\\p.png", Assert.Single(Rows(host, "SELECT source FROM Photo WHERE shotAt = 999000")));
+    }
+
+    [Fact(DisplayName = "Friend Connect が写真の行を消して入れ直しても、撮影時刻ごとの内容が同じなら変更ではない")]
+    public void PhotosReinsertedByAppAreNotChanges()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM Photo;" + InsertPhoto(1_500, "t-1500.webp", "usr_a", 1));
+
+        Assert.Empty(DatabaseSummary.Compute(local, MergeProfiles.FriendConnect, out _)!.FindChangedTables(baseline));
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(0, report.ChangedRows);
+        Assert.Equal("1500:t-1500.webp:usr_a@1", Photos(host));
+    }
+
+    [Fact(DisplayName = "写真は、規則に加える前の要約に祖先が無くても中止せず、手元にしか無いものを足す")]
+    public void PhotosUnionWithoutAncestor()
+    {
+        var (host, local, baseline) = Arrange();
+        baseline.Tables.Remove("Photo");
+        baseline.RulesDigest = "older";
+        Exec(local, "DELETE FROM Photo WHERE shotAt = 1500;" + InsertPhoto(999_000, "t-999000.webp"));
+        Exec(host, InsertPhoto(2_500, "t-2500.webp", "usr_a", 2));
+
+        var report = Merge(host, local, baseline);
+
+        // 祖先が無いので手元の削除は伝わらず、両方の写真が残る。
+        Assert.Equal("1500:t-1500.webp:usr_a@1,2500:t-2500.webp:usr_a@2,999000:t-999000.webp:-", Photos(host));
+        Assert.Equal(1, Assert.Single(report.Tables, t => t.Table == "Photo").Inserted);
+    }
+
+    [Fact(DisplayName = "インスタンスへのメモは、インスタンスの id と滞在のユーザー・開始時刻で合わせて付け替える")]
+    public void LocationNotesAreRemapped()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        Exec(local, NoteLocation(-5_000, "usr_a", 1, 50, "ln-a") + NoteLocation(-9_000_000, "usr_b", 305_000, 60, "ln-b"));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(new[] { "-5000|usr_a|1|ln-a", "-9000000|usr_b|305000|ln-b" }, Rows(host,
+            "SELECT n.locationMasterId, u.apiId, l.startAt, n.note FROM LocationNote n JOIN Location l ON l.id = n.locationId JOIN User u ON u.id = l.userId ORDER BY n.createdAt"));
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "LocationNote").Inserted);
+        Assert.Equal(0, Merge(host, local, baseline).Tables.Where(t => t.Table == "LocationNote").Sum(t => t.Inserted + t.Updated + t.Deleted));
+    }
+
+    [Fact(DisplayName = "滞在・動画・写真・メモは、同じ手元を 2 回合わせても結果が変わらない")]
+    public void Phase7TablesAreIdempotent()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        Exec(local, InsertVideo(307_000, "https://v/1", "usr_b", 305_000) + InsertVideo(342_000, "https://v/2", "usr_c", 340_500) +
+                    InsertVideo(355_000, "https://v/3", "usr_b", 350_000) +
+                    InsertPhoto(342_500, "t-342500.webp", "usr_c", 340_500) + NoteLocation(-9_000_000, "usr_b", 305_000, 60, "ln-b"));
+
+        Merge(host, local, baseline);
+        var first = (LocationMasters(host), Locations(host), Videos(host), Photos(host), Scalar(host, "SELECT count(*) FROM LocationNote"));
+        var again = Merge(host, local, baseline);
+
+        Assert.Equal(first, (LocationMasters(host), Locations(host), Videos(host), Photos(host), Scalar(host, "SELECT count(*) FROM LocationNote")));
+        Assert.Equal(0, again.Tables.Where(t => t.Table is "LocationMaster" or "Location" or "Video" or "Photo" or "LocationNote").Sum(t => t.Inserted + t.Updated + t.Deleted));
+    }
+
+    [Fact(DisplayName = "滞在の滞在中に伸びる endAt と seconds は、同期先の同じ行を大きい方の値にする")]
+    public void LocationGrowingColumnsAreExtended()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "UPDATE Location SET endAt = 9, seconds = 7 WHERE startAt = 2");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("usr_a@-5000@1-2,usr_a@-5000@2-9", Locations(host));
+        Assert.Equal(2, Assert.Single(report.Tables, t => t.Table == "Location").Updated);
     }
 }

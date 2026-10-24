@@ -98,10 +98,23 @@ public enum MergeTableKind
 /// 足せば、曖昧な突き合わせ無しで重複を避けられる。詳細は <see cref="Merge.RuntimeGate"/>。
 /// </param>
 /// <param name="UnionWithoutAncestor">
-/// <see cref="MergeTableKind.AppendOnly"/> で、前回の同期時点の要約にこのテーブルの祖先が無くても
-/// (規則に加える前の版のツールが要約を取った場合)、中止せずに全行を突き合わせて和集合を取る。
-/// 祖先が無いと手元で消した行を見分けられないので、アプリが行を消す操作を持たないテーブル
-/// (Friend Connect の稼働区間) だけに使う。
+/// 前回の同期時点の要約にこのテーブルの祖先が無くても (規則に加える前の版のツールが要約を
+/// 取った場合)、中止せずに合わせる。<see cref="MergeTableKind.AppendOnly"/> では全行を突き合わせて
+/// 和集合を取る。祖先が無いと手元で消した行を見分けられないので、アプリが行を消す操作を持たない
+/// テーブル (Friend Connect の稼働区間や履歴) だけに使う。<see cref="MergeTableKind.Keyed"/> では
+/// 祖先の無い 2-way になり、手元の削除は伝わらず、両方にあって内容が違うキーは同期先の内容を残す。
+/// 手元にしか無いキーを足せれば十分なテーブル (Friend Connect の写真の一覧) に使う。
+/// </param>
+/// <param name="UnionByKey">
+/// <see cref="MergeTableKind.AppendOnly"/> で、前回の同期の後に増えた行を rowid の範囲で絞らず、
+/// 手元の全行をキーで突き合わせて同期先に無い行を足す。id をアプリが決めていて新しい行の id が
+/// 小さいこともあるテーブル (Friend Connect の LocationMaster) では、rowid の最大値で増えた行を
+/// 取れないため。キーに rowid の別名の列 (id) が含まれていれば、その値も変えずに写す。
+/// </param>
+/// <param name="IdentityColumns">
+/// <see cref="MergeTableKind.AppendOnly"/> で、キーが同じ行なら両方の PC で同じ値を持つはずの列。
+/// キーの一致する行でこの列が違えば、キーが別の実体を指していて (アプリが決める id が PC ごとに
+/// 違う値になるなど) 突き合わせの前提が崩れているので、マージを中止する。
 /// </param>
 public sealed record MergeTableRule(
     string NamePattern,
@@ -120,7 +133,9 @@ public sealed record MergeTableRule(
     bool ClearOnDelete = false,
     IReadOnlyList<string>? ClearedColumns = null,
     RuntimeGate? RuntimeGate = null,
-    bool UnionWithoutAncestor = false)
+    bool UnionWithoutAncestor = false,
+    bool UnionByKey = false,
+    IReadOnlyList<string>? IdentityColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
@@ -138,8 +153,46 @@ public sealed record MergeTableRule(
 /// <param name="Table">参照先のテーブル。</param>
 /// <param name="KeyColumns">参照先の行を見分ける列。複数なら組で見分ける。</param>
 /// <param name="IdColumn">参照先の、<see cref="Column"/> の値が指す列。</param>
+/// <param name="KeyReferences">
+/// <see cref="KeyColumns"/> のうち、それ自体がさらに別のテーブルの行を id で指す列の対応。
+/// Friend Connect の滞在 (Location) はユーザーの id と開始時刻で見分けるが、ユーザーの id も
+/// PC ごとに違うので、その列は VRChat のユーザー ID に置き換えて比べる。
+/// </param>
+/// <param name="NullIfMissing">
+/// 手元の行を同期先へ写すとき、指す先の行が同期先に無ければ、その行を写さずにこの列を NULL に
+/// する。NULL を許す列で、対応が無くても行自体に意味があるもの (写真と滞在の対応) に使う。
+/// 指す先の行が相手の PC の稼働中の記録 (<see cref="MergeTableRule.RuntimeGate"/> で足さない行)
+/// だと、写すとその行を足すことになるため。
+/// </param>
+/// <param name="Fallback">
+/// 自然キーの一致する行が同期先に無いとき、代わりに指す行の探し方。<see cref="KeyColumns"/> から
+/// <see cref="IntervalMatch.StartColumn"/> を除いた列が一致し、このテーブルの行の時刻
+/// (<see cref="IntervalMatch.TimeColumn"/>) を区間に含む行を指す。相手の PC の稼働中に手元が記録した
+/// 滞在は足さないので、その間の動画や写真は、相手が記録した同じユーザーの滞在 (開始時刻が
+/// ポーリングの分だけ違う) に結び付ける。複数あれば開始時刻の最も遅い行。
+/// </param>
 public sealed record ColumnReference(
-    string Column, string Table, IReadOnlyList<string> KeyColumns, string IdColumn = "id");
+    string Column, string Table, IReadOnlyList<string> KeyColumns, string IdColumn = "id",
+    IReadOnlyList<ColumnReference>? KeyReferences = null, bool NullIfMissing = false, IntervalMatch? Fallback = null)
+{
+    /// <summary><paramref name="column"/> (参照先の列) が指す別のテーブルの行の対応。無ければ null。</summary>
+    public ColumnReference? KeyReferenceOf(string column)
+        => KeyReferences?.FirstOrDefault(r => string.Equals(r.Column, column, StringComparison.Ordinal));
+
+    /// <summary>
+    /// 参照先の行を id そのもので見分けるか。id が PC 間で同じ値を取る (アプリが入力から決める)
+    /// テーブルへの参照で、その行を同期先へ写すときは id も変えずに写す。
+    /// </summary>
+    public bool KeepsId => KeyColumns.Count == 1 && string.Equals(KeyColumns[0], IdColumn, StringComparison.Ordinal);
+}
+
+/// <summary>
+/// 自然キーの一致する行が無いときに、時刻を区間に含む行を代わりに指す対応 (<see cref="ColumnReference.Fallback"/>)。
+/// </summary>
+/// <param name="TimeColumn">参照する側のテーブルの、出来事の時刻の列。</param>
+/// <param name="StartColumn">参照先の、区間の開始時刻の列。自然キーに含まれる列で、一致を求めない。</param>
+/// <param name="EndColumn">参照先の、区間の終了時刻の列。</param>
+public sealed record IntervalMatch(string TimeColumn, string StartColumn, string EndColumn);
 
 /// <summary>
 /// 追加専用の履歴で、相手の PC のアプリが動いていた期間に手元が記録した行を足さないための対応。
@@ -189,9 +242,15 @@ public sealed class MergeProfile
     private string ComputeRulesDigest()
     {
         static string Columns(IReadOnlyList<string>? columns) => columns is null ? "-" : string.Join(",", columns);
+        // 参照の後から足した項目 (入れ子の参照、無ければ NULL、区間での代替) も、付いている参照だけに書く。
+        static string Reference(ColumnReference r)
+            => $"{r.Column}>{r.Table}.{r.IdColumn}({Columns(r.KeyColumns)})"
+               + (r.KeyReferences is { Count: > 0 } nested ? $"[{string.Join(",", nested.Select(Reference))}]" : string.Empty)
+               + (r.NullIfMissing ? "?" : string.Empty)
+               + (r.Fallback is { } f ? $"~{f.TimeColumn}:{f.StartColumn}-{f.EndColumn}" : string.Empty);
         static string References(IReadOnlyList<ColumnReference>? references) => references is null
             ? "-"
-            : string.Join(",", references.Select(r => $"{r.Column}>{r.Table}.{r.IdColumn}({Columns(r.KeyColumns)})"));
+            : string.Join(",", references.Select(Reference));
         // 後から足した印は、付いている規則だけに書く。既定値でも書くと、その印を使わない
         // プロファイル (VRCX) のダイジェストまで版が変わり、更新後の最初のマージで、前回の
         // 要約の後に両方の PC で作られた同名のテーブルを「以前は対象外だった」と見誤る。
@@ -201,7 +260,9 @@ public sealed class MergeProfile
             Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
             References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))
             + (r.RuntimeGate is { } g ? $"|g{g.TimeColumn}{(g.TimeEndColumn is null ? "" : "~" + g.TimeEndColumn)}@{g.Table}.{g.StartColumn}-{g.EndColumn}" : string.Empty)
-            + (r.UnionWithoutAncestor ? "|a" : string.Empty)));
+            + (r.UnionWithoutAncestor ? "|a" : string.Empty)
+            + (r.UnionByKey ? "|k" : string.Empty)
+            + (r.IdentityColumns is { Count: > 0 } ? $"|i{Columns(r.IdentityColumns)}" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 

@@ -15,9 +15,10 @@ namespace VRCToolsDataSync.Core.UseCase;
 /// 祖先の決め方 (送った写しの記録と強制 Push の版の照合) は、どちらのツールでも同じ。
 /// </para>
 /// <para>
-/// DB 以外のファイル (VRCX.json、Friend Connect の config.json やサムネイル) には触れない。
-/// 続く Push で手元のものが送られる。行単位で合わせられないので、マージを始めた PC の
-/// ものを残す。
+/// DB 以外のファイル (VRCX.json、Friend Connect の config.json) には触れない。続く Push で
+/// 手元のものが送られる。行単位で合わせられないので、マージを始めた PC のものを残す。
+/// DB と対応するフォルダ (Friend Connect のサムネイル) だけは、ツールが <see cref="UnionFiles"/> を
+/// 渡せば、同期先にしか無いファイルを手元へ取り出して和集合にする。
 /// </para>
 /// </summary>
 internal sealed class DatabaseMergeFlow
@@ -46,6 +47,21 @@ internal sealed class DatabaseMergeFlow
     public required Func<string?> CreateBackup { get; init; }
 
     public required ILogger Logger { get; init; }
+
+    /// <summary>
+    /// 同期先の項目のうち、<see cref="UnionFiles"/> で和集合にするフォルダのファイル (manifest の
+    /// 相対パス) を選ぶ。土台の要約の <see cref="DatabaseSummary.Files"/> に残し、次のマージで
+    /// 「前回の同期の後に同期先で増えたファイル」を見分けるのに使う。
+    /// </summary>
+    public Func<ToolManifestEntry, List<string>>? ListUnionFiles { get; init; }
+
+    /// <summary>
+    /// マージが成り立った後、ローカルを置き換える前に、同期先にあって手元に無いファイルを手元へ
+    /// 取り出す。引数は同期先、同期先の項目、祖先の要約 (無ければ null)、dry-run か。
+    /// 戻り値は結果に添える文 (何も無ければ null) と、中止の理由 (続けてよければ null)。
+    /// 置き換える前に行うので、取り出せなければ DB に触れずに中止できる。
+    /// </summary>
+    public Func<ISyncStorage, ToolManifestEntry, DatabaseSummary?, bool, (string? Note, string? Problem)>? UnionFiles { get; init; }
 
     public SyncResult Run(PullMergeOptions options)
     {
@@ -119,7 +135,11 @@ internal sealed class DatabaseMergeFlow
             // (3) 写しどうしでマージする。手元の DB にはまだ触れない。
             //     マージ後の祖先にするため、土台の要約をマージの前に取っておく。
             var hostBaseline = DatabaseSummary.Compute(hostPath, Profile, out var hostReason);
-            if (hostBaseline is not null) hostBaseline.RemoteVersion = entry.Version;
+            if (hostBaseline is not null)
+            {
+                hostBaseline.RemoteVersion = entry.Version;
+                if (ListUnionFiles is not null) hostBaseline.Files = ListUnionFiles(entry);
+            }
             else if (!options.DryRun)
             {
                 // 要約が無いと、置き換えた後のローカルに祖先が無くなり、次の同期で手元の
@@ -138,9 +158,20 @@ internal sealed class DatabaseMergeFlow
                 if (string.Equals(remoteSnapshot.Sha256, ownPush.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     // 同期先は自分が送った写しそのもの。手元との違いはすべて送った後の手元の変更
-                    // なので、同期先を祖先にする。
+                    // なので、同期先を祖先にする。フォルダの一覧だけは送ったときのものにする。同期先の
+                    // 今の一覧には、送った後に別の PC が DB を変えずに足したファイルも入っていて、それを
+                    // 祖先にあったものと見ると取り出さず、続く Push で一覧から落としてしまう。
                     Logger.LogInformation("同期先の DB は自分が送ったものなので、それを祖先にします");
-                    baseline = hostBaseline;
+                    baseline = hostBaseline is null ? null : new DatabaseSummary
+                    {
+                        Format = hostBaseline.Format,
+                        SchemaVersion = hostBaseline.SchemaVersion,
+                        RulesDigest = hostBaseline.RulesDigest,
+                        CreatedAt = hostBaseline.CreatedAt,
+                        RemoteVersion = hostBaseline.RemoteVersion,
+                        Tables = hostBaseline.Tables,
+                        Files = ownPush.Summary?.Files,
+                    };
                 }
                 else if (ownPush is { Committed: true, Version: long pushedVersion, Summary: not null }
                          && entry.Version > pushedVersion
@@ -261,13 +292,32 @@ internal sealed class DatabaseMergeFlow
                     MergeReport = report,
                 };
             }
+            // DB と対応するフォルダは、同期先にしか無いファイルを手元へ足して和集合にする。手元で消した
+            // ファイル (祖先の一覧にあるもの) は戻さない。続く Push が手元の一覧を送るので、同期先にも
+            // 和集合が残る。取り出せなければ、DB に触れる前にやめる。
+            var filesNote = string.Empty;
+            if (UnionFiles is not null)
+            {
+                var (note, problem) = UnionFiles(storage, entry, baseline, options.DryRun);
+                if (problem is not null)
+                {
+                    return new SyncResult
+                    {
+                        Outcome = SyncOutcome.Aborted,
+                        RemoteVersion = entry.Version,
+                        Message = $"マージは成り立ちましたが、同期先のファイルを取り出せないため中止しました: {problem}",
+                        MergeReport = report,
+                    };
+                }
+                if (note is not null) filesNote = "。" + note;
+            }
             if (options.DryRun)
             {
                 return new SyncResult
                 {
                     Outcome = SyncOutcome.Success,
                     RemoteVersion = entry.Version,
-                    Message = "(dry-run) " + report.Describe(),
+                    Message = "(dry-run) " + report.Describe() + filesNote,
                     MergeReport = report,
                 };
             }
@@ -309,7 +359,7 @@ internal sealed class DatabaseMergeFlow
                 Outcome = SyncOutcome.Success,
                 RemoteVersion = entry.Version,
                 BackupPath = backupPath,
-                Message = report.Describe(),
+                Message = report.Describe() + filesNote,
                 MergeReport = report,
                 AffectedFiles = new[] { SnapshotKey },
             };

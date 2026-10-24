@@ -187,4 +187,118 @@ public sealed class FriendConnectMergeSyncTests : IDisposable
         Assert.Equal("usr_a:memo-a,usr_b:memo-b", Notes(b.Paths.DbV11File));
         _ = a;
     }
+
+    private static void WriteThumbnail(Machine machine, string name)
+    {
+        Directory.CreateDirectory(machine.Paths.ThumbnailsDirectory);
+        File.WriteAllText(Path.Combine(machine.Paths.ThumbnailsDirectory, name), "webp:" + name);
+    }
+
+    private static string Thumbnails(Machine machine)
+        => Directory.Exists(machine.Paths.ThumbnailsDirectory)
+            ? string.Join(",", Directory.GetFiles(machine.Paths.ThumbnailsDirectory).Select(Path.GetFileName).Order(StringComparer.Ordinal))
+            : string.Empty;
+
+    [Fact(DisplayName = "マージではサムネイルを和集合にし、前回の同期の後に同期先で増えたものだけを取り出し、手元で消したものは戻さない")]
+    public void MergeUnionsThumbnails()
+    {
+        var a = CreateMachine("a");
+        FriendConnectSchema.Create(a.Paths.DbV11File);
+        Exec(a.Paths.DbV11File, InsertUser("usr_a", "A", "memo-a") + InsertUser("usr_b", "B"));
+        WriteThumbnail(a, "a1.webp");
+        WriteThumbnail(a, "a2.webp");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, Pull(b).Outcome);
+        Assert.Equal("a1.webp,a2.webp", Thumbnails(b));
+        // A は写真を 1 枚増やして Push した。B はその間に 1 枚消し、1 枚増やし、メモを書いた。
+        WriteThumbnail(a, "a3.webp");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        b.Settings.MergeFriendConnect = true;
+        File.Delete(Path.Combine(b.Paths.ThumbnailsDirectory, "a2.webp"));
+        WriteThumbnail(b, "b1.webp");
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+
+        var result = Push(b);
+
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Contains("サムネイル 1 件を取り出しました", result.Message);
+        // 同期先で増えた a3 は取り出し、前回の同期時点にあって手元で消した a2 は戻さない。
+        Assert.Equal("a1.webp,a3.webp,b1.webp", Thumbnails(b));
+        Assert.Equal("webp:a3.webp", File.ReadAllText(Path.Combine(b.Paths.ThumbnailsDirectory, "a3.webp")));
+        // 続く Push で和集合が同期先に渡り、A の Pull で a2 が消え b1 が届く。
+        Assert.Equal(SyncOutcome.Success, Pull(a, startup: true).Outcome);
+        Assert.Equal("a1.webp,a3.webp,b1.webp", Thumbnails(a));
+        Assert.Equal("usr_a:memo-a,usr_b:memo-b", Notes(a.Paths.DbV11File));
+    }
+
+    [Fact(DisplayName = "マージの祖先にサムネイルの一覧が無ければ、同期先にあって手元に無いものをすべて取り出す")]
+    public void MergeWithoutFileListFetchesAllMissingThumbnails()
+    {
+        var a = CreateMachine("a");
+        FriendConnectSchema.Create(a.Paths.DbV11File);
+        Exec(a.Paths.DbV11File, InsertUser("usr_a", "A", "memo-a") + InsertUser("usr_b", "B"));
+        WriteThumbnail(a, "a1.webp");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, Pull(b).Outcome);
+        Exec(a.Paths.DbV11File, "UPDATE User SET note = 'memo-a2' WHERE apiId = 'usr_a'");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        // 古い版のツールが取った要約のように、サムネイルの一覧を持たない要約にする。
+        var store = VRCToolsDataSync.Core.Merge.BaseSummaryStore.NextTo(Path.Combine(_root, "b", "settings.json"));
+        var stateKey = SyncRunner.ToolStateKey(_storage, FriendConnectSyncService.Key);
+        var summary = store.Load(stateKey)!;
+        Assert.Equal(new[] { "friend-connect/thumbnails/a1.webp" }, summary.Files);
+        summary.Files = null;
+        store.Save(stateKey, summary);
+        b.Settings.MergeFriendConnect = true;
+        File.Delete(Path.Combine(b.Paths.ThumbnailsDirectory, "a1.webp"));
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+
+        var result = Push(b);
+
+        // 手元で消したかどうかを見分けられないので、同期先にあって手元に無い a1 を取り出す。
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal("a1.webp", Thumbnails(b));
+        Assert.Contains("サムネイル 1 件を取り出しました", result.Message);
+    }
+
+    [Fact(DisplayName = "Push の後に要約を保存できず送った写しの記録で祖先を決めるときも、サムネイルの祖先は送った時点の一覧にする")]
+    public void MergeAfterLostSummaryUsesPushedFileList()
+    {
+        var a = CreateMachine("a");
+        FriendConnectSchema.Create(a.Paths.DbV11File);
+        Exec(a.Paths.DbV11File, InsertUser("usr_a", "A", "memo-a") + InsertUser("usr_b", "B"));
+        WriteThumbnail(a, "a1.webp");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        var b = CreateMachine("b");
+        Assert.Equal(SyncOutcome.Success, Pull(b).Outcome);
+        // B がサムネイルを足して Push した後、要約を保存する前に止まった (送った写しの記録だけが残る)。
+        WriteThumbnail(b, "b1.webp");
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b' WHERE apiId = 'usr_b'");
+        Assert.Equal(SyncOutcome.Success, Push(b).Outcome);
+        var store = VRCToolsDataSync.Core.Merge.BaseSummaryStore.NextTo(Path.Combine(_root, "b", "settings.json"));
+        var stateKey = SyncRunner.ToolStateKey(_storage, FriendConnectSyncService.Key);
+        var saved = store.Load(stateKey)!;
+        Assert.Equal(new[] { "friend-connect/thumbnails/a1.webp", "friend-connect/thumbnails/b1.webp" }, saved.Files!.Order(StringComparer.Ordinal));
+        var sentSha256 = _storage.LoadManifest().Manifest.Tools[FriendConnectSyncService.Key].Files
+            .Single(f => f.RelativePath == "friend-connect/db/db_1.1.sqlite").Sha256;
+        store.Delete(stateKey);
+        store.SavePushed(stateKey, new VRCToolsDataSync.Core.Merge.PushedRecord(sentSha256, saved, saved.RemoteVersion, Committed: true, PlannedVersion: saved.RemoteVersion));
+        b.Settings.ToolState[stateKey].LastPulledVersion = 1;
+        // A は DB を変えずにサムネイルだけを足して Push した。
+        Assert.Equal(SyncOutcome.Success, Pull(a).Outcome);
+        WriteThumbnail(a, "a2.webp");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        b.Settings.MergeFriendConnect = true;
+        Exec(b.Paths.DbV11File, "UPDATE User SET note = 'memo-b2' WHERE apiId = 'usr_b'");
+
+        var result = Push(b);
+
+        // 同期先の DB は B が送ったものだが、a2 は送った後に A が足したものなので取り出す。
+        Assert.Equal(SyncOutcome.Success, result.Outcome);
+        Assert.Equal("a1.webp,a2.webp,b1.webp", Thumbnails(b));
+        Assert.Equal(SyncOutcome.Success, Pull(a, startup: true).Outcome);
+        Assert.Equal("a1.webp,a2.webp,b1.webp", Thumbnails(a));
+    }
 }

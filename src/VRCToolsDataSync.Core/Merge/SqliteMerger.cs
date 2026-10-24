@@ -413,13 +413,12 @@ public static class SqliteMerger
             report.AbortReason = $"テーブル {table} の列が同期先と手元で違います";
             return null;
         }
-        if (!created && baseline is null && ancestorRulesChanged
-            && !(rule.Kind == MergeTableKind.AppendOnly && rule.UnionWithoutAncestor))
+        if (!created && baseline is null && ancestorRulesChanged && !rule.UnionWithoutAncestor)
         {
             // 前回の要約を取った版のツールは、このテーブルを規則に持っていなかった。祖先が無いまま
             // 合わせると、手元で消した行を同期先から戻す。内容が同じなら合わせるものが無い。
-            // アプリが行を消さない追加専用のテーブル (UnionWithoutAncestor) は、戻す削除が
-            // 無いので祖先なしで和集合を取る。
+            // アプリが行を消さない追加専用のテーブルや、手元にしか無いキーを足せれば足りるキー付きの
+            // テーブル (UnionWithoutAncestor) は、祖先なしで合わせる (キー付きでは手元の削除は伝わらない)。
             var local = DatabaseSummary.SummarizeTable(connection, Local, table, rule, localColumns);
             var host = DatabaseSummary.SummarizeTable(connection, "main", table, rule, hostColumns);
             if (!local.HasSameContent(host))
@@ -491,9 +490,13 @@ public static class SqliteMerger
         var target = $"main.{Quote(table)}";
         var source = $"{Local}.{Quote(table)}";
         var rowIdAlias = FindRowIdAlias(connection, table);
-        var insertColumns = string.Join(", ", columns.Where(c => c != rowIdAlias).Select(Quote));
-        var sinceRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
-        if (sinceRowId > 0 && WasDeletedLocally(connection, table, rule, baseline!))
+        // キーに rowid の別名 (id) を含み全行をキーで突き合わせるテーブルは、id をアプリが決めていて
+        // PC 間で同じ値を取るので、id も変えずに写す。他では SQLite に振らせる。
+        var keepRowId = rule.UnionByKey && rowIdAlias is not null && rule.KeyColumns.Contains(rowIdAlias, StringComparer.Ordinal);
+        var copiedColumns = keepRowId ? columns : columns.Where(c => c != rowIdAlias).ToList();
+        var insertColumns = string.Join(", ", copiedColumns.Select(Quote));
+        var ancestorMaxRowId = baseline is { Kind: MergeTableKind.AppendOnly } ? baseline.MaxRowId : 0;
+        if (ancestorMaxRowId > 0 && WasDeletedLocally(connection, table, rule, baseline!))
         {
             // VRCX は履歴の行を消す操作を持つ。和集合を取ると、手元で消した行が同期先から
             // 戻ってしまう。どの行を消したかは要約から分からないので、マージを中止する。
@@ -501,7 +504,7 @@ public static class SqliteMerger
             report.AbortReason = $"手元でテーブル {table} の行が消されています。消した行を同期先から戻さないよう、自動マージを中止しました";
             return null;
         }
-        if (sinceRowId > 0 && WasRewrittenLocallyAndDeletedByHost(connection, table, rule, baseline!))
+        if (ancestorMaxRowId > 0 && WasRewrittenLocallyAndDeletedByHost(connection, table, rule, baseline!))
         {
             // 同期先で消した行は、前回の同期より前の行なので足し直さない。その行の滞在時間
             // などを手元で書き込んでいたら、黙って失われる。どの行を書き換えたかは要約から
@@ -511,10 +514,24 @@ public static class SqliteMerger
             return null;
         }
         var hostMaxRowId = ScalarLong(connection, $"SELECT coalesce(max(rowid), 0) FROM {target}");
+        // 新しい行の id が小さい (負のこともある) テーブル (UnionByKey) は、rowid の範囲では前回の同期の
+        // 後に増えた行を取れないので、全行を突き合わせる。
+        var sinceRowId = rule.UnionByKey ? 0 : ancestorMaxRowId;
+        var sinceCondition = rule.UnionByKey ? "IS NOT NULL" : $"> {sinceRowId.ToString(CultureInfo.InvariantCulture)}";
 
         // 同期先にある行は足さない。突き合わせは、手元の写しの索引を使って同期先を順に読む
         // (CollectMatchedRowIds)。
-        var matched = CollectMatchedRowIds(connection, table, rule, $"> {sinceRowId.ToString(CultureInfo.InvariantCulture)}");
+        var matched = CollectMatchedRowIds(connection, table, rule, sinceCondition);
+        if (rule.IdentityColumns is { Count: > 0 }
+            && FindMatchedRowWithDifferentIdentity(connection, table, rule, matched) is { } differentIdentity)
+        {
+            // キーが同じなのに内容が違う。アプリが決める id が PC ごとに別の実体に付いているなど、
+            // 突き合わせの前提が崩れている。足すと手元の履歴が同期先の別の実体に結び付く。
+            Execute(connection, $"DROP TABLE {matched}");
+            report.AbortReason = $"テーブル {table} で、キー {differentIdentity} の行の内容 ({string.Join(", ", rule.IdentityColumns)}) が同期先と手元で違います。" +
+                                 "同じキーが別の実体を指しているため、自動マージを中止しました";
+            return null;
+        }
         // 移った祖先の行は、前回の最大 rowid が 0 (足した行が同期先の全行より古かった) でもある。
         if (baseline?.TailRows is { Count: > 0 } tail
             && ExcludeRenumberedAncestorRows(connection, table, rule, tail, sinceRowId, matched) is { } tailProblem)
@@ -524,7 +541,7 @@ public static class SqliteMerger
             return null;
         }
         // 足す候補: 前回の同期の後に増えた手元の行のうち、同期先に同じキーの行が無いもの。
-        var candidates = $"l.rowid > {sinceRowId.ToString(CultureInfo.InvariantCulture)} AND l.rowid NOT IN (SELECT rid FROM {matched})";
+        var candidates = $"l.rowid {sinceCondition} AND l.rowid NOT IN (SELECT rid FROM {matched})";
         long skipped = 0;
         if (rule.RuntimeGate is { } gate)
         {
@@ -540,7 +557,7 @@ public static class SqliteMerger
         {
             command.CommandText =
                 $"INSERT INTO {target} ({insertColumns}) " +
-                $"SELECT {string.Join(", ", columns.Where(c => c != rowIdAlias).Select(c => CopyExpression(rule, c, "l")))} " +
+                $"SELECT {string.Join(", ", copiedColumns.Select(c => CopyExpression(rule, c, "l")))} " +
                 $"FROM {source} AS l WHERE {candidates} ORDER BY l.rowid";
             inserted = command.ExecuteNonQuery();
         }
@@ -614,6 +631,25 @@ public static class SqliteMerger
             copiedReferences.Count > 0 ? copiedReferences : null, skipped);
     }
 
+    /// <summary>
+    /// 同期先に同じキーの行がある手元の行 (<paramref name="matched"/>) のうち、
+    /// <see cref="MergeTableRule.IdentityColumns"/> の値が同期先の行と違うものを探し、そのキーを返す。
+    /// 無ければ null。
+    /// </summary>
+    private static string? FindMatchedRowWithDifferentIdentity(
+        SqliteConnection connection, string table, MergeTableRule rule, string matched)
+    {
+        var (maps, match) = KeyJoin(connection, rule, "h", "l");
+        var crossMaps = string.Concat(maps.Select(m => $" CROSS JOIN {m.Table} AS {m.Alias}"));
+        var differs = string.Join(" OR ", rule.IdentityColumns!.Select(c => $"h.{Quote(c)} IS NOT l.{Quote(c)}"));
+        var key = string.Join(" || '|' || ", KeyExpressions(rule, Local, "l").Select(e => $"coalesce({e}, '')"));
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            $"SELECT {key} FROM main.{Quote(table)} AS h{crossMaps} CROSS JOIN {Local}.{Quote(table)} AS l " +
+            $"WHERE {match} AND l.rowid IN (SELECT rid FROM {matched}) AND ({differs}) LIMIT 1";
+        return command.ExecuteScalar() is { } value and not DBNull ? Convert.ToString(value, CultureInfo.InvariantCulture) : null;
+    }
+
     /// <summary>稼働区間による絞り込みの、同期先の区間を写した一時テーブルの名前。</summary>
     private static string RuntimeGateTable(RuntimeGate gate) => $"temp.{Quote("vrctds_gate_" + gate.Table)}";
 
@@ -681,7 +717,10 @@ public static class SqliteMerger
             var work = ReferenceMapTable(reference);
             var name = Quote("vrctds_map_" + reference.Table);
             var type = DeclaredType(connection, "main", reference.Table, reference.IdColumn);
-            var match = string.Join(" AND ", reference.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
+            // 参照先のキーの列がさらに別の行を指していれば (滞在のユーザー)、その先の自然キーで比べる。
+            var hostKeys = ReferencedKeyColumnExpressions(reference, "main", "h");
+            var localKeys = ReferencedKeyColumnExpressions(reference, Local, "l");
+            var match = string.Join(" AND ", hostKeys.Zip(localKeys, (h, l) => $"{h} IS {l}"));
             Execute(connection, $"DROP TABLE IF EXISTS {work}");
             Execute(connection, $"CREATE TEMP TABLE {name} (local_id {type} NOT NULL, host_id {type} NOT NULL, PRIMARY KEY (local_id, host_id)) WITHOUT ROWID");
             Execute(connection,
@@ -734,30 +773,124 @@ public static class SqliteMerger
 
     /// <summary>
     /// 手元の行のうち <paramref name="candidates"/> (別名 l) を満たすものが id で指す先が同期先に
-    /// 無ければ、その行を手元から写す。写す行の列は参照先の規則 (あれば) に従って付け替えや消去を
-    /// する。参照先のテーブル名から写した行数へ。
+    /// 無ければ、その行を手元から写す。参照先のテーブル名から写した行数へ。
     /// </summary>
     private static Dictionary<string, long> CopyReferencedRowsOf(
         SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile, string candidates)
     {
         var copied = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
-        {
-            var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
-            var columns = ListColumns(connection, Local, reference.Table);
-            var rowIdAlias = FindRowIdAlias(connection, reference.Table);
-            var targets = columns.Where(c => c != rowIdAlias).ToList();
-            var exists = string.Join(" AND ", reference.KeyColumns.Select(k => $"r.{Quote(k)} IS x.{Quote(k)}"));
-            var count = Execute(connection,
-                $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
-                $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "x")))} " +
-                $"FROM {Local}.{Quote(reference.Table)} AS x " +
-                $"WHERE x.{Quote(reference.IdColumn)} IN (SELECT l.{Quote(reference.Column)} FROM {Local}.{Quote(table)} AS l WHERE {candidates}) " +
-                $"AND NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {exists}) ORDER BY x.rowid");
-            if (count > 0) copied[reference.Table] = count;
-        }
+        CopyReferencedRows(connection, table, rule, profile, _ => candidates, copied);
         return copied;
     }
+
+    /// <summary>
+    /// 手元の行のうち <paramref name="localCondition"/> (別名 l、引数は command に足す) を満たすものが
+    /// id で指す先が同期先に無ければ、その行を手元から写す。写す行の列は参照先の規則 (あれば) に従って
+    /// 付け替えや消去をする。写す行がさらに別の行を指していれば (滞在のユーザーやインスタンス)、その先も
+    /// 同じ要領で先に写す。指す先を id そのもので見分ける参照 (<see cref="ColumnReference.KeepsId"/>)
+    /// では id も写す。無ければ NULL にする参照 (<see cref="ColumnReference.NullIfMissing"/>) では写さない。
+    /// 区間での代替 (<see cref="ColumnReference.Fallback"/>) がある参照では、代わりに指せる行も無いときだけ写す。
+    /// 写した行数は参照先のテーブル名ごとに <paramref name="copied"/> へ足す。
+    /// </summary>
+    private static void CopyReferencedRows(
+        SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
+        Func<SqliteCommand, string> localCondition, Dictionary<string, long> copied, HashSet<string>? copying = null)
+    {
+        // 参照が巡回していても (規則にはないが) 同じテーブルを写している最中に再び写しに来ないようにする。
+        copying ??= new HashSet<string>(StringComparer.Ordinal);
+        if (!copying.Add(table)) return;
+        try
+        {
+            foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
+            {
+                if (reference.NullIfMissing) continue;
+                var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
+                var columns = ListColumns(connection, Local, reference.Table);
+                var rowIdAlias = FindRowIdAlias(connection, reference.Table);
+                var targets = reference.KeepsId ? columns : columns.Where(c => c != rowIdAlias).ToList();
+                var localId = $"l.{Quote(reference.Column)}";
+                // 候補の行の指す先が同期先に無い条件。手元の指す先の行は l の id から引く (x は参照先の行)
+                // ので、候補を選ぶ副問い合わせは外側の行に依らず 1 回で済む。
+                var missing = $"NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {ReferencedRowMatch(reference, "r", localId)})";
+                if (reference.Fallback is { } fallback)
+                {
+                    missing += $" AND NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {FallbackMatch(reference, fallback, "r", localId, "l")})";
+                }
+                // 写す行の手元での id を先に集める。写す前に、その行が指す先 (滞在ならユーザーやインスタンス)
+                // を同じ要領で写すため。
+                var ids = Quote("vrctds_copy_" + reference.Table);
+                Execute(connection, $"DROP TABLE IF EXISTS temp.{ids}");
+                Execute(connection, $"CREATE TEMP TABLE {ids} (id PRIMARY KEY) WITHOUT ROWID");
+                long pending;
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText =
+                        $"INSERT OR IGNORE INTO temp.{ids} (id) SELECT {localId} FROM {Local}.{Quote(table)} AS l " +
+                        $"WHERE ({localCondition(command)}) AND {localId} IS NOT NULL AND {missing}";
+                    pending = command.ExecuteNonQuery();
+                }
+                try
+                {
+                    if (pending == 0) continue;
+                    if (referencedRule?.References is { Count: > 0 })
+                    {
+                        CopyReferencedRows(connection, reference.Table, referencedRule, profile,
+                            _ => $"l.{Quote(reference.IdColumn)} IN (SELECT id FROM temp.{ids})", copied, copying);
+                    }
+                    var count = Execute(connection,
+                        $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
+                        $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "x")))} " +
+                        $"FROM {Local}.{Quote(reference.Table)} AS x " +
+                        $"WHERE x.{Quote(reference.IdColumn)} IN (SELECT id FROM temp.{ids}) ORDER BY x.rowid");
+                    if (count > 0) copied[reference.Table] = copied.GetValueOrDefault(reference.Table) + count;
+                }
+                finally
+                {
+                    Execute(connection, $"DROP TABLE IF EXISTS temp.{ids}");
+                }
+            }
+        }
+        finally
+        {
+            copying.Remove(table);
+        }
+    }
+
+    /// <summary>
+    /// 同期先の参照先の行 (<paramref name="hostAlias"/>) が、手元の行の id <paramref name="localId"/>
+    /// の指す手元の参照先の行と同じ自然キーを持つ条件。<paramref name="exceptColumn"/> のキーの列は比べない。
+    /// </summary>
+    private static string ReferencedRowMatch(ColumnReference reference, string hostAlias, string localId, string? exceptColumn = null)
+    {
+        var parts = new List<string>();
+        foreach (var key in reference.KeyColumns)
+        {
+            if (string.Equals(key, exceptColumn, StringComparison.Ordinal)) continue;
+            var host = KeyColumnExpressions(reference, key, "main", hostAlias);
+            var local = KeyColumnExpressions(reference, key, Local, "x")
+                .Select(e => $"(SELECT {e} FROM {Local}.{Quote(reference.Table)} AS x WHERE x.{Quote(reference.IdColumn)} = {localId})");
+            parts.AddRange(host.Zip(local, (h, l) => $"{h} IS {l}"));
+        }
+        return string.Join(" AND ", parts);
+    }
+
+    /// <summary>
+    /// 自然キーの一致する行が無いときの代替 (<see cref="ColumnReference.Fallback"/>) の条件。開始時刻の列を
+    /// 除いたキーが一致し、参照する側の行 (<paramref name="referrerAlias"/>) の時刻を区間に含む。
+    /// </summary>
+    private static string FallbackMatch(
+        ColumnReference reference, IntervalMatch fallback, string hostAlias, string localId, string referrerAlias)
+    {
+        var time = $"{referrerAlias}.{Quote(fallback.TimeColumn)}";
+        return $"{ReferencedRowMatch(reference, hostAlias, localId, fallback.StartColumn)} " +
+               $"AND {hostAlias}.{Quote(fallback.StartColumn)} <= {time} AND {hostAlias}.{Quote(fallback.EndColumn)} >= {time}";
+    }
+
+    /// <summary>参照先のキーの列 <paramref name="key"/> 1 つぶんの、参照先の行 (<paramref name="alias"/>) から読む式。</summary>
+    private static List<string> KeyColumnExpressions(ColumnReference reference, string key, string schema, string alias)
+        => reference.KeyReferenceOf(key) is { } nested
+            ? ReferencedKeyExpressions(nested, schema, alias + "_r", column => $"{alias}.{Quote(column)}")
+            : new List<string> { $"{alias}.{Quote(key)}" };
 
     /// <summary>
     /// 振り直しで <see cref="TableSummary.MaxRowId"/> より後ろへ移った祖先の行
@@ -1347,66 +1480,33 @@ public static class SqliteMerger
 
     /// <summary>
     /// 手元の行を同期先へ写すときの、列 <paramref name="column"/> の値の式。別のテーブルを id で
-    /// 指す列は、手元で指している行の自然キーから同期先での id を引く。参照先に無い id を
-    /// 持つ列 (<see cref="MergeTableRule.ClearedColumns"/>) は NULL にする。
+    /// 指す列は、手元で指している行の自然キーから同期先での id を引く。自然キーの一致する行が無く
+    /// 区間での代替 (<see cref="ColumnReference.Fallback"/>) があれば、その行の id にする。どちらも
+    /// 無ければ NULL になる。参照先に無い id を持つ列 (<see cref="MergeTableRule.ClearedColumns"/>) は NULL にする。
     /// </summary>
     private static string CopyExpression(MergeTableRule? rule, string column, string alias)
     {
         if (rule?.ClearedColumns?.Contains(column, StringComparer.Ordinal) == true) return "NULL";
         if (rule?.ReferenceOf(column) is not { } reference) return $"{alias}.{Quote(column)}";
-        var match = string.Join(" AND ", reference.KeyColumns.Select(k =>
-            $"r.{Quote(k)} IS (SELECT x.{Quote(k)} FROM {Local}.{Quote(reference.Table)} AS x " +
-            $"WHERE x.{Quote(reference.IdColumn)} = {alias}.{Quote(reference.Column)})"));
-        return $"CASE WHEN {alias}.{Quote(column)} IS NULL THEN NULL ELSE " +
-               $"(SELECT r.{Quote(reference.IdColumn)} FROM main.{Quote(reference.Table)} AS r WHERE {match}) END";
+        var localId = $"{alias}.{Quote(reference.Column)}";
+        var id = $"r.{Quote(reference.IdColumn)}";
+        var exact = $"(SELECT {id} FROM main.{Quote(reference.Table)} AS r WHERE {ReferencedRowMatch(reference, "r", localId)})";
+        var lookup = reference.Fallback is { } fallback
+            ? $"coalesce({exact}, (SELECT {id} FROM main.{Quote(reference.Table)} AS r WHERE {FallbackMatch(reference, fallback, "r", localId, alias)} " +
+              $"ORDER BY r.{Quote(fallback.StartColumn)} DESC LIMIT 1))"
+            : exact;
+        return $"CASE WHEN {localId} IS NULL THEN NULL ELSE {lookup} END";
     }
 
     /// <summary>
-    /// 手元のそのキーの行が id で指している先が同期先に無ければ、その行を手元から写す。
-    /// 写す行の列は、参照先のテーブルの規則 (あれば) に従って付け替えや消去をする。
+    /// 手元のそのキーの行が id で指している先が同期先に無ければ、その行を手元から写す
+    /// (<see cref="CopyReferencedRows"/>)。
     /// </summary>
     private static void EnsureReferencedRows(
         SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
         object?[] keyValues, Dictionary<string, long> copiedReferences)
-    {
-        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
-        {
-            // 参照先の id は整数とは限らない (FavoriteLocal.groupKey は文字列)。
-            var localIds = new List<object>();
-            using (var command = connection.CreateCommand())
-            {
-                command.CommandText =
-                    $"SELECT DISTINCT l.{Quote(reference.Column)} FROM {Local}.{Quote(table)} AS l " +
-                    $"WHERE {KeyCondition(command, rule, keyValues, Local, "l")} AND l.{Quote(reference.Column)} IS NOT NULL";
-                using var reader = command.ExecuteReader();
-                while (reader.Read()) localIds.Add(reader.GetValue(0));
-            }
-            var match = string.Join(" AND ", reference.KeyColumns.Select(k =>
-                $"r.{Quote(k)} IS (SELECT x.{Quote(k)} FROM {Local}.{Quote(reference.Table)} AS x WHERE x.{Quote(reference.IdColumn)} = $id)"));
-            foreach (var id in localIds)
-            {
-                using (var command = connection.CreateCommand())
-                {
-                    command.CommandText = $"SELECT count(*) FROM main.{Quote(reference.Table)} AS r WHERE {match}";
-                    command.Parameters.AddWithValue("$id", id);
-                    if ((long)command.ExecuteScalar()! > 0) continue;
-                }
-                var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
-                var columns = ListColumns(connection, Local, reference.Table);
-                var rowIdAlias = FindRowIdAlias(connection, reference.Table);
-                var targets = columns.Where(c => c != rowIdAlias).ToList();
-                using (var command = connection.CreateCommand())
-                {
-                    command.CommandText =
-                        $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
-                        $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "l")))} " +
-                        $"FROM {Local}.{Quote(reference.Table)} AS l WHERE l.{Quote(reference.IdColumn)} = $id";
-                    command.Parameters.AddWithValue("$id", id);
-                    copiedReferences[reference.Table] = copiedReferences.GetValueOrDefault(reference.Table) + command.ExecuteNonQuery();
-                }
-            }
-        }
-    }
+        => CopyReferencedRows(connection, table, rule, profile,
+            command => KeyCondition(command, rule, keyValues, Local, "l"), copiedReferences);
 
     /// <summary>
     /// <paramref name="alias"/> の付いたテーブルの行がそのキー (<paramref name="keyValues"/>、
