@@ -68,11 +68,12 @@ public enum MergeTableKind
 /// 残すと、少ない側の PC で足した分が失われる。祖先の値が要約に無ければ大きい方を残す。
 /// </param>
 /// <param name="References">
-/// <see cref="MergeTableKind.Keyed"/> で、キーの列のうち別のテーブルの行を整数 id で指すもの。
-/// Friend Connect の id は PC ごとに別の値を取るので、id のままでは突き合わせられない。
+/// キーの列のうち別のテーブルの行を整数 id で指すもの。Friend Connect の id は PC ごとに
+/// 別の値を取るので、id のままでは突き合わせられない。
 /// 要約とマージでは、その列の値の代わりに指している行の自然キーを使い、手元の行を
 /// 同期先へ写すときは同期先での id に付け替える。指している行が同期先に無ければ、
-/// その行も手元から写す。
+/// その行も手元から写す。<see cref="MergeTableKind.AppendOnly"/> の突き合わせでは、
+/// 指す列が NULL の行は同期先に同じ行が無いものとして扱う。
 /// </param>
 /// <param name="UpdateInPlace">
 /// <see cref="MergeTableKind.Keyed"/> で、同期先にあるキーの行を消して入れ直すのではなく、
@@ -89,6 +90,12 @@ public enum MergeTableKind
 /// <param name="ClearedColumns">
 /// 手元の行を同期先へ写すときに NULL にする列。外部キーの制約が無いまま別の行の id を
 /// 持つ列で、同期先では別の行を指してしまうもの。
+/// </param>
+/// <param name="RuntimeGate">
+/// <see cref="MergeTableKind.AppendOnly"/> で、2 台の PC で同時にアプリを動かしていた期間の行を
+/// 足さないための絞り込み。同じ出来事を両方の PC が記録していて、記録した時刻がポーリングの
+/// 分だけずれるので、キーの一致では重複を除けない。相手が動いていなかった時間の記録だけを
+/// 足せば、曖昧な突き合わせ無しで重複を避けられる。詳細は <see cref="Merge.RuntimeGate"/>。
 /// </param>
 /// <param name="UnionWithoutAncestor">
 /// <see cref="MergeTableKind.AppendOnly"/> で、前回の同期時点の要約にこのテーブルの祖先が無くても
@@ -112,6 +119,7 @@ public sealed record MergeTableRule(
     bool UpdateInPlace = false,
     bool ClearOnDelete = false,
     IReadOnlyList<string>? ClearedColumns = null,
+    RuntimeGate? RuntimeGate = null,
     bool UnionWithoutAncestor = false)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
@@ -132,6 +140,32 @@ public sealed record MergeTableRule(
 /// <param name="IdColumn">参照先の、<see cref="Column"/> の値が指す列。</param>
 public sealed record ColumnReference(
     string Column, string Table, IReadOnlyList<string> KeyColumns, string IdColumn = "id");
+
+/// <summary>
+/// 追加専用の履歴で、相手の PC のアプリが動いていた期間に手元が記録した行を足さないための対応。
+/// <para>
+/// 同期先の稼働区間のテーブル (<see cref="Table"/>) の行のうち、手元の同じ区間 (開始時刻が同じ行)
+/// が知らない部分を「相手が動いていた期間」とみなす。手元に無い区間は全体、手元にもあるが
+/// 同期先の終了時刻の方が遅い区間は手元の終了時刻より後の部分である。手元の履歴行のうち
+/// <see cref="TimeColumn"/> がその期間に入るものは、相手の PC も同じ出来事を記録しているので
+/// 足さない。同期先の稼働区間は、マージが同期先の表を書き換える前の内容で取る。
+/// </para>
+/// <para>
+/// 同期先の表には、前回までの同期で手元から渡った手元自身の区間も入っているが、それは手元にも
+/// 同じ開始時刻の行があり、手元の終了時刻の方が遅いか等しいので、期間に数えない。
+/// </para>
+/// <para>
+/// <see cref="EndColumn"/> を指定すると、出来事が相手の停止後まで続いた行 (終了時刻が期間の外)
+/// は足す。相手の行は停止時点で止まっているので、除くとその後の記録が失われる。期間の中で
+/// 重なる 2 行が残るのは、相手の起動をまたいで始まった出来事と同じ扱いである。
+/// </para>
+/// </summary>
+/// <param name="TimeColumn">このテーブルの、出来事の開始時刻の列。</param>
+/// <param name="Table">稼働区間のテーブル。</param>
+/// <param name="StartColumn">稼働区間の開始時刻の列。区間を見分けるキーでもある。</param>
+/// <param name="EndColumn">稼働区間の終了時刻の列。</param>
+/// <param name="TimeEndColumn">このテーブルの、出来事の終了時刻の列。null なら開始時刻だけで判定する。</param>
+public sealed record RuntimeGate(string TimeColumn, string Table, string StartColumn, string EndColumn, string? TimeEndColumn = null);
 
 /// <summary>
 /// ツールごとのマージの規則一式。前回同期時点の要約 (<see cref="DatabaseSummary"/>) と、
@@ -166,6 +200,7 @@ public sealed class MergeProfile
             r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
             Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
             References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))
+            + (r.RuntimeGate is { } g ? $"|g{g.TimeColumn}{(g.TimeEndColumn is null ? "" : "~" + g.TimeEndColumn)}@{g.Table}.{g.StartColumn}-{g.EndColumn}" : string.Empty)
             + (r.UnionWithoutAncestor ? "|a" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }

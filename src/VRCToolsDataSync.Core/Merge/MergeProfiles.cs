@@ -92,6 +92,16 @@ public static class MergeProfiles
     /// <summary>Friend Connect の World を PC をまたいで見分ける列。VRChat のワールド ID。</summary>
     private static readonly ColumnReference WorldByApiId = new("worldId", "World", new[] { "apiId" });
 
+    /// <summary>Friend Connect の Avatar を PC をまたいで見分ける列。VRChat のアバター ID (UNIQUE)。</summary>
+    private static readonly ColumnReference AvatarByName = new("avatarId", "Avatar", new[] { "avatar" });
+
+    /// <summary>
+    /// Friend Connect の履歴を、相手の PC が動いていた期間 (同期先の ScanRuntime のうち手元が
+    /// 知らない部分) で絞る対応。履歴の時刻の列はどのテーブルも startAt / endAt で、相手の停止後
+    /// まで続いた出来事は足す。
+    /// </summary>
+    private static readonly RuntimeGate WhileHostRunning = new("startAt", "ScanRuntime", "startAt", "endAt", TimeEndColumn: "endAt");
+
     /// <summary>Friend Connect の Tag を見分ける列。名前は種類 (user / world) ごとに付く。</summary>
     private static readonly ColumnReference TagByName = new("tagId", "Tag", new[] { "type", "name" });
 
@@ -160,9 +170,20 @@ public static class MergeProfiles
             new("ScanRuntime", MergeTableKind.AppendOnly, new[] { "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
                 UnionWithoutAncestor: true),
 
-            // 履歴 (Location、UserStatus、UserAvatar、NUserHistory、LocationMaster)、写真の一覧 (Photo)
-            // と集計 (UserConnection、UserWorldVisit、UserAnalytics) はまだマージしない。履歴は
-            // 整数 id の付け替えが追加専用に無く、集計は足すと二重に数える。ここに無いテーブルは
+            // ステータスとアバター着用の履歴。追加専用で、滞在中は endAt と seconds が伸びる。
+            // ユーザー (とアバター) を指す id は PC ごとに違うので、自然キーで突き合わせて付け替え、
+            // 同期先に無いユーザーやアバターは写す。2 台で同時に動かしていた期間は両方が同じ出来事を
+            // ポーリングの分だけずれた startAt で記録するので、相手が動いていた期間の行は足さない。
+            // Friend Connect はこの履歴を消す操作を持たないので、祖先の無い最初のマージでも和集合を取る。
+            // ユーザーに同時に 2 つのステータスやアバターは無いので、キーにユーザーと開始時刻で足りる。
+            new("UserStatus", MergeTableKind.AppendOnly, new[] { "userId", "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
+                References: new[] { UserByApiId }, RuntimeGate: WhileHostRunning, UnionWithoutAncestor: true),
+            new("UserAvatar", MergeTableKind.AppendOnly, new[] { "userId", "avatarId", "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
+                References: new[] { UserByApiId, AvatarByName }, RuntimeGate: WhileHostRunning, UnionWithoutAncestor: true),
+
+            // 滞在の履歴 (Location、LocationMaster、NUserHistory)、写真の一覧 (Photo) と集計 (UserConnection、
+            // UserWorldVisit、UserAnalytics) はまだマージしない。LocationMaster の id はアプリが決める値で
+            // rowid の最大値では増えた行を取れず、集計は足すと二重に数える。ここに無いテーブルは
             // 同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,

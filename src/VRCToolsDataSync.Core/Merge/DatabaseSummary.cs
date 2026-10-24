@@ -161,7 +161,7 @@ public sealed class DatabaseSummary
                 entry.RowCount = (long)command.ExecuteScalar()!;
             }
             entry.MaxRowId = kept;
-            entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule.KeyColumns, kept);
+            entry.LastRowHash = kept == 0 ? null : HashRowKey(connection, "main", table.Table, rule, kept);
             // 後から書き換わる列のハッシュと、縮めた範囲から外れた祖先の行は、マージが
             // 合成する前の同期先の値で取ってある。マージ結果から取ると手元の書き換えが
             // 祖先に混ざり、次のマージでその書き換えを見分けられない。
@@ -184,6 +184,8 @@ public sealed class DatabaseSummary
             .Concat(rule.GrowingColumns ?? Array.Empty<string>())
             .Concat(rule.ShrinkingColumns ?? Array.Empty<string>())
             .Concat(rule.CounterColumns ?? Array.Empty<string>())
+            .Concat(rule.RuntimeGate is null ? Array.Empty<string>() : new[] { rule.RuntimeGate.TimeColumn })
+            .Concat(rule.RuntimeGate?.TimeEndColumn is { } timeEnd ? new[] { timeEnd } : Array.Empty<string>())
             .Where(c => !columns.Contains(c, StringComparer.Ordinal))
             .ToList();
 
@@ -223,7 +225,7 @@ public sealed class DatabaseSummary
         // 変わらないことがある。末尾の行のキーも残して、入れ替わりを拾う。
         summary.LastRowHash = summary.MaxRowId == 0
             ? null
-            : DigestRows(connection, schema, table, rule.KeyColumns, "rowid DESC LIMIT 1").Digest;
+            : HashRowKey(connection, schema, table, rule, summary.MaxRowId);
         if (rule.GrowingColumns is { Count: > 0 })
         {
             // 行数と rowid だけでは、既存行の書き換え (滞在時間の書き込みなど) を拾えない。
@@ -244,14 +246,15 @@ public sealed class DatabaseSummary
     {
         duplicated = false;
         var growing = rule.GrowingColumns ?? Array.Empty<string>();
-        var selected = rule.KeyColumns.Concat(growing).ToList();
+        var keys = KeyExpressions(rule, schema, "t");
+        var selected = keys.Concat(growing.Select(c => $"t.{Quote(c)}")).ToList();
         using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT rowid, {string.Join(", ", selected.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} WHERE {whereSql}";
+            $"SELECT t.rowid, {string.Join(", ", selected)} FROM {Quote(schema)}.{Quote(table)} AS t WHERE {whereSql}";
         using var reader = command.ExecuteReader();
 
         var rows = new Dictionary<string, (long, string)>(StringComparer.Ordinal);
-        var keyCount = rule.KeyColumns.Count;
+        var keyCount = keys.Count;
         var key = new StringBuilder();
         var values = new StringBuilder();
         while (reader.Read())
@@ -277,11 +280,12 @@ public sealed class DatabaseSummary
         SqliteConnection connection, string schema, string table, MergeTableRule rule, long maxRowId,
         string? excludeSql = null)
     {
-        var columns = rule.KeyColumns.Concat(rule.GrowingColumns ?? Array.Empty<string>()).ToList();
+        var columns = KeyExpressions(rule, schema, "t")
+            .Concat((rule.GrowingColumns ?? Array.Empty<string>()).Select(c => $"t.{Quote(c)}")).ToList();
         var exclude = excludeSql is null ? "" : $" AND NOT ({excludeSql})";
         return DigestQuery(connection, columns.Count,
-            $"SELECT {string.Join(", ", columns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
-            $"WHERE rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)}{exclude} ORDER BY rowid").Digest;
+            $"SELECT {string.Join(", ", columns)} FROM {Quote(schema)}.{Quote(table)} AS t " +
+            $"WHERE t.rowid <= {maxRowId.ToString(CultureInfo.InvariantCulture)}{exclude} ORDER BY t.rowid").Digest;
     }
 
     private static TableSummary SummarizeKeyed(
@@ -465,14 +469,16 @@ public sealed class DatabaseSummary
 
     /// <summary>
     /// rowid が <paramref name="rowId"/> の行のキーのハッシュを返す。行が無ければ null。
-    /// 要約の <see cref="TableSummary.LastRowHash"/> と同じ方法で求める。
+    /// 要約の <see cref="TableSummary.LastRowHash"/> と同じ方法で求める。id で参照先を指す
+    /// キーの列は、キー付きと同じく参照先の自然キーで取る (<see cref="KeyExpressions"/>)。
     /// </summary>
     internal static string? HashRowKey(
-        SqliteConnection connection, string schema, string table, IReadOnlyList<string> keyColumns, long rowId)
+        SqliteConnection connection, string schema, string table, MergeTableRule rule, long rowId)
     {
-        var (count, digest) = DigestQuery(connection, keyColumns.Count,
-            $"SELECT {string.Join(", ", keyColumns.Select(Quote))} FROM {Quote(schema)}.{Quote(table)} " +
-            $"WHERE rowid = {rowId.ToString(CultureInfo.InvariantCulture)}");
+        var keys = KeyExpressions(rule, schema, "t");
+        var (count, digest) = DigestQuery(connection, keys.Count,
+            $"SELECT {string.Join(", ", keys)} FROM {Quote(schema)}.{Quote(table)} AS t " +
+            $"WHERE t.rowid = {rowId.ToString(CultureInfo.InvariantCulture)}");
         return count == 0 ? null : digest;
     }
 
