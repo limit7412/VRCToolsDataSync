@@ -66,6 +66,7 @@ public enum MergeTableKind
 /// <see cref="MergeTableKind.Keyed"/> で、各 PC が自分の使った分を足していく累計の列。
 /// 両方が同じキーを書き換えていたら、祖先の値に双方の増分を足した値にする。大きい方を
 /// 残すと、少ない側の PC で足した分が失われる。祖先の値が要約に無ければ大きい方を残す。
+/// 値は整数でも実数でもよい (Friend Connect の同席の秒数は小数を持つ)。
 /// </param>
 /// <param name="References">
 /// キーの列のうち別のテーブルの行を整数 id で指すもの。Friend Connect の id は PC ごとに
@@ -116,6 +117,12 @@ public enum MergeTableKind
 /// キーの一致する行でこの列が違えば、キーが別の実体を指していて (アプリが決める id が PC ごとに
 /// 違う値になるなど) 突き合わせの前提が崩れているので、マージを中止する。
 /// </param>
+/// <param name="DerivedColumns">
+/// <see cref="MergeTableKind.Keyed"/> で、同じ行の他の列から決まる列と、その求め方。両方が同じキーを
+/// 書き換えていて累計の列などを合成したときに、合成した値からこの列を求め直す。合成しなかった行
+/// (片方の内容をそのまま残す行) はアプリが書いた値のままなので触らない。比べる列には含めない。
+/// Friend Connect のワールド訪問の平均滞在時間 (stayAvg) は、滞在の回数と秒数から決まる。
+/// </param>
 public sealed record MergeTableRule(
     string NamePattern,
     MergeTableKind Kind,
@@ -135,7 +142,8 @@ public sealed record MergeTableRule(
     RuntimeGate? RuntimeGate = null,
     bool UnionWithoutAncestor = false,
     bool UnionByKey = false,
-    IReadOnlyList<string>? IdentityColumns = null)
+    IReadOnlyList<string>? IdentityColumns = null,
+    IReadOnlyList<DerivedColumn>? DerivedColumns = null)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
@@ -145,6 +153,16 @@ public sealed record MergeTableRule(
     public ColumnReference? ReferenceOf(string column)
         => References?.FirstOrDefault(r => string.Equals(r.Column, column, StringComparison.Ordinal));
 }
+
+/// <summary>
+/// 同じ行の他の列から決まる列 (<see cref="MergeTableRule.DerivedColumns"/>) と、その求め方。
+/// </summary>
+/// <param name="Column">求め直す列。</param>
+/// <param name="Expression">
+/// 値を求める SQL の式。同じ行の列を名前で参照できる (別名は付けない)。整数の列なら、式の結果も
+/// 整数になるようにする (SQLite の整数どうしの除算は切り捨てで、実数が混ざれば CAST で切り捨てる)。
+/// </param>
+public sealed record DerivedColumn(string Column, string Expression);
 
 /// <summary>
 /// 別のテーブルの行を整数 id で指す列と、その行を PC をまたいで見分ける自然キーの対応。
@@ -262,7 +280,8 @@ public sealed class MergeProfile
             + (r.RuntimeGate is { } g ? $"|g{g.TimeColumn}{(g.TimeEndColumn is null ? "" : "~" + g.TimeEndColumn)}@{g.Table}.{g.StartColumn}-{g.EndColumn}" : string.Empty)
             + (r.UnionWithoutAncestor ? "|a" : string.Empty)
             + (r.UnionByKey ? "|k" : string.Empty)
-            + (r.IdentityColumns is { Count: > 0 } ? $"|i{Columns(r.IdentityColumns)}" : string.Empty)));
+            + (r.IdentityColumns is { Count: > 0 } ? $"|i{Columns(r.IdentityColumns)}" : string.Empty)
+            + (r.DerivedColumns is { Count: > 0 } ? $"|d{string.Join(",", r.DerivedColumns.Select(d => $"{d.Column}={d.Expression}"))}" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 
