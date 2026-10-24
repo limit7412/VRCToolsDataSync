@@ -102,6 +102,23 @@ public static class MergeProfiles
     /// </summary>
     private static readonly RuntimeGate WhileHostRunning = new("startAt", "ScanRuntime", "startAt", "endAt", TimeEndColumn: "endAt");
 
+    /// <summary>
+    /// Friend Connect のインスタンス (LocationMaster) を指す列。この表の id はアプリが入力 (日付、
+    /// ワールド、インスタンス番号) から決めるハッシュ値とされていて、PC 間で同じ値を取る前提で
+    /// id そのもので見分ける (前提の確認と崩れたときの扱いは <see cref="FriendConnect"/> の規則の注記)。
+    /// </summary>
+    private static ColumnReference LocationMasterById(string column) => new(column, "LocationMaster", new[] { "id" });
+
+    /// <summary>
+    /// Friend Connect の滞在 (Location) を指す列。滞在はユーザーと開始時刻で見分け、ユーザーの id は
+    /// VRChat のユーザー ID に置き換えて比べる。<paramref name="timeColumn"/> を与えると、同じ開始時刻の
+    /// 滞在が同期先に無いとき、その時刻を含む同じユーザーの滞在を代わりに指す (相手の PC の稼働中に
+    /// 手元が記録した滞在は足さないので、その間の動画や写真は相手の記録した滞在に結び付ける)。
+    /// </summary>
+    private static ColumnReference LocationByUserAndStart(string? timeColumn = null, bool nullIfMissing = false)
+        => new("locationId", "Location", new[] { "userId", "startAt" }, KeyReferences: new[] { UserByApiId },
+            NullIfMissing: nullIfMissing, Fallback: timeColumn is null ? null : new IntervalMatch(timeColumn, "startAt", "endAt"));
+
     /// <summary>Friend Connect の Tag を見分ける列。名前は種類 (user / world) ごとに付く。</summary>
     private static readonly ColumnReference TagByName = new("tagId", "Tag", new[] { "type", "name" });
 
@@ -181,10 +198,40 @@ public static class MergeProfiles
             new("UserAvatar", MergeTableKind.AppendOnly, new[] { "userId", "avatarId", "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
                 References: new[] { UserByApiId, AvatarByName }, RuntimeGate: WhileHostRunning, UnionWithoutAncestor: true),
 
-            // 滞在の履歴 (Location、LocationMaster、NUserHistory)、写真の一覧 (Photo) と集計 (UserConnection、
-            // UserWorldVisit、UserAnalytics) はまだマージしない。LocationMaster の id はアプリが決める値で
-            // rowid の最大値では増えた行を取れず、集計は足すと二重に数える。ここに無いテーブルは
-            // 同期先の内容がそのまま残る。
+            // インスタンスのマスタ (滞在履歴の親)。id は AUTOINCREMENT ではなく Friend Connect が入力
+            // (日付、ワールド、インスタンス番号) から決めるハッシュ値で、32 bit の全域に散り、新しい行の id が
+            // 小さいこともある。そのため rowid の範囲では増えた行を取れず、全行を id で突き合わせて同期先に
+            // 無い行を id ごと写す (UnionByKey)。id が PC 間で同じ値を取ること (入力から決まり、PC 固有の
+            // 値を含まないこと) は前提であって 2 台の実データでは未確認なので、同じ id の行はインスタンスの
+            // 文字列 (location) も同じことを確かめ、違えば中止する (IdentityColumns)。人数 (nUsers) や
+            // 更新時刻は同期先の値のまま。ワールド・所有者・グループを指す列は付け替え、無ければ写す。
+            new("LocationMaster", MergeTableKind.AppendOnly, new[] { "id" }, UnionByKey: true, UnionWithoutAncestor: true,
+                IdentityColumns: new[] { "location" },
+                References: new[] { WorldByApiId, new ColumnReference("ownerId", "User", new[] { "apiId" }), new ColumnReference("groupId", "Group", new[] { "apiId" }) }),
+            // 滞在の履歴。ステータスの履歴と同じ追加専用で、ユーザーは同時に 1 か所にしかいないので
+            // キーはユーザーと開始時刻。インスタンスは LocationMaster の id で、ワールドは VRChat の ID で付け替える。
+            new("Location", MergeTableKind.AppendOnly, new[] { "userId", "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
+                References: new[] { UserByApiId, LocationMasterById("locationKey"), WorldByApiId },
+                RuntimeGate: WhileHostRunning, UnionWithoutAncestor: true),
+            // 動画の再生履歴。再生時刻 (UNIQUE) がキー。VRChat のログから取るので、稼働区間では絞らない
+            // (相手の PC で Friend Connect が動いていても、VRChat を動かしていたのはこちら)。滞在は同じ
+            // 開始時刻の行が無ければ再生時刻を含む同じユーザーの滞在を指し、それも無ければ滞在を写す。
+            new("Video", MergeTableKind.AppendOnly, new[] { "dateTime" },
+                References: new[] { LocationByUserAndStart(timeColumn: "dateTime") }, UnionWithoutAncestor: true),
+            // インスタンスへのメモ。インスタンスと滞在と作成時刻で見分ける。
+            new("LocationNote", MergeTableKind.Keyed, new[] { "locationMasterId", "locationId", "createdAt" }, ValueColumns: new[] { "note" },
+                References: new[] { LocationMasterById("locationMasterId"), LocationByUserAndStart() }),
+            // 写真の一覧。撮影時刻 (UNIQUE) がキー。Friend Connect は写真フォルダを読み直すときに行を消して
+            // 入れ直す (id が安定しない) ので、追加専用ではなくキー付きで合わせる。比べるのはサムネイルの列
+            // だけで、元の写真のパス (source) は撮影した PC のものなので比べず、写すときは手元の値のまま。
+            // 滞在との対応は同期先に無ければ (相手の稼働中の滞在など) 空にして、写真の一覧には残す。
+            // 規則に加える前の要約に祖先が無くても、手元にしか無い写真を足せれば足りるので中止しない。
+            new("Photo", MergeTableKind.Keyed, new[] { "shotAt" }, ValueColumns: new[] { "thumbnail", "hasThumbnail" },
+                References: new[] { LocationByUserAndStart(timeColumn: "shotAt", nullIfMissing: true) }, UnionWithoutAncestor: true),
+
+            // インスタンスの人数の時系列 (NUserHistory)、通知の送信履歴 (UserNotificationHistory) と集計
+            // (UserConnection、UserWorldVisit、UserAnalytics) はまだマージしない。集計は足すと二重に数える。
+            // ここに無いテーブルは同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,
     };
