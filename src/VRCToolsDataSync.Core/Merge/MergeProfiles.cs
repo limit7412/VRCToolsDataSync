@@ -250,6 +250,7 @@ public static class MergeProfiles
             // 稼働区間で除けないため、精度より「反映されない」を避ける。規則に加える前の要約に祖先が無い
             // 最初のマージは、双方の増分が分からないので列ごとに大きい方を残す。Friend Connect は保持期間を
             // 過ぎたワールド訪問の行を自分で消すので、その削除は 3-way の削除としてそのまま伝える。
+            // 保持期間で消えた行を次の訪問で 0 から作り直すので、祖先より減っていた側の値はそのまま増分として足す。
             // 回数と秒数を合成した行では、平均滞在時間 (stayAvg) を回数と秒数から求め直す (切り捨て)。
             new("UserConnection", MergeTableKind.Keyed, new[] { "userId", "targetUserId" },
                 ValueColumns: ConnectionCounters.Concat(new[] { "lastContactAt", "lastUpdateAt" }).ToArray(),
@@ -261,9 +262,10 @@ public static class MergeProfiles
                 References: new[] { UserByApiId, WorldByApiId }, UnionWithoutAncestor: true,
                 DerivedColumns: new[] { new DerivedColumn("stayAvg", "CASE WHEN \"stayCount\" > 0 THEN CAST(\"staySeconds\" / \"stayCount\" AS INTEGER) ELSE 0 END") }),
             // ユーザーごとの分析結果 (割合やヒートマップの文字列)。足し合わせられないので、同期先にあれば
-            // その値を残し、無いユーザーの行だけ写す。Friend Connect は 2025 年 9 月以降この表を更新していない。
+            // その値を残し、無いユーザーの行だけ写す。手元で消えていても同期先の行は残す (Friend Connect が
+            // 作り直さない値を失わないため)。Friend Connect は 2025 年 9 月以降この表を更新していない。
             new("UserAnalytics", MergeTableKind.Keyed, new[] { "userId" }, ValueColumns: Array.Empty<string>(),
-                References: new[] { UserByApiId }, UnionWithoutAncestor: true),
+                References: new[] { UserByApiId }, UnionWithoutAncestor: true, KeepHostOnLocalDelete: true),
 
             // インスタンスの人数の時系列 (NUserHistory) と通知の送信履歴 (UserNotificationHistory) はまだ
             // マージしない。ユーザーやワールドの score は Friend Connect が集計から求める値で、同期先のまま。

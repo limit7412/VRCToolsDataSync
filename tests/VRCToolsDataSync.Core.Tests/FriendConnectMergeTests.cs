@@ -1029,6 +1029,32 @@ public sealed class FriendConnectMergeTests : IDisposable
         Assert.Contains(report.Conflicts, c => c.Table == "UserWorldVisit" && c.KeptLocal);
     }
 
+    [Fact(DisplayName = "手元で消えて作り直されたワールド訪問 (回数が祖先より少ない) は、作り直した分を増分として足す")]
+    public void WorldVisitRecreatedLocallyAddsRecountedValues()
+    {
+        var (host, local, baseline) = Arrange();
+        // 手元では保持期間で消え、次の訪問で 1 回 50 秒から数え直した。同期先では数え続けている。
+        Exec(local, "DELETE FROM UserWorldVisit; " + InsertWorldVisit("usr_a", "wrld_1", 1, 50, lastUpdateAt: 6));
+        Exec(host, "UPDATE UserWorldVisit SET stayCount = 5, staySeconds = 450, stayAvg = 90, lastUpdateAt = 5");
+
+        Merge(host, local, baseline);
+
+        // 回数 4 + 1 + 1、秒数 400 + 50 + 50、平均 500 / 6 の切り捨て。
+        Assert.Equal(new[] { "usr_a|wrld_1|6|500|83|6" }, WorldVisits(host));
+    }
+
+    [Fact(DisplayName = "分析結果が手元で消えていても、同期先の行は残す")]
+    public void AnalyticsDeletedLocallyStayOnHost()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM UserAnalytics");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM UserAnalytics"));
+        Assert.Equal(0, Assert.Single(report.Tables, t => t.Table == "UserAnalytics").Deleted);
+    }
+
     [Fact(DisplayName = "規則に加える前の要約に集計の祖先が無ければ、中止せず列ごとに大きい方を残し、手元にしか無い行を足す")]
     public void AggregatesWithoutAncestorKeepLargerValues()
     {

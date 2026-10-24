@@ -1091,6 +1091,7 @@ public static class SqliteMerger
                 continue;
             }
             if (mine?.Hash == original) continue;       // 手元は変えていない。同期先のまま
+            if (mine is null && rule.KeepHostOnLocalDelete) continue;   // 手元の削除は伝えない
 
             var conflict = theirs?.Hash != original;    // 同期先も変えている
             var takeLocal = !conflict
@@ -1357,9 +1358,11 @@ public static class SqliteMerger
     }
 
     /// <summary>
-    /// 累計の列を合成する。祖先の値があれば、祖先に双方の増分を足す。減っていた側の
-    /// 増分は 0 とみなす。祖先の値が無ければ大きい方を取り、数値でなければ同期先の値を残す。
-    /// 両方と祖先がすべて整数なら整数のまま足し、実数が混ざれば実数で足す。
+    /// 累計の列を合成する。祖先の値があれば、祖先に双方の増分を足す。祖先より減っていた側は、
+    /// アプリが行を消して数え直した (Friend Connect が保持期間で消したワールド訪問を、次の訪問で
+    /// 0 から作り直す) とみなし、その値をそのまま増分にする。祖先の値が無ければ大きい方を取り、
+    /// 数値でなければ同期先の値を残す。両方と祖先がすべて整数なら整数のまま足し、実数が混ざれば
+    /// 実数で足す。
     /// </summary>
     internal static object? AddCounter(object? mine, object? theirs, double? ancestor)
     {
@@ -1371,18 +1374,22 @@ public static class SqliteMerger
             if (a == Math.Floor(a) && Math.Abs(a) <= long.MaxValue / 2)
             {
                 var integer = (long)a;
-                return integer + Math.Max(0, l - integer) + Math.Max(0, h - integer);
+                return integer + IntegerIncrement(l, integer) + IntegerIncrement(h, integer);
             }
-            return a + Math.Max(0, l - a) + Math.Max(0, h - a);
+            return a + RealIncrement(l, a) + RealIncrement(h, a);
         }
         if (mine is long or double && theirs is long or double)
         {
             var m = Convert.ToDouble(mine, CultureInfo.InvariantCulture);
             var t = Convert.ToDouble(theirs, CultureInfo.InvariantCulture);
             if (ancestor is not { } a) return m >= t ? mine : theirs;
-            return a + Math.Max(0, m - a) + Math.Max(0, t - a);
+            return a + RealIncrement(m, a) + RealIncrement(t, a);
         }
         return theirs;
+
+        // 祖先からの増分。祖先より小さければ、0 から数え直した値そのものが増分。
+        static long IntegerIncrement(long value, long ancestor) => value >= ancestor ? value - ancestor : value;
+        static double RealIncrement(double value, double ancestor) => value >= ancestor ? value - ancestor : value;
     }
 
     /// <summary>

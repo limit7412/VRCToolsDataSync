@@ -984,7 +984,10 @@ public sealed class SqliteMergerTests : IDisposable
         Assert.Equal(112.5, SqliteMerger.AddCounter(110L, 102.5, 100.0));
         // 祖先が無ければ大きい方。減っていた側の増分は 0。
         Assert.Equal(130.75, SqliteMerger.AddCounter(130.75, 120L, null));
-        Assert.Equal(12L, SqliteMerger.AddCounter(8L, 12L, 10.0));
+        // 祖先より減っていた側は 0 から数え直したとみなし、その値を増分にする。
+        Assert.Equal(20L, SqliteMerger.AddCounter(8L, 12L, 10.0));
+        Assert.Equal(6L, SqliteMerger.AddCounter(1L, 5L, 4.0));
+        Assert.Equal(13L, SqliteMerger.AddCounter(10L, 13L, 10.0));
         Assert.Equal("x", SqliteMerger.AddCounter(1L, "x", 0.0));
     }
 }
