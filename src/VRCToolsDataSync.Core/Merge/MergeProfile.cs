@@ -154,12 +154,18 @@ public sealed record ColumnReference(
 /// 同期先の表には、前回までの同期で手元から渡った手元自身の区間も入っているが、それは手元にも
 /// 同じ開始時刻の行があり、手元の終了時刻の方が遅いか等しいので、期間に数えない。
 /// </para>
+/// <para>
+/// <see cref="EndColumn"/> を指定すると、出来事が相手の停止後まで続いた行 (終了時刻が期間の外)
+/// は足す。相手の行は停止時点で止まっているので、除くとその後の記録が失われる。期間の中で
+/// 重なる 2 行が残るのは、相手の起動をまたいで始まった出来事と同じ扱いである。
+/// </para>
 /// </summary>
-/// <param name="TimeColumn">このテーブルの、出来事の時刻の列。</param>
+/// <param name="TimeColumn">このテーブルの、出来事の開始時刻の列。</param>
 /// <param name="Table">稼働区間のテーブル。</param>
 /// <param name="StartColumn">稼働区間の開始時刻の列。区間を見分けるキーでもある。</param>
 /// <param name="EndColumn">稼働区間の終了時刻の列。</param>
-public sealed record RuntimeGate(string TimeColumn, string Table, string StartColumn, string EndColumn);
+/// <param name="TimeEndColumn">このテーブルの、出来事の終了時刻の列。null なら開始時刻だけで判定する。</param>
+public sealed record RuntimeGate(string TimeColumn, string Table, string StartColumn, string EndColumn, string? TimeEndColumn = null);
 
 /// <summary>
 /// ツールごとのマージの規則一式。前回同期時点の要約 (<see cref="DatabaseSummary"/>) と、
@@ -194,7 +200,7 @@ public sealed class MergeProfile
             r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
             Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
             References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))
-            + (r.RuntimeGate is { } g ? $"|g{g.TimeColumn}@{g.Table}.{g.StartColumn}-{g.EndColumn}" : string.Empty)
+            + (r.RuntimeGate is { } g ? $"|g{g.TimeColumn}{(g.TimeEndColumn is null ? "" : "~" + g.TimeEndColumn)}@{g.Table}.{g.StartColumn}-{g.EndColumn}" : string.Empty)
             + (r.UnionWithoutAncestor ? "|a" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }

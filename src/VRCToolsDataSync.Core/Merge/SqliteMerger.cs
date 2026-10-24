@@ -652,18 +652,26 @@ public static class SqliteMerger
         return null;
     }
 
-    /// <summary><paramref name="alias"/> の行の出来事の時刻が、相手の PC が動いていた期間に入る条件。</summary>
+    /// <summary>
+    /// <paramref name="alias"/> の行の出来事が、相手の PC が動いていた期間に入る条件。開始時刻が期間に
+    /// 入り、終了時刻の列があればそれも期間の終わりを越えていないこと。
+    /// </summary>
     private static string RuntimeGateCondition(RuntimeGate gate, string alias)
-        => $"EXISTS (SELECT 1 FROM {RuntimeGateTable(gate)} AS g " +
-           $"WHERE {alias}.{Quote(gate.TimeColumn)} > g.after_at AND {alias}.{Quote(gate.TimeColumn)} <= g.until_at)";
+    {
+        var start = $"{alias}.{Quote(gate.TimeColumn)}";
+        var end = gate.TimeEndColumn is null ? string.Empty : $" AND {alias}.{Quote(gate.TimeEndColumn)} <= g.until_at";
+        return $"EXISTS (SELECT 1 FROM {RuntimeGateTable(gate)} AS g WHERE {start} > g.after_at AND {start} <= g.until_at{end})";
+    }
 
     /// <summary>参照先のテーブルの、手元の id から同期先の id への対応表の名前。</summary>
     private static string ReferenceMapTable(ColumnReference reference) => $"temp.{Quote("vrctds_map_" + reference.Table)}";
 
     /// <summary>
     /// 規則のキーが id で指す参照先ごとに、手元の id から同期先の id への対応表を作り直す。自然キーで
-    /// 突き合わせ、同期先に同じ自然キーの行が複数あれば id の小さい方を取る。同期先に無い行は
-    /// 対応表に入らない (突き合わせでは「同期先に無い」になる)。
+    /// 突き合わせ、同期先に同じ自然キーの行が複数あれば (User.apiId は UNIQUE ではない) そのすべてを
+    /// 入れる。どの行を指していても同じ参照先として突き合わせるため。同期先に無い行は対応表に
+    /// 入らない (突き合わせでは「同期先に無い」になる)。列には参照先の id 列と同じ型を付ける。
+    /// 型が無いと、同期先の id (INTEGER) との比較で対応表の索引が使われず全走査になる。
     /// </summary>
     private static void BuildReferenceMaps(SqliteConnection connection, MergeTableRule rule)
     {
@@ -672,16 +680,27 @@ public static class SqliteMerger
             if (!rule.KeyColumns.Contains(reference.Column, StringComparer.Ordinal)) continue;
             var work = ReferenceMapTable(reference);
             var name = Quote("vrctds_map_" + reference.Table);
+            var type = DeclaredType(connection, "main", reference.Table, reference.IdColumn);
             var match = string.Join(" AND ", reference.KeyColumns.Select(k => $"h.{Quote(k)} IS l.{Quote(k)}"));
             Execute(connection, $"DROP TABLE IF EXISTS {work}");
-            Execute(connection, $"CREATE TEMP TABLE {name} (local_id PRIMARY KEY, host_id) WITHOUT ROWID");
+            Execute(connection, $"CREATE TEMP TABLE {name} (local_id {type} NOT NULL, host_id {type} NOT NULL, PRIMARY KEY (local_id, host_id)) WITHOUT ROWID");
             Execute(connection,
-                $"INSERT INTO {work} (local_id, host_id) " +
-                $"SELECT l.{Quote(reference.IdColumn)}, min(h.{Quote(reference.IdColumn)}) " +
+                $"INSERT OR IGNORE INTO {work} (local_id, host_id) " +
+                $"SELECT l.{Quote(reference.IdColumn)}, h.{Quote(reference.IdColumn)} " +
                 $"FROM {Local}.{Quote(reference.Table)} AS l JOIN main.{Quote(reference.Table)} AS h ON {match} " +
-                $"GROUP BY l.{Quote(reference.IdColumn)}");
-            Execute(connection, $"CREATE INDEX {Quote("vrctds_map_" + reference.Table + "_host")} ON {name} (host_id)");
+                $"WHERE l.{Quote(reference.IdColumn)} IS NOT NULL AND h.{Quote(reference.IdColumn)} IS NOT NULL");
+            Execute(connection, $"CREATE INDEX {Quote("vrctds_map_" + reference.Table + "_host")} ON {name} (host_id, local_id)");
         }
+    }
+
+    /// <summary>列の宣言された型。無ければ INTEGER (本ツールが参照に使う id は整数が既定)。</summary>
+    private static string DeclaredType(SqliteConnection connection, string schema, string table, string column)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT type FROM pragma_table_info({Literal(table)}, {Literal(schema)}) WHERE name = $c";
+        command.Parameters.AddWithValue("$c", column);
+        var type = command.ExecuteScalar() as string;
+        return string.IsNullOrWhiteSpace(type) ? "INTEGER" : type;
     }
 
     /// <summary>

@@ -650,4 +650,41 @@ public sealed class FriendConnectMergeTests : IDisposable
         Assert.False(report.Succeeded);
         Assert.Contains("ScanRuntime", report.AbortReason);
     }
+
+    [Fact(DisplayName = "相手の停止後まで続いた出来事は、開始が相手の稼働中でも足す")]
+    public void EventContinuingAfterHostStoppedIsKept()
+    {
+        var (host, local, baseline) = Arrange();
+        // 同期先は 330000〜380000 に動いて c のステータスを 340000 から記録し、停止で 380000 に止まった。
+        // 手元は同じステータスを 340500 から記録し、同期先の停止後の 400000 まで続いた。
+        Exec(host, InsertScanRuntime(330_000, 380_000) + InsertUserStatus("usr_c", 340_000, 380_000));
+        Exec(local, InsertScanRuntime(300_000, 400_000) + InsertUserStatus("usr_c", 340_500, 400_000) + InsertUserStatus("usr_b", 350_000, 360_000));
+
+        var report = Merge(host, local, baseline);
+
+        // 停止後の記録を失わないよう c の行は足す (重なる 2 行が残る)。b の行は相手の稼働中に収まるので足さない。
+        Assert.Equal("usr_a@110000-120000,usr_c@340000-380000,usr_c@340500-400000", UserStatuses(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserStatus");
+        Assert.Equal((1L, 1L), (table.Inserted, table.SkippedWhileHostRunning));
+    }
+
+    [Fact(DisplayName = "同期先に同じ VRChat ID のユーザー行が複数あっても、どちらを指す履歴も同じユーザーとして突き合わせる")]
+    public void DuplicateUserRowsInHostAreAllMatched()
+    {
+        var (host, local, baseline) = Arrange();
+        // 同期先では a の行が 2 つあり (apiId は UNIQUE でない)、既存の履歴は id の大きい方を指す。
+        Exec(host, InsertUser("usr_a", "A2") +
+                   "UPDATE UserStatus SET userId = (SELECT max(id) FROM User WHERE apiId = 'usr_a');" +
+                   "UPDATE UserAvatar SET userId = (SELECT max(id) FROM User WHERE apiId = 'usr_a');");
+        Exec(local, "UPDATE UserStatus SET endAt = 125000, seconds = 15 WHERE startAt = 110000;" +
+                    InsertUserStatus("usr_a", 300_000, 310_000));
+
+        var report = Merge(host, local, baseline);
+
+        // 伸びた endAt は id の大きい方を指す既存行に反映され、110000 の行は二重にならない。
+        Assert.Equal("usr_a@110000-125000,usr_a@300000-310000", UserStatuses(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "UserStatus");
+        Assert.Equal((1L, 2L), (table.Inserted, table.Updated));
+        Assert.Null(table.CopiedReferences);
+    }
 }

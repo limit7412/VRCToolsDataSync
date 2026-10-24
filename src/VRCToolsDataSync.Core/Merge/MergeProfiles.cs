@@ -97,9 +97,10 @@ public static class MergeProfiles
 
     /// <summary>
     /// Friend Connect の履歴を、相手の PC が動いていた期間 (同期先の ScanRuntime のうち手元が
-    /// 知らない部分) で絞る対応。履歴の時刻の列はどのテーブルも startAt。
+    /// 知らない部分) で絞る対応。履歴の時刻の列はどのテーブルも startAt / endAt で、相手の停止後
+    /// まで続いた出来事は足す。
     /// </summary>
-    private static readonly RuntimeGate WhileHostRunning = new("startAt", "ScanRuntime", "startAt", "endAt");
+    private static readonly RuntimeGate WhileHostRunning = new("startAt", "ScanRuntime", "startAt", "endAt", TimeEndColumn: "endAt");
 
     /// <summary>Friend Connect の Tag を見分ける列。名前は種類 (user / world) ごとに付く。</summary>
     private static readonly ColumnReference TagByName = new("tagId", "Tag", new[] { "type", "name" });

@@ -185,6 +185,7 @@ public sealed class DatabaseSummary
             .Concat(rule.ShrinkingColumns ?? Array.Empty<string>())
             .Concat(rule.CounterColumns ?? Array.Empty<string>())
             .Concat(rule.RuntimeGate is null ? Array.Empty<string>() : new[] { rule.RuntimeGate.TimeColumn })
+            .Concat(rule.RuntimeGate?.TimeEndColumn is { } timeEnd ? new[] { timeEnd } : Array.Empty<string>())
             .Where(c => !columns.Contains(c, StringComparer.Ordinal))
             .ToList();
 
