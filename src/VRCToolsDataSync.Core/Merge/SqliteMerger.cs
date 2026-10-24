@@ -786,39 +786,73 @@ public static class SqliteMerger
     /// <summary>
     /// 手元の行のうち <paramref name="localCondition"/> (別名 l、引数は command に足す) を満たすものが
     /// id で指す先が同期先に無ければ、その行を手元から写す。写す行の列は参照先の規則 (あれば) に従って
-    /// 付け替えや消去をする。指す先を id そのもので見分ける参照 (<see cref="ColumnReference.KeepsId"/>)
+    /// 付け替えや消去をする。写す行がさらに別の行を指していれば (滞在のユーザーやインスタンス)、その先も
+    /// 同じ要領で先に写す。指す先を id そのもので見分ける参照 (<see cref="ColumnReference.KeepsId"/>)
     /// では id も写す。無ければ NULL にする参照 (<see cref="ColumnReference.NullIfMissing"/>) では写さない。
     /// 区間での代替 (<see cref="ColumnReference.Fallback"/>) がある参照では、代わりに指せる行も無いときだけ写す。
     /// 写した行数は参照先のテーブル名ごとに <paramref name="copied"/> へ足す。
     /// </summary>
     private static void CopyReferencedRows(
         SqliteConnection connection, string table, MergeTableRule rule, MergeProfile profile,
-        Func<SqliteCommand, string> localCondition, Dictionary<string, long> copied)
+        Func<SqliteCommand, string> localCondition, Dictionary<string, long> copied, HashSet<string>? copying = null)
     {
-        foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
+        // 参照が巡回していても (規則にはないが) 同じテーブルを写している最中に再び写しに来ないようにする。
+        copying ??= new HashSet<string>(StringComparer.Ordinal);
+        if (!copying.Add(table)) return;
+        try
         {
-            if (reference.NullIfMissing) continue;
-            var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
-            var columns = ListColumns(connection, Local, reference.Table);
-            var rowIdAlias = FindRowIdAlias(connection, reference.Table);
-            var targets = reference.KeepsId ? columns : columns.Where(c => c != rowIdAlias).ToList();
-            var localId = $"l.{Quote(reference.Column)}";
-            // 候補の行の指す先が同期先に無い条件。手元の指す先の行は l の id から引く (x は参照先の行)
-            // ので、候補を選ぶ副問い合わせは外側の行に依らず 1 回で済む。
-            var missing = $"NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {ReferencedRowMatch(reference, "r", localId)})";
-            if (reference.Fallback is { } fallback)
+            foreach (var reference in rule.References ?? Array.Empty<ColumnReference>())
             {
-                missing += $" AND NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {FallbackMatch(reference, fallback, "r", localId, "l")})";
+                if (reference.NullIfMissing) continue;
+                var referencedRule = profile.Rules.FirstOrDefault(r => r.Matches(reference.Table));
+                var columns = ListColumns(connection, Local, reference.Table);
+                var rowIdAlias = FindRowIdAlias(connection, reference.Table);
+                var targets = reference.KeepsId ? columns : columns.Where(c => c != rowIdAlias).ToList();
+                var localId = $"l.{Quote(reference.Column)}";
+                // 候補の行の指す先が同期先に無い条件。手元の指す先の行は l の id から引く (x は参照先の行)
+                // ので、候補を選ぶ副問い合わせは外側の行に依らず 1 回で済む。
+                var missing = $"NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {ReferencedRowMatch(reference, "r", localId)})";
+                if (reference.Fallback is { } fallback)
+                {
+                    missing += $" AND NOT EXISTS (SELECT 1 FROM main.{Quote(reference.Table)} AS r WHERE {FallbackMatch(reference, fallback, "r", localId, "l")})";
+                }
+                // 写す行の手元での id を先に集める。写す前に、その行が指す先 (滞在ならユーザーやインスタンス)
+                // を同じ要領で写すため。
+                var ids = Quote("vrctds_copy_" + reference.Table);
+                Execute(connection, $"DROP TABLE IF EXISTS temp.{ids}");
+                Execute(connection, $"CREATE TEMP TABLE {ids} (id PRIMARY KEY) WITHOUT ROWID");
+                long pending;
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText =
+                        $"INSERT OR IGNORE INTO temp.{ids} (id) SELECT {localId} FROM {Local}.{Quote(table)} AS l " +
+                        $"WHERE ({localCondition(command)}) AND {localId} IS NOT NULL AND {missing}";
+                    pending = command.ExecuteNonQuery();
+                }
+                try
+                {
+                    if (pending == 0) continue;
+                    if (referencedRule?.References is { Count: > 0 })
+                    {
+                        CopyReferencedRows(connection, reference.Table, referencedRule, profile,
+                            _ => $"l.{Quote(reference.IdColumn)} IN (SELECT id FROM temp.{ids})", copied, copying);
+                    }
+                    var count = Execute(connection,
+                        $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
+                        $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "x")))} " +
+                        $"FROM {Local}.{Quote(reference.Table)} AS x " +
+                        $"WHERE x.{Quote(reference.IdColumn)} IN (SELECT id FROM temp.{ids}) ORDER BY x.rowid");
+                    if (count > 0) copied[reference.Table] = copied.GetValueOrDefault(reference.Table) + count;
+                }
+                finally
+                {
+                    Execute(connection, $"DROP TABLE IF EXISTS temp.{ids}");
+                }
             }
-            using var command = connection.CreateCommand();
-            command.CommandText =
-                $"INSERT INTO main.{Quote(reference.Table)} ({string.Join(", ", targets.Select(Quote))}) " +
-                $"SELECT {string.Join(", ", targets.Select(c => CopyExpression(referencedRule, c, "x")))} " +
-                $"FROM {Local}.{Quote(reference.Table)} AS x " +
-                $"WHERE x.{Quote(reference.IdColumn)} IN (SELECT {localId} FROM {Local}.{Quote(table)} AS l " +
-                $"WHERE ({localCondition(command)}) AND {localId} IS NOT NULL AND {missing}) ORDER BY x.rowid";
-            var count = command.ExecuteNonQuery();
-            if (count > 0) copied[reference.Table] = copied.GetValueOrDefault(reference.Table) + count;
+        }
+        finally
+        {
+            copying.Remove(table);
         }
     }
 

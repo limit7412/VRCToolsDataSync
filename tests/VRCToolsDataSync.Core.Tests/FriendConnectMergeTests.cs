@@ -793,6 +793,28 @@ public sealed class FriendConnectMergeTests : IDisposable
         Assert.Equal("usr_a@-5000@1-2,usr_a@-5000@2-3,usr_b@-9000000@305000-310000,usr_c@-7000@340000-345000,usr_b@-9000000@350000-360000", Locations(host));
     }
 
+    [Fact(DisplayName = "動画のために写す滞在が同期先に無いユーザーやインスタンスを指していれば、それらも先に写す")]
+    public void CopyingStayForVideoCopiesItsUserAndInstance()
+    {
+        var (host, local, baseline) = Arrange();
+        ArrangeLocations(host, local);
+        // d は同期先に無いユーザーで、メモも無く、滞在は相手の稼働中 (足されない)。その滞在中の動画がある。
+        // 滞在のインスタンスも同期先に無く、そのワールドも無い。
+        Exec(local, InsertUser("usr_d", "D") + InsertWorld("wrld_3", "W3") + InsertLocationMaster(42, "wrld_3:1~public", "wrld_3") +
+                    InsertLocation("usr_d", 42, 352_000, 353_000, "wrld_3") + InsertVideo(352_500, "https://v/4", "usr_d", 352_000));
+        // インスタンスのマスタは先に全行が写るので、動画の時点で無いのはユーザーだけ。マスタが写る前の
+        // 状態も確かめるため、写しの後に同期先からマスタを消しておく代わりに、ここでは順序どおりに任せる。
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("352500:usr_d@352000", Videos(host));
+        var videos = Assert.Single(report.Tables, t => t.Table == "Video");
+        Assert.Equal(1, videos.CopiedReferences?["Location"]);
+        Assert.Equal(1, videos.CopiedReferences?["User"]);
+        Assert.Equal("null|null|null", Assert.Single(Rows(host, "SELECT lastUserAvatarId, lastLocationId, lastUserStatusId FROM User WHERE apiId = 'usr_d'")));
+        Assert.Equal(0, Scalar(host, "SELECT count(*) FROM Location WHERE userId NOT IN (SELECT id FROM User) OR locationKey NOT IN (SELECT id FROM LocationMaster)"));
+    }
+
     [Fact(DisplayName = "写真は撮影時刻で合わせ、手元で足した・消したものを伝え、滞在が同期先に無ければ対応を空にする")]
     public void PhotosFollowLocalAddsAndRemovesAndLoseMissingStays()
     {

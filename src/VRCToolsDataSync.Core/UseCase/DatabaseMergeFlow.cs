@@ -158,9 +158,20 @@ internal sealed class DatabaseMergeFlow
                 if (string.Equals(remoteSnapshot.Sha256, ownPush.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     // 同期先は自分が送った写しそのもの。手元との違いはすべて送った後の手元の変更
-                    // なので、同期先を祖先にする。
+                    // なので、同期先を祖先にする。フォルダの一覧だけは送ったときのものにする。同期先の
+                    // 今の一覧には、送った後に別の PC が DB を変えずに足したファイルも入っていて、それを
+                    // 祖先にあったものと見ると取り出さず、続く Push で一覧から落としてしまう。
                     Logger.LogInformation("同期先の DB は自分が送ったものなので、それを祖先にします");
-                    baseline = hostBaseline;
+                    baseline = hostBaseline is null ? null : new DatabaseSummary
+                    {
+                        Format = hostBaseline.Format,
+                        SchemaVersion = hostBaseline.SchemaVersion,
+                        RulesDigest = hostBaseline.RulesDigest,
+                        CreatedAt = hostBaseline.CreatedAt,
+                        RemoteVersion = hostBaseline.RemoteVersion,
+                        Tables = hostBaseline.Tables,
+                        Files = ownPush.Summary?.Files,
+                    };
                 }
                 else if (ownPush is { Committed: true, Version: long pushedVersion, Summary: not null }
                          && entry.Version > pushedVersion
