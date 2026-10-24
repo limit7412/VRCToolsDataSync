@@ -28,7 +28,8 @@ public sealed class FriendConnectMergeTests : IDisposable
 
     /// <summary>
     /// 祖先: ユーザー a (メモあり)、b、c、ワールド w1、タグ friend / work、a に friend、
-    /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件。
+    /// お気に入りグループ fav に a、a の通知設定、a の滞在履歴 2 件、写真のお気に入り 1 件、
+    /// w1 へのメモ 1 件、稼働区間 2 件 (2 件目は手元で動作中)。
     /// </summary>
     private (string Host, string Local, DatabaseSummary Baseline) Arrange()
     {
@@ -42,7 +43,9 @@ public sealed class FriendConnectMergeTests : IDisposable
             InsertFavoriteGroup("fav", "Favorites") + FavoriteUser("fav", "usr_a") +
             SetNotification("usr_a", "login", "discord") +
             "INSERT INTO Location (userId, startAt) SELECT id, 1 FROM User WHERE apiId = 'usr_a';" +
-            "INSERT INTO Location (userId, startAt) SELECT id, 2 FROM User WHERE apiId = 'usr_a';");
+            "INSERT INTO Location (userId, startAt) SELECT id, 2 FROM User WHERE apiId = 'usr_a';" +
+            FavoritePhoto(1000) + NoteWorld("wrld_1", 10, "wn-a") +
+            InsertScanRuntime(100_000, 160_000) + InsertScanRuntime(200_000, 250_000));
         var baseline = DatabaseSummary.Compute(ancestor, MergeProfiles.FriendConnect, out var reason);
         Assert.True(baseline is not null, reason);
 
@@ -403,5 +406,123 @@ public sealed class FriendConnectMergeTests : IDisposable
         Assert.Equal("buddy,work", string.Join(",", Rows(host, "SELECT name FROM Tag WHERE type = 'user' ORDER BY name")));
         Assert.Equal("usr_a:buddy", string.Join(",", Rows(host,
             "SELECT u.apiId || ':' || t.name FROM UserTag ut JOIN User u ON u.id = ut.userId JOIN Tag t ON t.id = ut.tagId ORDER BY u.apiId")));
+    }
+
+    private static string PhotoFavorites(string db) => string.Join(",", Rows(db, "SELECT shotAt FROM PhotoFavorite ORDER BY shotAt"));
+
+    private static string WorldNotes(string db) => string.Join(",", Rows(db,
+        "SELECT w.apiId || ':' || n.createdAt || ':' || n.note FROM WorldNote n JOIN World w ON w.id = n.worldId ORDER BY w.apiId, n.createdAt"));
+
+    private static string ScanRuntimes(string db) => string.Join(",", Rows(db, "SELECT startAt || '-' || endAt || '/' || seconds FROM ScanRuntime ORDER BY startAt"));
+
+    [Fact(DisplayName = "写真のお気に入りは、手元で足した・消した撮影時刻を同期先に伝える")]
+    public void PhotoFavoritesFollowLocalAddsAndRemoves()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, "DELETE FROM PhotoFavorite WHERE shotAt = 1000;" + FavoritePhoto(2000));
+        Exec(host, FavoritePhoto(3000));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("2000,3000", PhotoFavorites(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "PhotoFavorite");
+        Assert.Equal((1L, 0L, 1L), (table.Inserted, table.Updated, table.Deleted));
+    }
+
+    [Fact(DisplayName = "ワールドのメモは同期先の World の id に付け替えて足し、ワールドが無ければ写す")]
+    public void WorldNotesAreRemappedAndMissingWorldsCopied()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, InsertWorld("wrld_2", "W2") + NoteWorld("wrld_2", 20, "wn-b") + NoteWorld("wrld_1", 30, "wn-c") +
+                    "UPDATE WorldNote SET note = 'wn-a2', updatedAt = 9 WHERE createdAt = 10");
+        var hostWorldId = Scalar(host, "SELECT id FROM World WHERE apiId = 'wrld_1'");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("wrld_1:10:wn-a2,wrld_1:30:wn-c,wrld_2:20:wn-b", WorldNotes(host));
+        Assert.Equal(hostWorldId, Scalar(host, "SELECT id FROM World WHERE apiId = 'wrld_1'"));
+        Assert.Equal(1, Scalar(host, "SELECT count(*) FROM World WHERE apiId = 'wrld_2'"));
+        var table = Assert.Single(report.Tables, t => t.Table == "WorldNote");
+        Assert.Equal((2L, 1L, 0L), (table.Inserted, table.Updated, table.Deleted));
+        Assert.Equal(1, table.CopiedReferences?["World"]);
+    }
+
+    [Fact(DisplayName = "両方で同じワールドのメモを書き換えていたら、同期先の内容を残す")]
+    public void ConflictingWorldNotesKeepHost()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(host, "UPDATE WorldNote SET note = 'host' WHERE createdAt = 10");
+        Exec(local, "UPDATE WorldNote SET note = 'local' WHERE createdAt = 10");
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("wrld_1:10:host", WorldNotes(host));
+        var conflict = Assert.Single(report.Conflicts);
+        Assert.Equal("WorldNote", conflict.Table);
+        Assert.False(conflict.KeptLocal);
+    }
+
+    [Fact(DisplayName = "稼働区間は和集合を取り、動作中に伸びた endAt と seconds は大きい方を残す")]
+    public void ScanRuntimesAreUnionedAndGrowingColumnsExtended()
+    {
+        var (host, local, baseline) = Arrange();
+        // 手元では前回の同期の後も 2 件目が動き続け、その後もう一度起動した。同期先でも 1 回起動した。
+        Exec(local, "UPDATE ScanRuntime SET endAt = 290000, seconds = 90 WHERE startAt = 200000;" + InsertScanRuntime(300_000, 310_000));
+        Exec(host, InsertScanRuntime(400_000, 410_000));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("100000-160000/60,200000-290000/90,300000-310000/10,400000-410000/10", ScanRuntimes(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "ScanRuntime");
+        Assert.Equal((1L, 2L, 0L), (table.Inserted, table.Updated, table.Deleted));
+        Assert.False(table.Renumbered);
+    }
+
+    [Fact(DisplayName = "稼働区間は、規則に加える前の要約に祖先が無くても中止せずに和集合を取る")]
+    public void ScanRuntimesUnionWithoutAncestor()
+    {
+        var (host, local, baseline) = Arrange();
+        // ScanRuntime を規則に持たなかった版のツールが取った要約。両方の PC で起動した回数は違う。
+        baseline.Tables.Remove("ScanRuntime");
+        baseline.RulesDigest = "older";
+        Exec(local, InsertScanRuntime(300_000, 310_000));
+        Exec(host, InsertScanRuntime(400_000, 410_000));
+
+        var report = Merge(host, local, baseline);
+
+        Assert.Equal("100000-160000/60,200000-250000/50,300000-310000/10,400000-410000/10", ScanRuntimes(host));
+        var table = Assert.Single(report.Tables, t => t.Table == "ScanRuntime");
+        Assert.Equal(1, table.Inserted);
+    }
+
+    [Fact(DisplayName = "写真のお気に入りは、規則に加える前の要約に祖先が無く内容が違えば中止する")]
+    public void PhotoFavoritesAbortWithoutAncestor()
+    {
+        var (host, local, baseline) = Arrange();
+        baseline.Tables.Remove("PhotoFavorite");
+        baseline.RulesDigest = "older";
+        // 祖先なしでは、手元で消したお気に入りを同期先から戻してしまう。
+        Exec(local, "DELETE FROM PhotoFavorite WHERE shotAt = 1000");
+
+        var report = SqliteMerger.Merge(host, local, MergeProfiles.FriendConnect, baseline, dryRun: false);
+
+        Assert.False(report.Succeeded);
+        Assert.Contains("PhotoFavorite", report.AbortReason);
+        Assert.Equal("1000", PhotoFavorites(host));
+    }
+
+    [Fact(DisplayName = "写真のお気に入り・ワールドのメモ・稼働区間は、同じ手元を 2 回合わせても結果が変わらない")]
+    public void Phase5TablesAreIdempotent()
+    {
+        var (host, local, baseline) = Arrange();
+        Exec(local, FavoritePhoto(2000) + InsertWorld("wrld_2", "W2") + NoteWorld("wrld_2", 20, "wn-b") +
+                    "UPDATE ScanRuntime SET endAt = 290000, seconds = 90 WHERE startAt = 200000;" + InsertScanRuntime(300_000, 310_000));
+
+        Merge(host, local, baseline);
+        var first = (PhotoFavorites(host), WorldNotes(host), ScanRuntimes(host));
+        var again = Merge(host, local, baseline);
+
+        Assert.Equal(first, (PhotoFavorites(host), WorldNotes(host), ScanRuntimes(host)));
+        Assert.Equal(0, again.Tables.Where(t => t.Table is "PhotoFavorite" or "WorldNote" or "ScanRuntime").Sum(t => t.Inserted + t.Updated + t.Deleted));
     }
 }

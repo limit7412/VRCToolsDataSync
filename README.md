@@ -11,7 +11,7 @@ VRCX と VRC Friend Connect のユーザーデータを、複数 PC 間で共有
     - `db\db_1.1.sqlite`（現行版の本体 DB。必須）
     - `db\db.sqlite`（v1.1 より前の版が使っていた DB。古くから使っている PC にだけあり、ある場合だけ同期する）
     - `config.json`（ライセンスキーと各種トークンを含む。同期先に置かれる点に注意）
-    - `thumbnails\`（写真のサムネイル）と、存在する場合は `notes\`
+    - `thumbnails\`（写真のサムネイル）
 - **保存先**: ローカル同期フォルダ（パスはユーザーが手動指定）または S3 互換オブジェクトストレージ
 - **マージ戦略**: 既定は last-writer-wins（置き換え）。VRCX と VRC Friend Connect のそれぞれについて、試験的なマージ同期を別々に有効にできる（[docs/merge-sync.md](docs/merge-sync.md)）。Pull 前にローカルを `%AppData%\VRCToolsDataSync\backup\<tool>\<timestamp>\` へ自動退避（既定10世代）
 - **未同期の変更の保護**: 同期のたびに、DB のうち手で編集するデータと追加専用の履歴だけの要約を `%AppData%\VRCToolsDataSync\base\` に残す。Pull は、リモートが新しくても手元の要約が前回から変わっていれば上書きしない。マージ同期が有効ならマージして Push し、無効なら見送って知らせる。手元の変更を捨てて上書きするのは、非常用の強制 Pull に限る（[docs/emergency.md](docs/emergency.md)）

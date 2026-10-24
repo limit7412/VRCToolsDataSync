@@ -298,4 +298,18 @@ public sealed class DatabaseSummaryTests : IDisposable
         Assert.NotNull(store.Load("fake|vrcx"));
         Assert.Empty(Directory.GetFiles(store.RootDirectory, "*.tmp"));
     }
+
+    [Fact(DisplayName = "VRCX の規則のダイジェストは、後から足した規則の印を使わない限り変わらない")]
+    public void VrcxRulesDigestIsStable()
+    {
+        // 規則の印 (UnionWithoutAncestor など) を足すと、使わないプロファイルのダイジェストまで変わり、
+        // 更新後の最初のマージで前回の要約に無いテーブルを「以前は対象外だった」と見誤る。
+        // VRCX の規則を意図して変えたときだけ、この値を更新する。
+        Assert.Equal("f9d660585e6a2dcb", MergeProfiles.Vrcx.RulesDigest);
+        var flagged = new MergeTableRule("t", MergeTableKind.AppendOnly, new[] { "k" }, UnionWithoutAncestor: true);
+        var plain = flagged with { UnionWithoutAncestor = false };
+        Assert.NotEqual(
+            new MergeProfile { ToolKey = "x", Rules = new[] { flagged } }.RulesDigest,
+            new MergeProfile { ToolKey = "x", Rules = new[] { plain } }.RulesDigest);
+    }
 }

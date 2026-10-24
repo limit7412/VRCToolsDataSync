@@ -90,6 +90,12 @@ public enum MergeTableKind
 /// 手元の行を同期先へ写すときに NULL にする列。外部キーの制約が無いまま別の行の id を
 /// 持つ列で、同期先では別の行を指してしまうもの。
 /// </param>
+/// <param name="UnionWithoutAncestor">
+/// <see cref="MergeTableKind.AppendOnly"/> で、前回の同期時点の要約にこのテーブルの祖先が無くても
+/// (規則に加える前の版のツールが要約を取った場合)、中止せずに全行を突き合わせて和集合を取る。
+/// 祖先が無いと手元で消した行を見分けられないので、アプリが行を消す操作を持たないテーブル
+/// (Friend Connect の稼働区間) だけに使う。
+/// </param>
 public sealed record MergeTableRule(
     string NamePattern,
     MergeTableKind Kind,
@@ -105,7 +111,8 @@ public sealed record MergeTableRule(
     IReadOnlyList<ColumnReference>? References = null,
     bool UpdateInPlace = false,
     bool ClearOnDelete = false,
-    IReadOnlyList<string>? ClearedColumns = null)
+    IReadOnlyList<string>? ClearedColumns = null,
+    bool UnionWithoutAncestor = false)
 {
     private readonly Regex _pattern = new("^(?:" + NamePattern + ")$", RegexOptions.CultureInvariant);
 
@@ -151,11 +158,15 @@ public sealed class MergeProfile
         static string References(IReadOnlyList<ColumnReference>? references) => references is null
             ? "-"
             : string.Join(",", references.Select(r => $"{r.Column}>{r.Table}.{r.IdColumn}({Columns(r.KeyColumns)})"));
+        // 後から足した印は、付いている規則だけに書く。既定値でも書くと、その印を使わない
+        // プロファイル (VRCX) のダイジェストまで版が変わり、更新後の最初のマージで、前回の
+        // 要約の後に両方の PC で作られた同名のテーブルを「以前は対象外だった」と見誤る。
         var text = string.Join("\n", Rules.Select(r => string.Join("|",
             r.NamePattern, r.Kind.ToString(), Columns(r.KeyColumns), Columns(r.ValueColumns),
             r.EditedAtColumn ?? "-", r.Filter ?? "-", Columns(r.IgnoredColumns), r.OrderColumn ?? "-",
             Columns(r.GrowingColumns), Columns(r.ShrinkingColumns), Columns(r.CounterColumns),
-            References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))));
+            References(r.References), r.UpdateInPlace ? "u" : "-", r.ClearOnDelete ? "c" : "-", Columns(r.ClearedColumns))
+            + (r.UnionWithoutAncestor ? "|a" : string.Empty)));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16].ToLowerInvariant();
     }
 
