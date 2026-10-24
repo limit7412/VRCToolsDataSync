@@ -116,6 +116,12 @@ public static class MergeProfiles
     private static readonly RuntimeGate WhileHostRunning = new("startAt", "ScanRuntime", "startAt", "endAt", TimeEndColumn: "endAt");
 
     /// <summary>
+    /// 時刻 1 点の記録 (インスタンスの人数の時系列) を、相手の PC が動いていた期間で絞る対応。
+    /// 記録した時刻 (checkedAt) がその期間に入れば、相手も同じ時刻の人数を記録している。
+    /// </summary>
+    private static readonly RuntimeGate SampledWhileHostRunning = new("checkedAt", "ScanRuntime", "startAt", "endAt");
+
+    /// <summary>
     /// Friend Connect のインスタンス (LocationMaster) を指す列。この表の id はアプリが入力 (日付、
     /// ワールド、インスタンス番号) から決めるハッシュ値とされていて、PC 間で同じ値を取る前提で
     /// id そのもので見分ける (前提の確認と崩れたときの扱いは <see cref="FriendConnect"/> の規則の注記)。
@@ -193,6 +199,12 @@ public static class MergeProfiles
             // をキーに含める。ワールドが同期先に無ければ写す。
             new("WorldNote", MergeTableKind.Keyed, new[] { "worldId", "createdAt" }, ValueColumns: new[] { "note" },
                 References: new[] { WorldByApiId }),
+            // 通知の送信履歴。Friend Connect がフレンドのログインなどを通知 (Discord など) するたびに 1 行
+            // 書き、消す操作は持たない。ユーザーと種類と作成時刻で見分け、ユーザーは VRChat の ID で付け替える。
+            // 2 台で同時に動かしていた期間は両方の PC が通知を送っていて、それぞれが送った記録なので、
+            // 稼働区間では絞らずに両方を残す。
+            new("UserNotificationHistory", MergeTableKind.AppendOnly, new[] { "userId", "type", "createdAt" },
+                References: new[] { UserByApiId }, UnionWithoutAncestor: true),
 
             // Friend Connect の稼働区間。起動 1 回が 1 行で、動作中は endAt と seconds が毎分伸びる。
             // Friend Connect はこの行を消さないので、祖先の無い最初のマージでも和集合を取る。
@@ -226,6 +238,15 @@ public static class MergeProfiles
             new("Location", MergeTableKind.AppendOnly, new[] { "userId", "startAt" }, GrowingColumns: new[] { "endAt", "seconds" },
                 References: new[] { UserByApiId, LocationMasterById("locationKey"), WorldByApiId },
                 RuntimeGate: WhileHostRunning, UnionWithoutAncestor: true),
+            // インスタンスの人数の時系列。Friend Connect が自分のいるインスタンスの人数を定期的に (ポーリングの
+            // たびに) 記録した 1 点ずつの履歴で、インスタンスと記録時刻で見分ける。インスタンスは LocationMaster の
+            // id で付け替え (同じ値を取る前提は LocationMaster の規則の注記)、同期先に無ければ写す。2 台で同時に
+            // 動かしていた期間は相手も同じ時刻の人数を記録しているので、その期間の行は足さない。人数 (nUsers) は
+            // 記録時点の値で後から書き換わらないので、合成する列は無い。行数は履歴の中で最も多い (実機で 550 万行)
+            // が、要約は行数と rowid の最大値だけで、足す候補も前回の同期の後に増えた行に限る。
+            new("NUserHistory", MergeTableKind.AppendOnly, new[] { "locationMasterId", "checkedAt" },
+                References: new[] { LocationMasterById("locationMasterId") },
+                RuntimeGate: SampledWhileHostRunning, UnionWithoutAncestor: true),
             // 動画の再生履歴。再生時刻 (UNIQUE) がキー。VRChat のログから取るので、稼働区間では絞らない
             // (相手の PC で Friend Connect が動いていても、VRChat を動かしていたのはこちら)。滞在は同じ
             // 開始時刻の行が無ければ再生時刻を含む同じユーザーの滞在を指し、それも無ければ滞在を写す。
@@ -267,9 +288,8 @@ public static class MergeProfiles
             new("UserAnalytics", MergeTableKind.Keyed, new[] { "userId" }, ValueColumns: Array.Empty<string>(),
                 References: new[] { UserByApiId }, UnionWithoutAncestor: true, KeepHostOnLocalDelete: true),
 
-            // インスタンスの人数の時系列 (NUserHistory) と通知の送信履歴 (UserNotificationHistory) はまだ
-            // マージしない。ユーザーやワールドの score は Friend Connect が集計から求める値で、同期先のまま。
-            // ここに無いテーブルは同期先の内容がそのまま残る。
+            // ユーザーやワールドの score は Friend Connect が集計から求める値で、同期先のまま。
+            // ここに無いテーブル (VRChat 側の写しなど) は同期先の内容がそのまま残る。
         },
         CheckSchema = CheckFriendConnectSchema,
     };
