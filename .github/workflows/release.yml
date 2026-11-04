@@ -68,10 +68,10 @@ jobs:
         arch: [x64, arm64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v4.3.1
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
@@ -87,7 +87,7 @@ jobs:
         run: ./scripts/build-release.ps1 -Arch ${{ matrix.arch }} -Version $env:VERSION
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: VRCToolsDataSync-win-${{ matrix.arch }}
           path: artifacts/VRCToolsDataSync-win-${{ matrix.arch }}.zip
@@ -102,7 +102,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           path: artifacts
           merge-multiple: true
@@ -136,7 +136,7 @@ jobs:
       # Draft で作る。
       - name: Create release
         if: steps.check.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.2
         with:
           tag_name: ${{ needs.version.outputs.name }}
           target_commitish: ${{ github.sha }}
