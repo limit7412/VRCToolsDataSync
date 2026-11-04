@@ -147,7 +147,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           # バージョンをタグの一覧から決めるため、履歴とタグをすべて取得する
           fetch-depth: 0
@@ -243,7 +243,7 @@ jobs:
 
       - name: Setup .NET 10
         if: steps.version.outputs.skip != 'true'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v4.3.1
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
@@ -268,7 +268,7 @@ jobs:
 
       - name: プレリリースを作る
         if: steps.version.outputs.skip != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.6.2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           # 版計算とビルドが対象にした master の先頭へタグを打つ。省略するとタグ作成
