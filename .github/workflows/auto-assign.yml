@@ -1,0 +1,37 @@
+# issue と PR を作成者に関係なくリポジトリ管理者 (limit7412) へ自動でアサインする。
+#
+# PR は pull_request_target で受ける。pull_request だとフォークからの PR では
+# GITHUB_TOKEN が読み取り専用になり、アサインできないためである。
+# このワークフローは PR のコードをチェックアウトも実行もしないので、
+# pull_request_target の書き込み権限が PR 側のコードに渡ることはない。
+#
+# サードパーティのアクションは使わず、ランナーに入っている gh で済ませる。
+# uses: を持たないので actions.lock の更新も要らない。
+
+name: auto-assign
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSIGNEE: limit7412
+      NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+    steps:
+      # REST API では PR も issue の一種として扱われるため、issues の
+      # assignees エンドポイントで両方をアサインできる。既にアサイン済みでも失敗しない。
+      - name: Assign
+        run: gh api --method POST "repos/$GH_REPO/issues/$NUMBER/assignees" -f "assignees[]=$ASSIGNEE"
