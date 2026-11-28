@@ -373,7 +373,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
         string? backupPath = null;
         if (!options.SkipBackup)
         {
-            // WAL/SHM もバックアップに含める。この後で消すので、含めておかないと
+            // WAL/SHM もバックアップに含める。差し替えが済めば消すので、含めておかないと
             // 本体へ未反映のローカル変更が復元できなくなる。
             var filesToBackup = new List<string>
             {
@@ -384,6 +384,10 @@ public sealed class VrcxSyncService : IMergeableSyncService
             if (File.Exists(_paths.SettingsJsonFile)) filesToBackup.Add(_paths.SettingsJsonFile);
             backupPath = _backup.CreateSnapshot(Key, filesToBackup);
         }
+
+        // WAL/SHM を脇へ退ける名前。退けた後、本体を差し替える前に止まると、本体は元のままで
+        // WAL だけが無い。次回に戻せるよう、名前を先に決めて置き換えの記録に残す。
+        var asideSuffix = AsideSuffix();
 
         // ローカルを書き換える前に、差し替える前後の本体のハッシュを控える。本体を差し替えた後に
         // 設定の差し替えや要約の保存で止まっても、次回に本体が差し替わったかを見分けて、
@@ -399,7 +403,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
             var localSha256 = !databaseStaged ? remoteSnapshot.Sha256
                 : File.Exists(_paths.SqliteFile) ? FileHasher.Sha256(_paths.SqliteFile) : "";
             options.BeforeReplaceLocal(new MergePendingState(
-                pulledSummary, entry.Version, localSha256, remoteSnapshot.Sha256, FromPull: true));
+                pulledSummary, entry.Version, localSha256, remoteSnapshot.Sha256, asideSuffix, FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
@@ -417,22 +421,25 @@ public sealed class VrcxSyncService : IMergeableSyncService
             };
         }
 
-        // WAL/SHM を消すのは、本体 DB を差し替えるとき。残したまま差し替えると
+        // WAL/SHM を片付けるのは、本体 DB を差し替えるとき。残したまま差し替えると
         // 古い WAL が新しい本体に対して再生されてデータが破損するため、
         // --no-backup でも飛ばさない。
         //
         // 明示的な Pull はリモートの内容へ戻す操作なので、本体を差し替えない場合でも
-        // 消す (手元の未反映分は破棄される。バックアップには含めてある)。
-        // 起動時の自動 Pull (SkipIfNotNewer) では消さない。リモートで変わったのが
+        // 片付ける (手元の未反映分は破棄される。バックアップには含めてある)。
+        // 起動時の自動 Pull (SkipIfNotNewer) では片付けない。リモートで変わったのが
         // latest.json だけだった場合に、差し替えるものが無いのに未反映のローカル変更を
         // 捨てることになるため。
-        if (staging.IsStaged(_paths.SqliteFile) || !options.SkipIfNotNewer)
-        {
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-shm");
-            DeleteIfExists(_paths.RootDirectory, "VRCX.sqlite3-wal");
-        }
+        //
+        // 片付けるときも、先に消さずに脇へ退けておく。差し替えに失敗して本体が元のまま
+        // なら戻し、差し替えが済めば消す。先に消すと、差し替えに失敗したときに本体は古いまま
+        // WAL の未反映分だけが失われる。
+        var sidecars = staging.IsStaged(_paths.SqliteFile) || !options.SkipIfNotNewer
+            ? SidecarsAside.MoveAside(_paths.SqliteFile, asideSuffix, _logger)
+            : SidecarsAside.None(_logger);
 
         var affected = new List<string>();
+        var applied = false;
         try
         {
             staging.Apply(affected);
@@ -445,6 +452,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 // 失敗は呼び出し側に伝播させる。
                 File.Delete(_paths.SettingsJsonFile);
             }
+            applied = true;
         }
         catch (Exception) when ((affected.Contains(_paths.SqliteFile) || !databaseStaged) && options.AfterDatabaseReplaced is not null)
         {
@@ -455,6 +463,13 @@ public sealed class VrcxSyncService : IMergeableSyncService
             // 同期履歴まで進め、次の Push が消した設定を同期先へ送り直す。
             options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteSnapshot.Sha256);
             throw;
+        }
+        finally
+        {
+            // 本体を差し替えずに止まったなら、退けた WAL はこの本体のものなので戻す。差し替えた
+            // 後なら、別内容の本体に対して再生されないよう戻さずに消す。
+            if (applied || affected.Contains(_paths.SqliteFile)) sidecars.Discard();
+            else sidecars.Restore();
         }
 
         _logger.LogInformation("VRCX Pull 完了 version={Version} backup={Backup}", entry.Version, backupPath ?? "(none)");
@@ -518,44 +533,23 @@ public sealed class VrcxSyncService : IMergeableSyncService
     /// </summary>
     internal static void ReplaceDatabase(string source, string destination, ILogger logger, string? asideSuffix = null)
     {
-        var suffix = asideSuffix ?? AsideSuffix();
-        var moved = new List<(string Original, string Aside)>();
+        var aside = SidecarsAside.MoveAside(destination, asideSuffix ?? AsideSuffix(), logger);
         try
         {
-            foreach (var path in SidecarsOf(destination))
-            {
-                if (!File.Exists(path)) continue;
-                var aside = path + suffix;
-                File.Move(path, aside);
-                moved.Add((path, aside));
-            }
             // 置き換えは File.Replace で行うので、失敗しても本体は元のまま残る。
             AtomicFile.Copy(source, destination);
         }
         catch
         {
-            foreach (var (original, aside) in moved)
-            {
-                try
-                {
-                    File.Move(aside, original, overwrite: true);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "退けたファイルを戻せませんでした。{Aside} を {Original} へ手で戻してください", aside, original);
-                }
-            }
+            aside.Restore();
             throw;
         }
-        foreach (var (_, aside) in moved)
-        {
-            try { File.Delete(aside); } catch { /* best-effort cleanup */ }
-        }
+        aside.Discard();
     }
 
     internal static string AsideSuffix() => ".vrctds-aside-" + Guid.NewGuid().ToString("N");
 
-    private static IEnumerable<string> SidecarsOf(string database) => new[] { database + "-wal", database + "-shm" };
+    internal static IEnumerable<string> SidecarsOf(string database) => new[] { database + "-wal", database + "-shm" };
 
     /// <summary><see cref="ReplaceDatabase"/> が脇へ退けたまま残っている WAL/SHM の場所。</summary>
     internal static string[] FindAsideFiles(string database, string asideSuffix)
@@ -591,18 +585,6 @@ public sealed class VrcxSyncService : IMergeableSyncService
         foreach (var path in SidecarsOf(database))
         {
             try { File.Delete(path + asideSuffix); } catch { /* best-effort cleanup */ }
-        }
-    }
-
-    private static void DeleteIfExists(string dir, string fileName)
-    {
-        var path = Path.Combine(dir, fileName);
-        if (File.Exists(path))
-        {
-            // WAL/SHM 削除失敗を握りつぶすと、直後にリモート DB で本体ファイルを
-            // 上書きしても古い WAL が新しい本体に対して再生されて Pull 内容が
-            // 破損する。失敗は呼び出し側 (Pull) に例外で伝え、Aborted にする。
-            File.Delete(path);
         }
     }
 }

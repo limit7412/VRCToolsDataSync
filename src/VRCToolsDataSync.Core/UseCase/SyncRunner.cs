@@ -624,6 +624,27 @@ public sealed class SyncRunner
                 // 要約と比べて手元の変更を見つけ、無ければ残りをやり直す。
                 _logger.LogInformation("前回の Pull は本体を差し替えた後に止まっていました。祖先を本体の版にそろえ、残りは次の Pull で差し替えます ({Tool})", service.ToolKey);
                 if (pending.Summary is not null) pending.Summary.RemoteVersion = pending.RemoteVersion;
+                if (!dryRun && pending.AsideSuffix is not null && aside.Length > 0)
+                {
+                    // Pull が退けた WAL/SHM が残っている。前後のハッシュが同じなら Pull は本体を
+                    // 差し替えない回だったので、退けた WAL はこの本体のもので、戻せば手元の変更を
+                    // 失わない。違えば本体は差し替わった後なので、戻すと古い WAL が別内容の本体に
+                    // 対して再生される。戻さずに消す。
+                    if (!string.Equals(pending.LocalSha256, pending.MergedSha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        VrcxSyncService.DeleteAsideFiles(tracked.Path, pending.AsideSuffix);
+                    }
+                    else if (!VrcxSyncService.RestoreAsideFiles(tracked.Path, pending.AsideSuffix, _logger))
+                    {
+                        return (new SyncResult
+                        {
+                            Outcome = SyncOutcome.Aborted,
+                            Message = "前回の Pull が退けた WAL を戻せません (" + string.Join(", ", aside) + ")。" +
+                                      "戻す先に別のファイルがあります。ツールを終了してからもう一度実行してください。" +
+                                      "それでも進まなければ、退けたファイルの中身が要らないことを確かめて消してください",
+                        }, null, null);
+                    }
+                }
                 if (!dryRun)
                 {
                     if (pending.Summary is null) _baseSummaries.Delete(stateKey);

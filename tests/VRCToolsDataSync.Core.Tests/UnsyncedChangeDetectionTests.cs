@@ -1794,6 +1794,24 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
     }
 
+    [Fact(DisplayName = "Pull が本体を差し替えた後に止まって退けた WAL が残っていれば、戻さずに消す")]
+    public void InterruptedPullDiscardsAsideWalAfterDatabaseReplaced()
+    {
+        var (b, store, key, pushed, _) = ArrangePullInterruptedAfterDatabase(mergeEnabled: false);
+        var pending = store.LoadPendingReplace(key);
+        Assert.NotNull(pending?.AsideSuffix);
+        // 本体を差し替えた後、退けた WAL を消す前にプロセスごと止まった状態。
+        var aside = b.Paths.SqliteFile + "-wal" + pending!.AsideSuffix;
+        File.WriteAllText(aside, "old-wal");
+
+        var retried = StartupPull(b);
+
+        // 本体は取り出した版なので、前の本体の WAL を戻すと別内容の本体に対して再生される。
+        Assert.True(retried.Outcome == SyncOutcome.Success, retried.Message);
+        Assert.False(File.Exists(aside));
+        Assert.Equal(pushed.RemoteVersion, b.Settings.ToolState[key].LastPulledVersion);
+    }
+
     [Fact(DisplayName = "Pull が本体を差し替えた後に止まっていれば、マージが有効でも Push は自動マージへ進まない")]
     public void PushWithMergeEnabledDoesNotMergeOverInterruptedPull()
     {
