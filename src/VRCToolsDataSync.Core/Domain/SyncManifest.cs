@@ -44,7 +44,7 @@ public sealed class ToolManifestEntry
     /// 前のエントリの値を引き継ぐ。ある版より後の版がその版の内容を取り込んでいると言えるのは、
     /// その版の後に上書きが無い (この値がその版以下) ときだけである。null は、この項目を
     /// 知らない古い版のツールが書いたエントリで、上書きの有無を確かめられない。通常の Push は
-    /// null も引き継ぎ、強制 Push が値を書き直すまで確かめられないままにする。
+    /// null の代わりに前のエントリの version を書く (そこで上書きがあったと見なす)。
     /// </summary>
     public long? LastForcedVersion { get; set; }
 

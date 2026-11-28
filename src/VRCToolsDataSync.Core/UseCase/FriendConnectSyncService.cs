@@ -207,8 +207,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-                // 初めての項目は 0。前の項目の null (古い版のツールが書いた) も引き継ぐ。
-                LastForcedVersion = forced ? version : existing is null ? 0 : existing.LastForcedVersion,
+                LastForcedVersion = ManifestStore.NextLastForcedVersion(existing, forced, version),
                 PushId = options.PushId,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が

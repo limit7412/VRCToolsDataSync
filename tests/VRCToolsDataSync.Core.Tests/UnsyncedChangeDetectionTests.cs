@@ -1114,19 +1114,63 @@ public sealed class UnsyncedChangeDetectionTests : IDisposable
         Assert.Equal(1, Scalar(b.Paths.SqliteFile, "SELECT count(*) FROM usr0123abcd_notes WHERE note = 'local note'"));
     }
 
-    [Fact(DisplayName = "古いツールが書いた版 (強制 Push の版が無い) の上に通常の Push をしても、無いままにする")]
-    public void NormalPushKeepsUnknownForcedVersion()
+    [Fact(DisplayName = "古いツールが書いた版 (強制 Push の版が無い) の上に通常の Push をすると、その版を強制 Push の版として書く")]
+    public void NormalPushFillsUnknownForcedVersion()
     {
         var (a, _) = ArrangeRemoteNewer();
-        var manifest = _storage.LoadManifest().Manifest;
-        manifest.Tools[VrcxSyncService.Key].LastForcedVersion = null;
-        _storage.SeedManifest(manifest);
+        var oldVersion = MarkLatestAsWrittenByOldTool();
         AddLocation(a, "2026-10-03T00:00:00Z");
 
         Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
 
-        // 0 にすると、古いツールの強制 Push があったかを後から確かめられなくなる。
-        Assert.Null(_storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].LastForcedVersion);
+        // 古いツールの強制 Push があったとしても、その版以前にある。
+        Assert.Equal(oldVersion, _storage.LoadManifest().Manifest.Tools[VrcxSyncService.Key].LastForcedVersion);
+    }
+
+    [Fact(DisplayName = "古いツールが書いた版を Pull 済みの PC は、その上に通常の Push があった後ならマージできる")]
+    public void MergeSucceedsAfterNormalPushFilledUnknownForcedVersion()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        MarkLatestAsWrittenByOldTool();
+        Assert.Equal(SyncOutcome.Success, b.Runner.Pull(b.Service, b.Settings, _storage, skipBackup: false).Outcome);
+        AddLocation(a, "2026-10-03T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        AddLocation(b, "2026-10-04T00:00:00Z");
+        b.Settings.MergeVrcx = true;
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        Assert.True(result.Outcome == SyncOutcome.Success, result.Message);
+        Assert.Equal(4, CountLocations(b.Paths.SqliteFile));
+    }
+
+    [Fact(DisplayName = "古いツールが書いた版より前の要約しか持たない PC は、その上に通常の Push があってもマージを中止する")]
+    public void MergeAbortsBeforeUnknownForcedVersionEvenAfterNormalPush()
+    {
+        var (a, b) = ArrangeRemoteNewer();
+        var oldVersion = MarkLatestAsWrittenByOldTool();
+        AddLocation(a, "2026-10-03T00:00:00Z");
+        Assert.Equal(SyncOutcome.Success, Push(a).Outcome);
+        AddLocation(b, "2026-10-04T00:00:00Z");
+        b.Settings.MergeVrcx = true;
+
+        var result = b.Runner.Merge(b.Service, b.Settings, _storage);
+
+        // B が持つ要約は古いツールが書いた版より前のもの。その間に古いツールの強制 Push が
+        // あったかを確かめられないので、その版で強制 Push があったものとして止める。
+        Assert.Equal(SyncOutcome.Aborted, result.Outcome);
+        Assert.Contains($"強制 Push (版 {oldVersion})", result.Message);
+        Assert.Equal(2, CountLocations(b.Paths.SqliteFile));
+    }
+
+    /// <summary>同期先の最新の版を、強制 Push の版を知らない古いツールが書いたことにする。</summary>
+    private long MarkLatestAsWrittenByOldTool()
+    {
+        var manifest = _storage.LoadManifest().Manifest;
+        var entry = manifest.Tools[VrcxSyncService.Key];
+        entry.LastForcedVersion = null;
+        _storage.SeedManifest(manifest);
+        return entry.Version;
     }
 
     [Fact(DisplayName = "退けた WAL が残っていれば、dry-run のマージは戻せないので中止する")]

@@ -196,10 +196,7 @@ public sealed class VrcxSyncService : IMergeableSyncService
                 MachineName = options.MachineName,
                 UpdatedAt = DateTimeOffset.Now,
                 Files = files,
-                // 初めての項目は 0。前の項目があれば、その値を null も含めて引き継ぐ。null は
-                // この項目を知らない古い版のツールが書いたことを表し、通常の Push で 0 にすると、
-                // 古いツールの強制 Push があったかを後から確かめられなくなる。
-                LastForcedVersion = forced ? version : existing is null ? 0 : existing.LastForcedVersion,
+                LastForcedVersion = ManifestStore.NextLastForcedVersion(existing, forced, version),
                 PushId = options.PushId,
             };
             // 非常用の強制 Push は全ファイルを置き換え済みなので、途中で他の PC が
