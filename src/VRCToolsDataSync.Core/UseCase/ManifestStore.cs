@@ -132,6 +132,26 @@ public sealed class ManifestStore
             Thread.Sleep(TimeSpan.FromMilliseconds(150 * attempt));
         }
     }
+
+    /// <summary>
+    /// Push で書く新しい項目の <see cref="ToolManifestEntry.LastForcedVersion"/> を決める。
+    /// 強制 Push はその版、初めての項目は 0、それ以外は前の項目の値を引き継ぐ。
+    /// <para>
+    /// 前の項目の値が null (この項目を知らない古い版のツールが書いた項目) なら、通常の Push は
+    /// 前の項目の版で強制 Push があったと見なして、その版を書く。通常の Push を通すのは、
+    /// 前の項目の版を Pull 済みかマージ済みの PC だけである (manifest の保存も、その版のままで
+    /// あることを条件にする)。古いツールの強制 Push があったとしても前の項目の版以前なので、
+    /// 新しい版はその版の内容を取り込んでいると言える。null のまま引き継ぐと、全 PC の
+    /// ツールを更新しても強制 Push の有無を確かめられないままになり、マージが中止し続ける。
+    /// 前の項目の版より古い要約を持つ PC は、この値を見て従来どおり中止する。
+    /// </para>
+    /// </summary>
+    internal static long NextLastForcedVersion(ToolManifestEntry? existing, bool forced, long version)
+    {
+        if (forced) return version;
+        if (existing is null) return 0;
+        return existing.LastForcedVersion ?? existing.Version;
+    }
 }
 
 /// <summary>
