@@ -392,7 +392,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
         string? backupPath = null;
         if (!options.SkipBackup)
         {
-            // WAL/SHM もバックアップに含める。この後で消すので、含めておかないと
+            // WAL/SHM もバックアップに含める。差し替えが済めば消すので、含めておかないと
             // 本体へ未反映のローカル変更が復元できなくなる。
             var filesToBackup = new List<string>
             {
@@ -426,13 +426,18 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
         // 長いので、書き換えの確認より前に済ませる。記録を残した後、差し替える前に中止した
         // ときは、呼び出し側が記録を消す。
         var databaseStaged = staging.IsStaged(_paths.DbV11File);
+        // WAL/SHM を脇へ退ける名前。退けた後、本体を差し替える前に止まると、本体は元のままで
+        // WAL だけが無い。次回に戻せるよう、名前を先に決めて置き換えの記録に残す。
+        // 記録が見るのは現行の本体 (db_1.1) だけなので、旧版の db.sqlite の WAL を退けた後に
+        // 止まった場合は、次回に自動では戻さない。
+        var asideSuffix = VrcxSyncService.AsideSuffix();
         if (options.BeforeReplaceLocal is not null && remoteDbV11 is not null)
         {
             // 差し替えないなら、本体は取得を省いた時点で同期先の写しと同じ内容。
             var localSha256 = !databaseStaged ? remoteDbV11.Sha256
                 : File.Exists(_paths.DbV11File) ? FileHasher.Sha256(_paths.DbV11File) : "";
             options.BeforeReplaceLocal(new MergePendingState(
-                pulledSummary, entry.Version, localSha256, remoteDbV11.Sha256, FromPull: true));
+                pulledSummary, entry.Version, localSha256, remoteDbV11.Sha256, asideSuffix, FromPull: true));
         }
 
         // (4) ここから先はローカルを書き換える。その直前に、取得と要約とバックアップと記録の
@@ -450,31 +455,46 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
             };
         }
 
-        // WAL/SHM を消すのは、その DB の本体を差し替えるか削除するとき。残したままだと
+        // WAL/SHM を片付けるのは、その DB の本体を差し替えるか削除するとき。残したままだと
         // 古い WAL が別内容の本体に対して再生されてデータが破損するため、
         // --no-backup でも飛ばさない。
         //
         // 明示的な Pull はリモートの内容へ戻す操作なので、本体を差し替えない場合でも
-        // 消す (手元の未反映分は破棄される。バックアップには含めてある)。
-        // 起動時の自動 Pull (SkipIfNotNewer) では消さない。差し替えるものが無いのに
+        // 片付ける (手元の未反映分は破棄される。バックアップには含めてある)。
+        // 起動時の自動 Pull (SkipIfNotNewer) では片付けない。差し替えるものが無いのに
         // 未反映のローカル変更を捨てることになるため。
+        //
+        // 片付けるときも、先に消さずに脇へ退けておく。差し替えに失敗して本体が元のまま
+        // なら戻し、差し替えか削除が済めば消す。先に消すと、差し替えに失敗したときに本体は
+        // 古いまま WAL の未反映分だけが失われる。
         var explicitPull = !options.SkipIfNotNewer;
+        var dbExisted = File.Exists(_paths.DbFile);
+        var dbV11Existed = File.Exists(_paths.DbV11File);
         // 旧版の db.sqlite も、リモートから消えた場合に本体だけ削除する経路がある。
-        if (staging.IsStaged(_paths.DbFile) || explicitPull || remoteDb is null)
-        {
-            DeleteIfExists(_paths.DbDirectory, "db.sqlite-shm");
-            DeleteIfExists(_paths.DbDirectory, "db.sqlite-wal");
-        }
+        var dbSidecars = staging.IsStaged(_paths.DbFile) || explicitPull || remoteDb is null
+            ? SidecarsAside.MoveAside(_paths.DbFile, asideSuffix, _logger)
+            : SidecarsAside.None(_logger);
         // db_1.1 はリモートから消えた場合に本体だけ削除する経路がある。
         // そのときも WAL を残すと、次に Friend Connect が本体を作り直したときに
         // 別 DB の WAL が再生されうる。
-        if (staging.IsStaged(_paths.DbV11File) || explicitPull || remoteDbV11 is null)
+        SidecarsAside dbV11Sidecars;
+        try
         {
-            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-shm");
-            DeleteIfExists(_paths.DbDirectory, "db_1.1.sqlite-wal");
+            dbV11Sidecars = staging.IsStaged(_paths.DbV11File) || explicitPull || remoteDbV11 is null
+                ? SidecarsAside.MoveAside(_paths.DbV11File, asideSuffix, _logger)
+                : SidecarsAside.None(_logger);
+        }
+        catch
+        {
+            dbSidecars.Restore();
+            throw;
         }
 
         var affected = new List<string>();
+        var applied = false;
+        // 本体を差し替えたか消したか。済んでいれば、退けた WAL は別内容の本体のものなので戻さない。
+        bool Replaced(string database, bool existed)
+            => affected.Contains(database) || (existed && !File.Exists(database));
         try
         {
             staging.Apply(affected);
@@ -498,6 +518,7 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
             {
                 RemoveStaleFiles(directory, remoteDirectoryFiles[directory]);
             }
+            applied = true;
         }
         catch (Exception) when ((affected.Contains(_paths.DbV11File) || !databaseStaged) && remoteDbV11 is not null && options.AfterDatabaseReplaced is not null)
         {
@@ -507,6 +528,15 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
             // 残りを取り込めない。
             options.AfterDatabaseReplaced(entry.Version, pulledSummary, remoteDbV11.Sha256);
             throw;
+        }
+        finally
+        {
+            // 本体を差し替えずに止まったなら、退けた WAL はその本体のものなので戻す。差し替えた
+            // 後なら、別内容の本体に対して再生されないよう戻さずに消す。
+            if (applied || Replaced(_paths.DbFile, dbExisted)) dbSidecars.Discard();
+            else dbSidecars.Restore();
+            if (applied || Replaced(_paths.DbV11File, dbV11Existed)) dbV11Sidecars.Discard();
+            else dbV11Sidecars.Restore();
         }
 
         _logger.LogInformation("Friend Connect Pull 完了 version={Version} backup={Backup}",
@@ -675,18 +705,6 @@ public sealed class FriendConnectSyncService : IMergeableSyncService
     /// </summary>
     private static string ToLocalPath(SyncedDirectory directory, ManifestFile file)
         => StorageKey.ToLocalPath(directory.LocalDirectory, file.RelativePath[directory.KeyPrefix.Length..]);
-
-    private static void DeleteIfExists(string dir, string fileName)
-    {
-        var path = Path.Combine(dir, fileName);
-        if (File.Exists(path))
-        {
-            // VRCX 側と同様: WAL/SHM 削除失敗を握りつぶすと、リモート DB を
-            // 上書きしても古い WAL が新しい本体 DB に再生される事故が起きるため、
-            // 失敗は呼び出し側 (Pull) に伝播させて Aborted にする。
-            File.Delete(path);
-        }
-    }
 
     /// <summary>
     /// Pull が差し替えるもの (2 つの DB 本体と WAL、設定の JSON、同期するフォルダの中身) の状態。
